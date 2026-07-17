@@ -1,0 +1,10 @@
+{
+  "outputPath": "F:\\Work\\HMDAODAO\\app\\server\\tmp-post-runtime-smoke-2\\supir.png",
+  "engine": "SUPIR Example Runtime",
+  "meta": {
+    "scale": 2.0,
+    "denoise": 0.12,
+    "sharpen": 0.48,
+    "detailBias": "photo"
+  }
+}

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+    <defs>
+      <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#050505"/>
+        <stop offset="0.52" stop-color="#0f766e"/>
+        <stop offset="1" stop-color="#111827"/>
+      </linearGradient>
+    </defs>
+    <rect width="1280" height="720" fill="url(#bg)"/>
+    <circle cx="234" cy="245" r="101" fill="#22d3ee" opacity="0.24"/>
+    <rect x="102" y="115" width="1075" height="418" rx="18" fill="rgba(0,0,0,0.26)" stroke="rgba(255,255,255,0.26)" stroke-width="2"/>
+    <text x="141" y="202" fill="#ffffff" font-family="Arial, sans-serif" font-size="53" font-weight="700">Blender Camera Preview</text>
+    <text x="141" y="274" fill="#d1fae5" font-family="Arial, sans-serif" font-size="34">Camera</text>
+    <text x="141" y="346" fill="#cbd5e1" font-family="Arial, sans-serif" font-size="27">Frame 1 · 1280 x 720</text>
+    <text x="141" y="446" fill="#e5e7eb" font-family="Arial, sans-serif" font-size="22">DCC bridge mock frame. Connect the real plugin to capture live camera output.</text>
+  </svg>

@@ -1,0 +1,10 @@
+{
+  "outputPath": "F:\\Work\\HMDAODAO\\app\\server\\tmp-post-runtime-smoke-4\\ocio.png",
+  "engine": "OCIO Example Runtime",
+  "meta": {
+    "ocioView": "filmic",
+    "ocioDisplay": "web-srgb",
+    "ocioLookStrength": 0.72,
+    "lutApplied": false
+  }
+}

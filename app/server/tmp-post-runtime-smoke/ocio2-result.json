@@ -1,0 +1,13 @@
+{
+  "outputPath": "F:\\Work\\HMDAODAO\\app\\server\\tmp-post-runtime-smoke\\ocio2.png",
+  "engine": "OCIO Example Runtime",
+  "meta": {
+    "ocioView": "filmic",
+    "ocioDisplay": "web-srgb",
+    "ocioLookStrength": 0.6,
+    "lutApplied": false
+  },
+  "warnings": [
+    "LUT 文件不可用，已自动回退到无 LUT 的 OCIO 示例链路。"
+  ]
+}

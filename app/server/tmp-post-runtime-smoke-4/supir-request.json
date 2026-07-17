@@ -1,0 +1,8 @@
+﻿{
+    "outputPath":  "F:\\Work\\HMDAODAO\\app\\server\\tmp-post-runtime-smoke-4\\supir.png",
+    "inputPath":  "F:\\Work\\HMDAODAO\\app\\server\\tmp-post-runtime-smoke-4\\input.png",
+    "mediaKind":  "image",
+    "denoise":  0.12,
+    "scale":  2,
+    "sharpen":  0.48
+}

@@ -1,0 +1,229 @@
+﻿/* ===== React Flow Custom Overrides ===== */
+.react-flow {
+  --xy-edge-stroke: #39d2c0;
+  --xy-edge-stroke-selected: #00d4aa;
+  --xy-connectionline-stroke: #00d4aa;
+  --xy-handle-background: #00d4aa;
+  --xy-handle-border-color: #161b22;
+  --xy-node-border-radius: 12px;
+  --xy-minimap-background-color: #161b22;
+  --xy-controls-button-background-color: #161b22;
+  --xy-controls-button-background-color-hover: #21262d;
+  --xy-controls-button-color: #8b949e;
+  --xy-controls-button-color-hover: #e6edf3;
+  --xy-controls-button-border-color: #30363d;
+  --xy-attribution-background-color: transparent;
+}
+
+.react-flow__edge-path {
+  stroke: var(--xy-edge-stroke) !important;
+  stroke-width: 2.2px;
+  opacity: 0.95;
+}
+
+.react-flow__connection-path {
+  stroke: var(--xy-connectionline-stroke) !important;
+  stroke-width: 2.2px;
+  opacity: 0.95;
+}
+
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: #00d4aa !important;
+  stroke-width: 3px !important;
+}
+
+.react-flow__edge.animated .react-flow__edge-path {
+  stroke-dasharray: 5;
+  animation: dashdraw 0.5s linear infinite;
+}
+
+@keyframes dashdraw {
+  from {
+    stroke-dashoffset: 10;
+  }
+}
+
+.react-flow__handle {
+  width: 10px;
+  height: 10px;
+  border: 2.5px solid #161b22;
+  background: #00d4aa;
+  transition: all 0.2s ease;
+}
+
+.react-flow__handle:hover {
+  width: 14px;
+  height: 14px;
+  background: #00e5b3;
+}
+
+.react-flow__handle-connecting {
+  background: #fbbf24 !important;
+}
+
+.react-flow__handle-valid {
+  background: #22c55e !important;
+}
+
+.react-flow__node {
+  border: none !important;
+  padding: 0 !important;
+}
+
+.react-flow__node.selected {
+  z-index: 10 !important;
+}
+
+.react-flow__minimap {
+  border-radius: 12px !important;
+  overflow: hidden;
+}
+
+.react-flow__controls {
+  border-radius: 12px !important;
+  overflow: hidden;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3) !important;
+}
+
+.react-flow__controls-button {
+  border-color: #30363d !important;
+}
+
+.react-flow__controls-button:hover {
+  background: #21262d !important;
+}
+
+.react-flow__attribution {
+  display: none !important;
+}
+
+/* Selection Box */
+.react-flow__selection {
+  background: rgba(0, 212, 170, 0.05) !important;
+  border: 1px solid rgba(0, 212, 170, 0.3) !important;
+  border-radius: 8px !important;
+}
+
+/* ===== Scrollbar Styling ===== */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #30363d;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #484f58;
+}
+
+/* ===== Global Styles ===== */
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: #0d1117;
+  color: #e6edf3;
+  font-family: 'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC', 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+#root {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ===== Select / Dropdown Styling ===== */
+select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b949e' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  padding-right: 24px;
+  cursor: pointer;
+}
+
+select option {
+  background: #161b22;
+  color: #e6edf3;
+}
+
+/* ===== Animations ===== */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(-10px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.2s ease-out;
+}
+
+.animate-slide-in {
+  animation: slideIn 0.2s ease-out;
+}
+
+/* ===== Node Pulse Animation ===== */
+@keyframes nodePulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0, 212, 170, 0.2); }
+  50% { box-shadow: 0 0 0 8px rgba(0, 212, 170, 0); }
+}
+
+.node-generating {
+  animation: nodePulse 2s ease-in-out infinite;
+}
+
+/* ===== ImageNode Handle Styles ===== */
+.image-node-handle {
+  width: 18px;
+  height: 18px;
+  background: #2a2a2c;
+  border: 1px solid #3a3a3c;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ===== Resizable Panel Animations ===== */
+@keyframes panelSlideIn {
+  from { opacity: 0; transform: scale(0.95) translateY(8px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+@keyframes panelSlideOut {
+  from { opacity: 1; transform: scale(1) translateY(0); }
+  to { opacity: 0; transform: scale(0.95) translateY(8px); }
+}
+
+.animate-panel-in {
+  animation: panelSlideIn 250ms ease-in-out;
+}
+
+.animate-panel-out {
+  animation: panelSlideOut 250ms ease-in-out;
+}
+
+/* ===== Responsive ===== */
+@media (max-width: 768px) {
+  .react-flow__minimap {
+    width: 120px !important;
+    height: 80px !important;
+  }
+}

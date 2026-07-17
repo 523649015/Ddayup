@@ -1,0 +1,71 @@
+import { readLocalMediaBlob } from '@/services/localMediaRegistry';
+import type { AssetImageAnalysis, AssetItem } from '@/types/assets';
+
+interface AnalyzeImagePayload {
+  item: AssetItem;
+  engine?: string;
+  provider?: string;
+  model?: string;
+}
+
+interface AnalyzeImageResponse {
+  success?: boolean;
+  analysis?: AssetImageAnalysis;
+  error?: { message?: string };
+}
+
+function buildJsonPayload(item: AssetItem, engine?: string, provider?: string, model?: string) {
+  return {
+    itemId: item.id,
+    name: item.name,
+    sourceUrl: item.sourceUrl || item.url,
+    width: item.width,
+    height: item.height,
+    tags: item.tags,
+    smartCategories: item.smartCategories,
+    engine,
+    provider,
+    model,
+  };
+}
+
+export async function analyzeAssetImage({ item, engine = 'auto', provider, model }: AnalyzeImagePayload): Promise<AssetImageAnalysis> {
+  if (item.type !== 'image') {
+    throw new Error('only-image-assets-supported');
+  }
+
+  const localBlob = readLocalMediaBlob(item.url);
+  let response: Response;
+
+  if (localBlob) {
+    const form = new FormData();
+    form.append('file', localBlob, item.name || 'asset-image');
+    form.append('itemId', item.id);
+    form.append('name', item.name);
+    form.append('width', String(item.width || ''));
+    form.append('height', String(item.height || ''));
+    form.append('tags', JSON.stringify(item.tags || []));
+    form.append('smartCategories', JSON.stringify(item.smartCategories || []));
+    form.append('engine', engine);
+    if (provider) form.append('provider', provider);
+    if (model) form.append('model', model);
+    response = await fetch('/api/local-image/analyze', {
+      method: 'POST',
+      body: form,
+    });
+  } else {
+    response = await fetch('/api/local-image/analyze', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(buildJsonPayload(item, engine, provider, model)),
+    });
+  }
+
+  const data = await response.json().catch(() => ({})) as AnalyzeImageResponse;
+  if (!response.ok || !data.success || !data.analysis) {
+    throw new Error(data.error?.message || 'asset-image-analysis-failed');
+  }
+  return data.analysis;
+}

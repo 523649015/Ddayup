@@ -1,0 +1,112 @@
+{
+  "success": true,
+  "apiUrl": "http://127.0.0.1:8794",
+  "artifactDir": "F:\\Work\\HMDAODAO\\app\\server\\artifacts\\image-analysis-smoke-2026-06-23T17-45-48-493Z",
+  "publicSummaryPath": "F:\\Work\\HMDAODAO\\app\\public\\verification\\local-image-analysis-smoke-summary.json",
+  "checkedAt": "2026-06-23T17:45:50.268Z",
+  "runtimes": {
+    "florencePath": "F:\\Work\\HMDAODAO\\app\\server\\artifacts\\image-analysis-smoke-2026-06-23T17-45-48-493Z\\smoke_florence2_runtime.py",
+    "qwenPath": "F:\\Work\\HMDAODAO\\app\\server\\artifacts\\image-analysis-smoke-2026-06-23T17-45-48-493Z\\smoke_qwen_runtime.py"
+  },
+  "analyses": {
+    "florence": {
+      "engine": "Florence-2 Smoke Runtime",
+      "subject": "Florence 烟雾测试主体",
+      "style": "Florence 结构化描述风格",
+      "promptZh": "Florence 烟雾测试中文提示词：保持主体不变，强化商业海报感。",
+      "warnings": [
+        "florence-smoke-invoked"
+      ],
+      "runtime": {
+        "wrapperConfigured": true,
+        "wrapperCommand": "florence2",
+        "recommendedModels": [
+          "CLIP Interrogator",
+          "Florence-2",
+          "Qwen Vision"
+        ],
+        "requestedEngine": "florence2",
+        "resolvedEngine": "florence2"
+      },
+      "metadata": {
+        "width": 64,
+        "height": 40,
+        "orientation": "横构图",
+        "sourceKind": "upload",
+        "requestedEngine": "florence2",
+        "resolvedEngine": "florence2",
+        "smoke": true,
+        "requestEngine": "florence2"
+      }
+    },
+    "qwen": {
+      "engine": "Qwen Vision Smoke Runtime",
+      "subject": "Qwen 烟雾测试主体",
+      "style": "Qwen 中文镜头整理风格",
+      "promptZh": "Qwen 烟雾测试中文提示词：保持主体和构图，强化镜头语言、风格和光影氛围。",
+      "warnings": [
+        "qwen-smoke-invoked"
+      ],
+      "runtime": {
+        "wrapperConfigured": true,
+        "wrapperCommand": "qwen35-vl",
+        "recommendedModels": [
+          "CLIP Interrogator",
+          "Florence-2",
+          "Qwen Vision"
+        ],
+        "requestedEngine": "qwen35-vl",
+        "resolvedEngine": "qwen35-vl"
+      },
+      "metadata": {
+        "width": 64,
+        "height": 40,
+        "orientation": "横构图",
+        "sourceKind": "upload",
+        "requestedEngine": "qwen35-vl",
+        "resolvedEngine": "qwen35-vl",
+        "smoke": true,
+        "requestEngine": "qwen35-vl"
+      }
+    },
+    "fusion": {
+      "engine": "prompt-fusion:florence2+qwen35-vl",
+      "subject": "Qwen 烟雾测试主体",
+      "style": "Qwen 中文镜头整理风格",
+      "promptZh": "保持横向构图，保留主体位置与景深层次和主体位置关系不变，以Qwen 烟雾测试主体为核心，场景设定为Qwen 烟雾测试城市场景，整体风格强调Qwen 中文镜头整理风格，光影采用Qwen 戏剧轮廓光，镜头语言突出Qwen 电影感跟拍镜头，整体氛围维持Qwen 高级氛围感，补强材质细节、色彩层次与画面完成度，用于高一致性的图片生成或重绘。",
+      "warnings": [
+        "当前未接入本地多模态模型，结果由本地启发式链路生成。",
+        "如需更强解析，建议优先配置 CLIP Interrogator、Florence-2 与 Qwen 视觉链 wrapper。",
+        "florence-smoke-invoked",
+        "qwen-smoke-invoked"
+      ],
+      "runtime": {
+        "wrapperConfigured": true,
+        "wrapperCommand": "prompt-fusion",
+        "recommendedModels": [
+          "CLIP Interrogator",
+          "Florence-2",
+          "Qwen Vision"
+        ],
+        "requestedEngine": "prompt-fusion",
+        "resolvedEngine": "prompt-fusion",
+        "fusionEngines": [
+          "florence2",
+          "qwen35-vl"
+        ]
+      },
+      "metadata": {
+        "width": 64,
+        "height": 40,
+        "orientation": "横构图",
+        "sourceKind": "upload",
+        "requestedEngine": "prompt-fusion",
+        "resolvedEngine": "prompt-fusion",
+        "fusionEngines": [
+          "florence2",
+          "qwen35-vl"
+        ]
+      }
+    }
+  }
+}

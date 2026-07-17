@@ -1,0 +1,10 @@
+{
+  "outputPath": "F:\\Work\\HMDAODAO\\app\\server\\tmp-post-runtime-smoke-4\\realbasicvsr.webm",
+  "engine": "RealBasicVSR Example Runtime",
+  "meta": {
+    "scale": 2.0,
+    "denoise": 0.18,
+    "sharpen": 0.34,
+    "temporalStability": 0.72
+  }
+}

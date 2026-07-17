@@ -1,0 +1,114 @@
+{
+  "version": 1,
+  "global": {
+    "weights": {
+      "activation": 1200,
+      "preferredModel": 260,
+      "preferredProvider": 140,
+      "regionMatch": 90,
+      "regionMismatch": -80,
+      "cost": -22,
+      "latency": -9,
+      "disabled": -100000,
+      "referenceRole": 180,
+      "generationMode": 260
+    },
+    "referenceRouting": {
+      "image": {
+        "style": { "preferredProviders": ["fal", "openai", "volcengine", "siliconflow"], "preferredModels": ["flux-pro", "gpt-image-2", "doubao-seedream-5-0-lite", "Qwen/Qwen-Image"] },
+        "subject": { "preferredProviders": ["fal", "openai", "volcengine", "siliconflow"], "preferredModels": ["flux-pro", "gpt-image-2", "grok-imagine-1.5-edit-apimart", "doubao-seedream-5-0-lite", "Qwen/Qwen-Image"] },
+        "element": { "preferredProviders": ["volcengine", "openai", "fal", "siliconflow"], "preferredModels": ["doubao-seedream-5-0-lite", "gpt-image-2", "flux-pro", "Qwen/Qwen-Image"] },
+        "composition": { "preferredProviders": ["fal", "openai", "volcengine", "siliconflow"], "preferredModels": ["flux-pro", "gpt-image-2", "doubao-seedream-5-0-lite", "Qwen/Qwen-Image"] },
+        "lighting": { "preferredProviders": ["volcengine", "fal", "openai", "siliconflow"], "preferredModels": ["doubao-seedream-5-0-lite", "flux-pro", "gpt-image-2", "Qwen/Qwen-Image"] }
+      },
+      "video": {
+        "style": { "preferredProviders": ["kling", "bailian", "fal", "siliconflow"], "preferredModels": ["kling-o3", "happyhorse-11", "seedance-v2", "Wan-AI/Wan2.2-I2V-A14B", "wan2.2-i2v-plus"] },
+        "subject": { "preferredProviders": ["kling", "bailian", "fal", "siliconflow"], "preferredModels": ["kling-o3", "happyhorse-11", "seedance-v2", "Wan-AI/Wan2.2-I2V-A14B", "wan2.2-i2v-plus"] },
+        "composition": { "preferredProviders": ["kling", "bailian", "fal", "siliconflow"], "preferredModels": ["kling-o3", "happyhorse-11", "seedance-v2", "Wan-AI/Wan2.2-I2V-A14B", "wan2.2-i2v-plus"] },
+        "lighting": { "preferredProviders": ["kling", "bailian", "fal", "siliconflow"], "preferredModels": ["kling-o3", "happyhorse-11", "seedance-v2", "Wan-AI/Wan2.2-I2V-A14B", "wan2.2-i2v-plus"] },
+        "motion": { "preferredProviders": ["kling", "bailian", "fal", "siliconflow"], "preferredModels": ["kling-o3", "happyhorse-11", "seedance-v2", "Wan-AI/Wan2.2-I2V-A14B", "wan2.2-i2v-plus"] },
+        "rhythm": { "preferredProviders": ["kling", "bailian", "fal", "siliconflow"], "preferredModels": ["kling-o3", "happyhorse-11", "seedance-v2", "Wan-AI/Wan2.2-I2V-A14B", "wan2.2-i2v-plus"] }
+      },
+      "videoGenerationModes": {
+        "textToVideo": { "preferredProviders": ["siliconflow", "bailian", "kling", "fal"], "preferredModels": ["Wan-AI/Wan2.2-T2V-A14B", "wan2.2-t2v-plus", "kling-o3"] },
+        "imageToVideo": { "preferredProviders": ["kling", "bailian", "fal", "siliconflow"], "preferredModels": ["kling-o3", "happyhorse-11", "seedance-v2", "Wan-AI/Wan2.2-I2V-A14B", "wan2.2-i2v-plus"] },
+        "firstLastFrame": { "preferredProviders": ["kling", "bailian", "fal", "siliconflow"], "preferredModels": ["kling-o3", "happyhorse-11", "seedance-v2", "Wan-AI/Wan2.2-I2V-A14B", "wan2.2-i2v-plus"] },
+        "referenceVideo": { "preferredProviders": ["kling", "bailian", "fal", "siliconflow"], "preferredModels": ["kling-o3", "happyhorse-11", "seedance-v2", "Wan-AI/Wan2.2-I2V-A14B", "wan2.2-i2v-plus"] },
+        "videoStyleTransfer": { "preferredProviders": ["kling", "bailian", "fal", "replicate"], "preferredModels": ["kling-o3", "happyhorse-11", "seedance-v2"] }
+      }
+    },
+    "regionPreference": {
+      "CN": {
+        "preferredProviders": ["siliconflow", "volcengine", "bailian", "kling"],
+        "secondaryProviders": ["openai", "fal", "replicate"]
+      },
+      "US": {
+        "preferredProviders": ["openai", "fal", "replicate"],
+        "secondaryProviders": ["siliconflow", "volcengine", "bailian", "kling"]
+      },
+      "OTHER": {
+        "preferredProviders": ["openai", "fal", "replicate", "siliconflow"],
+        "secondaryProviders": ["volcengine", "bailian", "kling"]
+      }
+    },
+    "disabledModels": []
+  },
+  "operations": {
+    "panorama_720": {
+      "label": "720 panorama generation",
+      "latestTechnique": "Single-image spherical panorama using geometry-aware scene extension and seam-constrained diffusion outpainting.",
+      "candidates": ["flux-pro", "gpt-image-2", "doubao-seedream-5-0-lite", "Qwen/Qwen-Image", "lib-image"],
+      "preferredProviders": ["fal", "openai", "volcengine", "siliconflow"],
+      "disabledModels": []
+    },
+    "multi_angle_view": {
+      "label": "consistent multi-angle generation",
+      "latestTechnique": "Geometry-consistent multi-view diffusion with identity locking, camera-conditioned view synthesis, and reference feature anchoring.",
+      "candidates": ["flux-pro", "gpt-image-2", "doubao-seedream-5-0-lite", "Qwen/Qwen-Image", "lib-image"],
+      "preferredProviders": ["fal", "openai", "volcengine", "siliconflow"],
+      "disabledModels": []
+    },
+    "pbr_relight": {
+      "label": "PBR relighting",
+      "latestTechnique": "Relightable representation with intrinsic decomposition, normal-aware shading reconstruction, and material-preserving highlight transfer.",
+      "candidates": ["doubao-seedream-5-0-lite", "flux-pro", "gpt-image-2", "Qwen/Qwen-Image", "lib-image"],
+      "preferredProviders": ["volcengine", "fal", "openai", "siliconflow"],
+      "disabledModels": []
+    },
+    "storyboard_grid": {
+      "label": "cinematic storyboard batching",
+      "latestTechnique": "Reference-consistent storyboard generation with shot-language prompting and panel-level composition control.",
+      "candidates": ["doubao-seedream-5-0-lite", "flux-pro", "gpt-image-2", "Qwen/Qwen-Image", "lib-image", "wanx-v1"],
+      "preferredProviders": ["volcengine", "fal", "openai", "siliconflow", "bailian"],
+      "disabledModels": []
+    },
+    "hd_toolbox_enhance": {
+      "label": "HD toolbox enhance",
+      "latestTechnique": "Hybrid super-resolution and restoration using detail hallucination control with face-preserving refinement.",
+      "candidates": ["flux-pro", "gpt-image-2", "doubao-seedream-5-0-lite", "Qwen/Qwen-Image", "lib-image"],
+      "preferredProviders": ["fal", "openai", "volcengine", "siliconflow"],
+      "disabledModels": []
+    },
+    "smart_grid_split": {
+      "label": "subject-aware grid split",
+      "latestTechnique": "Subject-aware composition analysis with face-safe cut line planning and export-ready tile layout.",
+      "candidates": ["Qwen/Qwen-Image", "gpt-image-2", "flux-pro", "wanx-v1"],
+      "preferredProviders": ["siliconflow", "openai", "fal", "bailian"],
+      "disabledModels": []
+    },
+    "cinematic_camera_simulation": {
+      "label": "cinematic camera simulation",
+      "latestTechnique": "Lens-character post-simulation with depth-aware bokeh, optical aberration shaping, and filmic color-science LUT mapping.",
+      "candidates": ["flux-pro", "gpt-image-2", "doubao-seedream-5-0-lite", "Qwen/Qwen-Image", "lib-image"],
+      "preferredProviders": ["fal", "openai", "volcengine", "siliconflow"],
+      "disabledModels": []
+    },
+    "preserveCompositionReplaceSubject": {
+      "label": "preserve composition replace subject",
+      "latestTechnique": "Reference-conditioned image editing that locks composition, perspective, and framing while replacing only the hero subject using stronger identity/layout control.",
+      "candidates": ["flux-pro", "gpt-image-2", "doubao-seedream-5-0-lite", "grok-imagine-1.5-edit-apimart", "Qwen/Qwen-Image", "lib-image"],
+      "preferredProviders": ["fal", "openai", "volcengine", "siliconflow"],
+      "disabledModels": []
+    }
+  }
+}

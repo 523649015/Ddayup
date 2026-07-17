@@ -1,0 +1,551 @@
+﻿import { useMemo, useState, type CSSProperties } from 'react';
+import { useCanvasStore } from '@/store/useCanvasStore';
+import { AssetLibrary } from './AssetLibrary';
+import { DccEnvironmentPanel } from './DccEnvironmentPanel';
+import { ResizableAssetPanel } from './ResizableAssetPanel';
+import { ModelDownloadPanel } from './ModelDownloadPanel';
+import {
+  AudioLines,
+  BookOpen,
+  Building2,
+  ChevronLeft,
+  ChevronRight,
+  Clapperboard,
+  Clock,
+  Edit3,
+  FileText,
+  Film,
+  FolderOpen,
+  GitBranch,
+  Globe,
+  HardDrive,
+  History,
+  Image,
+  LayoutGrid,
+  Layers,
+  MonitorUp,
+  Palette,
+  Plus,
+  RotateCcw,
+  Share2,
+  ShoppingBag,
+  Sofa,
+  Tags,
+  Trash2,
+  Video,
+  Zap,
+  type LucideIcon,
+} from 'lucide-react';
+import type { NodeType, SidebarTab } from '@/types';
+
+const MEDIA_NODE_TYPES = new Set<NodeType>(['script', 'storyboard', 'video', 'image']);
+
+const NODE_TYPE_CONFIG: Record<string, { color: string; icon: LucideIcon }> = {
+  script: { color: '#fbbf24', icon: FileText },
+  video: { color: '#ff6b35', icon: Video },
+  image: { color: '#1a8cff', icon: Image },
+  storyboard: { color: '#ec4899', icon: LayoutGrid },
+};
+
+interface WorkflowTemplate {
+  id: string;
+  name: string;
+  icon: LucideIcon;
+  color: string;
+  desc: string;
+  nodes: { type: NodeType; label: string; x: number; y: number }[];
+}
+
+const WORKFLOW_TEMPLATES: WorkflowTemplate[] = [
+  {
+    id: 'ecom',
+    name: '电商套图',
+    icon: ShoppingBag,
+    color: '#00d4aa',
+    desc: '产品文案 -> 场景图 -> 多角度 -> 视频 -> 配音',
+    nodes: [
+      { type: 'text', label: '产品文案', x: 100, y: 150 },
+      { type: 'image', label: '产品场景图', x: 500, y: 150 },
+      { type: 'image', label: '多角度展示', x: 900, y: 150 },
+      { type: 'video', label: '产品视频', x: 1300, y: 150 },
+      { type: 'audio', label: '配音', x: 1700, y: 150 },
+    ],
+  },
+  {
+    id: 'poster',
+    name: '海报设计',
+    icon: Palette,
+    color: '#1a8cff',
+    desc: '文案 -> 主视觉 -> Banner',
+    nodes: [
+      { type: 'text', label: '文案内容', x: 100, y: 150 },
+      { type: 'image', label: '主视觉海报', x: 500, y: 150 },
+      { type: 'image', label: 'Banner', x: 900, y: 150 },
+    ],
+  },
+  {
+    id: 'brand',
+    name: '品牌设计',
+    icon: Building2,
+    color: '#fbbf24',
+    desc: '品牌策略 -> 视觉 -> 脚本 -> 宣传片',
+    nodes: [
+      { type: 'text', label: '品牌策略', x: 100, y: 150 },
+      { type: 'image', label: '品牌视觉', x: 500, y: 150 },
+      { type: 'script', label: '脚本策划', x: 900, y: 150 },
+      { type: 'video', label: '宣传片', x: 1300, y: 150 },
+    ],
+  },
+  {
+    id: 'interior',
+    name: '室内设计',
+    icon: Sofa,
+    color: '#a855f7',
+    desc: '需求 -> 概念图 -> 效果图 -> 漫游',
+    nodes: [
+      { type: 'text', label: '设计需求', x: 100, y: 150 },
+      { type: 'image', label: '概念参考', x: 500, y: 150 },
+      { type: 'image', label: '效果图', x: 900, y: 150 },
+      { type: 'video', label: '空间漫游', x: 1300, y: 150 },
+    ],
+  },
+  {
+    id: 'social',
+    name: '社交媒体',
+    icon: Share2,
+    color: '#ff6b35',
+    desc: '文案 -> 竖版海报 -> 封面',
+    nodes: [
+      { type: 'text', label: '社媒文案', x: 100, y: 150 },
+      { type: 'image', label: '竖版海报', x: 500, y: 150 },
+      { type: 'image', label: '封面图', x: 900, y: 150 },
+    ],
+  },
+  {
+    id: 'shortfilm',
+    name: '剧情短片',
+    icon: Film,
+    color: '#ec4899',
+    desc: '大纲 -> 脚本 -> 分镜 -> 视频',
+    nodes: [
+      { type: 'text', label: '故事大纲', x: 100, y: 150 },
+      { type: 'script', label: '分镜脚本', x: 500, y: 150 },
+      { type: 'image', label: '分镜草图', x: 900, y: 150 },
+      { type: 'video', label: '片段预览', x: 1300, y: 150 },
+    ],
+  },
+  {
+    id: 'marketing',
+    name: '营销视频',
+    icon: Zap,
+    color: '#22c55e',
+    desc: '策略 -> 脚本 -> 素材 -> 成片',
+    nodes: [
+      { type: 'text', label: '营销策略', x: 100, y: 150 },
+      { type: 'script', label: '广告脚本', x: 500, y: 150 },
+      { type: 'image', label: '广告素材', x: 900, y: 150 },
+      { type: 'video', label: '广告成片', x: 1300, y: 150 },
+    ],
+  },
+  {
+    id: 'comic',
+    name: '智能漫剧',
+    icon: BookOpen,
+    color: '#06b6d4',
+    desc: '剧本 -> 角色 -> 场景 -> 分镜 -> 动画',
+    nodes: [
+      { type: 'text', label: '剧本故事', x: 100, y: 150 },
+      { type: 'image', label: '角色设计', x: 500, y: 150 },
+      { type: 'image', label: '场景绘制', x: 900, y: 150 },
+      { type: 'script', label: '分镜脚本', x: 1300, y: 150 },
+      { type: 'video', label: '漫剧片段', x: 1700, y: 150 },
+    ],
+  },
+];
+
+const nodeItems: { type: NodeType; icon: LucideIcon; label: string; desc: string; color: string }[] = [
+  { type: 'text', icon: FileText, label: '文本', desc: '脚本、广告词、品牌文案', color: '#00d4aa' },
+  { type: 'image', icon: Image, label: '图片', desc: '图像生成与编辑', color: '#1a8cff' },
+  { type: 'video', icon: Video, label: '视频', desc: '视频生成与编辑', color: '#ff6b35' },
+  { type: 'audio', icon: AudioLines, label: '音频', desc: '音频生成与处理', color: '#a855f7' },
+  { type: 'post', icon: Layers, label: '后期', desc: '图片 / 视频后期合成', color: '#f97316' },
+  { type: 'script', icon: FileText, label: '脚本生成器', desc: '剧本/角色生成分镜脚本', color: '#fbbf24' },
+  { type: 'storyboard', icon: LayoutGrid, label: '分镜格子', desc: '分镜故事板', color: '#ec4899' },
+  { type: 'aiapp', icon: Layers, label: 'AI 应用', desc: 'AI工作流应用', color: '#22c55e' },
+  { type: 'threed', icon: Globe, label: '3D 世界', desc: '3D场景与模型', color: '#06b6d4' },
+  { type: 'dcc', icon: MonitorUp, label: 'DCC捕捉', desc: 'Blender/UE视窗捕获', color: '#14b8a6' },
+  { type: 'region', icon: Tags, label: '打标签节点', desc: 'DCC 构图 / 区域标记 / 标签协议', color: '#8b5cf6' },
+];
+
+const navItems: { tab: SidebarTab; icon: LucideIcon; label: string }[] = [
+  { tab: 'assets', icon: FolderOpen, label: '资产库' },
+  { tab: 'workflow', icon: GitBranch, label: '工作流' },
+  { tab: 'history', icon: Clock, label: '历史' },
+  { tab: 'director', icon: Clapperboard, label: '导演台' },
+  { tab: 'models', icon: HardDrive, label: '模型' },
+  { tab: 'dcc', icon: MonitorUp, label: 'DCC环境' },
+];
+
+function iconTileStyle(color: string): CSSProperties {
+  return { backgroundColor: `${color}15`, color };
+}
+
+export function Sidebar() {
+  const canvas = useCanvasStore((s) => s.canvas);
+  const addNode = useCanvasStore((s) => s.addNode);
+  const toggleSidebar = useCanvasStore((s) => s.toggleSidebar);
+  const undo = useCanvasStore((s) => s.undo);
+  const undoSteps = useCanvasStore((s) => s.undoSteps);
+  const redo = useCanvasStore((s) => s.redo);
+  const clearHistory = useCanvasStore((s) => s.clearHistory);
+  const historyIndex = useCanvasStore((s) => s.historyIndex);
+  const history = useCanvasStore((s) => s.history);
+  const workflows = useCanvasStore((s) => s.workflows);
+  const loadWorkflow = useCanvasStore((s) => s.loadWorkflow);
+  const deleteWorkflow = useCanvasStore((s) => s.deleteWorkflow);
+  const renameWorkflow = useCanvasStore((s) => s.renameWorkflow);
+  const activeSidebarTab = useCanvasStore((s) => s.activeSidebarTab);
+  const sidebarCollapsed = useCanvasStore((s) => s.sidebarCollapsed);
+  const setSidebarTab = useCanvasStore((s) => s.setSidebarTab);
+  const selectNode = useCanvasStore((s) => s.selectNode);
+  const requestViewportFocus = useCanvasStore((s) => s.requestViewportFocus);
+
+  const [wfRenameId, setWfRenameId] = useState<string | null>(null);
+  const [wfRenameVal, setWfRenameVal] = useState('');
+
+  const mediaNodes = useMemo(
+    () => canvas?.nodes.filter((node) => MEDIA_NODE_TYPES.has(node.type as NodeType)) || [],
+    [canvas?.nodes],
+  );
+
+  const handleAddNode = (type: NodeType) => {
+    if (!canvas) return;
+    addNode(type);
+  };
+
+  const handleLoadTemplate = (template: WorkflowTemplate) => {
+    if (!canvas) return;
+    template.nodes.forEach((node) => {
+      addNode(node.type, { x: node.x, y: node.y });
+    });
+  };
+
+  const handleLocateNode = (nodeId: string) => {
+    selectNode(nodeId);
+    requestViewportFocus(nodeId);
+  };
+
+  const panelWidth = useMemo(() => {
+    if (activeSidebarTab === 'assets') return 'w-0';
+    if (activeSidebarTab === 'workflow' || activeSidebarTab === 'models') return 'w-[300px]';
+    if (activeSidebarTab === 'dcc') return 'w-[360px]';
+    return 'w-[260px]';
+  }, [activeSidebarTab]);
+
+  const renderAddPanel = () => (
+    <div className="flex h-full flex-col overflow-hidden">
+      <div className="flex items-center justify-between border-b border-[#21262d] px-4 py-3">
+        <h3 className="text-sm font-semibold text-[#e6edf3]">添加节点</h3>
+        <button type="button" onClick={toggleSidebar} className="flex h-7 w-7 items-center justify-center rounded-lg text-[#8b949e] transition-colors hover:bg-[#21262d] hover:text-[#e6edf3]" title="收起侧栏">
+          <ChevronLeft className="h-4 w-4" />
+        </button>
+      </div>
+      <div className="flex-1 space-y-1 overflow-y-auto p-3">
+        <div className="px-2 pb-1 text-[10px] font-medium uppercase tracking-wider text-[#6e7681]">基础节点</div>
+        {nodeItems.slice(0, 5).map((item) => (
+          <button
+            type="button"
+            key={item.type}
+            onClick={() => handleAddNode(item.type)}
+            title={item.label}
+            data-testid={`add-node-${item.type}`}
+            className="group flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition-colors hover:bg-[#21262d]"
+          >
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg" style={iconTileStyle(item.color)}>
+              <item.icon className="h-4.5 w-4.5" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium text-[#c9d1d9]">{item.label}</div>
+              <div className="truncate text-xs text-[#6e7681]">{item.desc}</div>
+            </div>
+          </button>
+        ))}
+        <div className="px-2 pb-1 pt-3 text-[10px] font-medium uppercase tracking-wider text-[#6e7681]">功能节点</div>
+        {nodeItems.slice(5).map((item) => (
+          <button
+            type="button"
+            key={item.type}
+            onClick={() => handleAddNode(item.type)}
+            title={item.label}
+            data-testid={`add-node-${item.type}`}
+            className="group flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition-colors hover:bg-[#21262d]"
+          >
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg" style={iconTileStyle(item.color)}>
+              <item.icon className="h-4.5 w-4.5" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium text-[#c9d1d9]">{item.label}</div>
+              <div className="truncate text-xs text-[#6e7681]">{item.desc}</div>
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+
+  const renderHistoryPanel = () => {
+    const canUndo = historyIndex >= 0;
+    const canRedo = historyIndex < history.length - 1;
+    const jumpTo = (index: number) => {
+      if (index === historyIndex) return;
+      if (index < historyIndex) {
+        undo(historyIndex - index);
+      } else {
+        redo(index - historyIndex);
+      }
+    };
+    return (
+    <div className="flex h-full flex-col overflow-hidden">
+      <div className="flex items-center justify-between border-b border-[#21262d] px-4 py-3">
+        <h3 className="text-sm font-semibold text-[#e6edf3]">操作历史</h3>
+        <div className="flex items-center gap-1">
+          <button type="button" onClick={() => undoSteps(10)} disabled={!canUndo} className="flex h-7 w-7 items-center justify-center rounded-lg text-[#8b949e] transition-colors hover:bg-[#21262d] hover:text-[#e6edf3] disabled:opacity-30" title="回退 10 步">
+            <RotateCcw className="h-4 w-4" />
+          </button>
+          <button type="button" onClick={() => undo()} disabled={!canUndo} className="flex h-7 w-7 items-center justify-center rounded-lg text-[#8b949e] transition-colors hover:bg-[#21262d] hover:text-[#e6edf3] disabled:opacity-30" title="撤销">
+            <ChevronLeft className="h-4 w-4" />
+          </button>
+          <button type="button" onClick={() => redo()} disabled={!canRedo} className="flex h-7 w-7 items-center justify-center rounded-lg text-[#8b949e] transition-colors hover:bg-[#21262d] hover:text-[#e6edf3] disabled:opacity-30" title="重做">
+            <ChevronRight className="h-4 w-4" />
+          </button>
+          <button type="button" onClick={clearHistory} disabled={history.length === 0} className="flex h-7 w-7 items-center justify-center rounded-lg text-[#8b949e] transition-colors hover:bg-[#21262d] hover:text-[#f85149] disabled:opacity-30" title="清除历史记录">
+            <Trash2 className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+      <div className="flex-1 overflow-y-auto p-3">
+        {history.length === 0 ? (
+          <div className="flex h-full flex-col items-center justify-center text-[#6e7681]">
+            <History className="mb-3 h-10 w-10 opacity-30" />
+            <p className="text-sm">暂无操作记录</p>
+            <p className="mt-1 text-[10px]">添加节点后将自动记录</p>
+          </div>
+        ) : (
+          <div className="space-y-1">
+            {history.map((entry, index) => (
+              <button
+                type="button"
+                key={`${entry.timestamp}-${index}`}
+                onClick={() => jumpTo(index)}
+                className={`flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs transition-colors ${index === historyIndex ? 'bg-[#00d4aa]/10 text-[#00d4aa]' : 'text-[#8b949e] hover:bg-[#21262d]'}`}
+              >
+                <div className={`h-1.5 w-1.5 shrink-0 rounded-full ${index === historyIndex ? 'bg-[#00d4aa]' : 'bg-[#3a3a3c]'}`} />
+                <span className="capitalize">{entry.type}</span>
+                {entry.nodes ? <span className="text-[#6e7681]">({entry.nodes.length} 节点)</span> : null}
+                <span className="ml-auto text-[#6e7681]">{new Date(entry.timestamp).toLocaleTimeString()}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+    );
+  };
+
+  const renderWorkflowPanel = () => (
+    <div className="flex h-full flex-col overflow-hidden">
+      <div className="border-b border-[#21262d] px-4 py-3">
+        <h3 className="mb-3 text-sm font-semibold text-[#e6edf3]">工作流模板</h3>
+        <div className="grid grid-cols-2 gap-1.5">
+          {WORKFLOW_TEMPLATES.map((template) => {
+            const Icon = template.icon;
+            return (
+              <button
+                type="button"
+                key={template.id}
+                onClick={() => handleLoadTemplate(template)}
+                title={template.name}
+                className="flex items-center gap-2 rounded-xl bg-[#161b22] px-2.5 py-2 text-left ring-1 ring-[#21262d] transition-all hover:bg-[#1c1c1e] hover:ring-[#3a3a3c]"
+              >
+                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg" style={iconTileStyle(template.color)}>
+                  <Icon className="h-3.5 w-3.5" />
+                </div>
+                <div className="min-w-0">
+                  <div className="truncate text-[10px] font-medium text-[#c9d1d9]">{template.name}</div>
+                  <div className="truncate text-[9px] text-[#6e7681]">{template.desc}</div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div className="flex-1 overflow-y-auto p-3">
+        <div className="mb-2 flex items-center justify-between">
+          <span className="text-[10px] font-medium uppercase tracking-wider text-[#6e7681]">已保存</span>
+          <span className="text-[10px] text-[#6e7681]">{workflows.length} 个</span>
+        </div>
+        {workflows.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-8 text-[#6e7681]">
+            <GitBranch className="mb-2 h-8 w-8 opacity-30" />
+            <p className="text-xs">暂无保存的工作流</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {workflows.map((workflow) => (
+              <div key={workflow.id} className="group flex items-center gap-3 rounded-xl bg-[#161b22] px-3 py-2 ring-1 ring-[#21262d] transition-all hover:ring-[#3a3a3c]">
+                <div className="h-3 w-3 shrink-0 rounded-full" style={{ backgroundColor: workflow.color || '#00d4aa' }} />
+                <div className="min-w-0 flex-1">
+                  {wfRenameId === workflow.id ? (
+                    <input
+                      value={wfRenameVal}
+                      onChange={(event) => setWfRenameVal(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                          renameWorkflow(workflow.id, wfRenameVal);
+                          setWfRenameId(null);
+                        }
+                      }}
+                      onBlur={() => {
+                        renameWorkflow(workflow.id, wfRenameVal);
+                        setWfRenameId(null);
+                      }}
+                      autoFocus
+                      aria-label="重命名工作流"
+                      className="w-full rounded border border-[#00d4aa] bg-[#0d1117] px-2 py-0.5 text-xs text-[#e6edf3] outline-none"
+                    />
+                  ) : (
+                    <p className="truncate text-xs font-medium text-[#c9d1d9]">{workflow.name}</p>
+                  )}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[9px] text-[#6e7681]">{workflow.nodes.length} 节点</span>
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                  <button type="button" onClick={() => loadWorkflow(workflow.id)} className="rounded bg-[#00d4aa]/10 px-2 py-1 text-[10px] text-[#00d4aa] hover:bg-[#00d4aa]/20" title="加载工作流">加载</button>
+                  <button type="button" onClick={() => { setWfRenameId(workflow.id); setWfRenameVal(workflow.name); }} className="text-[#8b949e] hover:text-[#e6edf3]" title="重命名">
+                    <Edit3 className="h-3 w-3" />
+                  </button>
+                  <button type="button" onClick={() => deleteWorkflow(workflow.id)} className="text-[#8b949e] hover:text-[#ef4444]" title="删除工作流">
+                    <Trash2 className="h-3 w-3" />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  const renderDirectorPanel = () => (
+    <div className="flex h-full flex-col overflow-hidden">
+      <div className="border-b border-[#21262d] px-4 py-3">
+        <h3 className="text-sm font-semibold text-[#e6edf3]">导演台</h3>
+        <p className="mt-0.5 text-[10px] text-[#6e7681]">管理脚本、分镜和媒体节点</p>
+      </div>
+      <div className="flex-1 space-y-2 overflow-y-auto p-3">
+        {mediaNodes.length === 0 ? (
+          <div className="flex h-full flex-col items-center justify-center text-[#6e7681]">
+            <Clapperboard className="mb-3 h-10 w-10 opacity-30" />
+            <p className="text-sm">暂无媒体节点</p>
+            <p className="mt-1 text-[10px]">添加脚本、分镜或图片视频节点后会显示在这里</p>
+          </div>
+        ) : (
+          mediaNodes.map((node) => {
+            const typeConfig = NODE_TYPE_CONFIG[node.type] || NODE_TYPE_CONFIG.storyboard;
+            const TypeIcon = typeConfig.icon;
+            return (
+              <div key={node.id} className="flex items-center gap-3 rounded-xl bg-[#161b22] px-3 py-2 ring-1 ring-[#21262d]">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg" style={iconTileStyle(typeConfig.color)}>
+                  <TypeIcon className="h-4 w-4" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-xs font-medium text-[#c9d1d9]">{String(node.data?.label || '') || node.type}</p>
+                  <p className="text-[10px] text-[#6e7681]">{node.type}</p>
+                </div>
+                <button type="button" onClick={() => handleLocateNode(node.id)} className="text-[10px] text-[#8b949e] hover:text-[#00d4aa]" title="定位到节点">定位</button>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+
+  const renderPanelContent = () => {
+    switch (activeSidebarTab) {
+      case 'add':
+        return renderAddPanel();
+      case 'assets':
+        return null;
+      case 'history':
+        return renderHistoryPanel();
+      case 'workflow':
+        return renderWorkflowPanel();
+      case 'director':
+        return renderDirectorPanel();
+      case 'models':
+        return <ModelDownloadPanel />;
+      case 'dcc':
+        return <DccEnvironmentPanel />;
+      default:
+        return renderAddPanel();
+    }
+  };
+
+  return (
+    <div className="flex h-full shrink-0">
+      <div className="z-20 flex w-14 flex-col items-center gap-1 border-r border-[#21262d] bg-[#0d1117] py-3">
+        <button
+          type="button"
+          onClick={() => {
+            if (sidebarCollapsed) toggleSidebar();
+            setSidebarTab('add');
+          }}
+          className={`mb-2 flex h-10 w-10 items-center justify-center rounded-xl transition-all ${activeSidebarTab === 'add' && !sidebarCollapsed ? 'bg-[#00d4aa]/15 text-[#00d4aa]' : 'text-[#8b949e] hover:bg-[#21262d] hover:text-white'}`}
+          title="添加节点"
+        >
+          <Plus className="h-5 w-5" />
+        </button>
+        <div className="my-1 h-px w-8 bg-[#21262d]" />
+        {navItems.map((item) => (
+          <button
+            type="button"
+            key={item.tab}
+            onClick={() => {
+              if (sidebarCollapsed) toggleSidebar();
+              setSidebarTab(item.tab);
+            }}
+            data-testid={`sidebar-tab-${item.tab}`}
+            className={`flex h-10 w-10 items-center justify-center rounded-xl transition-all ${activeSidebarTab === item.tab && !sidebarCollapsed ? 'bg-[#00d4aa]/15 text-[#00d4aa]' : 'text-[#8b949e] hover:bg-[#21262d] hover:text-white'}`}
+            title={item.label}
+          >
+            <item.icon className="h-5 w-5" />
+          </button>
+        ))}
+        <div className="flex-1" />
+        <div className="my-1 h-px w-8 bg-[#21262d]" />
+        <button
+          type="button"
+          onClick={toggleSidebar}
+          className="flex h-10 w-10 items-center justify-center rounded-xl text-[#8b949e] transition-all hover:bg-[#21262d] hover:text-white"
+          title={sidebarCollapsed ? '展开' : '收起'}
+        >
+          {sidebarCollapsed ? <ChevronRight className="h-5 w-5" /> : <ChevronLeft className="h-5 w-5" />}
+        </button>
+      </div>
+
+      {!sidebarCollapsed ? (
+        <div className={`${panelWidth} flex flex-col overflow-hidden border-r border-[#21262d] bg-[#161b22]`}>
+          {renderPanelContent()}
+        </div>
+      ) : null}
+
+      {activeSidebarTab === 'assets' && !sidebarCollapsed ? (
+        <ResizableAssetPanel isOpen={true} onClose={() => setSidebarTab('add')} title="资产库">
+          <AssetLibrary />
+        </ResizableAssetPanel>
+      ) : null}
+    </div>
+  );
+}

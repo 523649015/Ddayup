@@ -1,0 +1,200 @@
+const params = new URLSearchParams(location.search);
+const canvasId = params.get('id') || '';
+const shell = document.getElementById('shell');
+const world = document.getElementById('world');
+const composer = document.getElementById('composer');
+const createMenu = document.getElementById('createMenu');
+const promptInput = document.getElementById('promptInput');
+const mentionPicker = document.getElementById('mentionPicker');
+const mentionPreview = document.getElementById('mentionPreview');
+const engineSelect = document.getElementById('engineSelect');
+const dynamicParams = document.getElementById('dynamicParams');
+const runBtn = document.getElementById('runBtn');
+const cascadeRunBtn = document.getElementById('cascadeRunBtn');
+const fileInput = document.getElementById('fileInput');
+const apiKindToggle = document.getElementById('apiKindToggle');
+const inputThumbsRow = document.getElementById('inputThumbsRow');
+const inputPromptPreview = document.getElementById('inputPromptPreview');
+const minimap = document.getElementById('minimap');
+const minimapContent = document.getElementById('minimapContent');
+const imageEditModal = document.getElementById('imageEditModal');
+const smartLogModal = document.getElementById('smartLogModal');
+const smartLogList = document.getElementById('smartLogList');
+const smartShortcutModal = document.getElementById('smartShortcutModal');
+const smartWorkflowToggle = document.getElementById('smartWorkflowToggle');
+const smartWorkflowTransferModal = document.getElementById('smartWorkflowTransferModal');
+const smartWorkflowTransferSub = document.getElementById('smartWorkflowTransferSub');
+const smartWorkflowExportMeta = document.getElementById('smartWorkflowExportMeta');
+const smartWorkflowImportInput = document.getElementById('smartWorkflowImportInput');
+const smartWorkflowImportDropZone = document.getElementById('smartWorkflowImportDropZone');
+const selectionBox = document.getElementById('selectionBox');
+const assetToggle = document.getElementById('assetToggle');
+const assetPanel = document.getElementById('assetPanel');
+const assetCloseBtn = document.getElementById('assetCloseBtn');
+const assetLibrarySelect = document.getElementById('assetLibrarySelect');
+const assetCategorySelect = document.getElementById('assetCategorySelect');
+const assetGrid = document.getElementById('assetGrid');
+const assetDropZone = document.getElementById('assetDropZone');
+const workflowEmpty = document.getElementById('workflowEmpty');
+const assetImageControls = document.getElementById('assetImageControls');
+const assetAddCategoryBtn = document.getElementById('assetAddCategoryBtn');
+const assetRenameCategoryBtn = document.getElementById('assetRenameCategoryBtn');
+const assetDialogBackdrop = document.getElementById('assetDialogBackdrop');
+const assetDialogTitle = document.getElementById('assetDialogTitle');
+const assetDialogInput = document.getElementById('assetDialogInput');
+const assetDialogCancel = document.getElementById('assetDialogCancel');
+const assetDialogOk = document.getElementById('assetDialogOk');
+const assetHoverPreview = document.getElementById('assetHoverPreview');
+const promptPresetPanel = document.getElementById('promptPresetPanel');
+const promptPresetClose = document.getElementById('promptPresetClose');
+const promptPresetStatus = document.getElementById('promptPresetStatus');
+const promptPresetSelect = document.getElementById('promptPresetSelect');
+const promptPresetName = document.getElementById('promptPresetName');
+const promptPresetText = document.getElementById('promptPresetText');
+const promptPresetApply = document.getElementById('promptPresetApply');
+const promptPresetDelete = document.getElementById('promptPresetDelete');
+const promptPresetNew = document.getElementById('promptPresetNew');
+const promptPresetSave = document.getElementById('promptPresetSave');
+const promptTemplatePanel = document.getElementById('promptTemplatePanel');
+const promptTemplateClose = document.getElementById('promptTemplateClose');
+const promptTemplateSearch = document.getElementById('promptTemplateSearch');
+const promptTemplateLibrarySelect = document.getElementById('promptTemplateLibrarySelect');
+const promptTemplateCats = document.getElementById('promptTemplateCats');
+const promptTemplateBody = document.getElementById('promptTemplateBody');
+const composerTemplateBtn = document.getElementById('composerTemplateBtn');
+let minimapViewport = document.getElementById('minimapViewport');
+let canvas = null;
+let canvasUsesConnections = true;
+let nodes = [];
+let selectedId = '';
+let selectedIds = [];
+let selectedImage = {nodeId:'', index:-1};
+let dragState = null;
+let loopInsertPreview = null;
+let selectionState = null;
+let isRKeyDown = false;
+let selectionJustFinished = false;
+let resizeState = null;
+let llmInstructionResizeState = null;
+let thumbDragState = null;
+let uploadTargetId = '';
+let pendingGroupUploadPoint = null;
+let mentionRange = null;
+let panState = null;
+let didPan = false;
+let portDragState = null;
+let saveTimer = null;
+let apiProviders = [];
+let comfyWorkflows = [];
+let comfyInstanceCount = 1;
+let assetLibrary = {categories:[]};
+let assetLibraryOpen = false;
+let assetTab = 'image';
+let activeAssetCategoryId = '';
+let activeAssetLibraryId = '';
+let activeWorkflowAssetCategoryId = '';
+const LOCAL_ASSET_LIBRARY_ID = '__local_assets__';
+let localAssetLibrary = {items:[], tree:null};
+let activeLocalAssetFolderId = '__root__';
+let mentionSource = 'input';
+let mentionAssetCategoryId = '';
+let assetLibraryUpdatedAt = 0;
+let assetLibraryRefreshTimer = null;
+let activeAssetSmartClassId = '';
+const ASSET_SMART_CATEGORY_PREFIX = '__smart_class__::';
+const PROMPT_PRESETS_KEY = 'smart_canvas_prompt_presets_v1';
+const PROMPT_TEMPLATE_GROUPS_KEY = 'smart_canvas_prompt_template_groups_v1';
+const PROMPT_TEMPLATE_OVERRIDES_KEY = 'smart_canvas_prompt_template_overrides_v1';
+let promptPresets = [];
+let builtinPromptTemplates = [];
+let promptLibraries = [];
+let activePromptLibraryId = 'system';
+let promptTemplateGroups = [];
+let promptTemplateOverrides = {hiddenBuiltinIds:[], editedBuiltins:{}};
+let promptTemplateCategory = 'all';
+let promptTemplateSelectedId = '';
+let promptTemplateEditing = false;
+let promptTemplateGroupEditMode = false;
+let promptPresetDeleteArmed = false;
+let createMenuPoint = {x:0, y:0};
+let nodeClipboard = null;
+let imageClickTimer = null;
+let suppressImageClickUntil = 0;
+let lastMouseWorld = null;
+let lastConfigRefreshAt = 0;
+let smartMinimapState = null;
+let smartMinimapDrag = false;
+let zoomPreviewState = null;
+let runTimerInterval = null;
+let smartCascadeRunning = false;
+let smartCascadeActiveLoopId = '';
+let smartCascadeStopRequested = false;
+let smartCascadeSilentSelection = false;
+let smartCascadeRunPath = null;
+const smartCascadeRuns = new Map();
+let smartLoopContext = null;
+let transientSmartCloudLinks = [];
+let runBtnCooldownToken = 0;
+let smartRunStateToken = 0;
+const activeSmartTaskPolls = new Map();
+const smartNodeRunTokens = new Map();
+let smartRhRandomValues = {};
+let lastImagePasteAt = 0;
+let lastNodePasteAt = 0;
+let suppressNodeClickUntil = 0;
+let textSelectionGuard = null;
+const UNDO_LIMIT = 40;
+const undoStack = [];
+let undoSuppressed = false;
+let pendingUndoSnapshot = null;
+let runningHubWorkflowCache = {};
+function activeSmartCascadeCount(){ return smartCascadeRuns.size; }
+function smartCascadeRunForLoop(loopId){ return loopId ? smartCascadeRuns.get(loopId) || null : null; }
+function smartCascadeIsLoopRunning(loopId){ return Boolean(smartCascadeRunForLoop(loopId)); }
+function syncSmartCascadeLegacyState(preferredLoopId=''){
+    const activeIds = [...smartCascadeRuns.keys()];
+    smartCascadeRunning = activeIds.length > 0;
+    smartCascadeActiveLoopId = preferredLoopId && smartCascadeRuns.has(preferredLoopId)
+        ? preferredLoopId
+        : (activeIds[0] || '');
+    const activeRun = smartCascadeActiveLoopId ? smartCascadeRuns.get(smartCascadeActiveLoopId) : null;
+    smartCascadeStopRequested = Boolean(activeRun?.stopRequested);
+    smartCascadeRunPath = activeRun?.runPath || null;
+}
+function smartCascadeAnyRunning(){ return smartCascadeRunning || activeSmartCascadeCount() > 0; }
+function smartCascadeEdgeState(edgeKey){
+    for(const run of smartCascadeRuns.values()){
+        const state = run?.runPath?.states?.[edgeKey];
+        if(state) return state;
+    }
+    return smartCascadeRunPath?.states?.[edgeKey] || '';
+}
+function smartCascadePathForCtx(ctx=null){
+    return ctx?.runState?.runPath || ctx?.runPath || smartCascadeRunPath;
+}
+function capturePendingUndo(){ pendingUndoSnapshot = snapshotForUndo(); }
+function commitPendingUndo(){
+    if(pendingUndoSnapshot){
+        undoStack.push(pendingUndoSnapshot);
+        if(undoStack.length > UNDO_LIMIT) undoStack.shift();
+        pendingUndoSnapshot = null;
+    }
+}
+function discardPendingUndo(){ pendingUndoSnapshot = null; }
+function snapshotForUndo(){
+    return {
+        nodes: JSON.parse(JSON.stringify(nodes)),
+        connections: JSON.parse(JSON.stringify(canvas?.connections || [])),
+        selectedId,
+        selectedIds: selectedIds.slice(),
+        selectedImage: {...selectedImage}
+    };
+}
+function pushUndo(){
+    if(undoSuppressed) return;
+    if(!canvas) return;
+    undoStack.push(snapshotForUndo());
+    if(undoStack.length > UNDO_LIMIT) undoStack.shift();
+}
+function performUndo(){
+    if(!undoStack.length){ toast(tr('smart.toastNoUndo')); return; }

@@ -1,0 +1,11 @@
+{
+  "outputPath": "F:\\Work\\HMDAODAO\\app\\server\\tmp-post-runtime-smoke-4\\fsr.png",
+  "engine": "FSR Example Runtime",
+  "meta": {
+    "scale": 2.0,
+    "denoise": 0.2,
+    "sharpen": 0.3,
+    "seamFix": true,
+    "temporalStability": 0.65
+  }
+}

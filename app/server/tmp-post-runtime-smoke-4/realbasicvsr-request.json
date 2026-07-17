@@ -1,0 +1,9 @@
+﻿{
+    "outputPath":  "F:\\Work\\HMDAODAO\\app\\server\\tmp-post-runtime-smoke-4\\realbasicvsr.webm",
+    "inputPath":  "F:\\Work\\HMDAODAO\\app\\server\\tmp-post-runtime-smoke-4\\input.webm",
+    "mediaKind":  "video",
+    "temporalStability":  0.72,
+    "denoise":  0.18,
+    "scale":  2,
+    "sharpen":  0.34
+}
