@@ -27,6 +27,7 @@ interface ImageToolPanelHostProps {
   nodeLabel?: string;
   onChange: (value: Record<string, unknown>) => void;
   onApply?: (payload: Record<string, unknown>) => Promise<void>;
+  onCreateAsNewNode?: (payload: Record<string, unknown>) => Promise<void>;
   onClose: () => void;
   panelInteractionProps?: GuardedPanelInteractionProps;
   onInteract?: (event: { stopPropagation: () => void }) => void;
@@ -50,6 +51,7 @@ export function ImageToolPanelHost({
   nodeLabel,
   onChange,
   onApply,
+  onCreateAsNewNode,
   onClose,
   panelInteractionProps,
   onInteract,
@@ -85,7 +87,7 @@ export function ImageToolPanelHost({
 
       <div className="max-h-[620px] overflow-y-auto px-4 py-4">
         <Suspense fallback={<PanelSkeleton />}>
-          {renderCapabilityPanel(tool, value, onChange, sourceImageUrl, nodeLabel, onApply, onClose)}
+          {renderCapabilityPanel(tool, value, onChange, sourceImageUrl, nodeLabel, onApply, onCreateAsNewNode, onClose)}
         </Suspense>
         {showGenericForm && definition ? (
           <Suspense fallback={<PanelSkeleton />}>
@@ -104,14 +106,15 @@ function renderCapabilityPanel(
   sourceImageUrl?: string,
   nodeLabel?: string,
   onApply?: (payload: Record<string, unknown>) => Promise<void>,
+  onCreateAsNewNode?: (payload: Record<string, unknown>) => Promise<void>,
   onClose?: () => void,
 ) {
   if (tool === 'panorama') return <PanoramaCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
-  if (tool === 'multiAngle') return <MultiAngleCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} />;
+  if (tool === 'multiAngle') return <MultiAngleCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} onCreateAsNewNode={onCreateAsNewNode} />;
   if (tool === 'camera') return <CameraCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
-  if (tool === 'lighting') return <LightingCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} />;
+  if (tool === 'lighting') return <LightingCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} onCreateAsNewNode={onCreateAsNewNode} />;
   if (tool === 'grid') return <GridCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
-  if (tool === 'hd') return <HdCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} />;
+  if (tool === 'hd') return <HdCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} onCreateAsNewNode={onCreateAsNewNode} />;
   if (tool === 'split') return <SplitCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
   if (tool === 'brush') return <BrushCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} onClose={onClose} />;
   if (tool === 'bgRemove') return <BgRemoveCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} onClose={onClose} />;

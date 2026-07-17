@@ -99,60 +99,93 @@ const MODE_DEFAULTS: Record<HdMode, Record<string, unknown>> = {
   },
 };
 
-export default function HdCapabilityPanel({ value, onChange, sourceImageUrl, onApply }: ToolCapabilityPanelProps) {
+export default function HdCapabilityPanel({ value, onChange, sourceImageUrl, onApply, onCreateAsNewNode }: ToolCapabilityPanelProps) {
   const [activeMode, setActiveMode] = useState<HdMode>(parseHdMode(value.hdMode));
   const modeMeta = useMemo(() => HD_MODES.find((item) => item.key === activeMode) || HD_MODES[0], [activeMode]);
   const modeMaskPoints = useMemo(() => getModeMaskPoints(value.maskPoints, activeMode), [activeMode, value.maskPoints]);
   const [hdStatus, setHdStatus] = useState<string | null>(null);
 
-  async function handleApplyByMode() {
+  /**
+   * 按当前模式执行统一闭环，返回 { url, engine } 或抛错。
+   * 提取为独立函数，让「应用到素材图」与「生成新节点」共用同一执行体。
+   */
+  async function runByMode(): Promise<{ url: string; engine: string }> {
     if (typeof sourceImageUrl !== 'string' || !sourceImageUrl) {
-      setHdStatus('请先选择素材图');
-      return;
+      throw new Error('请先选择素材图');
     }
-    const startedAt = Date.now();
+    const mode = activeMode;
     setHdStatus('正在加载素材…');
+    if (mode === 'upscale') {
+      setHdStatus('正在放大…（可能 5~30s，取决于图片尺寸）');
+      return await applyHdUpscale(sourceImageUrl, value);
+    }
+    if (mode === 'restore') {
+      setHdStatus('正在修复…');
+      return await applyHdRestore(sourceImageUrl, value);
+    }
+    if (mode === 'outpaint') {
+      setHdStatus('正在扩图…');
+      return await applyHdOutpaint(sourceImageUrl, value);
+    }
+    if (mode === 'inpaint' || mode === 'erase') {
+      setHdStatus('正在重绘…（本地 LaMa 或 canvas 兜底）');
+      return await applyHdInpaint(sourceImageUrl, { ...value, mode });
+    }
+    if (mode === 'cutout') {
+      setHdStatus('正在抠图…（本地模型推理中）');
+      return await applyHdCutout(sourceImageUrl, value);
+    }
+    throw new Error(`未知模式：${mode}`);
+  }
+
+  async function handleApplyByMode() {
+    const startedAt = Date.now();
     try {
-      const mode = activeMode;
-      let result;
-      // 阶段 1：加载源图（受 30s 超时保护）
-      setHdStatus('正在加载素材…');
-      if (mode === 'upscale') {
-        setHdStatus('正在生成…（可能 5~30s，取决于图片尺寸）');
-        result = await applyHdUpscale(sourceImageUrl, value);
-      } else if (mode === 'restore') {
-        setHdStatus('正在修复…');
-        result = await applyHdRestore(sourceImageUrl, value);
-      } else if (mode === 'outpaint') {
-        setHdStatus('正在扩图…');
-        result = await applyHdOutpaint(sourceImageUrl, value);
-      } else if (mode === 'inpaint' || mode === 'erase') {
-        setHdStatus('正在重绘…（本地 LaMa 推理或 canvas 兜底）');
-        result = await applyHdInpaint(sourceImageUrl, { ...value, mode });
-      } else if (mode === 'cutout') {
-        setHdStatus('正在抠图…（本地模型推理中）');
-        result = await applyHdCutout(sourceImageUrl, value);
-      } else return;
+      const result = await runByMode();
       setHdStatus('正在写回节点…');
-      await onApply?.({ appliedImageUrl: result.url, imageUrl: sourceImageUrl, hdMode: mode, engine: result.engine, ...value });
+      await onApply?.({ appliedImageUrl: result.url, imageUrl: sourceImageUrl, hdMode: activeMode, engine: result.engine, ...value });
       const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
-      setHdStatus(`已生成并写回素材图（${result.engine}，${elapsed}s）`);
+      setHdStatus(`已应用到原素材（${result.engine}，${elapsed}s）`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setHdStatus(`失败：${message}`);
     }
   }
 
-  async function handleApplyCrop() {
+  async function handleCreateAsNewNodeByMode() {
+    const startedAt = Date.now();
+    const callback = onCreateAsNewNode ?? onApply;
+    if (!callback) {
+      setHdStatus('当前节点未启用生成新节点能力');
+      return;
+    }
+    try {
+      const result = await runByMode();
+      setHdStatus('正在创建新节点…');
+      await callback({ appliedImageUrl: result.url, imageUrl: sourceImageUrl, hdMode: activeMode, engine: result.engine, ...value });
+      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+      setHdStatus(`已生成新节点继承效果（${result.engine}，${elapsed}s）`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setHdStatus(`失败：${message}`);
+    }
+  }
+
+  async function handleApplyCrop(target: 'apply' | 'new' = 'apply') {
     if (typeof sourceImageUrl !== 'string' || !sourceImageUrl) {
       setHdStatus('请先选择素材图');
+      return;
+    }
+    const callback = target === 'new' ? (onCreateAsNewNode ?? onApply) : onApply;
+    if (!callback) {
+      setHdStatus('当前节点未启用该能力');
       return;
     }
     try {
       const frame = getCropFrame(String(value.cropRatio ?? '1:1'), Number(value.cropCenterX ?? 0.5), Number(value.cropCenterY ?? 0.5), Number(value.cropZoom ?? 1));
       const result = await applyHdCrop(sourceImageUrl, frame);
-      await onApply?.({ appliedImageUrl: result.url, imageUrl: sourceImageUrl, hdMode: 'crop', cropRatio: value.cropRatio, cropZoom: value.cropZoom, engine: result.engine });
-      setHdStatus('已裁切并写回素材图');
+      await callback({ appliedImageUrl: result.url, imageUrl: sourceImageUrl, hdMode: 'crop', cropRatio: value.cropRatio, cropZoom: value.cropZoom, engine: result.engine });
+      setHdStatus(target === 'new' ? '已裁切并生成新节点' : '已裁切并写回素材图');
     } catch (err) {
       setHdStatus(err instanceof Error ? err.message : '裁切失败');
     }
@@ -309,7 +342,24 @@ export default function HdCapabilityPanel({ value, onChange, sourceImageUrl, onA
               <MiniStat label="焦点 X" value={Number(value.cropCenterX ?? 0.5).toFixed(2)} />
               <MiniStat label="焦点 Y" value={Number(value.cropCenterY ?? 0.5).toFixed(2)} />
             </div>
-            <button type="button" data-testid="hd-crop-apply" onClick={() => void handleApplyCrop()} className="w-full rounded-lg border border-[#7b7b7b] bg-[#363636] px-3 py-2 text-sm text-white hover:bg-[#424242]">应用到素材图</button>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                data-testid="hd-crop-apply"
+                onClick={() => void handleApplyCrop('apply')}
+                className="rounded-lg border border-[#404040] bg-[#2a2a2a] px-3 py-2 text-sm text-[#cbcbcb] hover:bg-[#333]"
+              >
+                覆盖到原图
+              </button>
+              <button
+                type="button"
+                data-testid="hd-crop-new-node"
+                onClick={() => void handleApplyCrop('new')}
+                className="rounded-lg border border-[#7b7b7b] bg-[#363636] px-3 py-2 text-sm font-medium text-white hover:bg-[#424242]"
+              >
+                生成新节点继承
+              </button>
+            </div>
           </div>
         ) : null}
 
@@ -329,9 +379,24 @@ export default function HdCapabilityPanel({ value, onChange, sourceImageUrl, onA
         ) : null}
 
         {activeMode !== 'crop' ? (
-          <button type="button" data-testid={`hd-apply-${activeMode}`} onClick={() => void handleApplyByMode()} className="mt-4 w-full rounded-lg border border-[#7b7b7b] bg-[#363636] px-3 py-2 text-sm text-white hover:bg-[#424242]">
-            应用到素材图
-          </button>
+            <div className="mt-4 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                data-testid={`hd-apply-${activeMode}`}
+                onClick={() => void handleApplyByMode()}
+                className="rounded-lg border border-[#404040] bg-[#2a2a2a] px-3 py-2 text-sm text-[#cbcbcb] hover:bg-[#333]"
+              >
+                覆盖到原图
+              </button>
+              <button
+                type="button"
+                data-testid={`hd-new-node-${activeMode}`}
+                onClick={() => void handleCreateAsNewNodeByMode()}
+                className="rounded-lg border border-[#7b7b7b] bg-[#363636] px-3 py-2 text-sm font-medium text-white hover:bg-[#424242]"
+              >
+                生成新节点继承
+              </button>
+            </div>
         ) : null}
         {hdStatus ? (
           <div data-testid="hd-apply-status" className="mt-2 rounded-lg border border-[#404040] bg-[#161616] px-3 py-2 text-xs text-[#b4b4b4]">{hdStatus}</div>

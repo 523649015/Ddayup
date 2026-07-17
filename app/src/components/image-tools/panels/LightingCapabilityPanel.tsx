@@ -58,7 +58,7 @@ function temperatureToRgb(kelvin: number) {
   return `rgb(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)})`;
 }
 
-export default function LightingCapabilityPanel({ value, onChange, sourceImageUrl, onApply }: ToolCapabilityPanelProps) {
+export default function LightingCapabilityPanel({ value, onChange, sourceImageUrl, onApply, onCreateAsNewNode }: ToolCapabilityPanelProps) {
   const addAssetItem = useAssetStore((state) => state.addItem);
   const assetItems = useAssetStore((state) => state.items);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -70,16 +70,38 @@ export default function LightingCapabilityPanel({ value, onChange, sourceImageUr
   const [assetQuery, setAssetQuery] = useState('');
   const [applyStatus, setApplyStatus] = useState<string | null>(null);
 
-  async function handleApply() {
+  async function runLight(): Promise<{ url: string; engine: string }> {
     if (typeof sourceImageUrl !== 'string' || !sourceImageUrl) {
-      setApplyStatus('请先选择素材图');
-      return;
+      throw new Error('请先选择素材图');
     }
     setApplyStatus('烘焙中…');
+    return await applyLighting(sourceImageUrl, value);
+  }
+
+  async function handleApply() {
+    if (!onApply) {
+      setApplyStatus('当前节点未启用应用到原图能力');
+      return;
+    }
     try {
-      const result = await applyLighting(sourceImageUrl, value);
-      await onApply?.({ appliedImageUrl: result.url, imageUrl: sourceImageUrl, engine: result.engine, ...value });
-      setApplyStatus('已应用打光并写回素材图');
+      const result = await runLight();
+      await onApply({ appliedImageUrl: result.url, imageUrl: sourceImageUrl, engine: result.engine, ...value });
+      setApplyStatus('已覆盖到原图');
+    } catch (err) {
+      setApplyStatus(err instanceof Error ? err.message : '应用失败');
+    }
+  }
+
+  async function handleCreateAsNewNode() {
+    const callback = onCreateAsNewNode ?? onApply;
+    if (!callback) {
+      setApplyStatus('当前节点未启用生成新节点能力');
+      return;
+    }
+    try {
+      const result = await runLight();
+      await callback({ appliedImageUrl: result.url, imageUrl: sourceImageUrl, engine: result.engine, ...value });
+      setApplyStatus('已生成新节点继承效果');
     } catch (err) {
       setApplyStatus(err instanceof Error ? err.message : '应用失败');
     }
@@ -355,9 +377,24 @@ export default function LightingCapabilityPanel({ value, onChange, sourceImageUr
         </div>
       </details>
 
-      <button type="button" data-testid="lighting-apply" onClick={() => void handleApply()} className="mt-3 w-full rounded-lg border border-[#7b7b7b] bg-[#363636] px-3 py-2 text-sm text-white hover:bg-[#424242]">
-        应用打光并写回
-      </button>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <button
+          type="button"
+          data-testid="lighting-apply"
+          onClick={() => void handleApply()}
+          className="rounded-lg border border-[#404040] bg-[#2a2a2a] px-3 py-2 text-sm text-[#cbcbcb] hover:bg-[#333]"
+        >
+          覆盖到原图
+        </button>
+        <button
+          type="button"
+          data-testid="lighting-new-node"
+          onClick={() => void handleCreateAsNewNode()}
+          className="rounded-lg border border-[#7b7b7b] bg-[#363636] px-3 py-2 text-sm font-medium text-white hover:bg-[#424242]"
+        >
+          生成新节点继承
+        </button>
+      </div>
       {applyStatus ? (
         <div data-testid="lighting-status" className="mt-2 rounded-lg border border-[#404040] bg-[#161616] px-3 py-2 text-xs text-[#b4b4b4]">{applyStatus}</div>
       ) : null}

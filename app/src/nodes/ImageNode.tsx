@@ -575,6 +575,7 @@ function buildImageToolParams(tool: ImageTool | null, currentParams: Record<stri
 export function ImageNode({ selected, data, id }: NodeProps) {
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const removeEdge = useCanvasStore((state) => state.removeEdge);
+  const addConnectedNode = useCanvasStore((state) => state.addConnectedNode);
   const canvas = useCanvasStore((state) => state.canvas);
   const canvasVersion = Number(canvas?.updatedAt || 0);
   const setSelectedNodeIds = useCanvasStore((state) => state.setSelectedNodeIds);
@@ -1556,6 +1557,56 @@ export function ImageNode({ selected, data, id }: NodeProps) {
     }
   }
 
+  /**
+   * 工具面板的「生成新素材节点」入口（非破坏式编辑）：
+   * 1. 在当前节点右侧创建一个新图片节点
+   * 2. 把处理后的图设为新节点的 imageUrl
+   * 3. 在两节点之间连一条 media-output → image-contract 边
+   * 4. 关闭当前面板，焦点切到新节点
+   *
+   * 失败时不创建节点、不污染画布，错误向上抛回面板显示。
+   */
+  async function handleCreateAsNewNode(payload: Record<string, unknown>) {
+    const appliedImageUrl = typeof payload.appliedImageUrl === 'string' ? payload.appliedImageUrl : '';
+    if (!appliedImageUrl) throw new Error('缺少处理结果 URL');
+    const sourceUrl = typeof payload.imageUrl === 'string' ? payload.imageUrl : '';
+    const toolKey = activeTool ?? 'tool';
+    const currentNode = canvas?.nodes.find((n) => n.id === id);
+    const position = currentNode
+      ? { x: currentNode.position.x + 360, y: currentNode.position.y }
+      : undefined;
+    const sourceLabel = typeof data?.label === 'string' && data.label.trim() ? data.label.trim() : '图片节点';
+    const newNodeId = addConnectedNode({
+      type: 'image',
+      position,
+      data: {
+        imageUrl: appliedImageUrl,
+        outputs: [
+          {
+            id: `${toolKey}-${Date.now()}`,
+            type: 'image',
+            url: appliedImageUrl,
+            metadata: {
+              originalUrl: sourceUrl,
+              derivedFrom: id,
+              tool: toolKey,
+              engine: payload.engine,
+            },
+          },
+        ],
+        label: `${sourceLabel} · ${toolKey}`,
+      },
+      sourceId: id,
+      sourceHandle: 'media-output',
+      targetHandle: 'image-contract',
+      select: true,
+    });
+    if (!newNodeId) throw new Error('创建新节点失败');
+    setActiveTool(null);
+    setToolPanelOpen(false);
+    return { newNodeId, url: appliedImageUrl };
+  }
+
   async function handlePromptAssist(action: PromptAssistAction) {
     // 撤销：再次点击同一按钮时，切回原提示词
     if (assistBaseline && assistBaseline.action === action) {
@@ -2218,6 +2269,7 @@ export function ImageNode({ selected, data, id }: NodeProps) {
           nodeLabel={typeof data?.label === 'string' ? data.label : '图片节点'}
           onChange={updateToolConfig}
           onApply={handleToolApply}
+          onCreateAsNewNode={handleCreateAsNewNode}
           onClose={() => setToolPanelOpen(false)}
           panelInteractionProps={imagePanelInteractionProps}
           onInteract={stopImagePanelInteraction}

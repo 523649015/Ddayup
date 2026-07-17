@@ -19,6 +19,15 @@ function securityHeadersPlugin(): Plugin {
         }));
       });
 
+      // 关键：ONNX Runtime Web / WASM 模型 (@imgly, LaMa) 需要 application/wasm MIME
+      // Vite dev 默认对 .wasm 返回 text/plain，导致 wasm streaming compile 失败
+      server.middlewares.use((req, res, next) => {
+        if (req.url && /\.wasm(\?|$)/i.test(req.url)) {
+          res.setHeader('Content-Type', 'application/wasm');
+        }
+        next();
+      });
+
       server.middlewares.use((_req, res, next) => {
         res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
         res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
@@ -30,7 +39,7 @@ function securityHeadersPlugin(): Plugin {
             "style-src 'self' 'unsafe-inline'",
             "img-src 'self' data: blob: https:",
             "media-src 'self' blob:",
-            "connect-src 'self' http://127.0.0.1:* http://localhost:* https: ws: wss:",
+            "connect-src 'self' http://127.0.0.1:* http://localhost:* https: ws: wss: blob:",
             "frame-src 'self' http://127.0.0.1:* http://localhost:*",
             "worker-src 'self' blob:",
             "font-src 'self' data:",
