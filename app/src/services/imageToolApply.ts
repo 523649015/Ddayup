@@ -13,6 +13,7 @@ import { commitResultToAsset } from '@/services/assetWriteback';
 import { runLocalHdUpscale, removeImageBackground, LocalModelError } from './imageModelRouting';
 import { applyBrushEdit, BrushEditError } from './imageBrush';
 import { hasLocalModelRunner } from './localModelRunner';
+import { resolveLocalMediaUrl, isLocalMediaHandle } from './localMediaRegistry';
 
 export interface ToolApplyResult {
   url: string;
@@ -33,13 +34,22 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
+function resolveImageUrl(url: string): string {
+  if (isLocalMediaHandle(url)) {
+    const resolved = resolveLocalMediaUrl(url);
+    if (resolved) return resolved;
+  }
+  return url;
+}
+
 function loadImage(url: string): Promise<HTMLImageElement> {
+  const renderable = resolveImageUrl(url);
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => resolve(img);
     img.onerror = () => reject(new Error('图片加载失败，无法处理'));
-    img.src = url;
+    img.src = renderable;
   });
 }
 
