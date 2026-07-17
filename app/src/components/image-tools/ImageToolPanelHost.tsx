@@ -107,9 +107,9 @@ function renderCapabilityPanel(
   onClose?: () => void,
 ) {
   if (tool === 'panorama') return <PanoramaCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
-  if (tool === 'multiAngle') return <MultiAngleCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
+  if (tool === 'multiAngle') return <MultiAngleCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} />;
   if (tool === 'camera') return <CameraCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
-  if (tool === 'lighting') return <LightingCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
+  if (tool === 'lighting') return <LightingCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} />;
   if (tool === 'grid') return <GridCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
   if (tool === 'hd') return <HdCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} />;
   if (tool === 'split') return <SplitCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;

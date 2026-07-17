@@ -1521,6 +1521,38 @@ export function ImageNode({ selected, data, id }: NodeProps) {
       });
       setActiveTool(null);
       setToolPanelOpen(false);
+    } else if (activeTool === 'multiAngle') {
+      const { appliedImageUrl, imageUrl: payloadImageUrl } = payload as { appliedImageUrl?: string; imageUrl?: string };
+      if (!appliedImageUrl) return;
+      updateNodeData(id, {
+        imageUrl: appliedImageUrl,
+        outputs: [
+          {
+            id: `multiangle-${Date.now()}`,
+            type: 'image',
+            url: appliedImageUrl,
+            metadata: { originalUrl: payloadImageUrl, tool: 'multiAngle' },
+          },
+        ],
+      });
+      setActiveTool(null);
+      setToolPanelOpen(false);
+    } else if (activeTool === 'lighting') {
+      const { appliedImageUrl, imageUrl: payloadImageUrl } = payload as { appliedImageUrl?: string; imageUrl?: string };
+      if (!appliedImageUrl) return;
+      updateNodeData(id, {
+        imageUrl: appliedImageUrl,
+        outputs: [
+          {
+            id: `lighting-${Date.now()}`,
+            type: 'image',
+            url: appliedImageUrl,
+            metadata: { originalUrl: payloadImageUrl, tool: 'lighting' },
+          },
+        ],
+      });
+      setActiveTool(null);
+      setToolPanelOpen(false);
     }
   }
 

@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ToolCapabilityPanelProps } from './capabilityPanelTypes';
 import { InteractiveImageStage } from './InteractiveImageStage';
+import { applyMultiAngle } from '@/services/imageToolApply';
 
 const SHOT_SCALE_OPTIONS = [
   { label: '特写', value: 'close' },
@@ -41,10 +42,26 @@ function deriveShotScale(zoom: number) {
   return 'medium';
 }
 
-export default function MultiAngleCapabilityPanel({ value, onChange, sourceImageUrl }: ToolCapabilityPanelProps) {
+export default function MultiAngleCapabilityPanel({ value, onChange, sourceImageUrl, onApply }: ToolCapabilityPanelProps) {
   const configRef = useRef(value);
   const dragStateRef = useRef<OrbitDragState | null>(null);
   const [keyframeName, setKeyframeName] = useState('');
+  const [applyStatus, setApplyStatus] = useState<string | null>(null);
+
+  async function handleGenerate() {
+    if (typeof sourceImageUrl !== 'string' || !sourceImageUrl) {
+      setApplyStatus('请先选择素材图');
+      return;
+    }
+    setApplyStatus('生成中…');
+    try {
+      const result = await applyMultiAngle(sourceImageUrl, value);
+      await onApply?.({ appliedImageUrl: result.url, imageUrl: sourceImageUrl, engine: result.engine, ...value });
+      setApplyStatus('已生成并写回素材图');
+    } catch (err) {
+      setApplyStatus(err instanceof Error ? err.message : '生成失败');
+    }
+  }
 
   useEffect(() => {
     configRef.current = value;
@@ -248,6 +265,13 @@ export default function MultiAngleCapabilityPanel({ value, onChange, sourceImage
           )}
         </div>
       </div>
+
+      <button type="button" data-testid="multi-angle-generate" onClick={() => void handleGenerate()} className="mt-3 w-full rounded-lg border border-[#7b7b7b] bg-[#363636] px-3 py-2 text-sm text-white hover:bg-[#424242]">
+        生成当前机位并写回
+      </button>
+      {applyStatus ? (
+        <div data-testid="multi-angle-status" className="mt-2 rounded-lg border border-[#404040] bg-[#161616] px-3 py-2 text-xs text-[#b4b4b4]">{applyStatus}</div>
+      ) : null}
     </div>
   );
 }

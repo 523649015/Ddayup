@@ -1,7 +1,14 @@
 ﻿import { Camera, Crop, Eraser, LayoutGrid, Paintbrush2, ScanEye, Sparkles, Wand2 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import { toRenderableAssetUrl } from '@/services/generation';
-import { runLocalHdUpscale, LocalModelError } from '@/services/imageModelRouting';
+import {
+  applyHdUpscale,
+  applyHdRestore,
+  applyHdOutpaint,
+  applyHdInpaint,
+  applyHdCutout,
+  applyHdCrop,
+} from '@/services/imageToolApply';
 import type { ToolCapabilityPanelProps } from './capabilityPanelTypes';
 
 const HD_MODE_KEYS = ['upscale', 'outpaint', 'inpaint', 'erase', 'cutout', 'crop', 'restore'] as const;
@@ -42,31 +49,6 @@ const OUTPAINT_DIRECTIONS = [
 ] as const;
 const PREVIEW_WIDTH = 360;
 const PREVIEW_HEIGHT = 220;
-
-function loadImageElement(url: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error('图片加载失败，无法裁切'));
-    img.src = url;
-  });
-}
-
-async function cropSourceToDataUrl(sourceUrl: string, frame: { left: number; top: number; width: number; height: number }) {
-  const img = await loadImageElement(sourceUrl);
-  const sx = (frame.left / 100) * img.naturalWidth;
-  const sy = (frame.top / 100) * img.naturalHeight;
-  const sw = (frame.width / 100) * img.naturalWidth;
-  const sh = (frame.height / 100) * img.naturalHeight;
-  const canvas = document.createElement('canvas');
-  canvas.width = Math.max(1, Math.round(sw));
-  canvas.height = Math.max(1, Math.round(sh));
-  const ctx = canvas.getContext('2d');
-  if (!ctx) throw new Error('无法创建画布');
-  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL('image/png');
-}
 
 const MODE_DEFAULTS: Record<HdMode, Record<string, unknown>> = {
   upscale: {
@@ -123,16 +105,26 @@ export default function HdCapabilityPanel({ value, onChange, sourceImageUrl, onA
   const modeMaskPoints = useMemo(() => getModeMaskPoints(value.maskPoints, activeMode), [activeMode, value.maskPoints]);
   const [hdStatus, setHdStatus] = useState<string | null>(null);
 
-  async function handleLocalUpscale() {
+  async function handleApplyByMode() {
     if (typeof sourceImageUrl !== 'string' || !sourceImageUrl) {
-      setHdStatus('请先上传或选择高清源图');
+      setHdStatus('请先选择素材图');
       return;
     }
+    setHdStatus('处理中…');
     try {
-      const { url } = await runLocalHdUpscale(sourceImageUrl);
-      setHdStatus(`本地放大完成，已入库「高清」：${url.slice(0, 24)}…`);
+      const mode = activeMode;
+      let result;
+      if (mode === 'upscale') result = await applyHdUpscale(sourceImageUrl, value);
+      else if (mode === 'restore') result = await applyHdRestore(sourceImageUrl, value);
+      else if (mode === 'outpaint') result = await applyHdOutpaint(sourceImageUrl, value);
+      else if (mode === 'inpaint') result = await applyHdInpaint(sourceImageUrl, { ...value, mode: 'inpaint' });
+      else if (mode === 'erase') result = await applyHdInpaint(sourceImageUrl, { ...value, mode: 'erase' });
+      else if (mode === 'cutout') result = await applyHdCutout(sourceImageUrl, value);
+      else return;
+      await onApply?.({ appliedImageUrl: result.url, imageUrl: sourceImageUrl, hdMode: mode, engine: result.engine, ...value });
+      setHdStatus(`已生成并写回素材图（${result.engine}）`);
     } catch (err) {
-      const message = err instanceof LocalModelError ? err.message : err instanceof Error ? err.message : String(err);
+      const message = err instanceof Error ? err.message : String(err);
       setHdStatus(message);
     }
   }
@@ -144,8 +136,8 @@ export default function HdCapabilityPanel({ value, onChange, sourceImageUrl, onA
     }
     try {
       const frame = getCropFrame(String(value.cropRatio ?? '1:1'), Number(value.cropCenterX ?? 0.5), Number(value.cropCenterY ?? 0.5), Number(value.cropZoom ?? 1));
-      const url = await cropSourceToDataUrl(sourceImageUrl, frame);
-      await onApply?.({ appliedImageUrl: url, imageUrl: sourceImageUrl, hdMode: 'crop', cropRatio: value.cropRatio, cropZoom: value.cropZoom });
+      const result = await applyHdCrop(sourceImageUrl, frame);
+      await onApply?.({ appliedImageUrl: result.url, imageUrl: sourceImageUrl, hdMode: 'crop', cropRatio: value.cropRatio, cropZoom: value.cropZoom, engine: result.engine });
       setHdStatus('已裁切并写回素材图');
     } catch (err) {
       setHdStatus(err instanceof Error ? err.message : '裁切失败');
@@ -225,12 +217,6 @@ export default function HdCapabilityPanel({ value, onChange, sourceImageUrl, onA
               <Toggle active={Boolean(value.faceRestore ?? true)} label="人脸修复" testId="hd-face-restore-toggle" onClick={() => patchValue({ faceRestore: !Boolean(value.faceRestore ?? true) })} />
               <Toggle active={Boolean(value.preserveTexture ?? true)} label="纹理保真" testId="hd-preserve-texture-toggle" onClick={() => patchValue({ preserveTexture: !Boolean(value.preserveTexture ?? true) })} />
             </div>
-            <button type="button" data-testid="hd-local-upscale" onClick={() => void handleLocalUpscale()} className="w-full rounded-lg border border-[#7b7b7b] bg-[#363636] px-3 py-2 text-sm text-white hover:bg-[#424242]">
-              本地放大（Real-ESRGAN）
-            </button>
-            {hdStatus ? (
-              <div data-testid="hd-local-status" className="rounded-lg border border-[#404040] bg-[#161616] px-3 py-2 text-xs text-[#b4b4b4]">{hdStatus}</div>
-            ) : null}
           </div>
         ) : null}
 
@@ -326,6 +312,15 @@ export default function HdCapabilityPanel({ value, onChange, sourceImageUrl, onA
               <Toggle active={Boolean(value.preserveTexture ?? true)} label="纹理保真" testId="hd-restore-texture-toggle" onClick={() => patchValue({ preserveTexture: !Boolean(value.preserveTexture ?? true) })} />
             </div>
           </div>
+        ) : null}
+
+        {activeMode !== 'crop' ? (
+          <button type="button" data-testid={`hd-apply-${activeMode}`} onClick={() => void handleApplyByMode()} className="mt-4 w-full rounded-lg border border-[#7b7b7b] bg-[#363636] px-3 py-2 text-sm text-white hover:bg-[#424242]">
+            应用到素材图
+          </button>
+        ) : null}
+        {hdStatus ? (
+          <div data-testid="hd-apply-status" className="mt-2 rounded-lg border border-[#404040] bg-[#161616] px-3 py-2 text-xs text-[#b4b4b4]">{hdStatus}</div>
         ) : null}
       </div>
     </div>

@@ -5,6 +5,7 @@ import { toRenderableAssetUrl } from '@/services/generation';
 import { useAssetStore } from '@/store/useAssetStore';
 import type { ToolCapabilityPanelProps } from './capabilityPanelTypes';
 import { InteractiveImageStage } from './InteractiveImageStage';
+import { applyLighting } from '@/services/imageToolApply';
 
 const LIGHTING_PRESETS = [
   { key: 'rembrandt', label: '伦勃朗', azimuth: 45, elevation: 30, intensity: 0.82, temperature: 5200 },
@@ -57,7 +58,7 @@ function temperatureToRgb(kelvin: number) {
   return `rgb(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)})`;
 }
 
-export default function LightingCapabilityPanel({ value, onChange, sourceImageUrl }: ToolCapabilityPanelProps) {
+export default function LightingCapabilityPanel({ value, onChange, sourceImageUrl, onApply }: ToolCapabilityPanelProps) {
   const addAssetItem = useAssetStore((state) => state.addItem);
   const assetItems = useAssetStore((state) => state.items);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -67,6 +68,22 @@ export default function LightingCapabilityPanel({ value, onChange, sourceImageUr
   const rectRef = useRef<DOMRect | null>(null);
   const activeLightRef = useRef(String(value.activeLight ?? 'key'));
   const [assetQuery, setAssetQuery] = useState('');
+  const [applyStatus, setApplyStatus] = useState<string | null>(null);
+
+  async function handleApply() {
+    if (typeof sourceImageUrl !== 'string' || !sourceImageUrl) {
+      setApplyStatus('请先选择素材图');
+      return;
+    }
+    setApplyStatus('烘焙中…');
+    try {
+      const result = await applyLighting(sourceImageUrl, value);
+      await onApply?.({ appliedImageUrl: result.url, imageUrl: sourceImageUrl, engine: result.engine, ...value });
+      setApplyStatus('已应用打光并写回素材图');
+    } catch (err) {
+      setApplyStatus(err instanceof Error ? err.message : '应用失败');
+    }
+  }
 
   useEffect(() => {
     configRef.current = value;
@@ -337,6 +354,13 @@ export default function LightingCapabilityPanel({ value, onChange, sourceImageUr
           </div>
         </div>
       </details>
+
+      <button type="button" data-testid="lighting-apply" onClick={() => void handleApply()} className="mt-3 w-full rounded-lg border border-[#7b7b7b] bg-[#363636] px-3 py-2 text-sm text-white hover:bg-[#424242]">
+        应用打光并写回
+      </button>
+      {applyStatus ? (
+        <div data-testid="lighting-status" className="mt-2 rounded-lg border border-[#404040] bg-[#161616] px-3 py-2 text-xs text-[#b4b4b4]">{applyStatus}</div>
+      ) : null}
     </div>
   );
 }
