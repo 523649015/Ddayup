@@ -1505,6 +1505,22 @@ export function ImageNode({ selected, data, id }: NodeProps) {
           setActivation({ mode: 'image', provider: selectedModel.provider, reason: 'api-key' });
         }
       }
+    } else if (activeTool === 'hd') {
+      const { appliedImageUrl, imageUrl: payloadImageUrl } = payload as { appliedImageUrl?: string; imageUrl?: string };
+      if (!appliedImageUrl) return;
+      updateNodeData(id, {
+        imageUrl: appliedImageUrl,
+        outputs: [
+          {
+            id: `hd-${Date.now()}`,
+            type: 'image',
+            url: appliedImageUrl,
+            metadata: { originalUrl: payloadImageUrl },
+          },
+        ],
+      });
+      setActiveTool(null);
+      setToolPanelOpen(false);
     }
   }
 

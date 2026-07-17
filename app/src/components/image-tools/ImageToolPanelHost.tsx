@@ -63,7 +63,7 @@ export function ImageToolPanelHost({
   return (
     <div
       data-testid={`image-tool-panel-${tool}`}
-      className="nodrag nopan nowheel z-40 w-[460px] absolute left-full top-0 ml-4 overflow-hidden rounded-2xl border border-[#424242] bg-[#1f1f1f] shadow-2xl"
+      className="nodrag nopan nowheel z-40 w-[520px] absolute left-full top-0 ml-4 overflow-hidden rounded-2xl border border-[#424242] bg-[#1f1f1f] shadow-2xl"
       {...panelInteractionProps}
       onPointerDown={panelInteractionProps?.onPointerDown || onInteract || stopCanvasEvent}
       onMouseDown={panelInteractionProps?.onMouseDown || onInteract || stopCanvasEvent}
@@ -83,7 +83,7 @@ export function ImageToolPanelHost({
         </button>
       </div>
 
-      <div className="max-h-[520px] overflow-y-auto px-4 py-4">
+      <div className="max-h-[620px] overflow-y-auto px-4 py-4">
         <Suspense fallback={<PanelSkeleton />}>
           {renderCapabilityPanel(tool, value, onChange, sourceImageUrl, nodeLabel, onApply, onClose)}
         </Suspense>
@@ -111,7 +111,7 @@ function renderCapabilityPanel(
   if (tool === 'camera') return <CameraCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
   if (tool === 'lighting') return <LightingCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
   if (tool === 'grid') return <GridCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
-  if (tool === 'hd') return <HdCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
+  if (tool === 'hd') return <HdCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} />;
   if (tool === 'split') return <SplitCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
   if (tool === 'brush') return <BrushCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} onClose={onClose} />;
   if (tool === 'bgRemove') return <BgRemoveCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} onClose={onClose} />;

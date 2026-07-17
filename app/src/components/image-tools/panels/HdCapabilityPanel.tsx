@@ -43,6 +43,31 @@ const OUTPAINT_DIRECTIONS = [
 const PREVIEW_WIDTH = 360;
 const PREVIEW_HEIGHT = 220;
 
+function loadImageElement(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('图片加载失败，无法裁切'));
+    img.src = url;
+  });
+}
+
+async function cropSourceToDataUrl(sourceUrl: string, frame: { left: number; top: number; width: number; height: number }) {
+  const img = await loadImageElement(sourceUrl);
+  const sx = (frame.left / 100) * img.naturalWidth;
+  const sy = (frame.top / 100) * img.naturalHeight;
+  const sw = (frame.width / 100) * img.naturalWidth;
+  const sh = (frame.height / 100) * img.naturalHeight;
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(sw));
+  canvas.height = Math.max(1, Math.round(sh));
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('无法创建画布');
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL('image/png');
+}
+
 const MODE_DEFAULTS: Record<HdMode, Record<string, unknown>> = {
   upscale: {
     upscale: '2x',
@@ -92,7 +117,7 @@ const MODE_DEFAULTS: Record<HdMode, Record<string, unknown>> = {
   },
 };
 
-export default function HdCapabilityPanel({ value, onChange, sourceImageUrl }: ToolCapabilityPanelProps) {
+export default function HdCapabilityPanel({ value, onChange, sourceImageUrl, onApply }: ToolCapabilityPanelProps) {
   const [activeMode, setActiveMode] = useState<HdMode>(parseHdMode(value.hdMode));
   const modeMeta = useMemo(() => HD_MODES.find((item) => item.key === activeMode) || HD_MODES[0], [activeMode]);
   const modeMaskPoints = useMemo(() => getModeMaskPoints(value.maskPoints, activeMode), [activeMode, value.maskPoints]);
@@ -109,6 +134,21 @@ export default function HdCapabilityPanel({ value, onChange, sourceImageUrl }: T
     } catch (err) {
       const message = err instanceof LocalModelError ? err.message : err instanceof Error ? err.message : String(err);
       setHdStatus(message);
+    }
+  }
+
+  async function handleApplyCrop() {
+    if (typeof sourceImageUrl !== 'string' || !sourceImageUrl) {
+      setHdStatus('请先选择素材图');
+      return;
+    }
+    try {
+      const frame = getCropFrame(String(value.cropRatio ?? '1:1'), Number(value.cropCenterX ?? 0.5), Number(value.cropCenterY ?? 0.5), Number(value.cropZoom ?? 1));
+      const url = await cropSourceToDataUrl(sourceImageUrl, frame);
+      await onApply?.({ appliedImageUrl: url, imageUrl: sourceImageUrl, hdMode: 'crop', cropRatio: value.cropRatio, cropZoom: value.cropZoom });
+      setHdStatus('已裁切并写回素材图');
+    } catch (err) {
+      setHdStatus(err instanceof Error ? err.message : '裁切失败');
     }
   }
 
@@ -196,15 +236,9 @@ export default function HdCapabilityPanel({ value, onChange, sourceImageUrl }: T
 
         {activeMode === 'outpaint' ? (
           <div className="space-y-3">
-            <div className="grid grid-cols-5 gap-2 text-sm">
-              {OUTPAINT_DIRECTIONS.map((direction) => {
-                const active = String(value.outpaintDirection ?? 'right') === direction.value;
-                return (
-                  <button key={direction.value} type="button" onClick={() => patchValue({ outpaintDirection: direction.value })} data-testid={`hd-outpaint-${direction.value}`} className={`rounded-lg border px-3 py-2 ${active ? 'border-[#7b7b7b] bg-[#363636] text-white' : 'border-[#404040] text-[#cbcbcb]'}`}>
-                    {direction.label}
-                  </button>
-                );
-              })}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-[#b4b4b4]">拖拽预览区边缘手柄扩展</span>
+              <button type="button" onClick={() => patchValue({ outpaintDirection: 'both' })} data-testid="hd-outpaint-both" className={`nodrag rounded-full border px-2.5 py-1 text-xs ${String(value.outpaintDirection ?? 'right') === 'both' ? 'border-[#7b7b7b] bg-[#363636] text-white' : 'border-[#404040] text-[#cbcbcb]'}`}>四周扩展</button>
             </div>
             <RangeRow label="扩图比例" value={Number(value.outpaintRatio ?? 0.35).toFixed(2)}>
               <input type="range" min={0.1} max={1} step={0.01} value={Number(value.outpaintRatio ?? 0.35)} onChange={(event) => patchValue({ outpaintRatio: Number(event.target.value) })} className="nodrag nopan nowheel w-full" data-testid="hd-outpaint-ratio-slider" />
@@ -275,6 +309,7 @@ export default function HdCapabilityPanel({ value, onChange, sourceImageUrl }: T
               <MiniStat label="焦点 X" value={Number(value.cropCenterX ?? 0.5).toFixed(2)} />
               <MiniStat label="焦点 Y" value={Number(value.cropCenterY ?? 0.5).toFixed(2)} />
             </div>
+            <button type="button" data-testid="hd-crop-apply" onClick={() => void handleApplyCrop()} className="w-full rounded-lg border border-[#7b7b7b] bg-[#363636] px-3 py-2 text-sm text-white hover:bg-[#424242]">应用到素材图</button>
           </div>
         ) : null}
 
@@ -348,11 +383,48 @@ function HdPreviewStage({ sourceImageUrl, mode, value, onChange }: { sourceImage
   const stageRef = useRef<HTMLDivElement | null>(null);
   const [drawingMask, setDrawingMask] = useState(false);
   const [draggingCrop, setDraggingCrop] = useState(false);
+  const cropCornerRef = useRef<{ corner: string; startX: number; startY: number; baseZoom: number } | null>(null);
+  const outpaintRef = useRef<{ dir: string } | null>(null);
   const modeMaskPoints = useMemo(() => getModeMaskPoints(value.maskPoints, mode), [mode, value.maskPoints]);
   const cropFrame = useMemo(() => getCropFrame(String(value.cropRatio ?? '1:1'), Number(value.cropCenterX ?? 0.5), Number(value.cropCenterY ?? 0.5), Number(value.cropZoom ?? 1)), [value.cropCenterX, value.cropCenterY, value.cropRatio, value.cropZoom]);
   const modeMeta = getModeMeta(mode);
   const resultSignals = buildResultSignals(mode, value, modeMaskPoints.length);
   const renderSourceImageUrl = useMemo(() => toRenderableAssetUrl(sourceImageUrl || '', 'image'), [sourceImageUrl]);
+
+  useEffect(() => {
+    function onMove(event: MouseEvent) {
+      if (cropCornerRef.current && stageRef.current) {
+        const rect = stageRef.current.getBoundingClientRect();
+        const dx = (event.clientX - cropCornerRef.current.startX) / rect.width;
+        const dy = (event.clientY - cropCornerRef.current.startY) / rect.height;
+        const delta = Math.max(Math.abs(dx), Math.abs(dy));
+        const sign = cropCornerRef.current.corner === 'tl' || cropCornerRef.current.corner === 'br' ? -1 : 1;
+        const nextZoom = clamp(cropCornerRef.current.baseZoom + sign * delta * 1.8, 1, 2.4);
+        onChange({ cropZoom: Number(nextZoom.toFixed(2)) });
+      }
+      if (outpaintRef.current && stageRef.current) {
+        const rect = stageRef.current.getBoundingClientRect();
+        const dir = outpaintRef.current.dir;
+        let ratio = 0.35;
+        if (dir === 'right') ratio = ((event.clientX - rect.left) / rect.width) * 1.2;
+        else if (dir === 'left') ratio = ((rect.right - event.clientX) / rect.width) * 1.2;
+        else if (dir === 'bottom') ratio = ((event.clientY - rect.top) / rect.height) * 1.2;
+        else ratio = ((rect.bottom - event.clientY) / rect.height) * 1.2;
+        onChange({ outpaintRatio: Number(clamp(ratio, 0.1, 1).toFixed(2)), outpaintDirection: dir });
+      }
+    }
+    function onUp() {
+      cropCornerRef.current = null;
+      outpaintRef.current = null;
+      setDraggingCrop(false);
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    return () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+  }, [onChange]);
 
   function appendMaskPoint(event: ReactPointerEvent<HTMLDivElement>, targetMode: 'inpaint' | 'erase') {
     const point = getRelativePoint(event, stageRef.current);
@@ -392,7 +464,7 @@ function HdPreviewStage({ sourceImageUrl, mode, value, onChange }: { sourceImage
 
   if (!renderSourceImageUrl) {
     return (
-      <div className="mb-4 flex h-[220px] w-full items-center justify-center rounded-lg border border-[#303030] bg-[linear-gradient(135deg,#10161f,#133337)] text-center text-sm text-[#d8d8d8]" data-testid="hd-preview-canvas">
+      <div className="mb-4 flex h-[300px] w-full items-center justify-center rounded-lg border border-[#303030] bg-[linear-gradient(135deg,#10161f,#133337)] text-center text-sm text-[#d8d8d8]" data-testid="hd-preview-canvas">
         <div>
           <div className="font-medium text-white">HD 预览区</div>
           <div className="mt-1 text-xs text-[#b7c2c8]">上传或选择图片后，可在这里直接预演精修结果。</div>
@@ -405,7 +477,7 @@ function HdPreviewStage({ sourceImageUrl, mode, value, onChange }: { sourceImage
     <div
       ref={stageRef}
       data-testid="hd-preview-canvas"
-      className="nodrag nopan nowheel relative mb-4 h-[220px] w-full overflow-hidden rounded-lg border border-[#303030] bg-[#101010]"
+      className="nodrag nopan nowheel relative mb-4 h-[300px] w-full overflow-hidden rounded-lg border border-[#303030] bg-[#101010]"
       style={{ touchAction: 'none' }}
       onPointerDown={(event) => {
         if (mode !== 'inpaint' && mode !== 'erase' && mode !== 'crop') return;
@@ -481,8 +553,32 @@ function HdPreviewStage({ sourceImageUrl, mode, value, onChange }: { sourceImage
     >
       <img src={renderSourceImageUrl} alt="" className="absolute inset-0 h-full w-full object-cover opacity-90" draggable={false} />
       {mode === 'upscale' ? <img src={renderSourceImageUrl} alt="" className="absolute inset-0 h-full w-full object-cover mix-blend-screen opacity-70" style={{ filter: upscaleFilter }} draggable={false} /> : null}
-      {mode === 'outpaint' ? <OutpaintOverlay direction={String(value.outpaintDirection ?? 'right')} ratio={Number(value.outpaintRatio ?? 0.35)} /> : null}
-      {mode === 'crop' ? <CropOverlay frame={cropFrame} /> : null}
+      {mode === 'outpaint' ? (
+        <>
+          <OutpaintOverlay direction={String(value.outpaintDirection ?? 'right')} ratio={Number(value.outpaintRatio ?? 0.35)} />
+          <div
+            data-outpaint-handle="left"
+            onMouseDown={(event) => { event.preventDefault(); event.stopPropagation(); outpaintRef.current = { dir: 'left' }; }}
+            className="absolute left-0 top-0 h-full w-3.5 cursor-ew-resize bg-gradient-to-r from-cyan-300/40 to-transparent"
+          />
+          <div
+            data-outpaint-handle="right"
+            onMouseDown={(event) => { event.preventDefault(); event.stopPropagation(); outpaintRef.current = { dir: 'right' }; }}
+            className="absolute right-0 top-0 h-full w-3.5 cursor-ew-resize bg-gradient-to-l from-cyan-300/40 to-transparent"
+          />
+          <div
+            data-outpaint-handle="top"
+            onMouseDown={(event) => { event.preventDefault(); event.stopPropagation(); outpaintRef.current = { dir: 'top' }; }}
+            className="absolute left-0 top-0 h-3.5 w-full cursor-ns-resize bg-gradient-to-b from-cyan-300/40 to-transparent"
+          />
+          <div
+            data-outpaint-handle="bottom"
+            onMouseDown={(event) => { event.preventDefault(); event.stopPropagation(); outpaintRef.current = { dir: 'bottom' }; }}
+            className="absolute bottom-0 left-0 h-3.5 w-full cursor-ns-resize bg-gradient-to-t from-cyan-300/40 to-transparent"
+          />
+        </>
+      ) : null}
+      {mode === 'crop' ? <CropOverlay frame={cropFrame} onCornerDown={(corner, event) => { event.preventDefault(); event.stopPropagation(); cropCornerRef.current = { corner, startX: event.clientX, startY: event.clientY, baseZoom: Number(value.cropZoom ?? 1) }; }} /> : null}
       {mode === 'cutout' ? <CutoutOverlay threshold={Number(value.subjectThreshold ?? 0.58)} feather={Number(value.edgeFeather ?? 0.35)} /> : null}
       {mode === 'restore' ? (
         <>
@@ -494,7 +590,6 @@ function HdPreviewStage({ sourceImageUrl, mode, value, onChange }: { sourceImage
 
       <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between p-3 text-[11px] text-[#f6f6f6]">
         <span className="rounded-full bg-black/45 px-2 py-1">{modeMeta.label}预演</span>
-        <span className="rounded-full bg-black/45 px-2 py-1">交互不穿透画布</span>
       </div>
       <div className="pointer-events-none absolute left-3 top-11 flex max-w-[78%] flex-wrap gap-1.5">
         {resultSignals.slice(0, 3).map((signal) => (
@@ -518,7 +613,13 @@ function OutpaintOverlay({ direction, ratio }: { direction: string; ratio: numbe
   );
 }
 
-function CropOverlay({ frame }: { frame: ReturnType<typeof getCropFrame> }) {
+function CropOverlay({ frame, onCornerDown }: { frame: ReturnType<typeof getCropFrame>; onCornerDown?: (corner: string, event: React.MouseEvent) => void; }) {
+  const corners = [
+    { key: 'tl', style: { left: 0, top: 0, transform: 'translate(-50%, -50%)' } },
+    { key: 'tr', style: { right: 0, top: 0, transform: 'translate(50%, -50%)' } },
+    { key: 'bl', style: { left: 0, bottom: 0, transform: 'translate(-50%, 50%)' } },
+    { key: 'br', style: { right: 0, bottom: 0, transform: 'translate(50%, 50%)' } },
+  ] as const;
   return (
     <>
       <div className="absolute inset-0 bg-black/40" />
@@ -528,6 +629,15 @@ function CropOverlay({ frame }: { frame: ReturnType<typeof getCropFrame> }) {
         <div className="absolute top-1/3 h-px w-full bg-white/45" />
         <div className="absolute top-2/3 h-px w-full bg-white/45" />
         <div className="absolute left-1/2 top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white bg-black/60" />
+        {corners.map((corner) => (
+          <div
+            key={corner.key}
+            data-crop-corner={corner.key}
+            onMouseDown={(event) => onCornerDown?.(corner.key, event)}
+            className="absolute h-4 w-4 cursor-nwse-resize rounded-sm border border-cyan-200 bg-black/70"
+            style={corner.style}
+          />
+        ))}
       </div>
     </>
   );
