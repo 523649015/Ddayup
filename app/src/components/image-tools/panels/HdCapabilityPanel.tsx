@@ -110,22 +110,36 @@ export default function HdCapabilityPanel({ value, onChange, sourceImageUrl, onA
       setHdStatus('请先选择素材图');
       return;
     }
-    setHdStatus('处理中…');
+    const startedAt = Date.now();
+    setHdStatus('正在加载素材…');
     try {
       const mode = activeMode;
       let result;
-      if (mode === 'upscale') result = await applyHdUpscale(sourceImageUrl, value);
-      else if (mode === 'restore') result = await applyHdRestore(sourceImageUrl, value);
-      else if (mode === 'outpaint') result = await applyHdOutpaint(sourceImageUrl, value);
-      else if (mode === 'inpaint') result = await applyHdInpaint(sourceImageUrl, { ...value, mode: 'inpaint' });
-      else if (mode === 'erase') result = await applyHdInpaint(sourceImageUrl, { ...value, mode: 'erase' });
-      else if (mode === 'cutout') result = await applyHdCutout(sourceImageUrl, value);
-      else return;
+      // 阶段 1：加载源图（受 30s 超时保护）
+      setHdStatus('正在加载素材…');
+      if (mode === 'upscale') {
+        setHdStatus('正在生成…（可能 5~30s，取决于图片尺寸）');
+        result = await applyHdUpscale(sourceImageUrl, value);
+      } else if (mode === 'restore') {
+        setHdStatus('正在修复…');
+        result = await applyHdRestore(sourceImageUrl, value);
+      } else if (mode === 'outpaint') {
+        setHdStatus('正在扩图…');
+        result = await applyHdOutpaint(sourceImageUrl, value);
+      } else if (mode === 'inpaint' || mode === 'erase') {
+        setHdStatus('正在重绘…（本地 LaMa 推理或 canvas 兜底）');
+        result = await applyHdInpaint(sourceImageUrl, { ...value, mode });
+      } else if (mode === 'cutout') {
+        setHdStatus('正在抠图…（本地模型推理中）');
+        result = await applyHdCutout(sourceImageUrl, value);
+      } else return;
+      setHdStatus('正在写回节点…');
       await onApply?.({ appliedImageUrl: result.url, imageUrl: sourceImageUrl, hdMode: mode, engine: result.engine, ...value });
-      setHdStatus(`已生成并写回素材图（${result.engine}）`);
+      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+      setHdStatus(`已生成并写回素材图（${result.engine}，${elapsed}s）`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      setHdStatus(message);
+      setHdStatus(`失败：${message}`);
     }
   }
 

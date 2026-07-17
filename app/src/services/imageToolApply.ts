@@ -14,6 +14,7 @@ import { runLocalHdUpscale, removeImageBackground, LocalModelError } from './ima
 import { applyBrushEdit, BrushEditError } from './imageBrush';
 import { hasLocalModelRunner } from './localModelRunner';
 import { resolveLocalMediaUrl, isLocalMediaHandle } from './localMediaRegistry';
+import { toRenderableAssetUrl } from './generation';
 
 export interface ToolApplyResult {
   url: string;
@@ -35,21 +36,50 @@ function clamp(value: number, min: number, max: number) {
 }
 
 function resolveImageUrl(url: string): string {
+  if (!url) throw new Error('缺少可加载的图片地址');
   if (isLocalMediaHandle(url)) {
     const resolved = resolveLocalMediaUrl(url);
     if (resolved) return resolved;
+    throw new Error('本地素材句柄已失效（blob 未在注册表中找到），请重新上传或刷新页面后重试');
   }
-  return url;
+  // 远端 http(s) / file:// 走与预览一致的 /api/media-proxy 代理，规避 CORS
+  return toRenderableAssetUrl(url, 'image') || url;
 }
+
+const IMAGE_LOAD_TIMEOUT_MS = 30000;
 
 function loadImage(url: string): Promise<HTMLImageElement> {
   const renderable = resolveImageUrl(url);
+  const needsCors = renderable.startsWith('http') || renderable.startsWith('//') || renderable.startsWith('/api/media-proxy');
   return new Promise((resolve, reject) => {
     const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error('图片加载失败，无法处理'));
-    img.src = renderable;
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`图片加载超时（${IMAGE_LOAD_TIMEOUT_MS / 1000}s），请检查素材图或网络`));
+    }, IMAGE_LOAD_TIMEOUT_MS);
+    img.onload = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      resolve(img);
+    };
+    img.onerror = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      reject(new Error('图片加载失败，无法处理（可能是 CORS 拦截或后端未启动，请确认 8792 服务在跑）'));
+    };
+    try {
+      if (needsCors) img.crossOrigin = 'anonymous';
+      img.src = renderable;
+    } catch (err) {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      reject(err instanceof Error ? err : new Error(String(err)));
+    }
   });
 }
 
