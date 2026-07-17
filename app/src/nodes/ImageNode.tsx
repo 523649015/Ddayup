@@ -1971,7 +1971,7 @@ export function ImageNode({ selected, data, id }: NodeProps) {
         <AssetPicker assets={imageAssets} onChoose={chooseAsset} emptyText="素材库暂无图片" panelInteractionProps={imagePanelInteractionProps} onInteract={stopImagePanelInteraction} />
       ) : null}
 
-      <div className="flex items-start gap-4">
+      <div className="relative">
         <div
           className={`relative rounded-lg transition-all duration-150 flex-shrink-0 ${
             isNodeSelected ? 'ring-2 ring-[#9a9a9a] shadow-[0_0_0_1px_rgba(255,255,255,0.22)]' : 'ring-1 ring-[#343434]'

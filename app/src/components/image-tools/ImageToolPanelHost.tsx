@@ -63,7 +63,7 @@ export function ImageToolPanelHost({
   return (
     <div
       data-testid={`image-tool-panel-${tool}`}
-      className="nodrag nopan nowheel z-40 w-[460px] shrink-0 self-start overflow-hidden rounded-2xl border border-[#424242] bg-[#1f1f1f] shadow-2xl"
+      className="nodrag nopan nowheel z-40 w-[460px] absolute left-full top-0 ml-4 overflow-hidden rounded-2xl border border-[#424242] bg-[#1f1f1f] shadow-2xl"
       {...panelInteractionProps}
       onPointerDown={panelInteractionProps?.onPointerDown || onInteract || stopCanvasEvent}
       onMouseDown={panelInteractionProps?.onMouseDown || onInteract || stopCanvasEvent}
