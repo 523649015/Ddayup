@@ -17,10 +17,27 @@ artifacts/
 # Temp files & logs
 tmp/
 tmp_*
+tmp-*
+**/tmp_*
+**/tmp-*
+app/tmp_*
+app/tmp-*
+app/tmp-*/
 *.log
 tmp_chrome_profile_verify/
 dcc-browser-*
 cdp-*
+
+# Build caches / runtime state
+.vite/
+.vite-cache/
+.vite-cache-react-lite/
+.hmdao-data/
+**/.vite/
+**/.vite-cache*
+**/.hmdao-data/
+.patch-debug.txt
+.playwright-cli/
 
 # OS / editor
 .DS_Store
