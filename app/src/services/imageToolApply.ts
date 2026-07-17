@@ -47,6 +47,7 @@ function resolveImageUrl(url: string): string {
 }
 
 const IMAGE_LOAD_TIMEOUT_MS = 30000;
+const MAX_CANVAS_DIM = 8192;
 
 function loadImage(url: string): Promise<HTMLImageElement> {
   const renderable = resolveImageUrl(url);
@@ -205,13 +206,18 @@ function normalizeMaskPoint(raw: unknown): MaskPoint | null {
 /** 高清放大：本地 Real-ESRGAN 优先，否则 canvas 双三次放大。 */
 export async function applyHdUpscale(imageUrl: string, params: Record<string, unknown> = {}): Promise<ToolApplyResult> {
   const scale = parseScale(String(params.upscale ?? '2x'));
+  const renderable = resolveImageUrl(imageUrl);
   if (hasLocalModelRunner('real-esrgan-x4')) {
-    const { url, assetId } = await runLocalHdUpscale(imageUrl);
-    return { url, assetId, engine: 'real-esrgan-x4' };
+    try {
+      const { url, assetId } = await runLocalHdUpscale(renderable);
+      return { url, assetId, engine: 'real-esrgan-x4' };
+    } catch {
+      // 本地模型失败（大图 OOM 等），回退到 canvas 双三次放大
+    }
   }
-  const img = await loadImage(imageUrl);
-  const w = Math.max(1, Math.round(img.naturalWidth * scale));
-  const h = Math.max(1, Math.round(img.naturalHeight * scale));
+  const img = await loadImage(renderable);
+  const w = Math.min(MAX_CANVAS_DIM, Math.max(1, Math.round(img.naturalWidth * scale)));
+  const h = Math.min(MAX_CANVAS_DIM, Math.max(1, Math.round(img.naturalHeight * scale)));
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
@@ -340,9 +346,10 @@ export async function applyHdInpaint(imageUrl: string, params: Record<string, un
     : [];
   const maskCanvas = renderMaskCanvas(points);
   const mask = maskCanvas.toDataURL('image/png');
+  const renderable = resolveImageUrl(imageUrl);
   try {
     const result = await applyBrushEdit({
-      imageUrl,
+      imageUrl: renderable,
       mask,
       folderId: 'img-hd',
       prompt: mode === 'erase' ? 'remove object and inpaint background' : 'inpaint the masked region',
@@ -350,17 +357,27 @@ export async function applyHdInpaint(imageUrl: string, params: Record<string, un
     return { url: result.url, assetId: result.assetId, engine: 'lama-inpaint' };
   } catch (err) {
     if (err instanceof BrushEditError && err.code === 'no-backend') {
-      const url = await canvasHeal(imageUrl, maskCanvas);
+      const url = await canvasHeal(renderable, maskCanvas);
       return { url, assetId: '', engine: 'canvas-heal' };
     }
-    throw err;
+    // LaMa 失败（OOM/模型损坏），同样回退 canvas 镜像修复
+    const url = await canvasHeal(renderable, maskCanvas);
+    return { url, assetId: '', engine: 'canvas-heal-lama-fallback' };
   }
 }
 
 /** 智能抠图：本地 imgly 去背优先；未安装则抛出明确引导。 */
 export async function applyHdCutout(imageUrl: string, _params: Record<string, unknown> = {}): Promise<ToolApplyResult> {
-  const { url, assetId } = await removeImageBackground(imageUrl);
-  return { url, assetId, engine: 'imgly-bgremoval' };
+  const renderable = resolveImageUrl(imageUrl);
+  try {
+    const { url, assetId } = await removeImageBackground(renderable);
+    return { url, assetId, engine: 'imgly-bgremoval' };
+  } catch (err) {
+    if (err instanceof LocalModelError && err.code === 'no-model') {
+      throw err; // 引导用户安装模型
+    }
+    throw new Error(`智能抠图失败：${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /** 智能裁切：前端 canvas 裁切（与面板预演一致）。 */

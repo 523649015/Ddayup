@@ -2127,6 +2127,11 @@ export function ImageNode({ selected, data, id }: NodeProps) {
             {posterLayout.enabled ? (
               <PosterOverlay layout={{ ...posterLayout, editor: posterEditor }} previewHeight={displaySize.height} />
             ) : null}
+            {imageMeta ? (
+              <div className="pointer-events-none absolute bottom-2 right-2 select-none rounded-full bg-black/55 px-2.5 py-0.5 text-[10px] font-medium text-white/90 backdrop-blur-sm">
+                {imageMeta.width}×{imageMeta.height}
+              </div>
+            ) : null}
             <button
               type="button"
               onClick={openFilePicker}
