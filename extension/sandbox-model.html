@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<title>Ddayup 3D 沙箱预览</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #14171d; }
+  #cv { width: 100%; height: 100%; display: block; }
+  #hint {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    color: #8b949e; font: 12px system-ui, sans-serif; text-align: center; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="hint">模型加载中…</div>
+<!--
+  沙箱页：不受 extension_pages 的 CSP（script-src 'self' 硬禁 WASM）限制，
+  其默认 CSP 含 'unsafe-eval'（Chrome 中同时放行 WebAssembly），因此可在面板内
+  直接运行 Three.js + DRACO(纯JS解码器) + meshopt(WASM) 渲染压缩 glb/gltf。
+  沙箱内禁用任何 chrome.* API，仅通过 postMessage 与父页面(侧栏)通信。
+-->
+<script type="module" src="sandbox-model.js"></script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <radialGradient id="face" cx="50%" cy="40%" r="65%">
+      <stop offset="0%" stop-color="#b6f0a3"/>
+      <stop offset="55%" stop-color="#7ddf64"/>
+      <stop offset="100%" stop-color="#4cb04d"/>
+    </radialGradient>
+  </defs>
+  <!-- 圆角深底（与 chrome://extensions 列表背景融合） -->
+  <rect width="128" height="128" rx="22" fill="#0d1117"/>
+  <!-- 尖耳朵 -->
+  <path d="M22 44 C8 30 6 60 26 64 Z" fill="#5cb04d"/>
+  <path d="M106 44 C120 30 122 60 102 64 Z" fill="#5cb04d"/>
+  <!-- 圆脸 -->
+  <circle cx="64" cy="68" r="42" fill="url(#face)"/>
+  <!-- 腮红 -->
+  <ellipse cx="36" cy="82" rx="8" ry="5" fill="#ff9eb3" opacity="0.6"/>
+  <ellipse cx="92" cy="82" rx="8" ry="5" fill="#ff9eb3" opacity="0.6"/>
+  <!-- 眼白 -->
+  <ellipse cx="48" cy="60" rx="11" ry="14" fill="#fff" stroke="#06231d" stroke-width="2"/>
+  <ellipse cx="80" cy="60" rx="11" ry="14" fill="#fff" stroke="#06231d" stroke-width="2"/>
+  <!-- 瞳孔 -->
+  <ellipse cx="50" cy="62" rx="5.5" ry="7.5" fill="#06231d"/>
+  <ellipse cx="82" cy="62" rx="5.5" ry="7.5" fill="#06231d"/>
+  <!-- 高光 -->
+  <circle cx="52" cy="58" r="2.2" fill="#fff"/>
+  <circle cx="84" cy="58" r="2.2" fill="#fff"/>
+  <!-- 微笑 -->
+  <path d="M50 90 Q64 102 78 90" stroke="#06231d" stroke-width="3" fill="none" stroke-linecap="round"/>
+  <!-- 魔法光点 -->
+  <path d="M104 22 l2 5 5 2 -5 2 -2 5 -2 -5 -5 -2 5 -2 Z" fill="#ffe27a"/>
+</svg>

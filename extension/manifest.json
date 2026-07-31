@@ -1,0 +1,68 @@
+{
+  "manifest_version": 3,
+  "name": "Ddayup网页素材采集扩展",
+  "version": "0.1.3",
+  "description": "Ddayup 网页素材采集扩展：扫描当前网页的图片 / 视频 / 音效 / 3D 模型资源，支持下载到本地、保存到自定义目录、导入 Ddayup 素材库 / 画布（Chrome / Edge 通用）",
+  "icons": {
+    "16": "icons/icon.svg",
+    "48": "icons/icon.svg",
+    "128": "icons/icon.svg"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "downloads",
+    "sidePanel",
+    "webRequest",
+    "webNavigation",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess",
+    "cookies",
+    "clipboardWrite",
+    "tabs"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "externally_connectable": {
+    "matches": ["http://127.0.0.1:3000/*", "http://localhost:3000/*"]
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Ddayup网页素材采集扩展",
+    "default_icon": {
+      "16": "icons/icon.svg",
+      "48": "icons/icon.svg",
+      "128": "icons/icon.svg"
+    }
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "sandbox": {
+    "pages": ["sandbox-model.html"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://127.0.0.1:3000/*", "http://localhost:3000/*"],
+      "js": ["detect.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://*.bilibili.com/*",
+        "*://*.youtube.com/*"
+      ],
+      "js": ["inject-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["model-api-capture.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}

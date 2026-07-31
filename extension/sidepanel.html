@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <title>Ddayup网页素材采集扩展</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <!-- 第三方 Cookie 被阻止时的友好提示（默认隐藏，由 sidepanel.js 检测后显示） -->
+    <div id="thirdPartyCookieNotice" class="notice-banner" style="display:none" role="alert">
+      <div class="notice-icon">🍪</div>
+      <div class="notice-body">
+        <div class="notice-title">部分功能可能受限</div>
+        <div class="notice-text">
+          浏览器已阻止第三方 Cookie。跨站视频/音频预览、需要会话 Cookie 的媒体直接下载可能不可用，
+          但素材扫描、图片/动图预览、glb/obj 等 3D 模型预览与本地下载仍可正常使用。
+        </div>
+        <div class="notice-actions">
+          <a id="thirdPartyCookieIssuesLink" class="notice-link" href="#" target="_blank" rel="noopener">了解更多（Issues）</a>
+          <button id="thirdPartyCookieDismiss" class="notice-dismiss" type="button">知道了</button>
+        </div>
+      </div>
+    </div>
+    <header>
+      <h1>
+        <svg id="elfIcon" viewBox="0 0 100 100" width="34" height="34" style="vertical-align:-10px;margin-right:6px;cursor:pointer">
+          <circle cx="50" cy="50" r="38" fill="#7ddf64"/>
+          <path d="M16 35 L8 25 L20 42 Z" fill="#5cb04d"/>
+          <path d="M84 35 L92 25 L80 42 Z" fill="#5cb04d"/>
+          <circle cx="32" cy="62" r="6" fill="#ff9eb3" opacity="0.55"/>
+          <circle cx="68" cy="62" r="6" fill="#ff9eb3" opacity="0.55"/>
+          <path d="M40 68 Q50 76 60 68" stroke="#06231d" stroke-width="2" fill="none" stroke-linecap="round"/>
+          <ellipse cx="38" cy="50" rx="9" ry="10" fill="#fff" stroke="#06231d" stroke-width="1"/>
+          <ellipse cx="62" cy="50" rx="9" ry="10" fill="#fff" stroke="#06231d" stroke-width="1"/>
+          <g class="pupil-group">
+            <circle id="pupilLeft" cx="38" cy="50" r="3.6" fill="#06231d"/>
+            <circle id="pupilRight" cx="62" cy="50" r="3.6" fill="#06231d"/>
+          </g>
+        </svg>
+        Ddayup 素材采集 <span id="statusDot" class="dot gray"></span>
+      </h1>
+      <div class="sub" id="pageInfo">初始化中…</div>
+    </header>
+
+    <div class="preview">
+      <img id="previewThumb" class="previewThumb" alt="" />
+      <div class="previewMeta">
+        <div class="previewTitle" id="previewTitle">—</div>
+        <div class="previewUrl" id="previewUrl">—</div>
+      </div>
+    </div>
+
+    <div class="stats">
+      <button class="chip active" data-type="all">全部 <b id="cntAll">0</b></button>
+      <button class="chip" data-type="image">图片 <b id="cntImg">0</b></button>
+      <button class="chip" data-type="video">视频 <b id="cntVid">0</b></button>
+      <button class="chip" data-type="audio">音频 <b id="cntAud">0</b></button>
+      <button class="chip" data-type="model">3D 模型 <b id="cntMod">0</b></button>
+      <button class="chip" data-type="archive">📦 归档 <b id="cntArc">0</b></button>
+      <button class="chip" data-type="netdisk">🔗 网盘 <b id="cntNet">0</b></button>
+      <button class="refresh" id="revealBtn" style="margin-left:6px" title="自动点击「下载/获取」按钮触发动态注入的链接">▶ 自动点击揭示</button>
+      <button class="refresh" id="rescan" title="重新扫描">↻ 重新扫描</button>
+    </div>
+
+    <!-- 尺寸/低质量筛选 -->
+    <div class="filters">
+      <button class="hint">排除：</button>
+      <label><input type="checkbox" id="excludeIcons" /> 小图标(≤64×64)</label>
+      <label>宽≥<input type="number" id="minWidth" placeholder="0" /></label>
+      <label>高≥<input type="number" id="minHeight" placeholder="0" /></label>
+      <button id="applyFilter">应用</button>
+      <button id="clearFilter">清空</button>
+    </div>
+
+    <details open>
+      <summary>📸 专业图片源</summary>
+      <div class="presetRow">
+        <button class="preset" data-url="https://unsplash.com">Unsplash</button>
+        <button class="preset" data-url="https://www.pexels.com/zh-cn/">Pexels</button>
+        <button class="preset" data-url="https://pixabay.com/zh/images/">Pixabay</button>
+        <button class="preset" data-url="https://stocksnap.io">StockSnap</button>
+        <button class="preset" data-url="https://splitshire.com">SplitShire</button>
+      </div>
+    </details>
+    <details>
+      <summary>🎬 专业视频源</summary>
+      <div class="presetRow">
+        <button class="preset" data-url="https://www.pexels.com/zh-cn/videos/">Pexels Videos</button>
+        <button class="preset" data-url="https://coverr.co">Coverr</button>
+        <button class="preset" data-url="https://mixkit.co/free-stock-video/">Mixkit 视频</button>
+        <button class="preset" data-url="https://pixabay.com/zh/videos/">Pixabay 视频</button>
+      </div>
+    </details>
+    <details>
+      <summary>🎵 音效 / 音乐源</summary>
+      <div class="presetRow">
+        <button class="preset" data-url="https://freesound.org">Freesound</button>
+        <button class="preset" data-url="https://mixkit.co/free-stock-music/">Mixkit Music</button>
+        <button class="preset" data-url="https://pixabay.com/zh/music/">Pixabay Music</button>
+        <button class="preset" data-url="https://soundbible.com">SoundBible</button>
+      </div>
+    </details>
+    <details>
+      <summary>🧊 3D 模型源</summary>
+      <div class="presetRow">
+        <button class="preset" data-url="https://sketchfab.com">Sketchfab</button>
+        <button class="preset" data-url="https://poly.pizza">Poly Pizza</button>
+        <button class="preset" data-url="https://quaternius.com">Quaternius</button>
+        <button class="preset" data-url="https://kenney.nl">Kenney</button>
+      </div>
+    </details>
+    <details>
+      <summary>🤖 AI 助手（Ddayup 智能机器人）</summary>
+      <div class="presetRow" style="flex-direction:column;align-items:stretch;gap:8px">
+        <button class="act primary" id="summonBot" style="flex:none">🤖 在侧栏显示机器人</button>
+        <div style="font-size:11px;color:#6e7681;padding:2px 0 0;line-height:1.5">侧栏内机器人可拖动 / 全屏。AI 走 Ddayup 网页后端，需先打开 127.0.0.1:3000。</div>
+      </div>
+    </details>
+
+    <div class="actions">
+      <button class="act primary" id="import" title="导入到 Ddayup 素材库 / 画布">导入 Ddayup</button>
+      <button class="act primary alt" id="download">下载选中</button>
+      <button class="act primary alt2" id="saveLocal">存到本地</button>
+    </div>
+
+    <details>
+      <summary>按类型自定义保存路径（支持中文）</summary>
+      <div class="pathRow"><span class="pathType">📸 图片</span><button class="pathPick" data-type="image">选择目录</button><span class="pathText" data-type="image">未设置</span></div>
+      <div class="pathRow"><span class="pathType">🎬 视频</span><button class="pathPick" data-type="video">选择目录</button><span class="pathText" data-type="video">未设置</span></div>
+      <div class="pathRow"><span class="pathType">🎵 音频</span><button class="pathPick" data-type="audio">选择目录</button><span class="pathText" data-type="audio">未设置</span></div>
+      <div class="pathRow"><span class="pathType">🧊 3D模型</span><button class="pathPick" data-type="model">选择目录</button><span class="pathText" data-type="model">未设置</span></div>
+      <div class="pathRow"><span class="pathType">📦 归档</span><button class="pathPick" data-type="archive">选择目录</button><span class="pathText" data-type="archive">未设置</span></div>
+    </details>
+
+    <div id="status"></div>
+    <div id="ytDlpNotice" style="display:none;margin:10px;padding:10px 12px;border:1px solid #e0b341;border-radius:8px;background:rgba(224,179,65,0.12);font-size:12px;line-height:1.5;color:#caa12e;">
+      <div style="font-weight:600;margin-bottom:4px;">⚠ 需要 yt-dlp 才能解析视频直链</div>
+      <div>浏览器扩展已安装，但后端 <b>yt-dlp</b> 未就绪。YouTube / B站 等视频的清晰度选择与下载需先在 Ddayup Web App 安装 yt-dlp。</div>
+      <button class="install-btn" style="margin-top:8px;padding:5px 12px;border:0;border-radius:6px;background:#3b82f6;color:#fff;cursor:pointer;font-size:12px;">前往「模型下载」安装 yt-dlp</button>
+    </div>
+    <div id="list"></div>
+    <div id="buildTag" class="buildTag">build …（加载中）</div>
+    <div class="hint">双击预览原图/视频/音频 · 右键保存/下载/找相似 · 直接拖拽卡片仅可到<b>桌面/文件夹</b>（Chrome 限制，拖到微信/PS 无效）· 图片请点预览里的「📋 复制图片」再在微信按 Ctrl+V · 顶部筛选栏可排除小图标与低分辨率</div>
+
+    <!-- 预览模态窗 -->
+    <div class="overlay" id="previewOverlay">
+      <div class="overlayContent">
+        <button class="closeBtn" id="closePreview">&times;</button>
+        <img class="previewImg" id="previewImg" style="display:none" alt="" />
+        <video class="previewVideo" id="previewVideo" style="display:none" controls autoplay></video>
+        <audio class="previewAudio" id="previewAudio" style="display:none" controls autoplay></audio>
+        <div class="previewCard" id="previewYoutube" style="display:none">
+          <iframe id="previewYtIframe" style="width:100%;max-width:640px;aspect-ratio:16/9;border:none;border-radius:8px" allow="autoplay;encrypted-media" allowfullscreen></iframe>
+        </div>
+        <div class="previewCard" id="previewModel" style="display:none">
+          <!-- 可渲染格式(glb/gltf/obj/stl/ply/fbx/dae/3ds)：Three.js 交互视口；专有格式(c4d/blend/max…)：信息卡 -->
+          <div id="pvModelViewport" style="display:none;width:100%;max-width:480px;height:280px;margin:0 auto;border-radius:8px;overflow:hidden;background:#14171d;position:relative"></div>
+          <iframe id="pvModelFrame" sandbox="allow-scripts allow-same-origin" style="display:none;width:100%;max-width:480px;height:280px;border:none;border-radius:8px;background:#14171d"></iframe>
+          <div id="pvModelStatus" style="display:none;font-size:11px;color:#8b949e;margin:6px 0"></div>
+          <button id="pvModelOpenApp" style="display:none;margin:4px auto 0;padding:5px 12px;border:none;border-radius:6px;background:#2f81f7;color:#fff;font-size:12px;cursor:pointer">在 Ddayup 中预览 3D</button>
+          <div class="icon" id="pvModelIcon">🧊</div>
+          <div class="pname" id="previewModelName"></div>
+          <div class="purl" id="previewModelUrl"></div>
+        </div>
+        <div class="previewCard" id="previewArchive" style="display:none">
+          <div class="icon">📦</div>
+          <div class="pname" id="previewArchiveName"></div>
+          <div class="purl" id="previewArchiveUrl"></div>
+          <div id="pvArchiveEntries" style="display:none;text-align:left;max-height:160px;overflow:auto;font-size:11px;color:#8b949e;background:#14171d;border-radius:8px;padding:8px 10px;margin-top:8px;white-space:pre-wrap"></div>
+        </div>
+        <div class="previewInfo" id="previewInfo"></div>
+        <div class="previewAltRes" id="pvAltResolutions" style="display:none"></div>
+        <div class="previewActions" id="previewActions">
+          <button class="accent" id="pvRefresh" title="在源页重新捕获视频 URL，解决 B站 blob / 签名过期">🔄 源页刷新</button>
+          <button class="accent" id="pvPlay" style="display:none">▶ 试听</button>
+          <button class="accent" id="pvCopyImage" style="display:none" title="复制图片到系统剪贴板，到微信/PS 按 Ctrl+V 粘贴">📋 复制图片</button>
+          <button class="accent" id="pvDownload">⬇ 下载</button>
+          <button id="pvSaveLocal">💾 存到本地</button>
+          <button id="pvCopyLink">📋 复制链接</button>
+          <button id="pvOpenTab">🔗 新标签页打开</button>
+          <button id="pvSimilar">🔍 找相似</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右键上下文菜单 -->
+    <div class="ctxMenu" id="ctxMenu">
+      <button data-action="preview">🔍 预览原图</button>
+      <button data-action="play">▶ 试听</button>
+      <button data-action="download">⬇ 下载</button>
+      <button data-action="save">💾 存到本地</button>
+      <button data-action="copy">📋 复制链接</button>
+      <button data-action="open">🔗 新标签页打开</button>
+      <button data-action="netresolve">🔓 网盘深度解析</button>
+      <button data-action="similar">🔍 找相似</button>
+    </div>
+
+    <!-- Ddayup 智能机器人浮标（与 Web App SmartAgent 同款形象） -->
+    <div class="ai-bot" id="aiBot" style="display:none">
+      <div class="ai-bot-chat" id="aiBotChat" style="display:none">
+        <div class="ai-bot-chat-head">
+          <span>🤖 Ddayup 智能机器人</span>
+          <button id="aiBotFull" title="全屏/还原">⛶</button>
+          <button id="aiBotClose" title="收起对话">×</button>
+        </div>
+        <div class="ai-bot-msgs" id="aiBotMsgs"></div>
+        <div class="ai-bot-input">
+          <textarea id="aiBotText" placeholder="粘贴网页文案，或点「复制本页文案」…（可上传图片/视频交给画布智能体工作流）" rows="2"></textarea>
+          <div class="ai-bot-btns">
+            <button id="aiCopyPage">📄 复制本页文案</button>
+            <button id="aiAnalyzePage">🔎 分析本网页</button>
+            <button id="aiSummarize">📝 总结</button>
+            <button id="aiTranslate">🌐 翻译</button>
+            <button id="aiReverse">🎨 反推提示词</button>
+            <button id="aiUpload">📎 上传图片/视频</button>
+            <button id="aiDeep">🧠 深度分析</button>
+            <input type="file" id="aiFile" accept="image/*,video/*" style="display:none" />
+          </div>
+        </div>
+        <div class="ai-bot-status" id="aiBotStatus"></div>
+      </div>
+      <button class="ai-bot-btn" id="aiBotBtn" title="Ddayup 智能机器人 · 点击展开/收起对话">
+        <span class="ai-bot-glow"></span>
+        <span class="ai-bot-sheen"></span>
+        <span class="ai-bot-float">
+          <span class="ai-bot-shadow"></span>
+          <span class="ai-bot-antenna-dot"></span>
+          <span class="ai-bot-antenna-stalk"></span>
+          <span class="ai-bot-body"></span>
+          <span class="ai-bot-glasses" id="aiBotGlasses">
+            <span class="ai-bot-eye"><span class="ai-bot-pupil" id="aiPupilL"></span><span class="ai-bot-lid"></span></span>
+            <span class="ai-bot-bridge"></span>
+            <span class="ai-bot-eye"><span class="ai-bot-pupil" id="aiPupilR"></span><span class="ai-bot-lid"></span></span>
+          </span>
+          <span class="ai-bot-mouth"></span>
+          <span class="ai-bot-foot-l"></span>
+          <span class="ai-bot-foot-r"></span>
+        </span>
+      </button>
+    </div>
+
+    <!-- ===== 视频下载面板（双击视频→点下载→弹出，选分辨率后下载）===== -->
+    <div class="overlay" id="downloadPanel" style="display:none">
+      <div class="overlayContent" style="max-width:520px">
+        <button class="closeBtn" id="closeDownloadPanel">&times;</button>
+        <div class="pname" id="dlTitle" style="margin-bottom:8px">⬇ 下载视频</div>
+        <div id="dlInfo" class="purl" style="margin-bottom:10px;word-break:break-all"></div>
+        <div style="font-size:12px;color:#8b949e;margin-bottom:6px">选择分辨率 / 画质：</div>
+        <div id="dlResolutionList" style="display:flex;flex-direction:column;gap:6px;max-height:300px;overflow:auto;margin-bottom:12px"></div>
+        <div id="dlLoading" style="font-size:12px;color:#d29922;margin-bottom:10px">正在获取可用分辨率…</div>
+        <div class="previewActions" style="justify-content:flex-end">
+          <button id="dlCancel" style="padding:6px 14px;border:none;border-radius:6px;background:#30363d;color:#ccc;font-size:13px;cursor:pointer">取消</button>
+          <button class="accent" id="dlConfirm" style="padding:6px 16px;font-size:13px">⬇ 下载选中</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="vendor/mp4box.all.min.js"></script>
+    <script src="vendor/mp4-muxer.js"></script>
+    <script src="ui-utils.js"></script>
+    <script src="assetTypes.js"></script>
+    <script src="media-transcode.js"></script>
+    <script src="sidepanel.js"></script>
+    <script src="media-fetch.js"></script>
+    <script src="card-render.js"></script>
+    <script src="bulk-actions.js"></script>
+    <script src="audio-playback.js"></script>
+    <script src="context-menu.js"></script>
+    <script src="download.js"></script>
+    <script src="preview-render.js"></script>
+    <script src="vendor/hls.min.js"></script>
+    <!-- 3D 模型渲染（本地 vendoring Three.js，MV3 CSP 不允许 CDN）；module 异步加载，就绪后派发 hmdao:model3d-ready -->
+    <script type="module" src="model-preview.js"></script>
+  </body>
+</html>
