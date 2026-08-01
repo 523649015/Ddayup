@@ -1,4 +1,18 @@
 // MAIN-world 拦截器（由 manifest 以 "world":"MAIN" 注入模型/资源站）。
+
+// ===== B站播放页熔断（兼容 B站原生播放器）=====
+// 实测：在 B站视频播放页（bilibili.com/video/）即便只「监听」fetch/XHR 响应，
+// 也会因微任务时序变化导致 B站播放器读取 playurl 配置（nc_policy / reward_pcdn_loader_policy）
+// 时对象为 undefined，进而视频加载失败。为彻底兼容，B站播放页直接跳过全部 patch，
+// 让扩展在该页面 100% 静默（与「无扩展」行为完全一致）。侧栏采集仍可在 B站列表/首页页工作，
+// 但不在视频播放页注入。
+function __hmdao_isBiliPlayPage() {
+  try {
+    const h = location.hostname || '';
+    return (h.endsWith('bilibili.com') || h.endsWith('b23.tv')) && /\/(video|blackboard\/.*play|festival)\//.test(location.pathname);
+  } catch (_) { return false; }
+}
+
 // 目标：爱给 / CG模型 等站的 3D 模型、压缩包下载地址是「点下载按钮才由下载 API 动态签名返回」的，
 // DOM 静态扫描（scanPage）拿不到，chrome.webRequest 又读不到响应体。
 // 故在页面主世界 patch fetch/XHR，解析下载 API 响应里的 fileUrl/cdnLink/url 字段，
@@ -105,6 +119,7 @@ if (typeof module !== 'undefined' && module.exports) {
 // ===== 浏览器主世界注入（patch fetch/XHR） =====
 (function () {
   if (typeof window === 'undefined' || window.__hmdao_model_capture) return;
+  if (__hmdao_isBiliPlayPage()) return; // B站播放页熔断：不 patch，兼容原生播放器
   window.__hmdao_model_capture = true;
 
   // 站点经私有 API 直接返回 glb/gltf 二进制（URL 无 .glb 扩展名、content-type 也非 model/，
@@ -365,6 +380,7 @@ if (typeof module !== 'undefined' && module.exports) {
 // 由 background 扫描时以 world:'MAIN' 的 readAllCapturesMAIN 读回合并。
 (function () {
   if (typeof window === 'undefined' || window.__hmdao_audio_capture) return;
+  if (__hmdao_isBiliPlayPage()) return; // B站播放页熔断：不 patch，兼容原生播放器
   window.__hmdao_audio_capture = true;
 
   function bag() {

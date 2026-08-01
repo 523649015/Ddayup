@@ -1,8 +1,20 @@
 // MAIN-world 拦截器（由 manifest 以 "world":"MAIN" 注入，浏览器直接执行，不受页面 CSP 限制）
 // 早期(document_start)捕获 B站 / YouTube 的 player API 响应，供侧栏下载兜底使用。
 // 注意：本文件运行在页面主世界，禁止使用 chrome.* API。
+// ===== B站播放页熔断（兼容 B站原生播放器）=====
+// 实测：在 B站视频播放页即便只监听 fetch/XHR 响应，也会因微任务时序变化导致 B站播放器
+// 读取 playurl 配置（nc_policy / reward_pcdn_loader_policy）时对象为 undefined，视频加载失败。
+// 故 B站播放页（bilibili.com/video/ 等）直接跳过本注入脚本的全部逻辑，扩展在该页面 100% 静默。
+function __hmdao_isBiliPlayPage() {
+  try {
+    const h = location.hostname || '';
+    return (h.endsWith('bilibili.com') || h.endsWith('b23.tv')) && /\/(video|blackboard\/.*play|festival)\//.test(location.pathname);
+  } catch (_) { return false; }
+}
+
 (function () {
   if (window.__hmdao_installed) return;
+  if (__hmdao_isBiliPlayPage()) return; // B站播放页熔断：不执行任何 patch，兼容原生播放器
   window.__hmdao_installed = true;
   window.__hmdao_captures = {};
 

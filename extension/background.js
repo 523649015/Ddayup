@@ -1069,15 +1069,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           try {
             const u = new URL(typeof r === 'string' ? r : (r.url || ''));
             const host = u.hostname.toLowerCase();
-            let referer;
-            if (host.includes('douyin') || host.includes('bytedance') || host.includes('tiktok')) referer = 'https://www.douyin.com/';
-            else if (host.includes('weixin') || host.includes('qq.com')) referer = 'https://' + host + '/';
-            else { const dom = registeredDomain(host); if (dom) referer = 'https://' + (host.startsWith('www.') ? host : 'www.' + dom) + '/'; }
-            if (referer) {
-              // B站域名刻意只匹配 ['other']，避免覆盖页面 <video> 原生媒体流的合法 Referer/Origin，
-              // 否则 B站视频会 403 加载不了（dNR modifyHeaders 优先级高于页面原生请求头）。
-              const isBili = host.includes('bilivideo.com') || host.includes('bilivideo.cn') || host.includes('hdslb.com');
-              await installRefererRuleForDomain(registeredDomain(host) || host, referer, undefined, isBili ? ['other'] : undefined);
+            // ★B站播放页熔断：刷新出的若是 B站视频 CDN 且当前页是 B站播放页，完全不装 Referer 规则，
+            // 让 B站原生播放器保持静默无干扰（与「无扩展」行为一致）。
+            const isBili = host.includes('bilivideo.com') || host.includes('bilivideo.cn') || host.includes('hdslb.com');
+            const senderTab = (sender && sender.tab && sender.tab.url) || (sender && sender.tab && sender.tab.pendingUrl) || '';
+            const senderIsBiliPlay = /bilibili\.com\/(video|blackboard\/.*play|festival)\//.test(senderTab);
+            if (isBili && senderIsBiliPlay) {
+              // 跳过：B站播放页不注入任何规则，避免干扰原生播放器。
+            } else {
+              let referer;
+              if (host.includes('douyin') || host.includes('bytedance') || host.includes('tiktok')) referer = 'https://www.douyin.com/';
+              else if (host.includes('weixin') || host.includes('qq.com')) referer = 'https://' + host + '/';
+              else { const dom = registeredDomain(host); if (dom) referer = 'https://' + (host.startsWith('www.') ? host : 'www.' + dom) + '/'; }
+              if (referer) {
+                // B站域名（非播放页场景，如侧栏预览）刻意只匹配 ['other']，避免覆盖页面 <video> 原生媒体流。
+                await installRefererRuleForDomain(registeredDomain(host) || host, referer, undefined, isBili ? ['other'] : undefined);
+              }
             }
           } catch (_) {}
         }
