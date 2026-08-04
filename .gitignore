@@ -75,7 +75,12 @@ app/server/tmp-post-runtime-smoke*/
 # Local verification scripts (development-only)
 app/server/verify-*.mjs
 app/server/verify-*.mts
+scripts/test-*.mjs
+scripts/test-*.cjs
 scripts/verify-*.mjs
+scripts/verify-*.cjs
+scripts/tmp-diag*.txt
+scripts/tmp-embed.txt
 
 # Backup / temp artifacts
 *.hmdao-encoding-backup-*
