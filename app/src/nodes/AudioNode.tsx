@@ -15,23 +15,18 @@ import {
   Waves,
   X,
 } from 'lucide-react';
-import type { ByokRuntimeRecommendationSummary } from '@/api/byok';
 import { ModelActivationPrompt } from '@/components/ModelActivationPrompt';
-import { NodeModelBrowser } from '@/components/NodeModelBrowser';
 import { SourceBadge, relaySourceLabel } from '@/components/SourceBadge';
-import { resolveProviderGuideId } from '@/config/providerGuides';
 import { useNodeFloatingPanel } from '@/hooks/useNodeFloatingPanel';
 import { useNodeToolLifecycle } from '@/hooks/useNodeToolLifecycle';
 import { useUILanguage } from '@/i18n/ui';
 import { ensureLocalMediaUrl, isLocalMediaHandle, isTransientBlobUrl, registerLocalMedia } from '@/services/localMediaRegistry';
-import { generateAudioLocally, type LocalAudioGenerationPayload } from '@/services/localAudioGeneration';
+import { generateAudioLocally, generateAudioRemotely, generateAudioWithFallback, type LocalAudioGenerationPayload, type RemoteAudioGenerationPayload } from '@/services/localAudioGeneration';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useAssetStore } from '@/store/useAssetStore';
 import { useByokRuntimeStore } from '@/store/useByokRuntimeStore';
 import { useCanvasStore } from '@/store/useCanvasStore';
 import { useModelCatalogStore } from '@/store/useModelCatalogStore';
-import { getDirectRecommendationCards } from '@/utils/directProviderRecommendationCards';
-import { summaryToRecommendationCard } from '@/utils/runtimeRecommendationCards';
 import { EditableNodeTitle } from './EditableNodeTitle';
 import { ErrorDetailBlock, StatusBadge } from './NodeShellShared';
 
@@ -428,8 +423,10 @@ function nextBackendForMode(mode: AudioGenerationMode, preferredBackend: string)
     if (CLEAN_BACKEND_META[backend].supportedModes.includes(mode)) {
       return backend;
     }
+    return 'fallback-local';
   }
-  return 'fallback-local';
+  // 远程/未知后端 id（火山方舟、百炼等聚合平台的具体模型）原样透传
+  return preferredBackend as AudioBackend;
 }
 
 function readRecord(value: unknown): AnyRecord {
@@ -518,8 +515,8 @@ export function AudioNode(props: NodeProps) {
   const [durationDraft, setDurationDraft] = useState(8);
   const [intensityDraft, setIntensityDraft] = useState(0.62);
   const [speechRateDraft, setSpeechRateDraft] = useState(0);
-  const [audioModelBrowserOpen, setAudioModelBrowserOpen] = useState(false);
   const [activation, setActivation] = useState<{ mode: 'audio'; provider: string; reason: 'auth' } | null>(null);
+  const [instructionsDraft, setInstructionsDraft] = useState('');
 
   const outputs = Array.isArray(data?.outputs) ? data.outputs : [];
   const params = readRecord(data?.params);
@@ -532,13 +529,15 @@ export function AudioNode(props: NodeProps) {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const catalogItems = useModelCatalogStore((state) => state.models);
   const fetchCatalog = useModelCatalogStore((state) => state.fetchCatalog);
-  const byokRuntime = useByokRuntimeStore((state) => state.runtime);
   const fetchByokRuntime = useByokRuntimeStore((state) => state.fetchRuntime);
   const rawMode = String(params.audioMode || 'bgm');
   const safeMode: AudioGenerationMode = rawMode in CLEAN_MODE_META ? rawMode as AudioGenerationMode : 'bgm';
   const requestedBackendRaw = String(params.audioBackend || audioMeta.requestedBackend || 'fallback-local');
   const resolvedBackendRaw = String(audioMeta.backend || 'fallback-local');
-  const safeRequestedBackend: AudioBackend = requestedBackendRaw in CLEAN_BACKEND_META ? requestedBackendRaw as AudioBackend : 'fallback-local';
+  const isRemoteAudioBackend = (catalogItems || []).some((m) => m.id === requestedBackendRaw && (m.nodeTypes || []).includes('audio'));
+  const safeRequestedBackend: AudioBackend = (requestedBackendRaw in CLEAN_BACKEND_META || isRemoteAudioBackend)
+    ? (requestedBackendRaw as AudioBackend)
+    : 'fallback-local';
   const safeResolvedBackend: AudioBackend = resolvedBackendRaw in CLEAN_BACKEND_META ? resolvedBackendRaw as AudioBackend : 'fallback-local';
 
   useEffect(() => {
@@ -546,11 +545,12 @@ export function AudioNode(props: NodeProps) {
   }, [safeMode]);
 
   useEffect(() => {
+    setInstructionsDraft(String(params.audioInstructions || ''));
+  }, [params.audioInstructions]);
+
+  useEffect(() => {
     setDraftBackend(nextBackendForMode(draftMode, safeRequestedBackend));
   }, [draftMode, safeRequestedBackend]);
-  useEffect(() => {
-    if (panelTab !== 'model') setAudioModelBrowserOpen(false);
-  }, [panelTab]);
 
   const uiMode = draftMode;
   const uiRequestedBackend = nextBackendForMode(uiMode, draftBackend);
@@ -563,9 +563,6 @@ export function AudioNode(props: NodeProps) {
   const channels = Number(audioMeta.channels || outputMeta.channels || 0);
   const engine = String(audioMeta.engine || outputMeta.engine || data?.model || CLEAN_MODE_META[uiMode].model);
   const savedAssetId = String(params.localAudioAssetId || '');
-  const fallbackUsed = Boolean(audioMeta.fallbackUsed);
-  const backendAvailable = Boolean(audioMeta.backendAvailable ?? safeResolvedBackend === safeRequestedBackend);
-  const fallbackReason = String(audioMeta.fallbackReason || '');
   const backendOptions = (Object.keys(CLEAN_BACKEND_META) as AudioBackend[]).filter((backend) => CLEAN_BACKEND_META[backend].supportedModes.includes(uiMode));
   const invalidLegacyBlob = isTransientBlobUrl(sourceUrl) && !renderUrl;
   const isNodeActive = selectedNodeIds.includes(id);
@@ -578,7 +575,28 @@ export function AudioNode(props: NodeProps) {
   const isComposerOpen = activeFloatingPanelKind === 'audio-composer';
   const showComposer = isComposerOpen || (isNodeExclusivelyActive && !renderUrl);
   const previewTitle = String(data?.label || '\u97f3\u9891\u8282\u70b9');
-  const voicePresetMeta = CLEAN_VOICE_PRESETS.find((item) => item.value === voicePreset) || CLEAN_VOICE_PRESETS[0];
+  const voicePresetMeta = (() => {
+    const local = CLEAN_VOICE_PRESETS.find((item) => item.value === voicePreset);
+    if (local) return local;
+    for (const m of catalogItems || []) {
+      if ((m.nodeTypes || []).includes('audio') && m.audioVoices) {
+        const v = m.audioVoices.find((vv) => vv.value === voicePreset);
+        if (v) {
+          return {
+            value: v.value,
+            label: v.label,
+            hint: `音色编码：${v.value}`,
+            tone: v.gender === 'male' ? '男声' : v.gender === 'female' ? '女声' : '',
+            emotion: '',
+            locale: '多语种',
+            gender: v.gender === 'female' ? '女声' : v.gender === 'male' ? '男声' : (v.gender || ''),
+            favorite: false,
+          } as VoicePreset;
+        }
+      }
+    }
+    return CLEAN_VOICE_PRESETS[0];
+  })();
   const effectiveDuration = duration || Number(audioMeta.duration || outputMeta.duration || 0);
   const previewDurationLabel = formatSeconds(effectiveDuration || storedDurationValue);
   const previewModeLabel = CLEAN_MODE_META[uiMode].label;
@@ -586,24 +604,11 @@ export function AudioNode(props: NodeProps) {
   const emptyReason = invalidLegacyBlob
     ? '\u8fd9\u662f\u5386\u53f2\u753b\u5e03\u4e2d\u7684\u672c\u5730\u97f3\u9891\u7f13\u5b58\uff0c\u6d4f\u89c8\u5668\u91cd\u542f\u540e\u539f\u59cb\u7d20\u6750\u5df2\u5931\u6548\uff0c\u8bf7\u91cd\u65b0\u751f\u6210\u6216\u91cd\u65b0\u4e0a\u4f20\u3002'
     : '\u8f93\u5165\u63d0\u793a\u8bcd\u540e\uff0c\u53ef\u76f4\u63a5\u5728\u5f53\u524d\u97f3\u9891\u8282\u70b9\u751f\u6210 BGM\u3001\u97f3\u6548\u6216\u65c1\u767d\u3002';
-  const backendSummary = uiRequestedBackend === 'fallback-local'
-    ? '\u5f53\u524d\u4f7f\u7528\u672c\u5730\u9884\u89c8\u94fe\uff0c\u9002\u5408\u96f6 Key \u5feb\u901f\u9884\u89c8\u3002'
-    : fallbackUsed
-      ? `${CLEAN_BACKEND_META[uiRequestedBackend].label} \u5f53\u524d\u672a\u63a5\u901a\uff0c\u5df2\u81ea\u52a8\u56de\u9000\u5230\u672c\u5730\u9884\u89c8\u94fe\u3002`
-      : `\u5f53\u524d\u4f18\u5148\u4f7f\u7528 ${CLEAN_BACKEND_META[uiRequestedBackend].label}\u3002`;
   const capabilityAdvice = uiMode === 'voiceover'
     ? '\u60f3\u8981\u66f4\u81ea\u7136\u3001\u5c11 AI \u611f\u3001\u5e26\u60c5\u7eea\u8bed\u6c14\u7684\u4e2d\u6587\u65c1\u767d\uff0c\u4f18\u5148\u5207\u5230 VoxCPM\uff0c\u5e76\u4f7f\u7528\u4e0b\u65b9\u771f\u5b9e\u53e3\u8bed\u5316\u97f3\u8272\u3002'
     : uiMode === 'sfx'
       ? '\u60f3\u8981\u66f4\u50cf\u771f\u5b9e\u7d20\u6750\u5e93\u7684\u9ad8\u8d28\u91cf\u97f3\u6548\uff0c\u4f18\u5148\u5207\u5230 AudioLDM 2\u3002'
       : '\u60f3\u8981\u66f4\u5b8c\u6574\u7684\u7f16\u66f2\u5c42\u6b21\u548c\u6c1b\u56f4\u7ec6\u8282\uff0c\u4f18\u5148\u5207\u5230 AudioLDM 2\u3002';
-  const freeBackendOptions = useMemo(
-    () => backendOptions.filter((backend) => backend === 'fallback-local'),
-    [backendOptions],
-  );
-  const localQualityBackendOptions = useMemo(
-    () => backendOptions.filter((backend) => backend !== 'fallback-local'),
-    [backendOptions],
-  );
   const activatedRemoteAudioModels = useMemo(
     () => catalogItems
       .filter((model) => model.nodeTypes.includes('audio') && model.activated)
@@ -615,84 +620,33 @@ export function AudioNode(props: NodeProps) {
         provider: model.providerMeta?.name || model.provider,
         price: typeof model.price === 'number' ? `${String(model.currency || 'CNY').toUpperCase()} ${Number(model.price).toFixed(Number(model.price) >= 1 ? 2 : 3)}` : '预算待同步',
         sourceLabel: relaySourceLabel(model.activationRelaySource),
+        audioVoices: model.audioVoices || null,
+        capabilities: model.capabilities || null,
+        supportsInstructions: Boolean(model.capabilities && model.capabilities.supportsInstructions),
       })),
     [catalogItems],
   );
-  const audioModelRecommendations = useMemo(() => {
-    const audioSummary = byokRuntime?.recommendations?.audioGeneration as ByokRuntimeRecommendationSummary | null | undefined;
-    const runtimeCards = audioSummary
-      ? [
-          summaryToRecommendationCard(audioSummary, {
-            purposeLabel: '音频生成',
-            purposeTone: 'recommended',
-          }),
-        ].filter((card): card is NonNullable<typeof card> => Boolean(card))
-      : [];
 
-    const activeProviderId = resolveProviderGuideId(audioSummary?.provider)
-      || resolveProviderGuideId(activatedRemoteAudioModels[0]?.providerId)
-      || resolveProviderGuideId(activatedRemoteAudioModels[0]?.provider);
-    if (!activeProviderId) return runtimeCards;
-
-    const fallbackCards = getDirectRecommendationCards(activeProviderId, 'audio', isZh, 'audio-node');
-    const merged = [...runtimeCards];
-    const seen = new Set(merged.map((card) => card.id));
-    for (const card of fallbackCards) {
-      if (seen.has(card.id)) continue;
-      seen.add(card.id);
-      merged.push(card);
-      if (merged.length >= 3) break;
+  const selectedRemoteAudioModel = useMemo(
+    () => (activatedRemoteAudioModels || []).find((m) => m.id === uiRequestedBackend) || null,
+    [activatedRemoteAudioModels, uiRequestedBackend],
+  );
+  const usingRemoteVoices = Boolean(selectedRemoteAudioModel && selectedRemoteAudioModel.audioVoices && selectedRemoteAudioModel.audioVoices.length);
+  const effectiveVoices: VoicePreset[] = useMemo(() => {
+    if (usingRemoteVoices) {
+      return (selectedRemoteAudioModel?.audioVoices || []).map((v) => ({
+        value: v.value,
+        label: v.label,
+        hint: `音色编码：${v.value}`,
+        tone: v.gender === 'male' ? '男声' : v.gender === 'female' ? '女声' : '',
+        emotion: '',
+        locale: '多语种',
+        gender: v.gender === 'female' ? '女声' : v.gender === 'male' ? '男声' : (v.gender || ''),
+        favorite: false,
+      }));
     }
-    return merged;
-  }, [activatedRemoteAudioModels, byokRuntime?.recommendations?.audioGeneration, isZh]);
-  const audioModelSections = useMemo(() => {
-    const backendItems = backendOptions.map((backend) => ({
-      id: backend,
-      title: CLEAN_BACKEND_META[backend].label,
-      providerLabel: backend === 'fallback-local' ? '免费 / 本地' : '本地高质量',
-      modelLabel: backend,
-      description: CLEAN_BACKEND_META[backend].hint,
-      selected: uiRequestedBackend === backend,
-      kind: 'audio' as const,
-      badges: [
-        backend === 'fallback-local'
-          ? { label: '免费', tone: 'free' as const }
-          : { label: '本地', tone: 'local' as const },
-        uiRequestedBackend === backend ? { label: '当前生成链', tone: 'recommended' as const } : null,
-      ].filter(Boolean),
-    }));
-    const remoteItems = activatedRemoteAudioModels.map((model) => ({
-      id: model.id,
-      title: model.name,
-      providerLabel: model.provider,
-      modelLabel: model.id,
-      description: model.description,
-      selected: false,
-      disabled: true,
-      disabledReason: '远程音频路由接入后，这里会直接切换到对应生成链。',
-      kind: 'audio' as const,
-      badges: [
-        model.sourceLabel ? { label: model.sourceLabel, tone: 'relay' as const } : null,
-        { label: '已激活', tone: 'api' as const },
-      ].filter(Boolean),
-      meta: [model.price].filter(Boolean),
-    }));
-    return [
-      {
-        id: 'local-audio',
-        title: '本地 / 免费链路',
-        hint: '当前音频节点先统一走本地预览与本地高质量链，后续远程音频模型会复用同一入口。',
-        items: backendItems,
-      },
-      {
-        id: 'remote-audio',
-        title: 'API / 聚合平台',
-        hint: '这里显示已在 API 管理页激活的远程音频模型来源。',
-        items: remoteItems,
-        emptyMessage: '当前还没有已激活的远程音频模型。',
-      },
-    ];
-  }, [activatedRemoteAudioModels, backendOptions, uiRequestedBackend]);
+    return CLEAN_VOICE_PRESETS;
+  }, [usingRemoteVoices, selectedRemoteAudioModel]);
 
   useEffect(() => {
     void fetchCatalog({ nodeType: 'audio', force: true });
@@ -828,10 +782,10 @@ export function AudioNode(props: NodeProps) {
   const visibleVoiceOptions = useMemo(() => {
     const keyword = voiceSearch.trim().toLowerCase();
     const baseList = voiceLibraryTab === 'favorite'
-      ? CLEAN_VOICE_PRESETS.filter((item) => item.favorite)
+      ? effectiveVoices.filter((item) => item.favorite)
       : voiceLibraryTab === 'mine'
-        ? CLEAN_VOICE_PRESETS.filter((item) => item.value === voicePreset || item.favorite)
-        : CLEAN_VOICE_PRESETS;
+        ? effectiveVoices.filter((item) => item.value === voicePreset || item.favorite)
+        : effectiveVoices;
     if (!keyword) return baseList;
     return baseList.filter((item) => {
       const haystack = `${item.label} ${item.hint} ${item.tone} ${item.emotion} ${item.locale} ${item.gender}`.toLowerCase();
@@ -950,22 +904,9 @@ export function AudioNode(props: NodeProps) {
     openAudioFloatingPanel('audio-composer');
   }
 
-  function openAudioModelBrowserPanel() {
-    openComposer('model');
-    setAudioModelBrowserOpen(true);
-  }
-
-  function toggleAudioModelBrowserPanel() {
-    markPanelInteraction();
-    if (showComposer && panelTab === 'model' && audioModelBrowserOpen) {
-      setAudioModelBrowserOpen(false);
-      return;
-    }
-    openAudioModelBrowserPanel();
-  }
-
   function handleModeSelect(nextMode: AudioGenerationMode) {
-    const nextBackend = nextBackendForMode(nextMode, draftBackend);
+    const keepRemote = (activatedRemoteAudioModels || []).find((m) => m.id === requestedBackendRaw);
+    const nextBackend: AudioBackend = keepRemote ? (keepRemote.id as AudioBackend) : nextBackendForMode(nextMode, draftBackend);
     markPanelInteraction();
     scheduleNodeSelectionSync();
     scheduleComposerKeepAlive();
@@ -991,7 +932,15 @@ export function AudioNode(props: NodeProps) {
   function handleBackendSelect(nextBackend: AudioBackend) {
     markPanelInteraction();
     setDraftBackend(nextBackend);
-    patchNodeParamsTransition({ audioBackend: nextBackend });
+    const remote = (activatedRemoteAudioModels || []).find((m) => m.id === nextBackend);
+    if (remote && remote.audioVoices && remote.audioVoices.length) {
+      const firstVoice = remote.audioVoices[0].value;
+      const initialInstructions = remote.supportsInstructions ? String(params.audioInstructions || '') : '';
+      setInstructionsDraft(initialInstructions);
+      patchNodeParamsTransition({ audioBackend: nextBackend, audioVoicePreset: firstVoice, audioInstructions: initialInstructions });
+    } else {
+      patchNodeParamsTransition({ audioBackend: nextBackend });
+    }
   }
 
   function handleVoicePresetSelect(nextVoicePreset: string) {
@@ -1105,14 +1054,21 @@ export function AudioNode(props: NodeProps) {
       return;
     }
     const prompt = promptDraft.trim();
+    const remoteModel = (activatedRemoteAudioModels || []).find(
+      (m) => String(m?.id || '') === String(uiRequestedBackend),
+    ) || null;
+    const resolvedVoicePreset = remoteModel && remoteModel.audioVoices && remoteModel.audioVoices.length && !remoteModel.audioVoices.some((v) => v.value === voicePreset)
+      ? remoteModel.audioVoices[0].value
+      : voicePreset;
     const lifecycleConfig = {
       audioPrompt: prompt,
       audioMode: uiMode,
       audioDuration: clampDuration(uiMode, durationDraft),
       audioIntensity: clampUnitRange(intensityDraft, 0.62),
-      audioVoicePreset: voicePreset,
+      audioVoicePreset: resolvedVoicePreset,
       audioSpeechRate: clampSpeechRate(speechRateDraft, 0),
-      audioBackend: uiRequestedBackend,
+      audioInstructions: instructionsDraft,
+      audioBackend: remoteModel ? remoteModel.id : uiRequestedBackend,
     } satisfies AnyRecord;
     if (!prompt) {
       failAudioToolState('generate', lifecycleConfig, {
@@ -1131,28 +1087,45 @@ export function AudioNode(props: NodeProps) {
     const resolvedDuration = Number(lifecycleConfig.audioDuration || 0);
     const resolvedIntensity = Number(lifecycleConfig.audioIntensity || 0);
     const resolvedSpeechRate = Number(lifecycleConfig.audioSpeechRate || 0);
-    const payload: LocalAudioGenerationPayload = {
-      mode: uiMode,
-      prompt,
-      duration: resolvedDuration,
-      intensity: resolvedIntensity,
-      voicePreset,
-      speechRate: resolvedSpeechRate,
-      language: inferPromptLanguage(prompt),
-      backend: uiRequestedBackend,
-    };
+    const resolvedEngine = remoteModel ? remoteModel.id : CLEAN_MODE_META[uiMode].model;
+    const resolvedProvider = remoteModel ? remoteModel.providerId || 'remote' : 'local';
+    const progressMessage = remoteModel ? '远程音频生成中...' : '本地音频生成中...';
+
+    const payload = remoteModel
+      ? ({
+          model: remoteModel.id,
+          provider: remoteModel.providerId,
+          mode: uiMode,
+          prompt,
+          duration: resolvedDuration,
+          intensity: resolvedIntensity,
+          voicePreset: resolvedVoicePreset,
+          speechRate: resolvedSpeechRate,
+          language: inferPromptLanguage(prompt),
+          instructions: remoteModel.supportsInstructions ? instructionsDraft : '',
+        } as RemoteAudioGenerationPayload)
+      : ({
+          mode: uiMode,
+          prompt,
+          duration: resolvedDuration,
+          intensity: resolvedIntensity,
+          voicePreset,
+          speechRate: resolvedSpeechRate,
+          language: inferPromptLanguage(prompt),
+          backend: uiRequestedBackend,
+        } as LocalAudioGenerationPayload);
 
     setAudioToolGeneratingState('generate', lifecycleConfig, {
       progress: {
         progress: 8,
-        message: '\u672c\u5730\u97f3\u9891\u751f\u6210\u4e2d...',
-        stage: 'local-audio-generate',
+        message: progressMessage,
+        stage: remoteModel ? 'remote-audio-generate' : 'local-audio-generate',
       },
       nodeData: {
         prompt,
         error: '',
-        provider: 'local',
-        model: CLEAN_MODE_META[uiMode].model,
+        provider: resolvedProvider,
+        model: resolvedEngine,
       },
       params: {
         lastErrorCategory: '',
@@ -1161,16 +1134,33 @@ export function AudioNode(props: NodeProps) {
     });
     setActionMessage('');
 
-    const result = await generateAudioLocally(payload);
+    // 若智能体「免费优先路线」写入了回退链（图片/视频/音频通用），则运行期按优先级回退：
+    // 免费额度模型优先，失败则切换到按优先级排列的付费 API 模型。
+    const audioChainRaw = (data as unknown as Record<string, unknown>)?.modelFallbackChain;
+    const audioChain = Array.isArray(audioChainRaw) && audioChainRaw.length
+      ? (audioChainRaw as Array<Record<string, unknown>>)
+          .map((c) => ({ provider: String(c.provider || ''), model: String(c.model || ''), isFree: Boolean(c.isFree) }))
+          .filter((c) => c.provider && c.model)
+      : null;
+    const result = remoteModel
+      ? await generateAudioWithFallback(
+          {
+            ...(payload as RemoteAudioGenerationPayload),
+            model: audioChain ? audioChain[0].model : (payload as RemoteAudioGenerationPayload).model,
+            provider: audioChain ? audioChain[0].provider : (payload as RemoteAudioGenerationPayload).provider,
+          },
+          audioChain || undefined,
+        )
+      : await generateAudioLocally(payload as LocalAudioGenerationPayload);
     if (!result.success) {
       failAudioToolState('generate', lifecycleConfig, {
         error: result.error,
         errorCategory: 'render',
-        errorStage: 'local-audio-generate',
+        errorStage: remoteModel ? 'remote-audio-generate' : 'local-audio-generate',
         nodeData: {
           prompt,
-          provider: 'local',
-          model: CLEAN_MODE_META[uiMode].model,
+          provider: resolvedProvider,
+          model: resolvedEngine,
         },
       });
       return;
@@ -1197,7 +1187,7 @@ export function AudioNode(props: NodeProps) {
       nodeData: {
         label: String(data?.label || nextLabel),
         prompt,
-        provider: 'local',
+        provider: resolvedProvider,
         model: result.data.engine,
         outputs: [
           {
@@ -1300,8 +1290,8 @@ export function AudioNode(props: NodeProps) {
             </div>
             <div className="flex items-center justify-between gap-2">
               <span className="text-[#7f8b97]">后端</span>
-              <span className="max-w-[96px] truncate font-medium text-[#e4edf6]" title={CLEAN_BACKEND_META[uiRequestedBackend].label}>
-                {CLEAN_BACKEND_META[uiRequestedBackend].label}
+              <span className="max-w-[96px] truncate font-medium text-[#e4edf6]" title={selectedRemoteAudioModel ? selectedRemoteAudioModel.name : (CLEAN_BACKEND_META[uiRequestedBackend]?.label || uiRequestedBackend)}>
+                {selectedRemoteAudioModel ? selectedRemoteAudioModel.name : (CLEAN_BACKEND_META[uiRequestedBackend]?.label || uiRequestedBackend)}
               </span>
             </div>
             <div className="flex items-center justify-between gap-2">
@@ -1353,19 +1343,6 @@ export function AudioNode(props: NodeProps) {
               <Download className="h-4 w-4" />
             </button>
           </div>
-          <button
-            type="button"
-            data-testid={`audio-model-browser-toggle-${id}`}
-            onPointerDown={stopCanvasInteraction}
-            onClick={(event) => {
-              stopCanvasClick(event);
-              toggleAudioModelBrowserPanel();
-            }}
-            className="mt-2 flex w-full items-center justify-center gap-2 rounded-xl border border-[#343942] bg-[#1d2025] px-3 py-2 text-xs font-medium text-[#dce5ee] transition hover:bg-[#262a30]"
-          >
-            <Sparkles className="h-3.5 w-3.5" />
-            {showComposer && panelTab === 'model' && audioModelBrowserOpen ? '收起更多模型' : '更多模型'}
-          </button>
         </div>
 
         <Handle id="audio-input" type="target" position={Position.Left} className="image-node-handle" style={handleLeft}>
@@ -1497,146 +1474,54 @@ export function AudioNode(props: NodeProps) {
           ) : null}
 
           {panelTab === 'model' ? (
-            <div className="mt-4 space-y-4">
-              <div className="rounded-2xl border border-[#2b3136] bg-[#101315] px-3 py-3 text-[11px] leading-5 text-[#9ca9b6]">
-                <div className="font-medium text-[#eef3f8]">后端说明</div>
-                <div className="mt-1">{backendSummary}</div>
-                {!backendAvailable ? (
-                  <div className="mt-1 text-[#f4c27b]">当前后端未就绪，已自动回退到本地预览链。</div>
-                ) : null}
-                {fallbackReason ? (
-                  <div className="mt-1 text-[#f4c27b]">回退原因：{fallbackReason}</div>
-                ) : null}
-              </div>
-              <div className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,0.9fr)]">
-                <div className="space-y-4">
-                  <section className="rounded-2xl border border-[#2b3136] bg-[#11161a] px-3 py-3">
-                    <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                      <div>
-                        <div className="text-sm font-semibold text-[#eef3f8]">免费选项</div>
-                        <div className="text-[11px] leading-5 text-[#8ea0b2]">零 Key 即可预览，适合先确认节奏和方向。</div>
-                      </div>
-                      <SourceBadge label="免费" tone="free" />
-                    </div>
-                    <div className="grid gap-3">
-                      {freeBackendOptions.map((backend) => (
-                        <button
-                          key={backend}
-                          type="button"
-                          data-testid={`audio-backend-${id}-${backend}`}
-                          onPointerDown={stopCanvasInteraction}
-                          onClick={() => handleBackendSelect(backend)}
-                          title={CLEAN_BACKEND_META[backend].hint}
-                          className={`rounded-2xl border px-4 py-3 text-left transition ${backendButtonClass(uiRequestedBackend === backend)}`}
-                        >
-                          <div className="flex flex-wrap items-center gap-2">
-                            <div className="text-sm font-semibold">{CLEAN_BACKEND_META[backend].label}</div>
-                            {uiRequestedBackend === backend ? <SourceBadge label="当前生成链" tone="local" /> : null}
-                          </div>
-                          <div className="mt-1 text-[11px] leading-5 opacity-85">{CLEAN_BACKEND_META[backend].hint}</div>
-                        </button>
-                      ))}
-                    </div>
-                  </section>
-
-                  <section className="rounded-2xl border border-[#2b3136] bg-[#11161a] px-3 py-3">
-                    <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                      <div>
-                        <div className="text-sm font-semibold text-[#eef3f8]">本地高质量</div>
-                        <div className="text-[11px] leading-5 text-[#8ea0b2]">保持当前零 Key 预览链兜底，同时支持更高质量本地后端。</div>
-                      </div>
-                      <SourceBadge label="本地" tone="local" />
-                    </div>
-                    <div className="grid gap-3 md:grid-cols-2">
-                      {localQualityBackendOptions.map((backend) => (
-                        <button
-                          key={backend}
-                          type="button"
-                          data-testid={`audio-backend-${id}-${backend}`}
-                          onPointerDown={stopCanvasInteraction}
-                          onClick={() => handleBackendSelect(backend)}
-                          title={CLEAN_BACKEND_META[backend].hint}
-                          className={`rounded-2xl border px-4 py-3 text-left transition ${backendButtonClass(uiRequestedBackend === backend)}`}
-                        >
-                          <div className="flex flex-wrap items-center gap-2">
-                            <div className="text-sm font-semibold">{CLEAN_BACKEND_META[backend].label}</div>
-                            {uiRequestedBackend === backend ? <SourceBadge label="当前生成链" tone="local" /> : null}
-                          </div>
-                          <div className="mt-1 text-[11px] leading-5 opacity-85">{CLEAN_BACKEND_META[backend].hint}</div>
-                        </button>
-                      ))}
-                    </div>
-                  </section>
+            <div className="mt-4 space-y-3">
+              <section className="rounded-2xl border border-[#2b3136] bg-[#11161a] px-3 py-3">
+                <div className="mb-2 flex items-center justify-between">
+                  <div className="text-sm font-semibold text-[#eef3f8]">本地生成</div>
+                  <SourceBadge label="免费" tone="free" />
                 </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {backendOptions.map((backend) => (
+                    <button
+                      key={backend}
+                      type="button"
+                      data-testid={`audio-backend-${id}-${backend}`}
+                      onPointerDown={stopCanvasInteraction}
+                      onClick={() => handleBackendSelect(backend)}
+                      className={`flex items-center justify-between gap-2 rounded-xl border px-3 py-2.5 text-left transition ${backendButtonClass(uiRequestedBackend === backend)}`}
+                    >
+                      <div className="text-[13px] font-semibold">{CLEAN_BACKEND_META[backend].label}</div>
+                      {uiRequestedBackend === backend ? <SourceBadge label="已选" tone="local" /> : null}
+                    </button>
+                  ))}
+                </div>
+              </section>
 
-                <section className="rounded-2xl border border-[#2b3136] bg-[#11161a] px-3 py-3">
-                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                    <div>
-                      <div className="text-sm font-semibold text-[#eef3f8]">API / 聚合平台</div>
-                      <div className="text-[11px] leading-5 text-[#8ea0b2]">这里会自动显示已在 API 管理页激活的音频模型来源，后续接远程音频路由时可直接复用。</div>
-                    </div>
-                    <SourceBadge label="API" tone="api" />
-                  </div>
-                  {activatedRemoteAudioModels.length > 0 ? (
-                    <div className="space-y-3">
-                      {activatedRemoteAudioModels.map((model) => (
-                        <article key={model.id} className="rounded-2xl border border-[#2d3236] bg-[#121518] px-3 py-3">
-                          <div className="flex flex-wrap items-start justify-between gap-2">
-                            <div>
-                              <div className="text-sm font-semibold text-[#eef3f8]">{model.name}</div>
-                              <div className="mt-1 text-[11px] leading-5 text-[#8ea0b2]">{model.provider}</div>
-                            </div>
-                            <div className="flex flex-wrap gap-2">
-                              {model.sourceLabel ? <SourceBadge label={model.sourceLabel} tone="relay" /> : null}
-                              <SourceBadge label="已激活" tone="api" />
-                            </div>
-                          </div>
-                          <div className="mt-2 text-[11px] leading-5 text-[#aab8c5]">{model.description}</div>
-                          <div className="mt-2 text-[11px] text-[#6f8294]">{model.price}</div>
-                        </article>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="rounded-2xl border border-dashed border-[#2d3236] bg-[#121518] px-3 py-4 text-[11px] leading-5 text-[#8ea0b2]">
-                      当前还没有已激活的远程音频模型。先在 API 管理页激活 Comfly / Relay 后，这里会自动出现对应来源徽标和预算信息。
-                    </div>
-                  )}
-                  <button
-                    type="button"
-                    data-testid={`audio-model-browser-toggle-${id}-panel`}
-                    onPointerDown={stopCanvasInteraction}
-                    onClick={(event) => {
-                      stopCanvasClick(event);
-                      if (audioModelBrowserOpen) {
-                        setAudioModelBrowserOpen(false);
-                        return;
-                      }
-                      openAudioModelBrowserPanel();
+              <section className="rounded-2xl border border-[#2b3136] bg-[#11161a] px-3 py-3">
+                <div className="mb-2 flex items-center justify-between">
+                  <div className="text-sm font-semibold text-[#eef3f8]">API 聚合</div>
+                  {uiRequestedBackend && !backendOptions.includes(uiRequestedBackend) ? (
+                    <SourceBadge label="已选" tone="api" />
+                  ) : null}
+                </div>
+                {activatedRemoteAudioModels.length > 0 ? (
+                  <select
+                    value={backendOptions.includes(uiRequestedBackend) ? '' : uiRequestedBackend}
+                    onChange={(event) => {
+                      const nextValue = event.target.value;
+                      if (nextValue) handleBackendSelect(nextValue as AudioBackend);
                     }}
-                    className="mt-3 inline-flex items-center gap-2 rounded-xl border border-[#2d3236] bg-[#14181d] px-3 py-2 text-xs text-[#d9e4ee] transition hover:bg-[#1a1f25]"
+                    className="nodrag nopan w-full rounded-xl border border-[#444] bg-[#1f1f1f] px-3 py-2.5 text-[13px] text-[#e7e7e7] outline-none"
                   >
-                    <Sparkles className="h-3.5 w-3.5" />
-                    {audioModelBrowserOpen ? '收起更多模型' : '更多模型'}
-                  </button>
-                </section>
-              </div>
-              {audioModelBrowserOpen ? (
-                <div className="mt-4">
-                  <NodeModelBrowser
-                    title="音频节点模型池"
-                    subtitle="共享模型弹层已接入音频节点。当前先统一管理本地链与已激活远程来源，后续接远程音频生成时直接复用这一入口。"
-                    recommendations={audioModelRecommendations}
-                    sections={audioModelSections}
-                    onSelect={(item) => {
-                      if (item.id in CLEAN_BACKEND_META) {
-                        handleBackendSelect(item.id as AudioBackend);
-                      }
-                    }}
-                    testId={`audio-model-browser-${id}`}
-                    itemTestIdPrefix={`audio-model-option-${id}`}
-                  />
-                </div>
-              ) : null}
+                    <option value="">选择聚合音频模型</option>
+                    {activatedRemoteAudioModels.map((model) => (
+                      <option key={model.id} value={model.id}>{model.name}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <div className="rounded-xl border border-dashed border-[#2d3236] bg-[#121518] px-3 py-3 text-[11px] leading-5 text-[#8ea0b2]">暂无已激活的聚合音频模型</div>
+                )}
+              </section>
             </div>
           ) : null}
 
@@ -1718,9 +1603,27 @@ export function AudioNode(props: NodeProps) {
                 )}
               </div>
 
+              {selectedRemoteAudioModel?.supportsInstructions ? (
+                <label className="mt-3 block rounded-2xl border border-[#2d3236] bg-[#121518] px-3 py-3 text-xs text-[#c9d2db]">
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <span>语气 / 情绪指令（instructions）</span>
+                  </div>
+                  <textarea
+                    value={instructionsDraft}
+                    onPointerDown={stopCanvasInteraction}
+                    onChange={(event) => setInstructionsDraft(event.target.value)}
+                    placeholder="例如：用轻松愉快的语气朗读，语速稍快，带一点俏皮感"
+                    rows={3}
+                    className="nodrag nopan nowheel w-full resize-none rounded-xl border border-[#34383d] bg-[#0f1214] px-3 py-2 text-[#eef4fb] outline-none placeholder:text-[#677585]"
+                    data-testid={`audio-instructions-${id}`}
+                  />
+                </label>
+              ) : null}
+
               {uiMode === 'voiceover' ? (
                 <div className="rounded-2xl border border-[#2d3236] bg-[#121518] px-3 py-3">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
+                  {!usingRemoteVoices ? (
+                    <div className="flex flex-wrap items-center justify-between gap-3">
                     <div className="flex flex-wrap rounded-2xl bg-[#20242a] p-1">
                       {CLEAN_VOICE_LIBRARY_META.map((item) => (
                         <button
@@ -1755,6 +1658,7 @@ export function AudioNode(props: NodeProps) {
                       />
                     </div>
                   </div>
+                  ) : null}
 
                   <div className="mt-3 max-h-[320px] space-y-2 overflow-y-auto pr-1">
                     {visibleVoiceOptions.map((item) => {

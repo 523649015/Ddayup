@@ -12,9 +12,12 @@ export interface LocalModelRunInput {
 }
 
 export interface LocalModelRunOutput {
-  blob: Blob;
-  width: number;
-  height: number;
+  /** 真实推理结果；depth/matting/raft 的「仅激活占位」stub 运行器可不返回 */
+  blob?: Blob;
+  width?: number;
+  height?: number;
+  url?: string;
+  assetId?: string;
   engine: string;
 }
 

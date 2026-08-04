@@ -28,7 +28,7 @@ export function NodeShell({
   return (
     <div
       className={cn(
-        'rounded-xl overflow-hidden transition-all duration-200 bg-[#1c1c1e]',
+        'rounded-xl overflow-hidden transition-colors duration-150 bg-[#1c1c1e]',
         selected ? 'ring-2 ring-[#e6edf3]' : 'ring-1 ring-[#2a2a2c]'
       )}
       style={{ '--node-w': `${width}px` } as React.CSSProperties}

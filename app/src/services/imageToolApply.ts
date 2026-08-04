@@ -131,10 +131,11 @@ function withAlpha(rgb: { r: number; g: number; b: number }, alpha: number) {
 
 /** 多角度机位 → 仿射变换矩阵（a,b,c,d），用于前端透视预演合成。 */
 export function computeMultiAngleTransform(yaw: number, pitch: number, framingZoom: number) {
-  const sx = framingZoom * (1 - Math.min(0.4, (Math.abs(yaw) / 180) * 0.4));
-  const sy = framingZoom * (1 - Math.min(0.3, (Math.abs(pitch) / 90) * 0.3));
-  const c = (yaw / 180) * 0.3 * framingZoom;
-  const b = (-pitch / 90) * 0.22 * framingZoom;
+  // 增大系数使变换更显著（原 0.4/0.3/0.3/0.22 → 0.65/0.55/0.55/0.40）
+  const sx = framingZoom * (1 - Math.min(0.65, (Math.abs(yaw) / 180) * 0.65));
+  const sy = framingZoom * (1 - Math.min(0.55, (Math.abs(pitch) / 90) * 0.55));
+  const c = (yaw / 180) * 0.55 * framingZoom;
+  const b = (-pitch / 90) * 0.40 * framingZoom;
   return { a: Number(sx.toFixed(4)), b: Number(b.toFixed(4)), c: Number(c.toFixed(4)), d: Number(sy.toFixed(4)) };
 }
 
@@ -342,7 +343,7 @@ async function canvasHeal(imageUrl: string, maskCanvas: HTMLCanvasElement): Prom
 export async function applyHdInpaint(imageUrl: string, params: Record<string, unknown> = {}): Promise<ToolApplyResult> {
   const mode = params.mode === 'erase' ? 'erase' : 'inpaint';
   const points = Array.isArray(params.maskPoints)
-    ? (params.maskPoints as unknown[]).map(normalizeMaskPoint).filter((p): p is MaskPoint => Boolean(p) && p.targetMode === mode)
+    ? (params.maskPoints as unknown[]).map(normalizeMaskPoint).filter((p): p is MaskPoint => p != null && p.targetMode === mode)
     : [];
   const maskCanvas = renderMaskCanvas(points);
   const mask = maskCanvas.toDataURL('image/png');
@@ -400,26 +401,58 @@ export async function applyHdCrop(
   return { url, assetId, engine: 'canvas-crop' };
 }
 
-/** 多角度机位：基于机位参数做前端透视预演合成并写回。 */
+/** 多角度机位：大幅角度走 T2 生成式插件；否则深度驱动真实 3D 旋转，无深度模型时回退仿射。 */
 export async function applyMultiAngle(imageUrl: string, params: Record<string, unknown> = {}): Promise<ToolApplyResult> {
   const img = await loadImage(imageUrl);
-  const w = img.naturalWidth;
-  const h = img.naturalHeight;
   const yaw = Number(params.yaw ?? 45);
   const pitch = Number(params.pitch ?? 15);
   const framingZoom = Number(params.framingZoom ?? 1);
+  const consistency = Number(params.consistency ?? 0.85);
+
+  // 偏离正面的角度（最短弧长）：0/360=正面，90/270=侧面，180=背面
+  const devYaw = Math.min(yaw, 360 - yaw);
+  const largeAngle = devYaw > 35 || Math.abs(pitch) > 35;
+
+  // ===== T2：生成式新视角（可选插件，大幅角度优先）=====
+  if (largeAngle) {
+    try {
+      const { isNovelViewPluginReady, generateNovelView } = await import('@/services/novelViewSynthesis');
+      if (isNovelViewPluginReady()) {
+        const result = await generateNovelView(img, { yaw, pitch, zoom: framingZoom, consistency });
+        return { url: result.url, assetId: result.assetId, engine: 'novel-view-gen' };
+      }
+    } catch { /* 插件未装/失败 → 回退 T1 */ }
+  }
+
+  // ===== 管线 A：深度驱动真实 3D 旋转 =====
+  try {
+    const { isDepthModelReady, estimateDepth } = await import('@/services/depthEstimation');
+    if (isDepthModelReady()) {
+      // 传入 imageUrl 作为缓存 key，同一素材只推理一次
+      const depthResult = await estimateDepth(img, imageUrl);
+      const { rotateWithDepth } = await import('@/services/depthWarp');
+      const canvas = rotateWithDepth(img, depthResult, { yaw, pitch, zoom: framingZoom, consistency });
+      const { url, assetId } = await commitCanvas(canvas, `机位-3D-${Date.now()}.png`, 'img-multiview');
+      return { url, assetId, engine: 'depth-3d-rotate' };
+    }
+  } catch { /* 回退 */ }
+
+  // ===== 回退：平面仿射变换（加速参数感知） =====
+  const w = img.naturalWidth;
+  const h = img.naturalHeight;
   const transform = computeMultiAngleTransform(yaw, pitch, framingZoom);
+  console.log('[multiAngle] 仿射参数', { yaw, pitch, zoom: framingZoom, transform: { a: transform.a.toFixed(3), b: transform.b.toFixed(3), c: transform.c.toFixed(3), d: transform.d.toFixed(3) } });
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) throw new Error('无法创建画布');
+  const ctx = canvas.getContext('2d')!;
   ctx.fillStyle = '#0c0c0c';
   ctx.fillRect(0, 0, w, h);
+  ctx.save();
   ctx.translate(w / 2, h / 2);
   ctx.transform(transform.a, transform.b, transform.c, transform.d, 0, 0);
   ctx.drawImage(img, -w / 2, -h / 2, w, h);
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.restore();
   const { url, assetId } = await commitCanvas(canvas, `机位-${Date.now()}.png`, 'img-multiview');
   return { url, assetId, engine: 'canvas-camera' };
 }

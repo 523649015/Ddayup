@@ -1,8 +1,9 @@
 import { readLocalMediaBlob } from '@/services/localMediaRegistry';
 import type { AssetImageAnalysis, AssetItem } from '@/types/assets';
+import type { AssetImportResult } from '@/api/assetLibrary';
 
 interface AnalyzeImagePayload {
-  item: AssetItem;
+  item: AssetItem | AssetImportResult;
   engine?: string;
   provider?: string;
   model?: string;
@@ -18,7 +19,9 @@ function buildJsonPayload(item: AssetItem, engine?: string, provider?: string, m
   return {
     itemId: item.id,
     name: item.name,
-    sourceUrl: item.sourceUrl || item.url,
+    // 修复：优先使用可解析路径 item.url（如 /api/assets/content/<id>），
+    // 后端据此取字节；仅当缺失时回退退化的 sourceUrl（纯文件名）。
+    sourceUrl: item.url || item.sourceUrl,
     width: item.width,
     height: item.height,
     tags: item.tags,
@@ -29,7 +32,10 @@ function buildJsonPayload(item: AssetItem, engine?: string, provider?: string, m
   };
 }
 
-export async function analyzeAssetImage({ item, engine = 'auto', provider, model }: AnalyzeImagePayload): Promise<AssetImageAnalysis> {
+export async function analyzeAssetImage(params: AnalyzeImagePayload): Promise<AssetImageAnalysis> {
+  const { item: rawItem, engine = 'auto', provider, model } = params;
+  // 防御：兼容传入 importLocalAssetFile 返回的 { item, duplicate } 包装对象
+  const item = ('item' in rawItem ? rawItem.item : rawItem) as AssetItem;
   if (item.type !== 'image') {
     throw new Error('only-image-assets-supported');
   }

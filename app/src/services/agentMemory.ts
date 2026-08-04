@@ -59,6 +59,7 @@ const LAYER_PRIORITY: Record<NodeType, AgentMemoryLayer[]> = {
   threed: ['role', 'workflow', 'style', 'brand'],
   dcc: ['workflow', 'style', 'role', 'brand'],
   region: ['workflow', 'style', 'role', 'brand'],
+  comfyui: ['workflow', 'style', 'role', 'brand'],
 };
 
 function tokenize(input: string) {

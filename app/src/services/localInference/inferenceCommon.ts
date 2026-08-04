@@ -47,14 +47,15 @@ export async function detectTileSize(session: OrtSession, inChannels = 3): Promi
     }
     size = works128 ? null : 64;
   } else {
+    let parsed = 64;
     try {
       await tryRun(64);
     } catch (e) {
       const m = String((e as { message?: string })?.message ?? e ?? '');
       const nums = [...m.matchAll(/Expected:\s*(\d+)/g)].map((x) => Number(x[1]));
-      size = nums.length >= 2 && nums[1] === nums[2] ? nums[1] : 64;
+      parsed = nums.length >= 2 && nums[1] === nums[2] ? nums[1] : 64;
     }
-    if (size === undefined) size = 64;
+    size = parsed;
   }
 
   tileSizeCache.set(session, size);
@@ -128,7 +129,7 @@ export async function tiledRun(session: OrtSession, opts: TiledRunOptions): Prom
       // eslint-disable-next-line no-await-in-loop
       const res = await session.run({ [inputName]: t });
       const outTensor = res[outputName];
-      const odims = (outTensor as { dims: number[] }).dims;
+      const odims = (outTensor as { dims: readonly number[] }).dims;
       const OT = odims[2];
       const tileOut = outTensor.data as unknown as Float32Array;
 

@@ -248,7 +248,7 @@ export async function assistPrompt({
       || record.mode === 'fallback'
       || record.mode === 'local'
       || record.workflowFallback === true
-      || (record.asset && (record.asset as Record<string, unknown>)?.metadata?.fallback === true)
+      || (record.asset && (record.asset as { metadata?: { fallback?: boolean } })?.metadata?.fallback === true)
       || typeof record.fallbackReason === 'string';
 
     if (fallbackActivated) {

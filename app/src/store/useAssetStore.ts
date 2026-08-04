@@ -9,7 +9,7 @@ import { enqueueLocalAssetPersistence } from '@/services/localAssetPersistenceQu
 import { postAssetPatch, onAssetPatch } from '@/services/crossTabAssetSync';
 import { enhancedSearch } from '@/services/assetSearchService';
 import { findSimilarAssetsInLibrary } from '@/services/assetSimilarityService';
-import type { AssetFolder, AssetImageAnalysis, AssetItem, AssetLibrary, LocalSimilarResult } from '@/types/assets';
+import type { AIDeepAnalysis, AssetFolder, AssetImageAnalysis, AssetItem, AssetLibrary, LocalSimilarResult } from '@/types/assets';
 
 type SimilarImageResult = Array<{ url: string; thumb: string; title?: string; source?: string; width?: number; height?: number }>;
 type SimilarVideoResult = Array<{ url: string; thumb: string; title?: string; source?: string; duration?: string }>;
@@ -52,6 +52,9 @@ interface AssetStore extends AssetLibrary {
 
   addItem: (item: Omit<AssetItem, 'id' | 'createdAt' | 'updatedAt'>) => string;
   deleteItems: (itemIds: string[]) => void;
+  // 清理“后端内容已不存在”的死引用：图库里 url/thumbnail 指向 /api/assets/content/<id>
+  // 但后端 catalog 已无该条目（文件被删/重置）的素材，反复 GET 会 404。HEAD 探测后移除。
+  pruneMissingBackendAssets: () => Promise<void>;
   moveItems: (itemIds: string[], targetFolderId: string) => void;
   renameItem: (itemId: string, newName: string) => void;
   selectItem: (itemId: string, multi?: boolean) => void;
@@ -64,7 +67,7 @@ interface AssetStore extends AssetLibrary {
   legacyReversePrompt: (itemId: string) => Promise<string>;
   reversePrompt: (itemId: string, options?: { engine?: string }) => Promise<string>;
   analyzeImage: (itemId: string, options?: { engine?: string }) => Promise<AssetImageAnalysis>;
-  applyImageAnalysis: (itemId: string, analysis: AssetImageAnalysis) => void;
+  applyImageAnalysis: (itemId: string, analysis: AIDeepAnalysis | AssetImageAnalysis) => void;
   applyCrossTabItemPatch: (itemId: string, patch: {
     tags?: string[];
     smartCategories?: string[];
@@ -117,7 +120,10 @@ interface AssetStore extends AssetLibrary {
     folderId?: string;
     tags?: string[];
     smartCategories?: string[];
-    type?: 'image' | 'video' | 'audio';
+    type?: 'image' | 'video' | 'audio' | 'model';
+    source?: 'upload' | 'web' | 'crawl' | 'generate';
+    pageUrl?: string;
+    name?: string;
   }) => Promise<string>;
 
   setViewMode: (mode: 'grid' | 'list') => void;
@@ -751,6 +757,28 @@ export const useAssetStore = create<AssetStore>()(
       });
     },
 
+    pruneMissingBackendAssets: async () => {
+      const candidates = get().items.filter((item) => {
+        const u = String(item.url || item.thumbnail || '').trim();
+        return u.startsWith('/api/assets/content/');
+      });
+      if (!candidates.length) return;
+      const dead: string[] = [];
+      await Promise.all(
+        candidates.map(async (item) => {
+          const u = String(item.url || item.thumbnail);
+          try {
+            const resp = await fetch(u, { method: 'HEAD' });
+            // 404（asset-not-found / asset-file-missing）说明后端已无此素材，属死引用。
+            if (resp.status === 404) dead.push(item.id);
+          } catch {
+            // 网络异常不删除，避免误删仅离线/不可达的素材。
+          }
+        }),
+      );
+      if (dead.length) get().deleteItems(dead);
+    },
+
     moveItems: (itemIds, targetFolderId) => {
       const fromFolderId = get().items.find((item) => itemIds.includes(item.id))?.folderId;
       set((state) => {
@@ -1023,7 +1051,7 @@ export const useAssetStore = create<AssetStore>()(
           analysis.camera,
           analysis.mood,
         ].join(' '));
-        target.analysis = analysis;
+        target.analysis = analysis as AssetImageAnalysis;
         target.prompt = analysis.promptZh || target.prompt;
         target.smartCategories = uniqTags([...target.smartCategories, ...newCategories]);
         target.tags = uniqTags([...manualTags, ...newKeywords, ...newCategories]).slice(0, 16);
@@ -1400,7 +1428,7 @@ export const useAssetStore = create<AssetStore>()(
         throw new Error('empty-url');
       }
       const type = options?.type || inferTypeFromUrl(cleanedUrl, 'image');
-      const name = normalizeName(options?.title || inferNameFromUrl(cleanedUrl, '网页素材'), inferNameFromUrl(cleanedUrl, '网页素材'));
+      const name = normalizeName(options?.name || options?.title || inferNameFromUrl(cleanedUrl, '网页素材'), inferNameFromUrl(cleanedUrl, '网页素材'));
       const folderId = options?.folderId || get().importTargetFolderId || 'web';
       const mediaMeta = /^https?:\/\//i.test(cleanedUrl) ? {} : await readMediaDetails(type, cleanedUrl);
       try {
@@ -1429,8 +1457,8 @@ export const useAssetStore = create<AssetStore>()(
           duration: mediaMeta.duration,
           tags: options?.tags || [],
           smartCategories: options?.smartCategories || [],
-          source: 'crawl',
-          sourceUrl: cleanedUrl,
+          source: options?.source || 'crawl',
+          sourceUrl: options?.pageUrl || cleanedUrl,
         });
       }
     },

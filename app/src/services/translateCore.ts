@@ -64,21 +64,62 @@ export async function createTranslator(onProgress?: TranslateProgress): Promise<
   env.remoteHost = origin ? `${origin}/api/hf-proxy` : 'https://huggingface.co';
   env.remotePathTemplate = '{model}/resolve/{revision}';
 
-  // 同源提供 onnxruntime-web 的 wasm（/api/transformers 由后端同源托管），
-  // 避免浏览器直连外国 CDN（cdnjs.cloudflare.net / cdn.jsdelivr.net）下载 wasm 失败。
+  // onnxruntime-web 的 wasm 路径必须区分 dev / 生产：
+  //   - dev 模式：@xenova/transformers 2.17.2 走 src/transformers.js →
+  //     src/backends/onnx.js → `import 'onnxruntime-web'`。Vite 解析到项目装的
+  //     onnxruntime-web 1.27.0（不是 transformers 自带的 1.14.0）。
+  //     1.27.0 的 wasm 是外置的，必须从同源静态路径加载——本项目是 /ort-wasm/。
+  //   - 生产模式：translateCore 走 /api/transformers/transformers.min.js，
+  //     该文件是 webpack 自包含包（带 onnxruntime-web 1.14.0 + 内嵌 wasm），
+  //     wasm 也由该路径同源提供。
+  // 关键：@xenova/transformers 2.17.2 的 src/env.js 会在模块加载时立即把
+  //   onnx_env.wasm.wasmPaths 覆盖为 jsdelivr CDN（在浏览器下 RUNNING_LOCALLY=false）。
+  // 我们这里再覆盖一次，指向正确的同源路径。
+  // 同时强制单线程（numThreads=1），原因：
+  //   1) onnxruntime-web 1.27.0 在 numThreads>1 时会通过 PThread Worker 派生
+  //      ort-wasm-simd-threaded.jsep.mjs / jspi.mjs / .asyncify.mjs。
+  //      这些文件在 public/ort-wasm/ 下，Vite dev 模式 transform pipeline 会拦截并报
+  //      "This file is in /public and will be copied as-is during build" 错误。
+  //   2) Vite 7 的 ortWasmBypass 中间件虽然注册了，但只在 transformRequest 之外
+  //      拦截 HTTP 请求，对 Vite 内部的 transformRequest 流程不生效（这正是浏览器
+  //      报 "Failed to load url /ort-wasm/ort-wasm-simd-threaded.jsep.mjs" 的根因）。
+  //   3) 单线程走 ort-wasm-simd-threaded.mjs（不带 jsep/jspi/asyncify 后缀），
+  //      Vite 不会触发子模块 transform，避免整个错误链。
+  //   4) NLLB 翻译是串行解码（每 token 都要上一步的 hidden state），多线程加速有限，
+  //      单线程对翻译延迟影响可忽略。
+  const isDev = Boolean((import.meta as any).env?.DEV);
+  const wasmBase = isDev ? '/ort-wasm/' : `${origin}/api/transformers/`;
   env.backends = env.backends || {};
   env.backends.onnx = env.backends.onnx || {};
   env.backends.onnx.wasm = env.backends.onnx.wasm || {};
-  env.backends.onnx.wasm.wasmPaths = `${origin}/api/transformers/`;
-  // 启用多线程 wasm 推理（若后端 /api/transformers 提供了 *-threaded wasm 则生效，
-  // 否则 ONNX Runtime 自动回退到单线程，不影响正确性），可显著加速长文本解码。
+  env.backends.onnx.wasm.wasmPaths = wasmBase;
+  env.backends.onnx.wasm.numThreads = 1; // 强制单线程，避免 Vite 拦截 jsep/jspi 子 Worker
+  // proxy 关闭：onnxruntime-web 默认会从远程拉取 .mjs 文件（在我们这里会失败），
+  // 关掉后所有 wasm 路径都从 wasmPaths 解析。
+  env.backends.onnx.wasm.proxy = false;
+  env.logLevel = 'error';
+
+  // 运行时诊断：把 ORT 实际看到的 wasm 配置 POST 回 dev 服务器（/api/diag），
+  // 用于确认 wasmPaths 覆盖是否真的生效（中国网络下若回退到 jsdelivr CDN 会失败）。
   try {
-    const hw = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 1;
-    env.backends.onnx.wasm.numThreads = Math.max(1, Math.min(4, hw));
+    const wasm = env.backends?.onnx?.wasm ?? {};
+    const diag = {
+      wasmPaths: wasm.wasmPaths,
+      numThreads: wasm.numThreads,
+      proxy: wasm.proxy,
+      dev: Boolean((import.meta as any).env?.DEV),
+      origin: getCurrentOrigin(),
+      ua: typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown',
+    };
+    fetch('/api/diag', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(diag),
+    }).catch(() => {});
   } catch {
     /* noop */
   }
-  env.logLevel = 'error';
+
 
   const translator = await pipeline('translation', MODEL_NAME, {
     progress_callback: (p: number) => {

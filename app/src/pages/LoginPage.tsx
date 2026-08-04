@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
@@ -7,6 +7,7 @@ import { usePublicUILanguage } from '@/i18n/publicUi';
 import { emailLoginSchema, type EmailLoginInput } from '@/schemas/authSchemas';
 import { signInWithEmail } from '@/services/authService';
 import { ComplianceNotice } from '@/components/ComplianceNotice';
+import { ElfLogo } from '@/components/ElfLogo';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -32,14 +33,33 @@ export default function LoginPage() {
     return '';
   }, [searchParams, t]);
 
+  // 从注册页跳转而来（邮箱已注册）时预填邮箱并提示直接登录
+  const presetEmail = useMemo(() => {
+    const state = location.state as { email?: string; reason?: string } | null;
+    return state?.reason === 'already_registered' ? (state.email || '') : '';
+  }, [location.state]);
+
+  const alreadyRegisteredHint = useMemo(() => {
+    const state = location.state as { reason?: string } | null;
+    return state?.reason === 'already_registered'
+      ? t('该邮箱已注册，请直接登录。', 'This email is already registered. Please sign in directly.')
+      : '';
+  }, [location.state, t]);
+
   const {
     register,
     handleSubmit,
+    setValue,
     formState: { errors },
   } = useForm<EmailLoginInput>({
     resolver: zodResolver(emailLoginSchema),
-    defaultValues: { email: '', password: '' },
+    defaultValues: { email: presetEmail, password: '' },
   });
+
+  // 注册页带邮箱跳转时，将预填值写入表单
+  useEffect(() => {
+    if (presetEmail) setValue('email', presetEmail, { shouldValidate: false });
+  }, [presetEmail, setValue]);
 
   const serviceErrorHint = useMemo(() => {
     if (!['service_unreachable', 'service_unavailable', 'request_timeout', 'server_error'].includes(errorCode)) {
@@ -86,7 +106,10 @@ export default function LoginPage() {
         </div>
 
         <div className='space-y-2 text-center'>
-          <h1 className='text-3xl font-bold tracking-tight text-white'>DDUp</h1>
+          <div className='flex items-center justify-center gap-3'>
+            <ElfLogo size={52} />
+            <h1 className='text-3xl font-bold tracking-tight text-white'>DDUp</h1>
+          </div>
           <p className='text-sm text-slate-400'>
             {t('AI 驱动的无限创作画布', 'An AI-powered infinite canvas for creation')}
           </p>
@@ -105,6 +128,12 @@ export default function LoginPage() {
               {successMessage ? (
                 <div className='rounded-md border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-300'>
                   {successMessage}
+                </div>
+              ) : null}
+
+              {alreadyRegisteredHint ? (
+                <div className='rounded-md border border-blue-500/30 bg-blue-500/10 px-4 py-3 text-sm text-blue-300'>
+                  {alreadyRegisteredHint}
                 </div>
               ) : null}
 

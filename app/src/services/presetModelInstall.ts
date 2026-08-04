@@ -1,16 +1,13 @@
-/**
- * 预设模型/插件「已安装」状态管理（刷新安全 + 版本检查）
+﻿/**
+ * 预设模型/插件「已安装」状态管理（刷新安全 + 真缓存校验 + 版本检查）
  *
- * 复用 localTranslate 的稳健模式：
- *  - 安装态以 IndexedDB 中真实缓存记录为准（而非仅内存 progressMap），
- *    因此页面刷新或重新登录后仍能正确判定「已安装」，不会回到「下载」。
- *  - 同时在 localStorage 写标记，便于快速判定与跨会话一致性。
- *  - 提供版本检查：比较已安装版本与最新声明版本，提示更新。
- *
- * 与 ModelDownloadPanel 解耦，避免循环依赖（本模块只依赖 storage 与 config/presetModels）。
+ * 规则：
+ *  - 只有「安装标记 + 真实缓存完整」同时满足时，才对外判定为已安装。
+ *  - 若只剩 localStorage 标记、主模型或外部权重丢失，则显示为「待修复」而非「已安装」。
+ *  - 仍保留安装标记，便于面板提供「修复 / 重新下载」入口。
  */
 
-import { listModelCache } from '@/services/storage';
+import { getCachedModel, listModelCache } from '@/services/storage';
 import { PRESET_MODELS, type PresetModel } from '@/config/presetModels';
 
 const LS_KEY = 'hmdao_preset_installed';
@@ -21,6 +18,18 @@ interface PresetInstallRecord {
 }
 
 type InstalledMap = Record<string, PresetInstallRecord>;
+
+export interface PresetInstallHealth {
+  modelId: string;
+  status: 'not-installed' | 'installed' | 'needs-repair';
+  installedVersion: string | null;
+  markerVersion: string | null;
+  cachedVersion: string | null;
+  hasMarker: boolean;
+  hasMainCache: boolean;
+  missingFiles: string[];
+  message: string;
+}
 
 function readMarker(): InstalledMap {
   try {
@@ -38,7 +47,69 @@ function writeMarker(map: InstalledMap): void {
   }
 }
 
-let installed: InstalledMap = readMarker();
+function shouldValidateCache(model: PresetModel | undefined): boolean {
+  return Boolean(model?.url);
+}
+
+function buildNotInstalledHealth(modelId: string): PresetInstallHealth {
+  return {
+    modelId,
+    status: 'not-installed',
+    installedVersion: null,
+    markerVersion: null,
+    cachedVersion: null,
+    hasMarker: false,
+    hasMainCache: false,
+    missingFiles: [],
+    message: '未安装',
+  };
+}
+
+function buildInstalledHealth(
+  modelId: string,
+  installedVersion: string,
+  markerVersion: string | null,
+  cachedVersion: string | null,
+  hasMainCache: boolean,
+  message = '已安装',
+): PresetInstallHealth {
+  return {
+    modelId,
+    status: 'installed',
+    installedVersion,
+    markerVersion,
+    cachedVersion,
+    hasMarker: markerVersion != null,
+    hasMainCache,
+    missingFiles: [],
+    message,
+  };
+}
+
+function buildRepairHealth(
+  modelId: string,
+  installedVersion: string | null,
+  markerVersion: string | null,
+  cachedVersion: string | null,
+  hasMainCache: boolean,
+  missingFiles: string[],
+  message: string,
+): PresetInstallHealth {
+  return {
+    modelId,
+    status: 'needs-repair',
+    installedVersion,
+    markerVersion,
+    cachedVersion,
+    hasMarker: markerVersion != null,
+    hasMainCache,
+    missingFiles,
+    message,
+  };
+}
+
+let installed: InstalledMap = {};
+let installHealthMap: Record<string, PresetInstallHealth> = {};
 const listeners = new Set<() => void>();
 
 function emit(): void {
@@ -52,26 +123,53 @@ export function subscribePresetInstall(listener: () => void): () => void {
   };
 }
 
-/** 返回某模型当前已安装记录（含版本），未安装返回 null */
+/** 返回某模型当前真实可用的已安装记录（缓存缺失时返回 null） */
 export function getPresetInstallState(modelId: string): PresetInstallRecord | null {
   return installed[modelId] ?? null;
 }
 
+/** 返回某模型的安装健康状态，用于面板展示「已安装 / 待修复 / 未安装」 */
+export function getPresetInstallHealth(modelId: string): PresetInstallHealth {
+  return installHealthMap[modelId] ?? buildNotInstalledHealth(modelId);
+}
+
 /** 标记某模型已安装（下载/缓存成功后调用） */
 export function markPresetInstalled(modelId: string, version: string): void {
+  const nextMarker = { ...readMarker(), [modelId]: { modelId, version } };
+  const model = PRESET_MODELS.find((item) => item.id === modelId);
   installed = { ...installed, [modelId]: { modelId, version } };
-  writeMarker(installed);
+  installHealthMap = {
+    ...installHealthMap,
+    [modelId]: buildInstalledHealth(
+      modelId,
+      version,
+      version,
+      shouldValidateCache(model) ? version : null,
+      shouldValidateCache(model),
+    ),
+  };
+  writeMarker(nextMarker);
   emit();
 }
 
 /** 清除某模型的已安装标记（清除缓存时调用） */
 export function clearPresetInstalled(modelId: string): void {
-  if (!installed[modelId]) return;
-  const next = { ...installed };
-  delete next[modelId];
-  installed = next;
-  writeMarker(installed);
-  emit();
+  const marker = readMarker();
+  const hadMarker = Boolean(marker[modelId]);
+  if (hadMarker) delete marker[modelId];
+
+  const nextInstalled = { ...installed };
+  delete nextInstalled[modelId];
+  installed = nextInstalled;
+  installHealthMap = {
+    ...installHealthMap,
+    [modelId]: buildNotInstalledHealth(modelId),
+  };
+
+  if (hadMarker || installHealthMap[modelId] || nextInstalled[modelId]) {
+    writeMarker(marker);
+    emit();
+  }
 }
 
 export interface PresetUpdateInfo {
@@ -85,6 +183,17 @@ export interface PresetUpdateInfo {
 export function getPresetUpdateInfo(model: PresetModel): PresetUpdateInfo {
   const record = installed[model.id];
   const installedVersion = record?.version ?? null;
+  if (model.supersededBy) {
+    const successor = PRESET_MODELS.find((m) => m.id === model.supersededBy);
+    if (successor && installedVersion != null) {
+      return {
+        modelId: model.id,
+        installedVersion,
+        latestVersion: successor.version,
+        updateAvailable: true,
+      };
+    }
+  }
   const updateAvailable = installedVersion != null && installedVersion !== model.version;
   return {
     modelId: model.id,
@@ -94,30 +203,152 @@ export function getPresetUpdateInfo(model: PresetModel): PresetUpdateInfo {
   };
 }
 
+async function resolveInstallHealth(
+  modelId: string,
+  markerRecord: PresetInstallRecord | undefined,
+  cachedVersions: string[],
+): Promise<{ record: PresetInstallRecord | null; health: PresetInstallHealth }> {
+  const model = PRESET_MODELS.find((item) => item.id === modelId);
+  const markerVersion = markerRecord?.version ?? null;
+  const exactMarkerVersion = markerVersion && cachedVersions.includes(markerVersion) ? markerVersion : null;
+  const preferredCachedVersion =
+    exactMarkerVersion ??
+    (model && cachedVersions.includes(model.version) ? model.version : null) ??
+    cachedVersions[0] ??
+    null;
+
+  if (!markerVersion && !preferredCachedVersion) {
+    return { record: null, health: buildNotInstalledHealth(modelId) };
+  }
+
+  if (!shouldValidateCache(model)) {
+    const installedVersion = preferredCachedVersion ?? markerVersion;
+    if (!installedVersion) {
+      return { record: null, health: buildNotInstalledHealth(modelId) };
+    }
+    return {
+      record: { modelId, version: installedVersion },
+      health: buildInstalledHealth(
+        modelId,
+        installedVersion,
+        markerVersion,
+        preferredCachedVersion,
+        preferredCachedVersion != null,
+        preferredCachedVersion && !markerVersion ? '已从缓存恢复' : '已安装',
+      ),
+    };
+  }
+
+  if (!preferredCachedVersion) {
+    return {
+      record: null,
+      health: buildRepairHealth(
+        modelId,
+        markerVersion,
+        markerVersion,
+        null,
+        false,
+        ['model'],
+        '安装标记存在，但主模型缓存缺失，需修复或重新下载',
+      ),
+    };
+  }
+
+  const mainCache = await getCachedModel(modelId, preferredCachedVersion);
+  if (!mainCache?.data || mainCache.data.byteLength === 0) {
+    return {
+      record: null,
+      health: buildRepairHealth(
+        modelId,
+        markerVersion ?? preferredCachedVersion,
+        markerVersion,
+        preferredCachedVersion,
+        false,
+        ['model'],
+        '主模型缓存损坏或为空，请修复后重试',
+      ),
+    };
+  }
+
+  const missingFiles: string[] = [];
+  for (const ef of model?.extraFiles ?? []) {
+    const extraCache = await getCachedModel(modelId, `${preferredCachedVersion}#${ef.name}`);
+    if (!extraCache?.data || extraCache.data.byteLength === 0) {
+      missingFiles.push(ef.name);
+    }
+  }
+
+  if (missingFiles.length > 0) {
+    return {
+      record: null,
+      health: buildRepairHealth(
+        modelId,
+        markerVersion ?? preferredCachedVersion,
+        markerVersion,
+        preferredCachedVersion,
+        true,
+        missingFiles,
+        `外部权重缺失：${missingFiles.join('、')}，请修复后重试`,
+      ),
+    };
+  }
+
+  return {
+    record: { modelId, version: preferredCachedVersion },
+    health: buildInstalledHealth(
+      modelId,
+      preferredCachedVersion,
+      markerVersion,
+      preferredCachedVersion,
+      true,
+      preferredCachedVersion && !markerVersion ? '已从缓存恢复' : '已安装',
+    ),
+  };
+}
+
 /**
- * 模块加载/页面刷新时执行一次：直接读取 IndexedDB 中真实的模型缓存记录来判定「已安装」。
- * 这样即便是旧版本代码安装的模型（只有缓存、没有写 localStorage 标记），刷新后也能被自动识别。
- * 若缓存已丢失（如用户清过站点数据），则清除失效标记，回退到未安装态。
+ * 模块加载/页面刷新时执行一次：
+ *  - 从 IndexedDB 真实缓存恢复已安装状态；
+ *  - 将仅有标记但缓存缺失的模型标记为待修复；
+ *  - 兼容旧版本仅写缓存、未写 localStorage 标记的模型。
  */
 export async function initPresetInstalledState(): Promise<void> {
-  let cachedMap: InstalledMap = {};
+  let cachedVersionsById: Record<string, string[]> = {};
   try {
     const cached = await listModelCache();
-    cachedMap = {};
+    cachedVersionsById = {};
     for (const entry of cached) {
-      cachedMap[entry.modelId] = { modelId: entry.modelId, version: entry.version };
+      if (entry.version.includes('#')) continue;
+      cachedVersionsById[entry.modelId] ??= [];
+      cachedVersionsById[entry.modelId].push(entry.version);
     }
   } catch {
-    cachedMap = {};
+    cachedVersionsById = {};
   }
-  // IndexedDB 真实记录优先，标记作为补充（标记中的版本若比缓存新则保留）
-  const merged: InstalledMap = { ...cachedMap };
+
   const marker = readMarker();
-  for (const [id, record] of Object.entries(marker)) {
-    if (!merged[id]) merged[id] = record;
+  const nextInstalled: InstalledMap = {};
+  const nextHealth: Record<string, PresetInstallHealth> = {};
+  const allIds = new Set<string>([
+    ...Object.keys(marker),
+    ...Object.keys(cachedVersionsById),
+    ...PRESET_MODELS.map((model) => model.id),
+  ]);
+
+  for (const modelId of allIds) {
+    const resolved = await resolveInstallHealth(modelId, marker[modelId], cachedVersionsById[modelId] ?? []);
+    nextHealth[modelId] = resolved.health;
+    if (resolved.record) nextInstalled[modelId] = resolved.record;
   }
-  installed = merged;
-  writeMarker(installed);
+
+  installed = nextInstalled;
+  installHealthMap = nextHealth;
+
+  const mergedMarker: InstalledMap = { ...marker };
+  for (const [id, record] of Object.entries(nextInstalled)) {
+    if (!mergedMarker[id]) mergedMarker[id] = record;
+  }
+  writeMarker(mergedMarker);
   emit();
 }
 
@@ -137,12 +368,9 @@ export async function checkPresetUpdates(): Promise<void> {
       const fromManifest = manifest[model.id];
       if (fromManifest) latestById.set(model.id, fromManifest);
     }
-    // 仅更新 latestVersion 比对基准：通过覆盖 installed 中的"视为最新"判断。
-    // 这里直接复用 getPresetUpdateInfo 的声明版本；若 manifest 给出更高版本则视为有更新。
     for (const model of PRESET_MODELS) {
       const latest = latestById.get(model.id);
       if (latest && installed[model.id] && installed[model.id].version !== latest) {
-        // 标记存在但版本落后 → 视为有更新（保留已安装记录，仅提示）
         emit();
       }
     }

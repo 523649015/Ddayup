@@ -1,5 +1,9 @@
 // ===== Node Types =====
-export type NodeType = 'text' | 'image' | 'video' | 'audio' | 'storyboard' | 'aiapp' | 'threed' | 'script' | 'dcc' | 'post' | 'region';
+export type NodeType = 'text' | 'image' | 'video' | 'audio' | 'storyboard' | 'aiapp' | 'threed' | 'script' | 'dcc' | 'post' | 'region' | 'comfyui';
+
+// 复用 @/types/assets 的 AssetItem 规范定义，避免双定义歧义（本文件原有一份精简版，
+// 导致与 @/types/assets 的 AssetItem 字段不一致、多处字段缺失报错）。
+import type { AssetItem } from './assets';
 
 export interface CanvasNode {
   id: string;
@@ -28,6 +32,19 @@ export interface NodeData {
   cost?: number;
   createdAt?: number;
   updatedAt?: number;
+  comfyTempUrl?: string;
+  /** 智能体免费优先路线写入的按优先级回退链（运行期免费→付费切换用） */
+  modelFallbackChain?: Array<{ provider: string; model: string; isFree: boolean }>;
+  /** 运行期实际选用的 provider */
+  modelFallbackUsedProvider?: string;
+  /** 运行期实际选用的 model */
+  modelFallbackUsedModel?: string;
+  /** 是否因免费模型不支持/失败而切换到付费模型 */
+  modelFallbackAutoSwitched?: boolean;
+  /** 模型选择/回退的可读原因 */
+  modelFallbackReason?: string;
+  /** 智能体规划期记录的切换原因 */
+  modelFallbackReasonPlan?: string;
 }
 
 export interface MediaOutput {
@@ -332,6 +349,8 @@ export interface ModelCapabilityMatrix {
   supportsBackgroundFuse?: boolean;
   supportsMultiRegionExecution?: boolean;
   supportsTrackedVideoRegions?: boolean;
+  /** 是否支持语气/情绪指令（instructions），音频模型用于 TTS 语调控制 */
+  supportsInstructions?: boolean;
   bestFor?: string[];
   limitations?: string[];
 }
@@ -447,17 +466,6 @@ export interface QueueStatus {
   failed: number;
 }
 
-export interface AssetItem {
-  id: string;
-  type: 'image' | 'video' | 'audio';
-  url: string;
-  thumbnail: string;
-  category: string;
-  name: string;
-  size: number;
-  createdAt: number;
-}
-
 // ===== Workflow =====
 export interface Workflow {
   id: string;
@@ -534,3 +542,5 @@ export type TranslationKey =
   | 'toolbar.download'
   | 'toolbar.settings'
   | 'toolbar.agent';
+
+export type { AssetItem };

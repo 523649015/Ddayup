@@ -172,6 +172,14 @@ export function ModelActivationPrompt({
         setLoginPassword('');
         return;
       }
+      // 邮箱已注册：切到登录 tab 并预填邮箱，明确引导用户直接登录而非重复创建
+      if (result.code === 'user_already_exists') {
+        setAuthTab('login');
+        setLoginEmail(email);
+        setLoginPassword('');
+        setErrorMessage(t('该邮箱已注册，请切换到登录并直接登录。', 'This email is already registered. Switch to Sign in and log in directly.'));
+        return;
+      }
       setErrorMessage(result.error || t('注册失败，请稍后重试。', 'Sign up failed. Please try again.'));
     } finally {
       setSubmitting(false);

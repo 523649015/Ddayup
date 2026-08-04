@@ -11,7 +11,6 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
-  Globe,
   Grid3X3,
   Image as ImageIcon,
   List,
@@ -29,11 +28,23 @@ import {
   Wand2,
   X,
   Brain,
+  Box,
   ClipboardPaste,
   RefreshCw,
+  Globe,
 } from 'lucide-react';
 import { useAssetStore } from '@/store/useAssetStore';
 import { useCanvasStore } from '@/store/useCanvasStore';
+import {
+  detectHmdaoExtension,
+  onExtensionWebAssetsImported,
+  openExtensionScan,
+  startExtensionPresenceWatch,
+  recheckExtensionPresence,
+  getExtensionDetectionDiagnostics,
+  isExtensionDetected,
+  type ExtensionAssetRef,
+} from '@/services/extensionBridge';
 import {
   ANALYSIS_ENGINE_GROUPS,
   findAnalysisEngineOption,
@@ -50,6 +61,7 @@ import {
   fetchAssetLibrarySettings,
   fetchPersistedAssetCatalog,
   fetchPersistedAssetDuplicates,
+  pruneMissingAssets,
   importAssetDirectory,
   pickAssetLibraryDirectory,
   repairPersistedAsset,
@@ -57,7 +69,6 @@ import {
   validatePersistedAsset,
 } from '@/api/assetLibrary';
 import { toRenderableAssetUrl } from '@/services/generation';
-import { WebSearchPanel } from './WebSearchPanel';
 import { prepareFreeImport } from '@/services/freeImageSearchService';
 import { parseFileNameSemantics } from '@/services/autoClassifier';
 import { AssetSearchBar } from './AssetSearchBar';
@@ -67,144 +78,21 @@ import type { AssetFolder, AssetItem, WebSearchResult } from '@/types/assets';
 import { useUILanguage } from '@/i18n/ui';
 
 
-type AssetTab = 'all' | 'images' | 'videos' | 'audio' | 'prompts' | 'workflow';
-
-function normalizeStoragePathValue(value: string) {
-  return String(value || '')
-    .trim()
-    .replace(/\//g, '\\')
-    .replace(/\\+$/g, '')
-    .toLowerCase();
-}
-
-function getAssetDirectoryPickerTestPath() {
-  if (typeof window === 'undefined') return '';
-  try {
-    const storageValue = window.localStorage.getItem('HMDAO_ASSET_PICK_TEST_PATH');
-    if (typeof storageValue === 'string' && storageValue.trim()) {
-      return storageValue.trim();
-    }
-  } catch {
-    // Ignore localStorage access issues and fall back to normal native picker flow.
-  }
-  const debugWindow = window as Window & {
-    __HMDAO_ASSET_PICK_TEST_PATH__?: unknown;
-  };
-  return typeof debugWindow.__HMDAO_ASSET_PICK_TEST_PATH__ === 'string'
-    ? debugWindow.__HMDAO_ASSET_PICK_TEST_PATH__
-    : '';
-}
-
-function buildImportStatusMessage(report: {
-  importedCount: number;
-  skippedCount: number;
-  failedCount: number;
-  duplicateCount: number;
-  imageCount: number;
-  videoCount: number;
-  audioCount: number;
-  textCount: number;
-  autoTaggedCount: number;
-  autoClassifiedCount: number;
-  folderImport: boolean;
-}) {
-  const modeLabel = report.folderImport ? '文件夹素材' : '本地素材';
-  const typeParts = [
-    report.imageCount > 0 ? `${report.imageCount} 张图片` : '',
-    report.videoCount > 0 ? `${report.videoCount} 条视频` : '',
-    report.audioCount > 0 ? `${report.audioCount} 条音频` : '',
-    report.textCount > 0 ? `${report.textCount} 个文档` : '',
-  ].filter(Boolean);
-  const summary = typeParts.length ? `，包含 ${typeParts.join('、')}` : '';
-  const tagging = report.autoTaggedCount > 0 || report.autoClassifiedCount > 0
-    ? '，并已自动打标签和分类'
-    : '';
-  const skipped = report.skippedCount > 0 ? `，跳过 ${report.skippedCount} 个不支持的文件` : '';
-  const failed = report.failedCount > 0 ? `，失败 ${report.failedCount} 个` : '';
-  const duplicates = report.duplicateCount > 0 ? `，识别到 ${report.duplicateCount} 个重复素材并跳过重复入库` : '';
-  const indexing = report.folderImport ? '，已建立原文件引用，不额外复制素材' : '';
-  return `已导入 ${report.importedCount} 个${modeLabel}${summary}${tagging}${duplicates}${indexing}${skipped}${failed}。`;
-}
-
-function buildFolderImportStatusMessage(report: {
-  importedCount: number;
-  skippedCount: number;
-  failedCount: number;
-  duplicateCount: number;
-  imageCount: number;
-  videoCount: number;
-  audioCount: number;
-  textCount: number;
-  autoTaggedCount: number;
-  autoClassifiedCount: number;
-  folderImport: boolean;
-}) {
-  return buildImportStatusMessage(report);
-}
-
-type ContextMenuState =
-  | { x: number; y: number; kind: 'item'; itemId: string }
-  | { x: number; y: number; kind: 'folder'; folderId: string }
-  | null;
-
-const MEDIA_FOLDER_IDS = {
-  all: 'root',
-  images: 'media:image',
-  videos: 'media:video',
-  audio: 'media:audio',
-} as const;
-
-const PREVIEW_LIMITED_IMAGE_EXTENSIONS = new Set(['hdr', 'exr', 'heic', 'heif', 'dng', 'jxl']);
-
-function formatBytes(size: number) {
-  if (!Number.isFinite(size) || size <= 0) return '未知大小';
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(0)} KB`;
-  if (size < 1024 * 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
-
-function formatDuration(duration?: number) {
-  if (!duration || duration <= 0) return '未知时长';
-  const minutes = Math.floor(duration / 60);
-  const seconds = Math.round(duration % 60);
-  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-}
-
-function sanitizeNodeLabel(name: string) {
-  return name.replace(/\.[^.]+$/, '').trim() || '素材节点';
-}
-
-function getAssetNodeType(item: AssetItem) {
-  if (item.type === 'image') return 'image' as const;
-  if (item.type === 'video') return 'video' as const;
-  if (item.type === 'audio') return 'audio' as const;
-  return 'text' as const;
-}
-
-function getAssetBadge(item: AssetItem) {
-  if (item.type === 'image') return '图片';
-  if (item.type === 'video') return '视频';
-  if (item.type === 'audio') return '音频';
-  return '文本';
-}
-
-function getAssetExtension(item: AssetItem) {
-  const candidate = [
-    item.name,
-    item.filePath,
-    item.sourceUrl,
-    item.url,
-  ].find((value) => typeof value === 'string' && value.includes('.')) || '';
-  const normalized = String(candidate).split('?')[0].trim().toLowerCase();
-  const match = normalized.match(/\.([a-z0-9]+)$/i);
-  return match?.[1] || '';
-}
-
-function isPreviewLimitedImageAsset(item: AssetItem) {
-  return item.type === 'image' && PREVIEW_LIMITED_IMAGE_EXTENSIONS.has(getAssetExtension(item));
-}
-
+import {
+  buildFolderImportStatusMessage,
+  formatBytes,
+  formatDuration,
+  getAssetBadge,
+  getAssetDirectoryPickerTestPath,
+  getAssetExtension,
+  getAssetNodeType,
+  isPreviewLimitedImageAsset,
+  MEDIA_FOLDER_IDS,
+  normalizeStoragePathValue,
+  sanitizeNodeLabel,
+  type AssetTab,
+  type ContextMenuState,
+} from './AssetLibrary.shared';
 export function AssetLibrary() {
   const { isZh } = useUILanguage();
   const byokRuntime = useByokRuntimeStore((state) => state.runtime);
@@ -280,8 +168,19 @@ export function AssetLibrary() {
     setPreviewValidating(false);
   }, [previewItem?.id]);
 
+  // 自愈：清理图库里指向已被删除/重置的后端内容（/api/assets/content/<id>）的死引用，
+  // 避免这些素材反复发起 GET 请求导致控制台 404。
+  useEffect(() => {
+    void useAssetStore.getState().pruneMissingBackendAssets();
+  }, []);
+
   const [activeTab, setActiveTab] = useState<AssetTab>('images');
-  const [showSearchPanel, setShowSearchPanel] = useState(false);
+  const [showExtInstall, setShowExtInstall] = useState(false);
+  const [extDiag, setExtDiag] = useState(getExtensionDetectionDiagnostics);
+
+  useEffect(() => {
+    startExtensionPresenceWatch();
+  }, []);
   const [reverseSearchItem, setReverseSearchItem] = useState<{ id: string; url: string; name: string; type: string } | null>(null);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['root']));
   const [showNewFolder, setShowNewFolder] = useState(false);
@@ -323,6 +222,17 @@ export function AssetLibrary() {
   const [previewIssue, setPreviewIssue] = useState<{ state: 'missing' | 'corrupted' | 'reference' | 'ok'; canTranscode: boolean; detail?: string } | null>(null);
   const [previewValidating, setPreviewValidating] = useState(false);
   const [previewRepairToken, setPreviewRepairToken] = useState(0);
+  // 网格缩略图加载失败（多为 /api/assets/content/<id> 后端已删除的死引用 404）时静默降级，
+  // 用占位图标替代坏图，避免控制台持续刷 404；自愈逻辑（pruneMissingBackendAssets）会后续清理条目。
+  const [brokenImageIds, setBrokenImageIds] = useState<Set<string>>(new Set());
+  const handleGridImageError = useCallback((id: string) => {
+    setBrokenImageIds((prev) => {
+      if (prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+  }, []);
   // 双击缩放：预览面板中图片/视频放大到原始尺寸查看细节
   const [previewZoomed, setPreviewZoomed] = useState(false);
 
@@ -335,6 +245,31 @@ export function AssetLibrary() {
   const [showAIAnalysis, setShowAIAnalysis] = useState(false);
   const [showLocalSimilar, setShowLocalSimilar] = useState(true);
   const [aiAnalysisResult, setAiAnalysisResult] = useState<import('@/types/assets').AIDeepAnalysis | null>(null);
+
+  // 浏览器扩展：把扫描到的网页资源导入本地素材库（collectFromUrl 会下载为本地 hmdao-local:// 句柄，画布只读本地句柄）
+  const setSidebarTab = useCanvasStore((s) => s.setSidebarTab);
+  const importWebAssetsFromExtension = useCallback(async (assets: ExtensionAssetRef[]) => {
+    const store = useAssetStore.getState();
+    let ok = 0;
+    for (const a of assets) {
+      try {
+        await store.collectFromUrl(a.url, {
+          type: (a.type === 'model' ? 'image' : a.type) as 'image' | 'video' | 'audio',
+          source: 'web',
+          pageUrl: a.pageUrl || '',
+          name: a.name || '',
+        });
+        ok += 1;
+      } catch (err) {
+        console.error('[ext-import] 导入失败', a.url, err);
+      }
+    }
+    if (ok > 0) setImportStatus({ type: 'success', message: `已通过浏览器扩展导入 ${ok} 个本地素材` });
+  }, []);
+  useEffect(
+    () => onExtensionWebAssetsImported((assets) => void importWebAssetsFromExtension(assets)),
+    [importWebAssetsFromExtension],
+  );
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const directoryInputRef = useRef<HTMLInputElement>(null);
@@ -424,6 +359,29 @@ export function AssetLibrary() {
     const matchedItems = catalogItems.filter((item) => preferredIds.has(item.id));
     return matchedItems.length ? matchedItems : catalogItems;
   }, [syncPersistedItems]);
+
+  const [isPruningMissing, setIsPruningMissing] = useState(false);
+  const [pruneMessage, setPruneMessage] = useState<string | null>(null);
+
+  // 清理素材目录中“本地文件已缺失”的死引用条目（避免 /api/assets/content/<id> 反复 404）。
+  const handlePruneMissing = useCallback(async () => {
+    if (isPruningMissing) return;
+    setIsPruningMissing(true);
+    setPruneMessage(null);
+    try {
+      const result = await pruneMissingAssets();
+      await refreshPersistedCatalog();
+      setPruneMessage(
+        result.removedCount > 0
+          ? `已清理 ${result.removedCount} 条失效素材引用，当前保留 ${result.keptCount} 条。`
+          : `未发现失效素材引用，目录共 ${result.keptCount} 条均有效。`,
+      );
+    } catch (error) {
+      setPruneMessage(`清理失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setIsPruningMissing(false);
+    }
+  }, [isPruningMissing, refreshPersistedCatalog]);
 
   useEffect(() => {
     const item = previewItem;
@@ -538,9 +496,11 @@ export function AssetLibrary() {
   }, [storagePath]);
 
   const renderAssetUrl = useCallback((item: AssetItem) => {
-    if (item.type === 'video') return toRenderableAssetUrl(item.url, 'video');
-    if (item.type === 'audio') return toRenderableAssetUrl(item.url, 'audio');
-    return toRenderableAssetUrl(item.thumbnail || item.url, 'image');
+    // 远程/采集素材把来源页 URL 作为 referer 转发，绕过仅依赖 Referer 的防盗链。
+    const referer = item.sourceUrl || '';
+    if (item.type === 'video') return toRenderableAssetUrl(item.url, 'video', referer);
+    if (item.type === 'audio') return toRenderableAssetUrl(item.url, 'audio', referer);
+    return toRenderableAssetUrl(item.thumbnail || item.url, 'image', referer);
   }, []);
 
   const handleSelectAssetFolder = useCallback((folderId: string, options?: { tab?: AssetTab; clearSearch?: boolean }) => {
@@ -559,6 +519,7 @@ export function AssetLibrary() {
     if (activeTab === 'images') return item.type === 'image';
     if (activeTab === 'videos') return item.type === 'video';
     if (activeTab === 'audio') return item.type === 'audio';
+    if (activeTab === 'model') return item.type === 'model';
     if (activeTab === 'prompts') return Boolean(item.prompt) || item.type === 'text';
     return true;
   });
@@ -653,20 +614,16 @@ export function AssetLibrary() {
           }
         : null;
     }
-    if (
-      analysis.engine === 'local-heuristic-fallback'
-      && imageAnalysisEngine !== 'auto'
-      && imageAnalysisEngine !== 'local-heuristic'
-    ) {
+    if (analysis.engine === 'local-heuristic-fallback') {
       return {
         tone: 'warn' as const,
-        message: `未检测到 ${selectedAnalysisOption.label} 运行时，当前已自动回退到本地轻量解析。`,
+        message: '当前未配置可用的视觉模型，仅做了轻量本地占位解析。请在「模型下载」面板安装 Florence-2（本地免费）或激活云端付费模型（如 Qwen3.7-VL）后再解析。',
       };
     }
-    if (analysis.runtime?.provider || analysis.runtime?.model) {
+    if (analysis.runtime?.provider || analysis.runtime?.model || analysis.runtime?.modelLabel) {
       return {
         tone: 'success' as const,
-        message: `当前已通过 ${analysis.runtime?.provider || '云端'} / ${analysis.runtime?.model || analysis.engine} 完成解析。`,
+        message: `当前已通过 ${analysis.runtime?.modelLabel || `${analysis.runtime?.provider || '云端'} / ${analysis.runtime?.model || analysis.engine}`} 完成解析。`,
       };
     }
     if (analysis.warnings?.length) {
@@ -799,7 +756,6 @@ export function AssetLibrary() {
       name: item.name,
       type: item.type,
     });
-    setShowSearchPanel(true);
   }, []);
 
   const handleUpload = () => fileInputRef.current?.click();
@@ -1192,7 +1148,7 @@ export function AssetLibrary() {
     setPreviewValidating(true);
     void (async () => {
       try {
-        const result = await validatePersistedAsset(item.backendAssetId);
+        const result = await validatePersistedAsset(item.backendAssetId!);
         setPreviewIssue({ state: result.state, canTranscode: Boolean(result.canTranscode), detail: result.detail });
       } catch {
         setPreviewIssue({ state: 'corrupted', canTranscode: false });
@@ -1209,7 +1165,7 @@ export function AssetLibrary() {
     setPreviewValidating(true);
     void (async () => {
       try {
-        await repairPersistedAsset(item.backendAssetId);
+        await repairPersistedAsset(item.backendAssetId!);
         setPreviewRepairToken((token) => token + 1);
         setPreviewIssue(null);
         setImportStatus({ type: 'success', message: '已将素材转码为标准格式，预览已刷新。' });
@@ -1370,6 +1326,24 @@ export function AssetLibrary() {
         </div>
       );
     }
+    if (previewItem.type === 'model') {
+      return (
+        <div className="flex aspect-video flex-col items-center justify-center gap-3 bg-[#161b22]">
+          <Box className="h-10 w-10 text-[#a78bfa]" />
+          <div className="max-w-[84%] text-center text-xs leading-5 text-[#8b949e]">
+            3D 模型（{getAssetExtension(previewItem).toUpperCase() || '模型'}）已导入本地，可在外部 3D 软件中打开。
+          </div>
+          <a
+            href={renderAssetUrl(previewItem)}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1 rounded-md bg-[#a78bfa]/15 px-3 py-1.5 text-xs text-[#c4b5fd] hover:bg-[#a78bfa]/25"
+          >
+            <ExternalLink className="h-3.5 w-3.5" /> 打开/下载模型文件
+          </a>
+        </div>
+      );
+    }
     if (isPreviewLimitedImageAsset(previewItem)) {
       return (
         <div className="flex aspect-video flex-col items-center justify-center gap-3 bg-[radial-gradient(circle_at_top,#243247,transparent_58%),linear-gradient(180deg,#11161d,#0d1117)] px-4 text-center">
@@ -1467,6 +1441,7 @@ export function AssetLibrary() {
     { id: 'images', label: '图片素材', icon: ImageIcon as typeof Grid3X3 },
     { id: 'videos', label: '视频素材', icon: Video as typeof Grid3X3 },
     { id: 'audio', label: '音频素材', icon: Music as typeof Grid3X3 },
+    { id: 'model', label: '模型素材', icon: Box as typeof Grid3X3 },
     { id: 'prompts', label: '提示词库', icon: Tag as typeof Grid3X3 },
     { id: 'workflow', label: '工作流', icon: FolderOpen as typeof Grid3X3 },
   ];
@@ -1491,6 +1466,8 @@ export function AssetLibrary() {
                 handleSelectAssetFolder(MEDIA_FOLDER_IDS.audio, { tab: 'audio' });
               } else if ((tab.id === 'images' || tab.id === 'videos' || tab.id === 'audio') && selectedFolderId === 'root') {
                 handleSelectAssetFolder(MEDIA_FOLDER_IDS[tab.id], { tab: tab.id });
+              } else if (tab.id === 'model' && String(selectedFolderId || '').startsWith('media:')) {
+                handleSelectAssetFolder('root', { tab: 'model' });
               }
             }}
             className={`flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs transition-colors ${
@@ -1503,28 +1480,94 @@ export function AssetLibrary() {
         ))}
         <button
           type="button"
-          data-testid="asset-web-search-toggle"
-          onClick={() => setShowSearchPanel((current) => !current)}
-          className={`ml-auto flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs transition-colors ${
-            showSearchPanel ? 'bg-[#1a8cff]/15 text-[#1a8cff]' : 'text-[#8b949e] hover:bg-[#21262d] hover:text-[#c9d1d9]'
-          }`}
+          data-testid="asset-curator-toggle"
+          title="采集当前浏览器页面的图片/视频/音效/3D 模型（需安装 Ddayup 素材采集扩展）"
+          onClick={async () => {
+            if (isExtensionDetected()) {
+              const ok = await openExtensionScan();
+              if (!ok) setShowExtInstall(true);
+              return;
+            }
+            const ok = await recheckExtensionPresence();
+            setExtDiag(getExtensionDetectionDiagnostics());
+            if (ok) {
+              setShowExtInstall(false);
+              await openExtensionScan();
+            } else {
+              setShowExtInstall(true);
+            }
+          }}
+          className="ml-auto flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs transition-colors text-[#8b949e] hover:bg-[#21262d] hover:text-[#c9d1d9]"
         >
-          <Globe className="h-3.5 w-3.5" />
-          <span className="hidden lg:inline">联网搜索</span>
+          <Sparkles className="h-3.5 w-3.5" />
+          <span className="hidden lg:inline">网络资产采集</span>
         </button>
       </div>
 
-      {showSearchPanel ? (
-        <div className="max-h-[58%] shrink-0 overflow-hidden border-b border-[#21262d]">
-          <WebSearchPanel
-            isOpen={showSearchPanel}
-            onClose={() => {
-              setShowSearchPanel(false);
-              setReverseSearchItem(null);
-            }}
-            reverseItem={reverseSearchItem}
-            onClearReverseItem={() => setReverseSearchItem(null)}
-          />
+
+
+      {showExtInstall ? (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60" data-testid="ext-install-modal">
+          <div className="w-[470px] rounded-2xl border border-[#30363d] bg-[#161b22] p-5 shadow-2xl">
+            <div className="mb-2 flex items-center gap-2">
+              <Globe className="h-5 w-5 text-[#00d4aa]" />
+              <h3 className="text-sm font-semibold text-[#e6edf3]">未检测到浏览器素材采集扩展</h3>
+            </div>
+            <p className="text-xs leading-relaxed text-[#8b949e]">
+              「网络资产采集」依赖 Ddayup 浏览器扩展扫描当前网页的真实图片 / 视频 / 音效 / 3D 模型资源。
+            </p>
+            <div className="mt-3 rounded-lg border border-[#21262d] bg-[#0d1117] p-3 text-[10px] font-mono leading-5 text-[#9aa4af]">
+              <div>当前访问地址：{extDiag.origin || '—'}</div>
+              <div>扩展状态：{extDiag.installed ? '已检测到 ✓' : '未检测到 ✗'}</div>
+              <div>版本：{extDiag.version || '—'}（build {extDiag.build || '—'}）</div>
+              <div>扩展注入站点：{extDiag.manifestMatches.join('、')}</div>
+              {!extDiag.installed && (
+                <div className="mt-1 text-[#ffb86b]">若你通过局域网 IP / 域名（非 127.0.0.1:3000）访问，扩展不会注入——请把你的访问地址加入 manifest 的 content_scripts / externally_connectable matches。</div>
+              )}
+            </div>
+            <div className="mt-3 text-xs leading-relaxed text-[#8b949e]">
+              <strong className="text-[#e6edf3]">安装步骤：</strong>
+              <ol className="mt-1 list-decimal space-y-1 pl-4">
+                <li>在「模型下载」面板下载扩展包（.zip）并解压到本地目录；</li>
+                <li>打开 <code className="rounded bg-[#0f1317] px-1 text-[#9bf5df]">chrome://extensions</code>（Edge 为 edge://extensions）；</li>
+                <li>右上角开启「开发者模式」，点「加载已解压的扩展程序」并选择解压目录；</li>
+                <li>确认扩展已「启用」（开关打开、无报错），回到本页刷新即可采集。</li>
+              </ol>
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                className="rounded-lg border border-[#30363d] bg-[#0d1117] px-3 py-1.5 text-xs text-[#c9d1d9] hover:border-[#46515d]"
+                onClick={() => setShowExtInstall(false)}
+              >
+                关闭
+              </button>
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 rounded-lg border border-[#30363d] bg-[#0d1117] px-3 py-1.5 text-xs text-[#c9d1d9] hover:border-[#46515d]"
+                onClick={async () => {
+                  const ok = await recheckExtensionPresence();
+                  setExtDiag(getExtensionDetectionDiagnostics());
+                  if (ok) {
+                    setShowExtInstall(false);
+                    void openExtensionScan();
+                  }
+                }}
+              >
+                <RefreshCw className="h-3 w-3" /> 我已安装，重新检测
+              </button>
+              <button
+                type="button"
+                className="rounded-lg bg-[#00d4aa] px-3 py-1.5 text-xs font-semibold text-[#06231d] hover:bg-[#00e6b8]"
+                onClick={() => {
+                  setShowExtInstall(false);
+                  setSidebarTab('models');
+                }}
+              >
+                前往模型下载面板
+              </button>
+            </div>
+          </div>
         </div>
       ) : null}
 
@@ -1915,6 +1958,21 @@ export function AssetLibrary() {
               </button>
               <button
                 type="button"
+                onClick={handlePruneMissing}
+                disabled={isPruningMissing || isUploading || isImportingFolder}
+                data-testid="asset-prune-missing-button"
+                title="清理素材目录中本地文件已缺失的死引用条目（避免 /api/assets/content/<id> 反复 404）"
+                className={`flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs transition-colors ${
+                  isPruningMissing || isUploading || isImportingFolder
+                    ? 'bg-[#2a2a2c] text-[#6e7681]'
+                    : 'bg-[#2a1f1f] text-[#ff9b9b] hover:bg-[#3a2626]'
+                }`}
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                {isPruningMissing ? '清理中...' : '清理失效引用'}
+              </button>
+              <button
+                type="button"
                 onClick={() => setViewMode(viewMode === 'grid' ? 'list' : 'grid')}
                 className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#30363d] bg-[#0d1117] text-[#8b949e] hover:text-[#c9d1d9]"
                 title={viewMode === 'grid' ? '切换列表' : '切换网格'}
@@ -1923,6 +1981,21 @@ export function AssetLibrary() {
               </button>
             </div>
           </div>
+
+          {pruneMessage ? (
+            <div className="flex items-center gap-2 border-b border-[#21262d] bg-[#161b22] px-3 py-1.5 text-[11px] text-[#8b949e]">
+              <AlertCircle className="h-3 w-3 shrink-0 text-[#ff9b9b]" />
+              <span className="min-w-0 flex-1 truncate">{pruneMessage}</span>
+              <button
+                type="button"
+                onClick={() => setPruneMessage(null)}
+                className="shrink-0 rounded px-1 text-[#6e7681] hover:text-[#c9d1d9]"
+                aria-label="关闭提示"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          ) : null}
 
           <div className="flex flex-wrap items-center gap-2 border-b border-[#21262d] px-3 py-2">
             <label className="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-[#30363d] bg-[#161b22] px-3 py-2">
@@ -2137,7 +2210,7 @@ export function AssetLibrary() {
                     {candidates.map((item) => (
                       <div key={item.id} className="flex items-center gap-2 rounded-lg bg-[#161b22] px-2 py-1.5">
                         {item.thumbnail ? (
-                          <img src={item.thumbnail} alt="" className="h-8 w-8 shrink-0 rounded object-cover" />
+                          <img src={toRenderableAssetUrl(item.thumbnail, 'image')} alt="" className="h-8 w-8 shrink-0 rounded object-cover" />
                         ) : (
                           <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-[#21262d] text-[#6e7681]">
                             <Copy className="h-3.5 w-3.5" />
@@ -2397,12 +2470,19 @@ export function AssetLibrary() {
                               </div>
                             </div>
                           ) : (
-                            <img
-                              src={renderAssetUrl(item)}
-                              alt={item.name}
-                              className="h-full w-full object-cover"
-                              loading="lazy"
-                            />
+                            brokenImageIds.has(item.id) ? (
+                              <div className="flex h-full w-full items-center justify-center bg-[#11161d] text-[#8b949e]">
+                                <ImageIcon className="h-8 w-8" />
+                              </div>
+                            ) : (
+                              <img
+                                src={renderAssetUrl(item)}
+                                alt={item.name}
+                                className="h-full w-full object-cover"
+                                loading="lazy"
+                                onError={() => handleGridImageError(item.id)}
+                              />
+                            )
                           )
                         ) : item.type === 'video' ? (
                           <div
@@ -2431,6 +2511,11 @@ export function AssetLibrary() {
                           <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-[#a855f7]">
                             <Music className="h-10 w-10" />
                             <span className="text-[10px] text-[#b9a7d9]">音频素材</span>
+                          </div>
+                        ) : item.type === 'model' ? (
+                          <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-[#a78bfa]">
+                            <Box className="h-10 w-10" />
+                            <span className="text-[10px] text-[#c4b5fd]">3D 模型</span>
                           </div>
                         ) : (
                           <div className="flex h-full w-full items-center justify-center text-[#8b949e]">
@@ -2554,7 +2639,17 @@ export function AssetLibrary() {
                               {getAssetExtension(item).toUpperCase() || 'HDR'}
                             </div>
                           ) : (
-                            <img src={renderAssetUrl(item)} alt={item.name} className="h-full w-full object-cover" loading="lazy" />
+                            brokenImageIds.has(item.id) ? (
+                              <ImageIcon className="h-5 w-5 text-[#8b949e]" />
+                            ) : (
+                              <img
+                                src={renderAssetUrl(item)}
+                                alt={item.name}
+                                className="h-full w-full object-cover"
+                                loading="lazy"
+                                onError={() => handleGridImageError(item.id)}
+                              />
+                            )
                           )
                         ) : item.type === 'video' ? (
                           <Video className="h-5 w-5 text-[#ff6b35]" />
@@ -2769,6 +2864,7 @@ export function AssetLibrary() {
                         collectFromUrl(imageUrl, {
                           folderId: importTargetFolderId,
                           type: 'image',
+                          source: 'generate',
                           title: `AI生成_${previewItem.name}`,
                           tags: aiAnalysisResult?.keywords || [],
                         }).catch(() => {});
@@ -2990,10 +3086,15 @@ export function AssetLibrary() {
                             {new Date(previewItem.analysis.analyzedAt).toLocaleString('zh-CN', { hour12: false })}
                           </span>
                         </div>
-                        {previewItem.analysis.runtime?.provider || previewItem.analysis.runtime?.model || previewItem.analysis.runtime?.resolvedEngine ? (
-                          <div data-testid="asset-preview-analysis-runtime" className="rounded-lg border border-[#262626] bg-[#11161d] px-2 py-1.5 text-[10px] leading-5 text-[#8b949e]">
-                            运行链路：{previewItem.analysis.runtime?.provider ? `${previewItem.analysis.runtime.provider} / ` : ''}
-                            {previewItem.analysis.runtime?.model || previewItem.analysis.runtime?.resolvedEngine || '本地链路'}
+                        {previewItem.analysis.runtime?.provider || previewItem.analysis.runtime?.model || previewItem.analysis.runtime?.resolvedEngine || previewItem.analysis.runtime?.modelLabel ? (
+                          <div data-testid="asset-preview-analysis-runtime" className="rounded-lg border border-[#262626] bg-[#11161d] px-2 py-1.5 text-[10px] leading-5 text-[#8b949e] flex items-center gap-1.5 flex-wrap">
+                            <span>
+                              本次分析模型：{previewItem.analysis.runtime?.modelLabel
+                                || `${previewItem.analysis.runtime?.provider ? `${previewItem.analysis.runtime.provider} / ` : ''}${previewItem.analysis.runtime?.model || previewItem.analysis.runtime?.resolvedEngine || '本地链路'}`}
+                            </span>
+                            {(/免费|Florence|本地/.test(previewItem.analysis.runtime?.modelLabel || '') || previewItem.analysis.runtime?.resolvedEngine === 'florence2') && (
+                              <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 text-[9px] font-medium">免费额度</span>
+                            )}
                           </div>
                         ) : null}
                         <p className="text-xs leading-5 text-[#dbe4ee]">{previewItem.analysis.summary}</p>
@@ -3116,177 +3217,4 @@ export function AssetLibrary() {
   );
 }
 
-function InfoItem({ label, value, testId }: { label: string; value: string; testId?: string }) {
-  return (
-    <div data-testid={testId} className="rounded-xl border border-[#262626] bg-[#161b22] px-2.5 py-2">
-      <div className="text-[10px] text-[#6e7681]">{label}</div>
-      <div className="mt-1 text-xs text-[#e6edf3]">{value}</div>
-    </div>
-  );
-}
-
-function AnalysisField({ label, value }: { label: string; value?: string }) {
-  return (
-    <div className="rounded-lg border border-[#262626] bg-[#11161d] px-2 py-1.5">
-      <div className="text-[10px] text-[#6e7681]">{label}</div>
-      <div className="mt-1 text-[11px] leading-5 text-[#e6edf3]">{value || '未识别'}</div>
-    </div>
-  );
-}
-
-function ContextAction({
-  onClick,
-  icon,
-  label,
-  destructive = false,
-}: {
-  onClick: () => void;
-  icon: ReactNode;
-  label: string;
-  destructive?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-colors ${
-        destructive ? 'text-[#ff8c8c] hover:bg-[#3d2222]/30' : 'text-[#c9d1d9] hover:bg-[#21262d]'
-      }`}
-    >
-      {icon}
-      {label}
-    </button>
-  );
-}
-
-function FolderTreeItem({
-  folder,
-  folders,
-  expandedFolders,
-  selectedFolderId,
-  folderRenameId,
-  folderRenameValue,
-  onToggleFolder,
-  onSelectFolder,
-  onStartRename,
-  onFolderRenameValue,
-  onSaveRename,
-  onContextMenu,
-  depth = 0,
-}: {
-  folder: AssetFolder;
-  folders: AssetFolder[];
-  expandedFolders: Set<string>;
-  selectedFolderId: string | null;
-  folderRenameId: string | null;
-  folderRenameValue: string;
-  onToggleFolder: (folderId: string) => void;
-  onSelectFolder: (folderId: string) => void;
-  onStartRename: (folder: AssetFolder) => void;
-  onFolderRenameValue: (value: string) => void;
-  onSaveRename: (folderId: string) => void;
-  onContextMenu: (event: React.MouseEvent, folderId: string) => void;
-  depth?: number;
-}) {
-  const { collectFromUrl } = useAssetStore();
-  const [dropActive, setDropActive] = useState(false);
-  const children = folders.filter((entry) => entry.parentId === folder.id);
-  const expanded = expandedFolders.has(folder.id);
-  const renaming = folderRenameId === folder.id;
-
-  const handleWebResultDrop = useCallback(async (event: React.DragEvent) => {
-    event.preventDefault();
-    setDropActive(false);
-    const raw = event.dataTransfer.getData('application/json');
-    if (!raw) return;
-    try {
-      const payload = JSON.parse(raw) as { type?: string; result?: WebSearchResult };
-      if (payload.type !== 'web-search-result' || !payload.result?.url) return;
-      const result = payload.result;
-      const prepared = await prepareFreeImport(result, []);
-      await collectFromUrl(result.url, {
-        folderId: folder.id,
-        type: result.type,
-        title: result.title,
-        tags: prepared.tags,
-        smartCategories: prepared.smartCategories,
-      });
-    } catch {
-      /* 忽略非法拖拽数据 */
-    }
-  }, [collectFromUrl, folder.id]);
-
-  return (
-    <div
-      onContextMenu={(event) => onContextMenu(event, folder.id)}
-      onDragOver={(event) => {
-        if (event.dataTransfer.types.includes('application/json')) {
-          event.preventDefault();
-          setDropActive(true);
-        }
-      }}
-      onDragLeave={() => setDropActive(false)}
-      onDrop={handleWebResultDrop}
-      className={dropActive ? 'rounded-lg ring-1 ring-[#00d4aa] bg-[#00d4aa]/5' : ''}
-    >
-      <div
-        onClick={() => onSelectFolder(folder.id)}
-        onDoubleClick={() => onStartRename(folder)}
-        className={`flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs transition-colors ${
-          selectedFolderId === folder.id ? 'bg-[#00d4aa]/10 text-[#00d4aa]' : 'text-[#8b949e] hover:bg-[#21262d] hover:text-[#c9d1d9]'
-        }`}
-        style={{ paddingLeft: `${8 + depth * 14}px` }}
-      >
-        {children.length > 0 ? (
-          <button
-            type="button"
-            onClick={(event) => {
-              event.stopPropagation();
-              onToggleFolder(folder.id);
-            }}
-            className="flex h-4 w-4 items-center justify-center"
-          >
-            {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-          </button>
-        ) : (
-          <span className="block h-4 w-4 shrink-0" />
-        )}
-        <Folder className="h-3.5 w-3.5 shrink-0" />
-        {renaming ? (
-          <input
-            value={folderRenameValue}
-            onChange={(event) => onFolderRenameValue(event.target.value)}
-            onBlur={() => onSaveRename(folder.id)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') onSaveRename(folder.id);
-              if (event.key === 'Escape') onSaveRename(folder.id);
-            }}
-            autoFocus
-            className="min-w-0 flex-1 rounded border border-[#00d4aa] bg-[#0d1117] px-1.5 py-0.5 text-xs text-[#e6edf3] outline-none"
-          />
-        ) : (
-          <span className="min-w-0 flex-1 truncate">{folder.name}</span>
-        )}
-      </div>
-
-      {expanded ? children.map((child) => (
-        <FolderTreeItem
-          key={child.id}
-          folder={child}
-          folders={folders}
-          expandedFolders={expandedFolders}
-          selectedFolderId={selectedFolderId}
-          folderRenameId={folderRenameId}
-          folderRenameValue={folderRenameValue}
-          onToggleFolder={onToggleFolder}
-          onSelectFolder={onSelectFolder}
-          onStartRename={onStartRename}
-          onFolderRenameValue={onFolderRenameValue}
-          onSaveRename={onSaveRename}
-          onContextMenu={onContextMenu}
-          depth={depth + 1}
-        />
-      )) : null}
-    </div>
-  );
-}
+import { AnalysisField, ContextAction, FolderTreeItem, InfoItem } from './AssetLibrary.parts';

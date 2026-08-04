@@ -102,10 +102,14 @@ describe('图片节点智能去背', () => {
     useCanvasStore.setState({ selectedNodeIds: [], canvas: useCanvasStore.getState().canvas! });
   });
 
-  it('点击「智能去背」更新节点图片为去背结果', async () => {
+  it('点击「智能去背」→ 面板应用 → 调用 removeImageBackground 并更新节点', async () => {
     renderBgNode();
+    // 点击工具按钮打开去背能力面板（懒加载）
     fireEvent.click(screen.getByTitle('智能去背'));
-    expect(removeImageBackgroundMock).toHaveBeenCalledTimes(1);
+    const applyBtn = await screen.findByTestId('bgremove-apply');
+    fireEvent.click(applyBtn);
+
+    await waitFor(() => expect(removeImageBackgroundMock).toHaveBeenCalledTimes(1));
     await waitFor(() => {
       const node = useCanvasStore.getState().canvas!.nodes.find((n) => n.id === NODE_ID);
       expect(String((node?.data as Record<string, unknown>).imageUrl)).toBe('hmdao-local://bg-1');

@@ -13,6 +13,7 @@
  */
 
 import { createTranslator, translateWith, MODEL_NAME, type Lang } from './translateCore';
+import { PRESET_MODELS } from '@/config/presetModels';
 
 type TranslateState = {
   status: 'idle' | 'downloading' | 'ready' | 'error';
@@ -22,8 +23,6 @@ type TranslateState = {
 };
 
 type TranslateListener = (state: TranslateState) => void;
-
-const MODEL_DESC = '自动翻译提示词（中↔英），无需 API Key';
 
 let currentState: TranslateState = {
   status: 'idle',
@@ -45,19 +44,25 @@ export interface LocalModelPlugin {
   canUpdate: boolean;
 }
 
-export const MODEL_PLUGINS: LocalModelPlugin[] = [
-  {
-    id: 'nllb-200-translation',
-    name: 'NLLB-200 翻译模型',
-    description: MODEL_DESC,
-    size: '~600MB',
-    source: 'Hugging Face Hub',
-    status: 'idle',
-    progress: 0,
-    error: null,
-    canUpdate: false,
-  },
-];
+// NLLB 翻译插件作为单一数据源纳入 PRESET_MODELS（browserRuntime: 'nllb'），
+// 这里仅按该条目派生展示用的元数据，避免两处声明漂移。
+const NLLB_PRESET = PRESET_MODELS.find((m) => m.browserRuntime === 'nllb');
+
+export const MODEL_PLUGINS: LocalModelPlugin[] = NLLB_PRESET
+  ? [
+      {
+        id: NLLB_PRESET.id,
+        name: NLLB_PRESET.name,
+        description: NLLB_PRESET.desc,
+        size: NLLB_PRESET.size,
+        source: 'Hugging Face Hub',
+        status: 'idle',
+        progress: 0,
+        error: null,
+        canUpdate: false,
+      },
+    ]
+  : [];
 
 // ── 加载/翻译状态 ──
 let wasManuallyPaused = false;
@@ -99,17 +104,62 @@ export function getLocalTranslateState(): Readonly<TranslateState> {
   return currentState;
 }
 
+// P1b：安装前由后端异步把 NLLB 模型文件预热到磁盘缓存（同源、绕开美国 CDN 慢链路），
+// 浏览器首次拉取即可从后端磁盘命中，显著缩短首装与重试耗时。失败不影响浏览器直连代理，故静默。
+function warmNllbCache(): void {
+  try {
+    void fetch('/api/hf-proxy/prefetch/Xenova/nllb-200-distilled-600M', { method: 'POST' })
+      .then(() => {})
+      .catch(() => {});
+  } catch {
+    /* noop */
+  }
+}
+
+/** 清除浏览器端 NLLB 模型缓存（IndexedDB + Cache Storage），用于缓存损坏后彻底重下 */
+export async function clearNllbCache(): Promise<void> {
+  await clearTransformersCache().catch(() => {});
+  if (typeof caches !== 'undefined' && typeof caches.keys === 'function') {
+    try {
+      const names = await caches.keys();
+      await Promise.all(
+        names
+          .filter((n) => CACHE_NAME_HINTS.some((h) => n.toLowerCase().includes(h)))
+          .map((n) => caches.delete(n).catch(() => false)),
+      );
+    } catch {
+      /* noop */
+    }
+  }
+}
+
+/** 清除缓存并重新安装（应对 offset is out of bounds / 半截缓存导致的「安装失败」） */
+export async function clearNllbCacheAndRetry(): Promise<boolean> {
+  await clearNllbCache().catch(() => {});
+  loadOnce = null;
+  loadResolve = null;
+  setState({ status: 'idle', progress: 0, error: null });
+  return ensureTranslatorLoaded();
+}
+
 function formatLoadError(raw: string): string {
+  // P2：后端模型代理不可用（502 / hf-proxy-failed）→ 明确指向后端未启动，而非笼统的「网络」
+  if (raw.includes('hf-proxy-failed') || /\b502\b/.test(raw)) {
+    return (
+      '模型下载失败：后端模型代理（/api/hf-proxy）不可用。' +
+      '请确认 Ddayup 后端服务已启动（默认 3000 / 8792 端口），刷新页面后重试。'
+    );
+  }
   if (raw.includes('Failed to fetch') || raw.includes('NetworkError')) {
     return (
-      '模型下载失败：无法访问 Hugging Face Hub（已优先使用国内镜像 hf-mirror.com）。' +
-      '请检查网络后重试，或在 API 密钥页面配置硅基流动密钥作为备选方案。'
+      '模型下载失败：无法连接模型源。浏览器经后端代理 /api/hf-proxy 转发到国内镜像 hf-mirror.com，' +
+      '若后端未启动请先启动 Ddayup 后端；若后端已启动多为镜像较慢或网络波动，可点「清除缓存并重试」。'
     );
   }
   if (raw.includes('offset is out of bounds')) {
     return (
       '本地翻译模型加载失败：模型缓存文件已损坏（offset is out of bounds）。' +
-      '已自动清理浏览器模型缓存，请重新点击「翻译」重新下载。'
+      '已自动清理浏览器模型缓存，请点「清除缓存并重试」重新下载。'
     );
   }
   return `本地翻译模型加载失败：${raw}`;
@@ -141,6 +191,7 @@ function getWorker(): Worker {
         const formatted = formatLoadError(m);
         setState({ status: 'error', error: formatted });
         loadResolve && loadResolve(false);
+        loadOnce = null; // 关键：失败后清空缓存的 Promise，否则「重试」会返回旧的 resolved(false) 而不重新下载
       }
     };
   }
@@ -201,16 +252,18 @@ export async function ensureTranslatorLoaded(): Promise<boolean> {
   if (loadOnce) return loadOnce;
 
   setState({ status: 'downloading', progress: wasManuallyPaused ? currentState.progress : 0, error: null });
+  warmNllbCache(); // P1b：触发后端预热，浏览器首次拉取可从同源磁盘缓存命中
 
   loadOnce = new Promise<boolean>((resolve) => {
     loadResolve = resolve;
     const timer = setTimeout(() => {
       const m =
-        '模型下载超时（10分钟）：Hugging Face Hub 可能无法访问。请检查网络，' +
-        '或在 API 密钥页面配置硅基流动密钥作为备选方案。';
+        '模型下载超时：后端正在从镜像源拉取 NLLB 模型（约数百 MB），耗时较长，请保持页面打开耐心等待。' +
+        '若后端代理不可达或镜像持续无响应，可点「清除缓存并重试」，或确认 Ddayup 后端已启动（8008/8792/3000）。';
       setState({ status: 'error', error: m });
       loadResolve && loadResolve(false);
-    }, 600000);
+      loadOnce = null; // 超时失败后允许重试
+    }, 24 * 60 * 1000);
 
     const finishReady = () => {
       clearTimeout(timer);
@@ -227,6 +280,7 @@ export async function ensureTranslatorLoaded(): Promise<boolean> {
       }
       setState({ status: 'error', error: m });
       loadResolve && loadResolve(false);
+      loadOnce = null; // 失败后清空，确保「重试」真正重新拉取而非复用旧结果
     };
 
     try {
@@ -274,8 +328,8 @@ export async function localTranslate(text: string, sourceLang: Lang): Promise<st
     }
     if (m.includes('Failed to fetch') || m.includes('NetworkError')) {
       throw new Error(
-        '模型下载失败：无法访问 Hugging Face Hub（已优先使用国内镜像 hf-mirror.com）。' +
-        '请检查网络后重试，或在 API 密钥页面配置硅基流动密钥作为备选方案。',
+        '模型下载失败：无法连接模型源。浏览器经后端代理 /api/hf-proxy 转发到国内镜像 hf-mirror.com，' +
+        '若后端未启动请先启动 Ddayup 后端；若后端已启动多为镜像较慢或网络波动，可点「清除缓存并重试」。',
       );
     }
     if (m.includes('offset is out of bounds')) {
@@ -572,4 +626,4 @@ async function saveInstalledRevision(): Promise<void> {
 }
 
 // 导出类型，供面板展示
-export type { LocalModelPlugin, TranslateState };
+export type { TranslateState };

@@ -19,8 +19,26 @@ export interface AssetImageAnalysis {
   keywords: string[];
   promptZh: string;
   promptEn: string;
+  /** 综合描述提示词（从 AIDeepAnalysis 回填时兼容） */
+  compositePrompt?: string;
+  /** 建议的生成参数（从 AIDeepAnalysis 回填时兼容） */
+  suggestedParams?: {
+    aspectRatio?: string;
+    quality?: string;
+    stylePreset?: string;
+  };
   palette?: string[];
   warnings?: string[];
+  /** 主体颜色 */
+  subjectColors?: string;
+  /** 主体细节 */
+  subjectDetails?: string;
+  /** 动作 */
+  action?: string;
+  /** 表情 */
+  expression?: string;
+  /** 特效 */
+  vfx?: string;
   runtime?: {
     wrapperConfigured?: boolean;
     wrapperCommand?: string;
@@ -29,6 +47,7 @@ export interface AssetImageAnalysis {
     resolvedEngine?: string;
     provider?: string;
     model?: string;
+    modelLabel?: string;
     endpoint?: string;
     fusionEngines?: string[];
   };
@@ -39,7 +58,7 @@ export interface AssetImageAnalysis {
 export interface AssetItem {
   id: string;
   name: string;
-  type: 'image' | 'video' | 'audio' | 'text';
+  type: 'image' | 'video' | 'audio' | 'text' | 'model';
   url: string;
   thumbnail: string;
   folderId: string;
@@ -97,7 +116,7 @@ export interface SearchPlatformMeta {
   id: SearchPlatform;
   name: string;
   icon?: string;
-  supports: Array<'image' | 'video'>;
+  supports: Array<'image' | 'video' | 'audio' | 'model'>;
   description: string;
   searchUrl?: string;
   isCustom?: boolean;
@@ -107,7 +126,9 @@ export interface SearchPlatformMeta {
 export type MatchMode = 'similarity' | 'relevance' | 'diversity';
 export type TimeRange = 'any' | 'day' | 'week' | 'month' | 'six-months' | 'year';
 export type SortOrder = 'relevance' | 'popularity' | 'newest' | 'oldest';
-export type SearchMode = 'keyword' | 'reverse-image';
+export type SearchMode = 'keyword' | 'reverse-image' | 'scrape';
+/** 免费搜索的媒体类型（与 freeWebSearch 的 mediaType 参数一致；'all' 由调用方在 UI 层处理） */
+export type MediaType = 'image' | 'video' | 'audio' | 'model';
 
 export interface SearchFilters {
   platforms: SearchPlatform[];
@@ -125,11 +146,12 @@ export interface WebSearchResult {
   url: string;
   thumb: string;
   previewUrl?: string;
+  downloadUrl?: string;
   title: string;
   description?: string;
   source: SearchPlatform;
   sourceName: string;
-  type: 'image' | 'video';
+  type: 'image' | 'video' | 'audio' | 'model';
   width?: number;
   height?: number;
   duration?: string;
@@ -155,6 +177,7 @@ export interface WebSearchResponse {
   page: number;
   hasMore: boolean;
   query: string;
+  notice?: string;
 }
 
 export interface CollectedItem {
@@ -274,7 +297,7 @@ export interface ParsedSearchQuery {
   operators: ('AND' | 'OR')[];
 }
 
-export type AssetItemType = 'image' | 'video' | 'audio' | 'text';
+export type AssetItemType = 'image' | 'video' | 'audio' | 'text' | 'model';
 
 /* ===== 本地相似搜索 ===== */
 
@@ -332,6 +355,18 @@ export interface AIDeepAnalysis {
     quality?: string;
     stylePreset?: string;
   };
+  /** 综合描述（部分分析路径回填，可选） */
+  description?: string;
+  /** 主体颜色 */
+  subjectColors?: string;
+  /** 主体细节 */
+  subjectDetails?: string;
+  /** 动作 */
+  action?: string;
+  /** 表情 */
+  expression?: string;
+  /** 特效 */
+  vfx?: string;
   analyzedAt: number;
 }
 
@@ -371,7 +406,7 @@ export interface CollectionTask {
 export interface FreeSearchPlatform {
   id: string;
   name: string;
-  supports: Array<'image' | 'video'>;
+  supports: Array<'image' | 'video' | 'audio' | 'model'>;
   description: string;
   requiresKey: boolean;
   freeQuota: string;

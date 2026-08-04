@@ -1,4 +1,6 @@
 import './index.css';
+import './utils/themeSync';
+import './theme/light-overrides.css';
 import {
   ensureDebugBridgeStateElement,
   setDebugBridgeBootstrapState,
@@ -21,6 +23,13 @@ async function bootstrap() {
 }
 
 installPreloadRecovery();
+
+// 端到端测试桩：仅 DEV 注入，生产构建会被 tree-shake 剔除（无残留代码）。
+if (import.meta.env.DEV) {
+  void import('@/testHarness')
+    .then((m) => m.installTestHarness())
+    .catch(() => {});
+}
 
 void bootstrap().catch((error) => {
   const message = String(error instanceof Error ? error.message : error || 'unknown-bootstrap-error');

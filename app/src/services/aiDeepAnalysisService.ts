@@ -7,7 +7,9 @@
  */
 import type { AIDeepAnalysis, RecommendedVLMModel, RECOMMENDED_VLM_MODELS } from '@/types/assets';
 import type { AssetItem } from '@/types/assets';
+import type { NodeData } from '@/types';
 import { analyzeAssetImage } from './assetImageAnalysis';
+import { generateNodeOutput } from './generation';
 
 /* ===== 获取已激活的视觉模型 ===== */
 
@@ -231,33 +233,112 @@ export function randomSeed(): number {
   }
 }
 
+export type ReferenceMode = 'similar' | 'subject' | 'style';
+
+export interface GenerateSimilarOptions {
+  /** 多张参考图 URL（首位为主参考）。不传则回退到第二个位置参数 referenceImageUrl。 */
+  referenceUrls?: string[];
+  /** 相似 / 换主体(保持构图) / 换风格 */
+  mode?: ReferenceMode;
+  provider?: string;
+  model?: string;
+  apiKey?: string;
+  width?: number;
+  height?: number;
+  seed?: number;
+}
+
+/**
+ * 默认图像生成模型。
+ * 注意：图像生成没有 LLM 那样的 auto-free 分发，因此由面板在挂载时
+ * 根据「免费额度 / 已激活」解析并设置，避免静默落到付费模型。
+ */
+let defaultSimilarImageModel: { provider: string; model: string } = { provider: 'auto-free', model: 'auto-free' };
+export function setDefaultSimilarImageModel(value: { provider: string; model: string }): void {
+  if (value?.provider && value?.model) defaultSimilarImageModel = value;
+}
+
+function roleForReferenceMode(mode: ReferenceMode = 'similar'): 'subject' | 'style' | 'composition' {
+  if (mode === 'subject') return 'subject';
+  if (mode === 'style') return 'style';
+  return 'style'; // similar：保持风格相似
+}
+
+/**
+ * 基于分析结果 + 参考图生成相似内容（真实图像生成引擎，非纯文生图）。
+ *
+ * 关键修复：参考图通过 data.inputs(channel:'reference') 注入，由 generateNodeOutput
+ * 写入请求体 reference_image_url（首位）与 reference_assets（全部），彻底替代此前
+ * 用 Pollinations 纯文生图、完全忽略参考图的做法。
+ */
 export async function generateSimilarImage(
   analysis: AIDeepAnalysis,
-  _referenceImageUrl?: string,
-  options?: {
-    provider?: string;
-    model?: string;
-    width?: number;
-    height?: number;
-    seed?: number;
-  },
-): Promise<{ success: boolean; imageUrl?: string; prompt: string; error?: string }> {
-  const prompt = analysis.compositePrompt || analysis.promptEn || analysis.promptZh;
+  referenceImageUrl?: string,
+  options: GenerateSimilarOptions = {},
+): Promise<{
+  success: boolean;
+  imageUrl?: string;
+  prompt: string;
+  seed?: number;
+  referenceImageUrl?: string;
+  requestBody?: unknown;
+  error?: string;
+}> {
+  const referenceUrls = Array.isArray(options.referenceUrls) && options.referenceUrls.length
+    ? options.referenceUrls.filter(Boolean)
+    : (referenceImageUrl ? [referenceImageUrl] : []);
+  const prompt = analysis?.compositePrompt || analysis?.promptEn || analysis?.promptZh || analysis?.description || '';
   if (!prompt || !prompt.trim()) {
-    return { success: false, prompt: prompt || '', error: '缺少可用于生成的提示词' };
+    return { success: false, prompt: prompt || '', error: '缺少可用于生成的提示词（compositePrompt / promptEn / promptZh）' };
   }
+  if (referenceUrls.length === 0) {
+    return { success: false, prompt, error: '缺少参考图 URL，无法做参考图生成' };
+  }
+  const mode = options.mode || 'similar';
+  const role = roleForReferenceMode(mode);
+  const data = {
+    inputs: referenceUrls.map((url, index) => ({
+      channel: 'reference',
+      type: 'image',
+      url,
+      role: index === 0 ? role : 'style',
+      enabled: true,
+    })),
+    params: {
+      generationMode: mode === 'subject' ? 'preserve_composition' : undefined,
+    },
+    aspectRatio: '1:1',
+  } as unknown as NodeData;
+
+  let capturedBody: unknown;
+  const provider = options.provider || defaultSimilarImageModel.provider;
+  const model = options.model || defaultSimilarImageModel.model;
   try {
-    const imageUrl = buildPollinationsUrl(prompt, {
-      width: options?.width || 1024,
-      height: options?.height || 1024,
-      seed: options?.seed ?? randomSeed(),
+    const result = await generateNodeOutput({
+      nodeId: `deep-analysis-similar-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      nodeType: 'image',
+      prompt,
+      provider,
+      apiKey: options.apiKey || '',
+      model,
+      data,
+      onRequestBody: (body) => { capturedBody = body; },
     });
-    return { success: true, imageUrl, prompt };
+    return {
+      success: true,
+      imageUrl: result.imageUrl,
+      prompt,
+      seed: options.seed,
+      referenceImageUrl: referenceUrls[0],
+      requestBody: capturedBody,
+    };
   } catch (error) {
     return {
       success: false,
       prompt,
-      error: error instanceof Error ? error.message : '生成请求失败',
+      referenceImageUrl: referenceUrls[0],
+      requestBody: capturedBody,
+      error: error instanceof Error ? error.message : '参考图生成请求失败',
     };
   }
 }
@@ -267,9 +348,13 @@ export async function generateSimilarImage(
 export async function generateSimilarVariants(
   analysis: AIDeepAnalysis,
   variantCount = 4,
-  referenceImageUrl?: string,
-): Promise<Array<{ success: boolean; imageUrl?: string; prompt: string; error?: string; seed: number }>> {
-  const variants: Array<{ success: boolean; imageUrl?: string; prompt: string; error?: string; seed: number }> = [];
+  referenceImageUrls?: string | string[],
+  options: GenerateSimilarOptions = {},
+): Promise<Array<{ success: boolean; imageUrl?: string; prompt: string; seed: number; referenceImageUrl?: string; requestBody?: unknown; error?: string }>> {
+  const refs = Array.isArray(referenceImageUrls)
+    ? referenceImageUrls
+    : (referenceImageUrls ? [referenceImageUrls] : (options.referenceUrls || []));
+  const variants: Array<{ success: boolean; imageUrl?: string; prompt: string; seed: number; referenceImageUrl?: string; requestBody?: unknown; error?: string }> = [];
 
   // 生成多个变体（修改 seed / 微调 prompt）
   const variationPrompts = buildVariationPrompts(analysis, variantCount);
@@ -280,8 +365,8 @@ export async function generateSimilarVariants(
     variationPrompts.map((variantPrompt) =>
       generateSimilarImage(
         { ...analysis, compositePrompt: variantPrompt },
-        referenceImageUrl,
-        { width, height, seed: randomSeed() },
+        undefined,
+        { ...options, referenceUrls: refs, width, height, seed: randomSeed() },
       ),
     ),
   );
@@ -289,13 +374,13 @@ export async function generateSimilarVariants(
   for (const result of results) {
     if (result.status === 'fulfilled') {
       const value = result.value;
-      variants.push({ ...value, seed: 0 });
+      variants.push({ ...value, seed: value.seed ?? 0 });
     } else {
       variants.push({
         success: false,
         prompt: '',
-        error: result.reason?.message || '生成失败',
         seed: 0,
+        error: result.reason?.message || '生成失败',
       });
     }
   }

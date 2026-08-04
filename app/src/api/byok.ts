@@ -4,6 +4,8 @@ export interface ByokValidateRequest {
   mode?: 'llm' | 'image' | 'video' | 'audio';
   endpoint?: string;
   model?: string;
+  accessKeyId?: string;
+  secretKey?: string;
 }
 
 export interface ByokValidateResult {
@@ -177,8 +179,10 @@ export async function validateByokKey(
   mode?: 'llm' | 'image' | 'video' | 'audio',
   endpoint?: string,
   model?: string,
+  accessKeyId?: string,
+  secretKey?: string,
 ): Promise<ByokValidateResult> {
-  const body: ByokValidateRequest = { provider, apiKey, mode, endpoint, model };
+  const body: ByokValidateRequest = { provider, apiKey, mode, endpoint, model, accessKeyId, secretKey };
   const response = await fetch('/api/byok/validate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

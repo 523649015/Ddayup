@@ -312,7 +312,7 @@ describe('localTranslate 服务', () => {
       const state = getLocalTranslateState();
       expect(result).toBe(false);
       expect(state.status).toBe('error');
-      expect(state.error).toContain('无法访问 Hugging Face Hub');
+      expect(state.error).toContain('模型下载失败：无法连接模型源');
     });
 
     it('NetworkError 错误消息包含中文提示', async () => {
@@ -325,7 +325,7 @@ describe('localTranslate 服务', () => {
       const state = getLocalTranslateState();
       expect(result).toBe(false);
       expect(state.status).toBe('error');
-      expect(state.error).toContain('无法访问 Hugging Face Hub');
+      expect(state.error).toContain('模型下载失败：无法连接模型源');
     });
 
     it('非网络错误保留原始消息', async () => {

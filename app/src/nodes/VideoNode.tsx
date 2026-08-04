@@ -32,9 +32,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import type { ByokRuntimeRecommendationSummary, ByokRuntimeResult } from '@/api/byok';
 import { NodeModelBrowser } from '@/components/NodeModelBrowser';
-import { RecommendationCardsPanel } from '@/components/RecommendationCardsPanel';
 import { ReferenceConditioningSummary } from '@/components/ReferenceInputsPanel';
 import { ReferenceInputsPanel, type ReferenceBindingSection } from '@/components/ReferenceInputsPanel';
 import { SourceBadge, relaySourceLabel } from '@/components/SourceBadge';
@@ -45,7 +43,6 @@ import {
   findAnalysisEngineOption,
   getVideoSemanticEngineOptions,
 } from '@/config/analysisModelOptions';
-import { resolveProviderGuideId } from '@/config/providerGuides';
 import { useFloatingDraftEditors } from '@/hooks/useFloatingDraftEditors';
 import { useGuardedFloatingPanelInteraction, type GuardedPanelInteractionProps } from '@/hooks/useGuardedFloatingPanelInteraction';
 import { useNodeFloatingPanel } from '@/hooks/useNodeFloatingPanel';
@@ -60,14 +57,13 @@ import {
   type ReferenceRoleOption,
   type ReferenceSettingsValue,
 } from '@/lib/nodeReferenceGraph';
-import { getDirectRecommendationCards } from '@/utils/directProviderRecommendationCards';
-import { findRecommendationTask, summaryToRecommendationCard, taskToRecommendationCard } from '@/utils/runtimeRecommendationCards';
 import { patchDebugBridge, readDebugBridge } from '@/services/debugBridge';
 import {
   buildDebugGenerationBodyFromNode,
   classifyRenderableAssetIssue,
   describeGenerationError,
   generateNodeOutput,
+  generateNodeOutputWithFallback,
   GenerationError,
   probeRenderableAssetIssue,
   resolveGenerationAccess,
@@ -117,1270 +113,68 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { ErrorDetailBlock, GeneratingSkeleton, ProgressBadge, StatusBadge } from './NodeShellShared';
 import { EditableNodeTitle } from './EditableNodeTitle';
 
-function stopCanvasInteraction(event: { stopPropagation: () => void }) {
-  event.stopPropagation();
-}
-
-type VideoTool = 'clip' | 'crop' | 'hd' | 'parse' | 'removeSubtitle' | 'audioSplit';
-type VideoUploadTarget = 'main' | 'sourceImage' | 'firstFrame' | 'lastFrame' | 'referenceImage' | 'referenceVideo';
-const MAX_DEBUG_VIDEO_NODE_SNAPSHOTS = 24;
-
-function mergeBoundedVideoDebugSnapshots(
-  currentSnapshots: Record<string, unknown> | undefined,
-  nodeId: string,
-  snapshot: Record<string, unknown>,
-) {
-  const orderedEntries = Object.entries(currentSnapshots || {}).filter(([key]) => key !== nodeId);
-  orderedEntries.push([nodeId, snapshot]);
-  const trimmedEntries = orderedEntries.slice(-MAX_DEBUG_VIDEO_NODE_SNAPSHOTS);
-  return Object.fromEntries(trimmedEntries);
-}
-type CropResizeHandle = 'move' | 'n' | 's' | 'e' | 'w' | 'nw' | 'ne' | 'sw' | 'se';
-
-interface CropRect {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-interface ClipSegment {
-  id: string;
-  startTime: number;
-  endTime: number;
-  label: string;
-}
-
-function modelMatchesLocalKey(
-  model: { id: string; name: string; provider: string; upstreamModel?: string },
-  keyState: Pick<ProviderKeyState, 'mode' | 'model' | 'status' | 'apiKey' | 'metadataOnly'> | undefined,
-  mode: 'image' | 'video',
-) {
-  return Boolean(
-    keyState
-    && keyState.status !== 'expired'
-    && keyState.mode === mode
-    && (keyState.apiKey || keyState.metadataOnly)
-    && providerKeyMatchesModel(keyState, model.upstreamModel || model.id, { allowProviderOnlyFallback: false }),
-  );
-}
-
-const CONTRACT_IMAGE_ROLE_OPTIONS: ReferenceRoleOption[] = [
-  { value: 'subject', label: '主体参考' },
-  { value: 'element', label: '元素参考' },
-  { value: 'style', label: '风格参考' },
-  { value: 'composition', label: '构图参考' },
-  { value: 'lighting', label: '光影参考' },
-  { value: 'omni', label: '全能参考' },
-];
-
-const CONTRACT_VIDEO_ROLE_OPTIONS: ReferenceRoleOption[] = [
-  { value: 'motion', label: '运镜参考' },
-  { value: 'rhythm', label: '节奏参考' },
-  { value: 'style', label: '风格参考' },
-  { value: 'omni', label: '全能参考' },
-];
-
-function normalizeContractReferenceRole(value: unknown, fallback: ReferenceRole): ReferenceRole {
-  const next = String(value || '').trim();
-  if (
-    next === 'primary'
-    || next === 'style'
-    || next === 'subject'
-    || next === 'element'
-    || next === 'composition'
-    || next === 'lighting'
-    || next === 'motion'
-    || next === 'rhythm'
-    || next === 'omni'
-  ) {
-    return next;
-  }
-  return fallback;
-}
-
-function buildContractConnectedInput(
-  input: MediaInput,
-  settings: Record<string, ReferenceSettingsValue>,
-): ReturnType<typeof collectConnectedReferenceInputs>[number] {
-  const key = String(input.id || `region-contract:${input.sourceNodeId || 'source'}:${input.handleId || 'default'}:${input.type}`);
-  const roleOptions = input.channel === 'video-reference' ? CONTRACT_VIDEO_ROLE_OPTIONS : CONTRACT_IMAGE_ROLE_OPTIONS;
-  const fallbackRole = input.channel === 'primary'
-    ? 'primary'
-    : normalizeContractReferenceRole(input.role, input.channel === 'video-reference' ? 'motion' : 'style');
-  const setting = settings[key] || {};
-  const role = input.channel === 'primary'
-    ? 'primary'
-    : normalizeContractReferenceRole(setting.role, fallbackRole);
-  return {
-    id: String(input.id || key),
-    type: input.type,
-    url: input.url,
-    label: String(input.label || input.sourceNodeId || '打标签参考'),
-    metadata: input.metadata,
-    sourceNodeId: String(input.sourceNodeId || ''),
-    sourceNodeLabel: String(input.label || input.sourceNodeId || '打标签参考'),
-    sourceNodeType: input.sourceNodeType || (input.type === 'video' ? 'video' : input.type === 'audio' ? 'audio' : input.type === 'text' ? 'text' : 'image'),
-    edgeId: `region-contract:${input.sourceNodeId || 'source'}:${input.handleId || 'default'}`,
-    key,
-    channel: input.channel === 'video-reference' ? 'video-reference' : input.channel === 'primary' ? 'primary' : 'image-reference',
-    handleId: String(input.handleId || ''),
-    role,
-    weight: Math.max(0, Math.min(100, Math.round(Number(setting.weight ?? input.weight ?? (input.channel === 'primary' ? 100 : 80))))),
-    enabled: setting.enabled === undefined ? (input.enabled === undefined ? true : Boolean(input.enabled)) : Boolean(setting.enabled),
-    roleOptions: input.channel === 'primary' ? [{ value: 'primary', label: '主素材' }] : roleOptions,
-    isManualBinding: false,
-  };
-}
-
-interface VideoModelOption {
-  id: string;
-  name: string;
-  description: string;
-  cost: number;
-  currency?: string;
-  latency?: string;
-  provider: string;
-  providerLabel?: string;
-  upstreamModel?: string;
-  activated?: boolean;
-  discountLabel?: string;
-  maskedKey?: string;
-  activationModelMatched?: boolean;
-  activationModel?: string;
-  activationRelaySource?: string | null;
-  capabilities?: ModelCapabilityMatrix | null;
-  supportedForCurrentRequest?: boolean;
-  unsupportedReason?: string | null;
-}
-
-function videoModelActivationSourceLabel(model: Pick<VideoModelOption, 'activationRelaySource' | 'activated'>) {
-  if (!model.activated || !model.activationRelaySource) return null;
-  return relaySourceLabel(model.activationRelaySource);
-}
-
-interface VideoMeta {
-  width: number;
-  height: number;
-  duration: number;
-}
-
-interface VideoSourceConstraint {
-  supported: boolean;
-  reason: string;
-}
-
-interface ParsedStoryboardShot {
-  id: string;
-  startTime: number;
-  endTime: number;
-  duration: number;
-  shotNumber: number;
-  subjectCount?: number;
-  subjectSummary?: string;
-  subjectTraits?: string;
-  actionSummary?: string;
-  sceneSetting?: string;
-  storyboardPurpose?: string;
-  lensSuggestion?: string;
-  frameDescription: string;
-  narrativeBeat: string;
-  sceneType: string;
-  cameraAngle: string;
-  cameraMovement: string;
-  focusDepth: string;
-  lighting: string;
-  soundDesign: string;
-  cameraPrompt: string;
-  imagePrompt: string;
-  keyframePrompt: string;
-  keyframeTime: number;
-  visualKeywords: string[];
-  styleDescription?: string;
-  lightingMood?: string;
-  atmosphere?: string;
-  subjectMotion?: string;
-  cameraMotionDetail?: string;
-  compositionDetail?: string;
-  colorPalette?: string[];
-  keyframeImageBase64?: string;
-  keyframeMimeType?: string;
-  keyframeWidth?: number;
-  keyframeHeight?: number;
-  metrics?: Record<string, number>;
-}
-
-interface WindowWithPicker extends Window {
-  showOpenFilePicker?: (options?: {
-    multiple?: boolean;
-    excludeAcceptAllOption?: boolean;
-    types?: Array<{
-      description?: string;
-      accept: Record<string, string[]>;
-    }>;
-  }) => Promise<Array<{
-    getFile: () => Promise<File>;
-  }>>;
-}
-
-interface ToolModelHelpEntry {
-  label: string;
-  role: string;
-  advantage: string;
-}
-
-const PARSE_SCENE_ENGINE_HELP: Record<string, ToolModelHelpEntry> = {
-  auto: {
-    label: '自动',
-    role: '先走免费本地切镜链路，再根据本机可用模型自动升级。',
-    advantage: '默认最稳，不需要额外安装就能先跑通。',
-  },
-  scenedetect: {
-    label: 'PySceneDetect',
-    role: '按画面变化做基础镜头切分，适合先快速拆整段视频。',
-    advantage: '启动快、资源占用低、免费开源，适合粗分镜。',
-  },
-  transnetv2: {
-    label: 'TransNetV2',
-    role: '用深度学习做镜头切点检测，适合切换频繁、节奏强的视频。',
-    advantage: '切点更准，对广告、MV、综艺类视频更稳。',
-  },
-};
-
-const PARSE_SEMANTIC_ENGINE_HELP: Record<string, ToolModelHelpEntry> = {
-  'custom-api': {
-    label: '云端多模态',
-    role: '优先调用已激活的聚合平台视觉模型，补强关键帧和视频语义解析。',
-    advantage: '更适合多参考、复杂镜头语义、风格反推和中文提示词整理。',
-  },
-  auto: {
-    label: '自动',
-    role: '默认先用本地轻量语义，装了更强模型再自动切换。',
-    advantage: '兼顾速度和稳定性，适合多数本地工作流。',
-  },
-  'local-heuristic': {
-    label: '本地轻量语义',
-    role: '基于本地规则和抽样帧做主体、动作、场景的基础描述。',
-    advantage: '完全免费、速度快，适合先看视频大意和分镜骨架。',
-  },
-  'clip-interrogator': {
-    label: 'CLIP Interrogator',
-    role: '先抽关键帧，再用图片反推模型补主体、风格、光影和提示词。',
-    advantage: '对 AI 创作提示词更友好，适合海报感、风格化视频和参考片反推。',
-  },
-  internvideo: {
-    label: 'InternVideo',
-    role: '更强地理解主体、动作关系和场景变化。',
-    advantage: '动作分析更细，适合要反推镜头意图的场景。',
-  },
-  'video-llava': {
-    label: 'Video-LLaVA',
-    role: '输出更丰富的画面语义、镜头语言和文本描述。',
-    advantage: '更适合生成详细分镜脚本和提示词草稿。',
-  },
-};
-
-const SUBTITLE_ENGINE_HELP: Record<string, ToolModelHelpEntry> = {
-  auto: {
-    label: '自动',
-    role: '优先尝试更强的时序修复方案，不可用时自动回退到轻量本地链路。',
-    advantage: '最省心，能根据本机能力自动选稳妥路径。',
-  },
-  'opencv-telea': {
-    label: 'OpenCV Telea',
-    role: '对字幕区域做经典图像修补，适合固定底部字幕和简单水印。',
-    advantage: '无需额外安装、响应快，适合先快速出结果。',
-  },
-  'video-subtitle-remover': {
-    label: 'video-subtitle-remover',
-    role: '更适合标准字幕区域的自动检测和修补。',
-    advantage: '比纯 OpenCV 更省手，批量去字幕更实用。',
-  },
-  propainter: {
-    label: 'ProPainter',
-    role: '用更强的时序一致性修复复杂字幕、水印和遮挡。',
-    advantage: '复杂背景下更自然，跨帧闪烁更少。',
-  },
-};
-
-const AUDIO_SPLIT_MODEL_HELP: Record<string, ToolModelHelpEntry> = {
-  'Demucs-v4': {
-    label: 'Demucs-v4',
-    role: '做人声、伴奏、混合轨的综合分离，适合大多数视频素材。',
-    advantage: '免费开源里综合效果最好，默认推荐先选它。',
-  },
-  'UVR5-MDX-Net': {
-    label: 'UVR5-MDX-Net',
-    role: '偏向人声提取和常规伴奏分离，适合对白或配音较明显的内容。',
-    advantage: '社区成熟、兼容性高，做人声提取比较稳。',
-  },
-  MDX23C: {
-    label: 'MDX23C',
-    role: '针对复杂音乐混音做更细的分离，适合 BGM 较重的素材。',
-    advantage: '复杂音乐场景下伴奏保真更好，适合广告、MV、混剪。',
-  },
-};
-
-const FALLBACK_MODELS: VideoModelOption[] = [
-  { id: 'kling-v3-omni', name: 'Kling V3 Omni', description: '主视频保运镜、多参考换角与全能参考优先模型', cost: 3, currency: 'CNY', latency: '60s', provider: 'kling', providerLabel: 'Kling AI', upstreamModel: 'kling-v3-omni' },
-  { id: 'kling-o3', name: 'Kling O3', description: '强主体锁定与主视频运镜保留，适合全能参考视频', cost: 3, currency: 'CNY', latency: '60s', provider: 'kling', providerLabel: 'Kling AI', upstreamModel: 'kling-v3' },
-  { id: 'happyhorse-11', name: 'HappyHorse 1.1', description: '兼容 T2V / I2V / 多参考视频编辑的中转优先模型', cost: 1.6, currency: 'CNY', latency: '70s', provider: 'bailian', providerLabel: '阿里云百炼 / Relay', upstreamModel: 'happyhorse-1.1' },
-  { id: 'seedance-v2', name: 'Seedance V2', description: '保留 doubao-seedance-2.0 目录映射，适合主视频参考与镜头控制', cost: 2.8, currency: 'CNY', latency: '22s', provider: 'fal', providerLabel: 'fal.ai', upstreamModel: 'doubao-seedance-2.0' },
-  { id: 'wan22-i2v-a14b', name: 'Wan 2.2 图生视频', description: '硅基流动 Wan2.2 图生视频，适合首尾帧和参考图动画', cost: 0.29, currency: 'USD', latency: '95s', provider: 'siliconflow', providerLabel: '硅基流动', upstreamModel: 'Wan-AI/Wan2.2-I2V-A14B' },
-  { id: 'wan22-t2v-a14b', name: 'Wan 2.2 文生视频', description: '硅基流动 Wan2.2 文生视频，适合广告短片和镜头预演', cost: 0.29, currency: 'USD', latency: '88s', provider: 'siliconflow', providerLabel: '硅基流动', upstreamModel: 'Wan-AI/Wan2.2-T2V-A14B' },
-  { id: 'bailian-wan22-i2v-plus', name: '百炼 Wan 2.2 图生视频', description: '阿里云百炼 Wan2.2 图生视频，余额不足时可切回硅基流动', cost: 1.8, currency: 'CNY', latency: '100s', provider: 'bailian', providerLabel: '阿里云百炼', upstreamModel: 'wan2.2-i2v-plus' },
-  { id: 'bailian-wan22-t2v-plus', name: '百炼 Wan 2.2 文生视频', description: '阿里云百炼 Wan2.2 文生视频，适合广告短片和镜头预演', cost: 1.4, currency: 'CNY', latency: '90s', provider: 'bailian', providerLabel: '阿里云百炼', upstreamModel: 'wan2.2-t2v-plus' },
-];
-
-const TOOL_LABELS: Record<VideoTool, string> = {
-  clip: '剪辑',
-  crop: '裁剪',
-  hd: '高清',
-  parse: '解析',
-  removeSubtitle: '去字幕',
-  audioSplit: '音频分离',
-};
-
-const TOOL_FEEDBACK: Record<VideoTool, string> = {
-  clip: '已连接无损剪辑链路，调整起止时间会实时写入当前视频节点。',
-  crop: '已连接像素裁剪链路，裁剪框会实时反映当前节点的输出区域。',
-  hd: '已连接高清增强链路，超分、补帧和细节增强会随生成请求提交。',
-  parse: '已连接视频解析链路，场景检测和镜头语言会写入当前节点配置。',
-  removeSubtitle: '已连接字幕/水印移除链路，识别模式和羽化参数会同步到当前节点。',
-  audioSplit: '已连接音频分离链路，人声保留和工作流导出会同步到当前节点。',
-};
-
-const OUTPUT_COUNT_OPTIONS = [1, 2, 3, 4] as const;
-const PROMPT_ASSIST_PROVIDER_ORDER = ['siliconflow', 'deepseek', 'openai', 'bailian', 'zhipu', 'modelscope', 'minimax'] as const;
-
-const VIDEO_TOOL_OPERATIONS: Record<VideoTool, string> = {
-  clip: 'ffmpeg_lossless_trim_wavesurfer',
-  crop: 'ffmpeg_pixel_crop_cropper',
-  hd: 'real_cugan_rife_codeformer_enhance',
-  parse: 'opencv_scenedetect_keyframe_parse',
-  removeSubtitle: 'opencv_telea_subtitle_remove',
-  audioSplit: 'demucs_v4_audio_split',
-};
-
-const VIDEO_MOTION_PRESETS = [
-  { value: 'static', label: '固定镜头' },
-  { value: 'follow', label: '跟随拍摄' },
-  { value: 'orbit-up', label: '环绕抬升' },
-  { value: 'orbit-down', label: '环绕下降' },
-  { value: 'tilt-up', label: '镜头上摇' },
-  { value: 'tilt-down', label: '镜头下摇' },
-  { value: 'pan-left', label: '镜头左移' },
-  { value: 'pan-right', label: '镜头右移' },
-] as const;
-
-const VIDEO_MODE_OPTIONS = [
-  { value: 'textToVideo', label: '文生视频' },
-  { value: 'imageToVideo', label: '图生视频' },
-  { value: 'firstLastFrame', label: '首尾帧' },
-  { value: 'referenceVideo', label: '参考生成' },
-] as const;
-
-const VIDEO_ASPECT_OPTIONS = ['16:9', '9:16', '1:1', '4:3', '3:4'] as const;
-const VIDEO_QUALITY_OPTIONS = ['480p', '720p', '1080p', '1440p'] as const;
-
-function computeAllowedQualityOptions(model: Pick<VideoModelOption, 'id' | 'upstreamModel'>): string[] {
-  // seedance-v2 模型仅支持 480p/720p（根据文档及实测验证）
-  const modelId = String(model.id || model.upstreamModel || '');
-  if (/seedance/i.test(modelId)) return ['480p', '720p'];
-  return VIDEO_QUALITY_OPTIONS as unknown as string[];
-}
-
-const VIDEO_MODE_BLUEPRINTS: Record<string, { title: string; description: string; technique: string }> = {
-  textToVideo: {
-    title: '文生视频创作',
-    description: '纯文本驱动镜头、风格、景别与动作，适合广告短片、概念片和脚本预演。',
-    technique: '提示词优化 + 原生视频模型参数注入 + 运动预设控制',
-  },
-  imageToVideo: {
-    title: '单图生视频',
-    description: '上传一张首帧或产品图，锁定主体与风格后生成自然延展的视频。',
-    technique: '参考图锁定 + 运动幅度控制 + 色域与一致性约束',
-  },
-  firstLastFrame: {
-    title: '首尾帧生成',
-    description: '同时约束起始与结束画面，中间过程由模型补全，适合转场和剧情镜头。',
-    technique: '首尾帧双条件 + 光流对齐 + 结尾一致性约束',
-  },
-  referenceVideo: {
-    title: '参考素材生成',
-    description: '用参考图或参考视频复刻风格、构图、动作与镜头语言，可局部参考。',
-    technique: '视频条件控制 + 关键帧抽取 + 局部参考区域注入',
-  },
-};
-
-const VIDEO_STYLE_PRESETS = ['电影感', '电商精修', '真实纪实', '赛博霓虹', '柔光人像', '产品广告'] as const;
-
-function isImageConditionedGenerationMode(mode: string) {
-  return mode === 'imageToVideo' || mode === 'firstLastFrame' || mode === 'referenceVideo';
-}
-
-function normalizeVideoModelIdentifier(value: string | undefined | null) {
-  const normalized = String(value || '').trim().toLowerCase();
-  if (!normalized) return '';
-  if (/doubao[\-_/ ]?seedance[\-_/ ]?2(?:\.0)?/.test(normalized)) return 'seedance-v2';
-  if (/seedance[\-_/ ]?(?:2(?:\.0)?|v2)/.test(normalized)) return 'seedance-v2';
-  return normalized;
-}
-
-function videoModelMatchesIdentifier(
-  model: Pick<VideoModelOption, 'id' | 'upstreamModel' | 'name'>,
-  identifier: string | undefined | null,
-) {
-  const normalizedIdentifier = normalizeVideoModelIdentifier(identifier);
-  if (!normalizedIdentifier) return false;
-  const candidates = [
-    model.id,
-    model.upstreamModel,
-    model.name,
-  ]
-    .map((value) => normalizeVideoModelIdentifier(String(value || '')))
-    .filter(Boolean);
-  return candidates.includes(normalizedIdentifier);
-}
-
-function shouldPreservePinnedVideoModelIdentifier(
-  model: Pick<VideoModelOption, 'id' | 'upstreamModel' | 'name'>,
-  identifier: string | undefined | null,
-  pinnedByUser: boolean,
-) {
-  if (!pinnedByUser) return false;
-  const normalizedIdentifier = normalizeVideoModelIdentifier(identifier);
-  if (!normalizedIdentifier) return false;
-  if (normalizedIdentifier === 'kling-v3-omni') return true;
-  const normalizedModelId = normalizeVideoModelIdentifier(model.id);
-  if (normalizedIdentifier === normalizedModelId) return false;
-  return videoModelMatchesIdentifier(model, identifier);
-}
-
-function isI2vModel(model: Pick<VideoModelOption, 'id' | 'upstreamModel' | 'name'>) {
-  const target = `${model.id} ${model.upstreamModel || ''} ${model.name}`.toLowerCase();
-  return target.includes('i2v') || target.includes('图生');
-}
-
-function isT2vModel(model: Pick<VideoModelOption, 'id' | 'upstreamModel' | 'name'>) {
-  const target = `${model.id} ${model.upstreamModel || ''} ${model.name}`.toLowerCase();
-  return target.includes('t2v') || target.includes('文生');
-}
-
-function isVideoStyleTransferModel(model: Pick<VideoModelOption, 'id' | 'upstreamModel' | 'name' | 'provider'>) {
-  const target = `${model.id} ${model.upstreamModel || ''} ${model.name} ${model.provider}`.toLowerCase();
-  return model.provider === 'kling'
-    || model.provider === 'fal'
-    || model.provider === 'replicate'
-    || target.includes('seedance')
-    || target.includes('video-to-video')
-    || target.includes('v2v');
-}
-
-function videoBestForText(model: Pick<VideoModelOption, 'capabilities'>) {
-  const tags = Array.isArray(model.capabilities?.bestFor)
-    ? [...model.capabilities.bestFor]
-    : [];
-  if (model.capabilities?.supportsActionTransfer) tags.push('动作迁移');
-  if (model.capabilities?.supportsPrimaryVideoMotionLock) tags.push('主视频运镜保留');
-  if (model.capabilities?.supportsIdentityController) tags.push('主体锁定');
-  if (model.capabilities?.supportsVideoStyleTransfer) tags.push('风格迁移');
-  if (model.capabilities?.supportsReferenceVideo) tags.push('参考视频');
-  return Array.from(new Set(tags.map((item) => String(item || '').trim()).filter(Boolean))).join(' ').toLowerCase();
-}
-
-function videoRoutingHintText(model: Pick<VideoModelOption, 'id' | 'name' | 'provider' | 'upstreamModel' | 'description' | 'capabilities'>) {
-  return [
-    model.id,
-    model.name,
-    model.provider,
-    model.upstreamModel,
-    model.description,
-    videoBestForText(model),
-    Array.isArray(model.capabilities?.limitations) ? model.capabilities.limitations.join(' ') : '',
-  ].join(' ').toLowerCase();
-}
-
-function readNumericMediaMeta(value: unknown) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-}
-
-function readPrimaryVideoConstraint(primaryInputs: ReturnType<typeof collectConnectedReferenceInputs>): VideoSourceConstraint | null {
-  const primaryVideo = primaryInputs.find((item) => item.enabled !== false && item.type === 'video');
-  if (!primaryVideo) return null;
-  const meta = primaryVideo.metadata && typeof primaryVideo.metadata === 'object'
-    ? primaryVideo.metadata
-    : null;
-  const width = readNumericMediaMeta(meta && 'width' in meta ? meta.width : 0);
-  const height = readNumericMediaMeta(meta && 'height' in meta ? meta.height : 0);
-  if (height > 0 && height < 700) {
-    return {
-      supported: false,
-      reason: `当前主视频源分辨率约为 ${width > 0 ? `${width}×${height}` : `${height}px`}，Kling omni 上游通常要求主视频高度至少 700px。建议先换成 720p 以上主视频，或临时改走 Wan 2.2 I2V 这类图生视频路线。`,
-    };
-  }
-  return null;
-}
-
-export function resolvePreferredConditionedVideoModel(
-  models: VideoModelOption[],
-  selectedModel: VideoModelOption,
-  requirements: ReturnType<typeof buildVideoModelCapabilityRequirements>,
-  options: {
-    needsVideoStyleTransfer: boolean;
-    hasSubjectImageReference: boolean;
-    hasOmniImageReference: boolean;
-    hasOmniVideoReference: boolean;
-    hasVideoReference: boolean;
-    hasPrimaryVideo: boolean;
-    hasPrimaryImage: boolean;
-    referenceRoleCount: number;
-  },
-) {
-  const ranked = models
-    .filter((item) => item.activated)
-    .map((item) => {
-      const support = evaluateModelCapabilitySupport(item.capabilities || undefined, requirements);
-      const tags = videoBestForText(item);
-      const hints = videoRoutingHintText(item);
-      let score = 0;
-      if (support.supported) score += 500;
-      else score -= 500;
-      if (videoModelMatchesIdentifier(item, selectedModel.id) || videoModelMatchesIdentifier(item, selectedModel.upstreamModel)) score += 70;
-      if (item.provider === selectedModel.provider) score += 30;
-      if (options.hasPrimaryVideo && item.capabilities?.supportsPrimaryVideoMotionLock) score += 140;
-      if (options.hasPrimaryVideo && options.hasVideoReference && item.capabilities?.supportsActionTransfer) score += 220;
-      if (options.hasSubjectImageReference && item.capabilities?.supportsIdentityController) score += 120;
-      if (options.needsVideoStyleTransfer && isVideoStyleTransferModel(item)) score += 180;
-      if (options.hasPrimaryVideo && options.hasVideoReference && tags.includes('动作迁移')) score += 220;
-      if (options.hasPrimaryVideo && tags.includes('主视频运镜保留')) score += 180;
-      if (options.needsVideoStyleTransfer && tags.includes('风格迁移')) score += 120;
-      if (options.hasSubjectImageReference && tags.includes('主体锁定')) score += 180;
-      if (options.hasSubjectImageReference && tags.includes('高要求参考视频编辑')) score += 120;
-      if ((options.hasOmniImageReference || options.hasOmniVideoReference) && tags.includes('全能参考')) score += 220;
-      if (options.referenceRoleCount >= 3 && tags.includes('多参考视频生成')) score += 140;
-      if (options.referenceRoleCount >= 3 && tags.includes('高要求参考视频编辑')) score += 90;
-      if (options.hasPrimaryImage && tags.includes('图生视频')) score += 80;
-      if (options.hasPrimaryImage && tags.includes('首尾帧')) score += 40;
-      if (options.hasPrimaryVideo && options.hasSubjectImageReference) {
-        if (tags.includes('主体锁定')) score += 120;
-        if (tags.includes('高要求参考视频编辑')) score += 140;
-        if (tags.includes('主视频运镜保留')) score += 80;
-        if (tags.includes('全能参考')) score += 70;
-      }
-      if (options.hasOmniImageReference || options.hasOmniVideoReference) {
-        if (tags.includes('全能参考')) score += 230;
-        if (tags.includes('多参考视频生成')) score += 120;
-      }
-      if (options.referenceRoleCount >= 4) {
-        if (tags.includes('全能参考')) score += 100;
-        if (tags.includes('多参考视频生成')) score += 80;
-      }
-      if (options.hasPrimaryVideo && hints.includes('不支持主视频运镜锁定')) score -= 260;
-      if (options.needsVideoStyleTransfer && hints.includes('不支持视频风格迁移')) score -= 240;
-      return { item, score };
-    })
-    .sort((left, right) => right.score - left.score);
-  return ranked[0]?.item || selectedModel;
-}
-
-function choosePreferredVideoModel(models: VideoModelOption[], generationMode: string) {
-  const preferredMatcher = isImageConditionedGenerationMode(generationMode) ? isI2vModel : isT2vModel;
-  const isExactActivated = (item: VideoModelOption) => item.activated && item.activationModelMatched !== false;
-  const activatedPreferred = models.find((item) => isExactActivated(item) && preferredMatcher(item));
-  if (activatedPreferred) return activatedPreferred;
-  const generalPreferred = models.find((item) => preferredMatcher(item));
-  if (generalPreferred) return generalPreferred;
-  return models.find((item) => isExactActivated(item)) || models[0] || FALLBACK_MODELS[0];
-}
-
-function resolveProviderCompatibleVideoModel(
-  models: VideoModelOption[],
-  selectedModel: VideoModelOption,
-  provider: string,
-  generationMode: string,
-) {
-  if (selectedModel.provider === provider) return selectedModel;
-  const matcher = isI2vModel(selectedModel)
-    ? isI2vModel
-    : isT2vModel(selectedModel)
-      ? isT2vModel
-      : isImageConditionedGenerationMode(generationMode)
-        ? isI2vModel
-        : isT2vModel;
-  const pool = [...models, ...FALLBACK_MODELS];
-  return pool.find((item) => item.provider === provider && matcher(item)) || selectedModel;
-}
-
-function recordFrom(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-function defaultVideoToolConfig(tool: VideoTool, params: Record<string, unknown>, meta: VideoMeta | null): Record<string, unknown> {
-  const existing = recordFrom(params.videoToolConfig);
-  if (existing.tool === tool) return existing;
-  const duration = Math.max(1, Number(params.duration || meta?.duration || 5));
-  if (tool === 'clip') {
-    return {
-      tool,
-      startTime: 0,
-      endTime: Math.min(duration, 4),
-      rippleDelete: false,
-      waveform: true,
-      waveformZoom: 1,
-      snapToKeyframes: true,
-      selectedSegmentIndex: 0,
-      clipSegments: [{
-        id: 'segment-1',
-        startTime: 0,
-        endTime: Math.min(duration, 4),
-        label: '片段 1',
-      }],
-    };
-  }
-  if (tool === 'crop') {
-    return { tool, x: 8, y: 8, widthPercent: 84, heightPercent: 72, lockAspect: true, aspectRatio: '16:9' };
-  }
-  if (tool === 'hd') {
-    return { tool, scale: 2, mode: 'quality', detailStrength: 0.58, sharpen: 0.36, interpolate60fps: true, faceRestore: true };
-  }
-  if (tool === 'parse') {
-    return {
-      tool,
-      sceneDetect: true,
-      sampleFps: 2,
-      extractPrompt: true,
-      cameraLanguage: true,
-      model: 'local-semantic',
-      sceneEngine: 'auto',
-      semanticEngine: 'auto',
-    };
-  }
-  if (tool === 'removeSubtitle') {
-    return {
-      tool,
-      subtitleEngine: 'auto',
-      detectionMode: 'auto',
-      targets: ['subtitle', 'watermark'],
-      maskFeather: 8,
-      temporalConsistency: true,
-      previewFrame: 1,
-      regionX: 12,
-      regionY: 80,
-      regionWidth: 76,
-      regionHeight: 12,
-    };
-  }
-  return { tool, mode: 'fullTracks', keepVocalInVideo: false, exportToWorkflow: true, stemModel: 'Demucs-v4', sampleRate: 48000 };
-}
-
-function mediaKindFromFile(file: File): 'image' | 'video' | 'unknown' {
-  if (file.type.startsWith('image/')) return 'image';
-  if (file.type.startsWith('video/')) return 'video';
-  return 'unknown';
-}
-
-function createMediaDescriptor(file: File, url: string, kind: 'image' | 'video', role: VideoUploadTarget) {
-  return {
-    type: kind,
-    url,
-    thumbnail: kind === 'video' ? url : '',
-    folderId: 'root',
-    size: file.size,
-    tags: [role],
-    smartCategories: [],
-    source: 'upload' as const,
-    name: file.name,
-  };
-}
-
-function clampCount(value: unknown, fallback = 1) {
-  const next = Number(value);
-  if (!Number.isFinite(next)) return fallback;
-  return Math.max(1, Math.min(4, Math.round(next)));
-}
-
-function clampNumber(value: unknown, min: number, max: number, fallback: number) {
-  const next = Number(value);
-  if (!Number.isFinite(next)) return fallback;
-  return Math.max(min, Math.min(max, next));
-}
-
-function toggleArrayValue(values: unknown, value: string) {
-  const current = Array.isArray(values) ? values.filter((item) => typeof item === 'string').map(String) : [];
-  return current.includes(value) ? current.filter((item) => item !== value) : [...current, value];
-}
-
-function parseLatencySeconds(value: string | undefined) {
-  const match = String(value || '').trim().toLowerCase().match(/(\\d+(?:\\.\\d+)?)s/);
-  return match ? Number(match[1]) : 0;
-}
-
-function formatEta(seconds: number) {
-  if (!Number.isFinite(seconds) || seconds <= 0) return '未知';
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remain = Math.round(seconds % 60);
-  return remain > 0 ? `${minutes}m ${remain}s` : `${minutes}m`;
-}
-
-function formatCurrency(value: number, currency = 'CNY') {
-  if (!Number.isFinite(value)) return '未知';
-  if (currency === 'CNY') return `¥${value >= 100 ? value.toFixed(0) : value.toFixed(2)}`;
-  return `${currency} ${value.toFixed(2)}`;
-}
-
-function formatVideoCapabilityPreview(
-  requirements: ReturnType<typeof buildVideoModelCapabilityRequirements>,
-  intent: string,
-) {
-  const roles = Array.from(new Set(
-    requirements
-      .filter((item) => item.key === 'referenceRole')
-      .map((item) => String(item.value || '').trim())
-      .filter(Boolean),
-  ));
-  const generationMode = requirements.find((item) => item.key === 'generationMode');
-  return [
-    `任务 ${intent}`,
-    generationMode?.value ? `模式 ${String(generationMode.value)}` : '',
-    roles.length ? `参考 ${roles.join(' / ')}` : '参考 无',
-    requirements.some((item) => item.key === 'supportsActionTransfer') ? '动作迁移' : '',
-    requirements.some((item) => item.key === 'supportsPrimaryVideoMotionLock') ? '保运镜' : '',
-    requirements.some((item) => item.key === 'supportsIdentityController') ? '身份锁定' : '',
-  ].filter(Boolean).join(' · ');
-}
-
-function formatHdValue(value: number, digits = 2) {
-  if (!Number.isFinite(value)) return '0.00';
-  return value.toFixed(digits);
-}
-
-function deriveLinkedAudioMixConfig(params: Record<string, unknown>): LocalVideoAudioMixConfig | null {
-  const linkedAudioSourceUrl = typeof params.linkedAudioSourceUrl === 'string' ? params.linkedAudioSourceUrl.trim() : '';
-  if (!linkedAudioSourceUrl) return null;
-  const linkedAudioMode = typeof params.linkedAudioMode === 'string' ? params.linkedAudioMode.trim() : '';
-  const requestedMixMode = typeof params.linkedAudioMixMode === 'string' ? params.linkedAudioMixMode.trim() : '';
-  const audioMixMode = (requestedMixMode || (
-    linkedAudioMode === 'voiceover'
-      ? 'voiceover-dub'
-      : linkedAudioMode === 'bgm'
-        ? 'bgm-under'
-        : linkedAudioMode === 'sfx'
-          ? 'bgm-under'
-          : 'replace'
-  )) as LocalVideoAudioMixConfig['audioMixMode'];
-  const audioGain = clampNumber(
-    params.linkedAudioGain,
-    0,
-    2,
-    linkedAudioMode === 'voiceover' ? 1.15 : linkedAudioMode === 'bgm' ? 0.84 : 1,
-  );
-  const videoGain = clampNumber(
-    params.linkedVideoGain,
-    0,
-    2,
-    linkedAudioMode === 'voiceover' ? 0.3 : linkedAudioMode === 'bgm' ? 0.74 : 0.92,
-  );
-  return {
-    linkedAudioSourceUrl,
-    linkedAudioAssetId: typeof params.linkedAudioAssetId === 'string' ? params.linkedAudioAssetId : '',
-    linkedAudioLabel: typeof params.linkedAudioLabel === 'string' ? params.linkedAudioLabel : '',
-    linkedAudioMode,
-    linkedAudioBackend: typeof params.linkedAudioBackend === 'string' ? params.linkedAudioBackend : '',
-    audioMixMode,
-    audioGain,
-    videoGain,
-  };
-}
-
-function videoQualityCostMultiplier(quality: string) {
-  switch (String(quality || '').toLowerCase()) {
-    case '480p': return 1;
-    case '720p': return 1.55;
-    case '1080p': return 2.6;
-    case '1440p': return 4.2;
-    default: return 1.55;
-  }
-}
-
-function videoModelQualityCostMultiplier(model: VideoModelOption, quality: string) {
-  const upstream = String(model.upstreamModel || model.id);
-  if (model.provider === 'siliconflow' && upstream.includes('Wan2.2')) return 1;
-  return videoQualityCostMultiplier(quality);
-}
-
-function classifyFriendlyFailureReason(reason: string, category = '') {
-  const normalized = String(reason || '').trim().toLowerCase();
-  const normalizedCategory = String(category || '').trim().toLowerCase();
-
-  if (!normalized && !normalizedCategory) {
-    return { summary: '未知原因', detail: '系统没有返回更具体的失败说明。' };
-  }
-
-  if (
-    normalized.includes('hmdao_real_api')
-    || normalized.includes('real api')
-    || normalized.includes('真实上游代理')
-    || normalized.includes('真实生成')
-    || normalized.includes('real-api-disabled')
-  ) {
-    return { summary: '真实链路未开启', detail: '当前 HMDao 后端没有启用真实上游代理，结果已回退为本地占位结果。请先以 HMDAO_REAL_API=1 重启后端。' };
-  }
-
-  if (
-    normalized.includes('base url')
-    || normalized.includes('missing-base-url')
-    || normalized.includes('中转地址')
-    || normalized.includes('上游地址')
-  ) {
-    return { summary: 'Base URL 缺失', detail: '当前 provider 没有可用的 Base URL 或中转地址，真实上游请求没有发出。' };
-  }
-
-  if (
-    normalized.includes('balance is insufficient')
-    || normalized.includes('insufficient balance')
-    || normalized.includes('余额不足')
-    || normalized.includes('quota exceeded')
-  ) {
-    return { summary: '余额不足', detail: '当前平台账户余额或额度不足，真实上游生成未完成。' };
-  }
-
-  if (
-    normalizedCategory === 'auth'
-    || normalized.includes('invalid api key')
-    || normalized.includes('incorrect api key')
-    || normalized.includes('unauthorized')
-    || normalized.includes('authentication')
-    || normalized.includes('forbidden')
-    || normalized.includes('无权限')
-    || normalized.includes('鉴权')
-    || normalized.includes('api key')
-  ) {
-    return { summary: 'API Key 无效', detail: '当前平台的 API Key 无效、缺失或没有对应模型权限。' };
-  }
-
-  if (
-    normalizedCategory === 'timeout'
-    || normalized.includes('timed out')
-    || normalized.includes('timeout')
-    || normalized.includes('超时')
-  ) {
-    return { summary: '请求超时', detail: '真实上游在规定时间内没有返回结果。' };
-  }
-
-  if (
-    normalizedCategory === 'routing'
-    || normalized.includes('model not found')
-    || normalized.includes('not found')
-    || normalized.includes('does not exist')
-    || normalized.includes('unavailable model')
-    || normalized.includes('model is disabled')
-    || normalized.includes('模型不可用')
-    || normalized.includes('模型不存在')
-  ) {
-    return { summary: '模型不可用', detail: '当前选择的模型不可用、未开通，或该工具没有路由到可用模型。' };
-  }
-
-  if (
-    normalized.includes('rate limit')
-    || normalized.includes('too many requests')
-    || normalized.includes('429')
-    || normalized.includes('频率限制')
-  ) {
-    return { summary: '请求过于频繁', detail: '平台触发了频控或并发限制，请稍后重试。' };
-  }
-
-  if (normalizedCategory === 'upstream' || normalized.includes('upstream')) {
-    return { summary: '上游服务异常', detail: '模型平台服务端异常，真实生成链路未成功完成。' };
-  }
-
-  if (normalizedCategory === 'validation') {
-    return { summary: '参数配置无效', detail: '当前参数或工具配置不符合模型要求。' };
-  }
-
-  return {
-    summary: '请求失败',
-    detail: reason.trim() || '真实上游请求失败，但系统没有返回更明确的分类。',
-  };
-}
-
-function createGeneratedVideoDescriptor(
-  name: string,
-  url: string,
-  size: number,
-  width: number,
-  height: number,
-  duration: number,
-  localTool: 'crop' | 'clip' | 'hd' | 'removeSubtitle' | 'audioSplit' | 'audioMix',
-) {
-  return {
-    name,
-    type: 'video' as const,
-    url,
-    thumbnail: url,
-    folderId: 'root',
-    size,
-    width,
-    height,
-    duration,
-    tags: [`local-${localTool}`],
-    smartCategories: [],
-    source: 'generate' as const,
-  };
-}
-
-function createGeneratedAudioDescriptor(
-  name: string,
-  url: string,
-  size: number,
-  duration: number,
-  localTool: 'audioSplit',
-  branchLabel = '音频',
-) {
-  return {
-    name,
-    type: 'audio' as const,
-    url,
-    thumbnail: '',
-    folderId: 'root',
-    size,
-    duration,
-    tags: [`local-${localTool}`],
-    smartCategories: [branchLabel],
-    source: 'generate' as const,
-  };
-}
-
-function createGeneratedImageDescriptor(
-  name: string,
-  url: string,
-  size: number,
-  width: number,
-  height: number,
-  tags: string[],
-) {
-  return {
-    name,
-    type: 'image' as const,
-    url,
-    thumbnail: url,
-    folderId: 'root',
-    size,
-    width,
-    height,
-    tags,
-    smartCategories: [],
-    source: 'generate' as const,
-  };
-}
-
-function base64ToBlob(base64: string, mimeType: string) {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return new Blob([bytes], { type: mimeType });
-}
-
-function normalizeParsedStoryboardShots(
-  analysis: Record<string, unknown>,
-  videoMeta: VideoMeta | null,
-): ParsedStoryboardShot[] {
-  const parseRows = Array.isArray(analysis.parseRows)
-    ? analysis.parseRows.filter((item) => item && typeof item === 'object') as Array<Record<string, unknown>>
-    : [];
-  if (parseRows.length > 0) {
-    return parseRows.map((row, index) => ({
-      id: String(row.id || `parsed-shot-${index + 1}`),
-      shotNumber: Math.max(1, Number(row.shotNumber || index + 1)),
-      startTime: Number(row.startTime || 0),
-      endTime: Number(row.endTime || 0),
-      duration: Number(row.duration || 0),
-      frameDescription: String(row.frameDescription || ''),
-      subjectCount: Number(row.subjectCount || 0),
-      subjectSummary: String(row.subjectSummary || ''),
-      subjectTraits: String(row.subjectTraits || ''),
-      actionSummary: String(row.actionSummary || ''),
-      sceneSetting: String(row.sceneSetting || ''),
-      storyboardPurpose: String(row.storyboardPurpose || ''),
-      lensSuggestion: String(row.lensSuggestion || ''),
-      narrativeBeat: String(row.narrativeBeat || ''),
-      sceneType: String(row.sceneType || ''),
-      cameraAngle: String(row.cameraAngle || ''),
-      cameraMovement: String(row.cameraMovement || ''),
-      focusDepth: String(row.focusDepth || ''),
-      lighting: String(row.lighting || ''),
-      soundDesign: String(row.soundDesign || ''),
-      cameraPrompt: String(row.cameraPrompt || ''),
-      imagePrompt: String(row.imagePrompt || ''),
-      keyframePrompt: String(row.keyframePrompt || ''),
-      keyframeTime: Number(row.keyframeTime || 0),
-      visualKeywords: Array.isArray(row.visualKeywords)
-        ? row.visualKeywords.map((item) => String(item))
-        : [],
-      styleDescription: String(row.styleDescription || ''),
-      lightingMood: String(row.lightingMood || ''),
-      atmosphere: String(row.atmosphere || ''),
-      subjectMotion: String(row.subjectMotion || ''),
-      cameraMotionDetail: String(row.cameraMotionDetail || ''),
-      compositionDetail: String(row.compositionDetail || ''),
-      colorPalette: Array.isArray(row.colorPalette)
-        ? row.colorPalette.map((item) => String(item))
-        : [],
-      keyframeImageBase64: String(row.keyframeImageBase64 || ''),
-      keyframeMimeType: String(row.keyframeMimeType || ''),
-      keyframeWidth: Number(row.keyframeWidth || 0),
-      keyframeHeight: Number(row.keyframeHeight || 0),
-      metrics: row.metrics && typeof row.metrics === 'object'
-        ? Object.fromEntries(Object.entries(row.metrics).map(([key, value]) => [key, Number(value || 0)]))
-        : undefined,
-    }));
-  }
-  const sceneCuts = Array.isArray(analysis.sceneCuts)
-    ? analysis.sceneCuts.map((item) => Number(item)).filter((item) => Number.isFinite(item) && item >= 0)
-    : [];
-  const sampleFps = Math.max(1, Number(analysis.sampleFps || 2));
-  const totalDuration = Math.max(
-    0.1,
-    Number(analysis.duration || videoMeta?.duration || 0) || 0.1,
-  );
-  const suggestedShots = Array.isArray(analysis.suggestedShots)
-    ? analysis.suggestedShots.filter((item) => item && typeof item === 'object') as Array<Record<string, unknown>>
-    : [];
-  const breakpoints = [0, ...sceneCuts.filter((item) => item > 0 && item < totalDuration), totalDuration]
-    .sort((left, right) => left - right)
-    .filter((item, index, list) => index === 0 || Math.abs(item - list[index - 1]) > 0.02);
-
-  const sceneTypePool = ['近景', '中景', '全景'];
-  const anglePool = ['平视', '低机位', '俯视', '三分之二侧面'];
-  const movementPool = ['固定', '缓慢推近', '横移跟拍', '轻微环绕'];
-  const depthPool = ['浅景深', '中景深', '深景深'];
-  const lightingPool = ['柔光主照明', '高对比侧光', '冷暖混合氛围光', '轮廓逆光'];
-  const soundPool = ['环境底噪与音乐铺垫', '动作节奏点强化', '空间氛围音延展', '情绪收束音效'];
-
-  const shots: ParsedStoryboardShot[] = [];
-  for (let index = 0; index < Math.max(1, breakpoints.length - 1); index += 1) {
-    const startTime = Number(breakpoints[index].toFixed(3));
-    const endTime = Number(Math.max(startTime + 0.08, breakpoints[index + 1] ?? totalDuration).toFixed(3));
-    const duration = Number(Math.max(0.08, endTime - startTime).toFixed(3));
-    const suggested = suggestedShots[index] || suggestedShots.find((item) => Number(item.time || 0) >= startTime && Number(item.time || 0) <= endTime) || null;
-    const label = suggested ? String(suggested.label || `镜头 ${index + 1}`) : `镜头 ${index + 1}`;
-    const sceneType = sceneTypePool[index % sceneTypePool.length];
-    const cameraAngle = anglePool[index % anglePool.length];
-    const cameraMovement = String(suggested?.cameraPrompt || movementPool[index % movementPool.length]).replace(/，[^，]*$/, '');
-    const focusDepth = depthPool[index % depthPool.length];
-    const lighting = lightingPool[index % lightingPool.length];
-    const cameraPrompt = String(suggested?.cameraPrompt || `${movementPool[index % movementPool.length]}，${cameraAngle}，${sceneType}，保持主体与原构图稳定。`);
-    const imagePrompt = String(suggested?.imagePrompt || `主体保持原构图不变，${sceneType}，${cameraAngle}，${focusDepth}，${lighting}，细节真实。`);
-    const keyframePrompt = String(suggested?.keyframePrompt || `关键帧 ${index + 1}：保留主体姿态与画面重心，强化 ${lighting} 和 ${movementPool[index % movementPool.length]} 的视觉提示。`);
-    shots.push({
-      id: String(suggested?.id || `parsed-shot-${index + 1}`),
-      shotNumber: index + 1,
-      startTime,
-      endTime,
-      duration,
-      frameDescription: `${label}：围绕当前片段主体，保留原有构图、运动方向与空间层次，抽样 ${sampleFps}fps 做本地镜头解析，并可直接转成画面提示词或关键帧。`,
-      subjectCount: 0,
-      subjectSummary: '未启用语义角色解析',
-      subjectTraits: '建议接入本地多模态模型补充角色特征',
-      actionSummary: '当前为基础镜头统计描述',
-      sceneSetting: '当前为基础场景推断',
-      storyboardPurpose: index === 0 ? '建立镜头' : '承接镜头',
-      lensSuggestion: '建议结合本地多模态解析补充镜头建议',
-      narrativeBeat: index === 0 ? '建立主体与空间关系。' : index === breakpoints.length - 2 ? '完成段落收束与情绪落点。' : '承接上一镜并推进当前动作与叙事。' ,
-      sceneType,
-      cameraAngle,
-      cameraMovement,
-      focusDepth,
-      lighting,
-      soundDesign: soundPool[index % soundPool.length],
-      cameraPrompt,
-      imagePrompt,
-      keyframePrompt,
-      keyframeTime: Number((startTime + duration * 0.5).toFixed(3)),
-      visualKeywords: [sceneType, cameraAngle, cameraMovement, focusDepth, lighting],
-    });
-  }
-
-  return shots;
-}
-
-async function fileToDataUrl(file: File): Promise<string> {
-  return await new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(reader.error || new Error('Failed to read local file.'));
-    reader.onload = () => resolve(String(reader.result || ''));
-    reader.readAsDataURL(file);
-  });
-}
-
-function getVideoOutcomeLabel(data: Partial<NodeData> | undefined, currentParams: Record<string, unknown>) {
-  const outputs = Array.isArray(data?.outputs) ? data.outputs : [];
-  const firstOutput = outputs[0]?.metadata && typeof outputs[0].metadata === 'object'
-    ? outputs[0].metadata as Record<string, unknown>
-    : undefined;
-  const localTool = String(firstOutput?.localTool || currentParams.localVideoEditTool || '').trim();
-  const localDerivedNodeId = String(currentParams.localVideoDerivedNodeId || '').trim();
-  const localDerivedTool = String(currentParams.localVideoDerivedTool || '').trim();
-  const localDerivedLabel = String(currentParams.localVideoDerivedLabel || '').trim();
-  const workflowFallback = Boolean(
-    currentParams.workflowFallbackReason
-      || firstOutput?.workflowFallback
-      || firstOutput?.workflowFallbackReason
-      || firstOutput?.fallback,
-  );
-  const fallbackReason = String(currentParams.workflowFallbackReason || firstOutput?.workflowFallbackReason || '').trim();
-  const fallbackCategory = String(firstOutput?.fallbackCategory || firstOutput?.category || currentParams.lastErrorCategory || '').trim();
-  const requestFailed = data?.status === 'error' || Boolean(currentParams.lastError || currentParams.lastErrorStage);
-  const requestReason = String(currentParams.lastError || data?.error || '').trim();
-  const requestCategory = String(currentParams.lastErrorCategory || '').trim();
-
-  if (requestFailed) {
-    const friendly = classifyFriendlyFailureReason(requestReason, requestCategory);
-    return {
-      tone: 'error' as const,
-      label: `上游请求失败 · ${friendly.summary}`,
-      reason: friendly.detail,
-    };
-  }
-
-  if (workflowFallback || fallbackReason) {
-    const friendly = classifyFriendlyFailureReason(fallbackReason, fallbackCategory);
-    return {
-      tone: 'warning' as const,
-      label: `本地兜底结果 · ${friendly.summary}`,
-      reason: friendly.detail,
-    };
-  }
-
-  if (localDerivedNodeId && localDerivedTool === 'crop') {
-    return {
-      tone: 'success' as const,
-      label: '已生成裁剪结果节点',
-      reason: `${localDerivedLabel || '裁剪结果节点'}已创建，原视频素材保持不变，可继续在新节点上预览、生成或导出。`,
-    };
-  }
-
-  if (localDerivedNodeId && localDerivedTool === 'clip') {
-    return {
-      tone: 'success' as const,
-      label: '已生成剪辑结果节点',
-      reason: `${localDerivedLabel || '剪辑结果节点'}已创建，原视频素材保持不变，可继续在新节点上预览、生成或导出。`,
-    };
-  }
-
-  if (localDerivedNodeId && localDerivedTool === 'hd') {
-    return {
-      tone: 'success' as const,
-      label: '已生成高清增强结果节点',
-      reason: `${localDerivedLabel || '高清结果节点'}已创建，原视频素材保持不变，可继续在新节点上预览、生成或导出。`,
-    };
-  }
-
-  if (localDerivedNodeId && localDerivedTool === 'removeSubtitle') {
-    const engineLabel = String(currentParams.localVideoProcessingEngine || '').trim();
-    return {
-      tone: 'success' as const,
-      label: '已生成去字幕结果节点',
-      reason: `${localDerivedLabel || '去字幕结果节点'}已创建，原视频素材保持不变，可继续在新节点上预览、生成或导出。${engineLabel ? `当前引擎：${engineLabel}。` : ''}`,
-    };
-  }
-
-  if (localDerivedNodeId && localDerivedTool === 'parse') {
-    const engineLabel = String(currentParams.localVideoAnalysisEngine || '').trim();
-    return {
-      tone: 'success' as const,
-      label: '已生成解析分镜节点',
-      reason: `${localDerivedLabel || '解析分镜节点'}已创建，原视频素材保持不变，可继续查看分镜表、关键帧和镜头描述。${engineLabel ? `当前引擎：${engineLabel}。` : ''}`,
-    };
-  }
-
-  if (localDerivedNodeId && localDerivedTool === 'audioSplit') {
-    const engineLabel = String(currentParams.localVideoProcessingEngine || '').trim();
-    return {
-      tone: 'success' as const,
-      label: '已生成音频分离结果节点',
-      reason: `${localDerivedLabel || '音频分离结果节点'}已创建，原视频素材保持不变，同时完整音轨、人声和伴奏结果可继续在新节点中预览或下载。${engineLabel ? `当前引擎：${engineLabel}。` : ''}`,
-    };
-  }
-
-  if (localTool === 'crop') {
-    return {
-      tone: 'success' as const,
-      label: '本地裁剪已应用',
-      reason: '裁剪已完成，原视频素材保持不变，结果已输出到新的结果节点。',
-    };
-  }
-
-  if (localTool === 'clip') {
-    return {
-      tone: 'success' as const,
-      label: '本地剪辑已应用',
-      reason: '剪辑已完成，原视频素材保持不变，结果已输出到新的结果节点。',
-    };
-  }
-
-  if (localTool === 'hd') {
-    return {
-      tone: 'success' as const,
-      label: '本地高清增强已应用',
-      reason: '高清增强已完成，原视频素材保持不变，结果已输出到新的结果节点。',
-    };
-  }
-
-  if (localTool === 'removeSubtitle') {
-    const engineLabel = String(currentParams.localVideoProcessingEngine || '').trim();
-    return {
-      tone: 'success' as const,
-      label: '本地去字幕已应用',
-      reason: `去字幕已完成，原视频素材保持不变，结果已输出到新的结果节点。${engineLabel ? `当前引擎：${engineLabel}。` : ''}`,
-    };
-  }
-
-  if (localTool === 'audioSplit') {
-    const engineLabel = String(currentParams.localVideoProcessingEngine || '').trim();
-    return {
-      tone: 'success' as const,
-      label: '本地音频分离已应用',
-      reason: `当前视频素材已完成本地音频分离，独立音频结果已写入素材库。${engineLabel ? `当前引擎：${engineLabel}。` : ''}`,
-    };
-  }
-
-  if (String(currentParams.localVideoEditTool || '') === 'parse' && String(currentParams.localVideoAnalysisSummary || '').trim()) {
-    const engineLabel = String(currentParams.localVideoAnalysisEngine || '').trim();
-    return {
-      tone: 'success' as const,
-      label: '本地解析已完成',
-      reason: `${String(currentParams.localVideoAnalysisSummary || '')}${engineLabel ? `（解析引擎：${engineLabel}）` : ''}`,
-    };
-  }
-
-  if (data?.status === 'completed' && data.videoUrl) {
-    return {
-      tone: 'success' as const,
-      label: '真实模型出视频',
-      reason: '当前结果来自真实生成链路。',
-    };
-  }
-
-  return null;
-}
-
-function pickPromptAssistProvider(provider: string, apiKeys: Record<string, ProviderKeyState>) {
-  if (PROMPT_ASSIST_PROVIDER_ORDER.includes(provider as typeof PROMPT_ASSIST_PROVIDER_ORDER[number]) && findProviderKeyState(apiKeys, provider)?.apiKey) {
-    return provider;
-  }
-  const available = PROMPT_ASSIST_PROVIDER_ORDER.find((item) => Boolean(findProviderKeyState(apiKeys, item)?.apiKey));
-  return available || 'deepseek';
-}
-
-function workflowHandleStorage(value: string) {
-  if (!value) return 'inline' as const;
-  return isLocalMediaHandle(value) ? 'local-handle' as const : /^https?:\/\//i.test(value) ? 'remote-url' as const : 'inline' as const;
-}
+import {
+  AUDIO_SPLIT_MODEL_HELP,
+  base64ToBlob,
+  buildContractConnectedInput,
+  choosePreferredVideoModel,
+  clampCount,
+  clampNumber,
+  computeAllowedQualityOptions,
+  createGeneratedAudioDescriptor,
+  createGeneratedImageDescriptor,
+  createGeneratedVideoDescriptor,
+  createMediaDescriptor,
+  dedupeVideoModels,
+  defaultVideoToolConfig,
+  deriveLinkedAudioMixConfig,
+  FALLBACK_MODELS,
+  fileToDataUrl,
+  formatCurrency,
+  formatEta,
+  formatHdValue,
+  getVideoOutcomeLabel,
+  isVideoStyleTransferModel,
+  mediaKindFromFile,
+  mergeBoundedVideoDebugSnapshots,
+  modelMatchesLocalKey,
+  normalizeParsedStoryboardShots,
+  normalizeVideoCost,
+  OUTPUT_COUNT_OPTIONS,
+  PARSE_SCENE_ENGINE_HELP,
+  PARSE_SEMANTIC_ENGINE_HELP,
+  parseLatencySeconds,
+  pickPromptAssistProvider,
+  readPrimaryVideoConstraint,
+  recordFrom,
+  resolvePreferredConditionedVideoModel,
+  resolveProviderCompatibleVideoModel,
+  shouldPreservePinnedVideoModelIdentifier,
+  stopCanvasInteraction,
+  SUBTITLE_ENGINE_HELP,
+  TOOL_FEEDBACK,
+  TOOL_LABELS,
+  VIDEO_ASPECT_OPTIONS,
+  VIDEO_MODE_BLUEPRINTS,
+  VIDEO_MODE_OPTIONS,
+  VIDEO_STYLE_PRESETS,
+  VIDEO_TOOL_OPERATIONS,
+  videoModelActivationSourceLabel,
+  videoModelMatchesIdentifier,
+  videoModelQualityCostMultiplier,
+  videoRoutingHintText,
+  workflowHandleStorage,
+  type ClipSegment,
+  type CropRect,
+  type CropResizeHandle,
+  type ParsedStoryboardShot,
+  type ToolModelHelpEntry,
+  type VideoMeta,
+  type VideoModelOption,
+  type VideoTool,
+  type VideoUploadTarget,
+  type WindowWithPicker,
+} from './VideoNode.shared';
 
 export function VideoNode({ selected, data, id }: NodeProps) {
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
@@ -1391,7 +185,6 @@ export function VideoNode({ selected, data, id }: NodeProps) {
   const setSelectedNodeIds = useCanvasStore((state) => state.setSelectedNodeIds);
   const selectedNodeIds = useCanvasStore((state) => state.selectedNodeIds);
   const canvas = useCanvasStore((state) => state.canvas);
-  const canvasVersion = Number(canvas?.updatedAt || 0);
   const canvasZoom = useCanvasStore((state) => Number(state.canvas?.viewport?.zoom || state.zoom || 1));
   const assetItems = useAssetStore((state) => state.items);
   const addAssetItem = useAssetStore((state) => state.addItem);
@@ -1401,8 +194,6 @@ export function VideoNode({ selected, data, id }: NodeProps) {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const catalogItems = useModelCatalogStore((state) => state.models);
   const fetchCatalog = useModelCatalogStore((state) => state.fetchCatalog);
-  const backendRealApiEnabled = useBackendHealthStore((state) => state.realApiEnabled);
-  const backendHealthLoading = useBackendHealthStore((state) => state.loading);
   const fetchBackendHealth = useBackendHealthStore((state) => state.fetchHealth);
   const byokRuntime = useByokRuntimeStore((state) => state.runtime);
   const fetchByokRuntime = useByokRuntimeStore((state) => state.fetchRuntime);
@@ -1560,14 +351,14 @@ export function VideoNode({ selected, data, id }: NodeProps) {
 
   const connectedRegionContracts = useMemo(
     () => collectConnectedRegionContracts(canvas, id, 'video'),
-    [canvas, canvasVersion, id],
+    [canvas?.edges, canvas?.nodes, id],
   );
   const activeRegionContractEntry = connectedRegionContracts[0] || null;
   const activeRegionContract = activeRegionContractEntry?.contract || null;
   const contractMode = Boolean(activeRegionContract);
   const directConnectedInputs = useMemo(
     () => collectConnectedReferenceInputs(canvas, id, 'video', referenceSettings),
-    [canvas, canvasVersion, data?.inputs, id, referenceSettings],
+    [canvas?.edges, canvas?.nodes, data?.inputs, id, referenceSettings],
   );
   const contractConnectedInputs = useMemo(
     () => buildRegionContractMediaInputs(activeRegionContract).map((item) => buildContractConnectedInput(item, referenceSettings)),
@@ -1622,35 +413,6 @@ export function VideoNode({ selected, data, id }: NodeProps) {
     () => buildRegionCapabilityRequirements('video', activeRegionContract),
     [activeRegionContract],
   );
-  const conditioningDebugSummary = useMemo(() => {
-    const primaryRole = primaryInputs[0]?.type === 'video'
-      ? 'motion'
-      : primaryInputs[0]?.type === 'image'
-        ? 'composition'
-        : String(primaryInputs[0]?.role || 'primary');
-    const referenceRoles = Array.from(new Set(referenceInputs.map((item) => String(item.role || (item.type === 'video' ? 'motion' : 'style'))).filter(Boolean)));
-    const hasOmni = referenceRoles.includes('omni');
-    const hasSubject = referenceRoles.includes('subject');
-    const hasMotion = referenceRoles.includes('motion');
-    const intent = primaryInputs.some((item) => item.type === 'video') && hasSubject
-      ? '保运镜换主体'
-      : primaryInputs.some((item) => item.type === 'video') && hasOmni
-        ? '主视频锁定 + 全能参考'
-        : primaryInputs.some((item) => item.type === 'video') && hasMotion
-          ? '运镜与风格融合'
-          : hasSubject
-            ? '主体参考图生视频'
-            : hasOmni
-              ? '全能参考视频生成'
-              : '参考驱动视频生成';
-    return {
-      primaryRole,
-      referenceRoles,
-      hasOmni,
-      intent,
-      text: `主素材 ${primaryRole} · 参考 ${referenceRoles.length ? referenceRoles.join(' / ') : '无'} · 意图 ${intent}`,
-    };
-  }, [primaryInputs, referenceInputs]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1745,7 +507,7 @@ export function VideoNode({ selected, data, id }: NodeProps) {
 
   const bindingCandidates = useMemo(
     () => collectReferenceBindingCandidates(canvas, id, 'video'),
-    [canvas, canvasVersion, id],
+    [canvas?.nodes, id],
   );
   const videoImageReferenceHandleIds = useMemo(() => {
     const incomingEdges = canvas?.edges.filter((edge) => edge.target === id) || [];
@@ -1771,7 +533,7 @@ export function VideoNode({ selected, data, id }: NodeProps) {
     ];
     const highest = occupied.length > 0 ? Math.max(...occupied) : -1;
     return Array.from({ length: Math.max(1, highest + 2) }, (_, index) => `video-image-reference-${index}`);
-  }, [canvas?.edges, canvasVersion, data?.inputs, id]);
+  }, [canvas?.edges, data?.inputs, id]);
   const videoVideoReferenceHandleIds = useMemo(() => {
     const incomingEdges = canvas?.edges.filter((edge) => edge.target === id) || [];
     const manualInputs = Array.isArray(data?.inputs) ? data.inputs : [];
@@ -1796,7 +558,7 @@ export function VideoNode({ selected, data, id }: NodeProps) {
     ];
     const highest = occupied.length > 0 ? Math.max(...occupied) : -1;
     return Array.from({ length: Math.max(1, highest + 2) }, (_, index) => `video-video-reference-${index}`);
-  }, [canvas?.edges, canvasVersion, data?.inputs, id]);
+  }, [canvas?.edges, data?.inputs, id]);
   const modelPinnedByUser = Boolean(currentParams.modelPinnedByUser);
 
   useEffect(() => {
@@ -1910,8 +672,10 @@ export function VideoNode({ selected, data, id }: NodeProps) {
   }, [hasDockedDraft, isNodeInteractionActive, syncDismissedDockedEditors, toolPanelOpen]);
 
   const models = useMemo<VideoModelOption[]>(() => {
-    const catalogModels = catalogItems.filter((model) => model.nodeTypes.includes('video'));
-    return catalogModels.length > 0
+    const catalogModels = catalogItems.filter(
+      (model) => model.nodeTypes.includes('video') && model.mode === 'video',
+    );
+    const sourceOptions: VideoModelOption[] = catalogModels.length > 0
       ? catalogModels.map((model) => {
           const localKey = findProviderKeyState(apiKeys, model.provider, 'video');
           const activated = Boolean(
@@ -1927,12 +691,13 @@ export function VideoNode({ selected, data, id }: NodeProps) {
               'video',
             ),
           );
+          const cost = normalizeVideoCost(Number(model.price || 0), model.currency || 'CNY');
           return {
             id: model.id,
             name: model.name,
             description: model.description,
-            cost: Number(model.price || 0),
-            currency: model.currency || 'CNY',
+            cost: cost.cost,
+            currency: cost.currency,
             latency: model.latency || '',
             provider: model.provider,
             providerLabel: model.providerMeta?.name || model.provider,
@@ -1946,7 +711,11 @@ export function VideoNode({ selected, data, id }: NodeProps) {
             capabilities: model.capabilities || null,
           };
         })
-      : FALLBACK_MODELS;
+      : FALLBACK_MODELS.map((model) => {
+          const cost = normalizeVideoCost(model.cost, model.currency || 'CNY');
+          return { ...model, cost: cost.cost, currency: cost.currency };
+        });
+    return dedupeVideoModels(sourceOptions);
   }, [apiKeys, catalogItems]);
   const currentGenerationMode = String(currentParams.generationMode || 'textToVideo');
   const identityController = useMemo<IdentityControllerConfig>(
@@ -1998,12 +767,12 @@ export function VideoNode({ selected, data, id }: NodeProps) {
     () => modelsWithSupport.filter((model) => model.supportedForCurrentRequest !== false),
     [modelsWithSupport],
   );
-  const videoCapabilityPreviewText = useMemo(
-    () => formatVideoCapabilityPreview(capabilityRequirements, conditioningDebugSummary.intent),
-    [capabilityRequirements, conditioningDebugSummary.intent],
-  );
 
-  const selectedModelId = String(data?.model || modelsWithSupport[0]?.id || FALLBACK_MODELS[0].id);
+  const preferredModel = useMemo(
+    () => choosePreferredVideoModel(selectableModels.length ? selectableModels : modelsWithSupport, currentGenerationMode),
+    [currentGenerationMode, modelsWithSupport, selectableModels],
+  );
+  const selectedModelId = String(data?.model || preferredModel?.id || modelsWithSupport[0]?.id || FALLBACK_MODELS[0].id);
   const selectedModel = useMemo(
     () => [...modelsWithSupport, ...FALLBACK_MODELS]
       .find((item, index, items) => (
@@ -2011,10 +780,6 @@ export function VideoNode({ selected, data, id }: NodeProps) {
         && videoModelMatchesIdentifier(item, selectedModelId)
       )) || modelsWithSupport[0] || FALLBACK_MODELS[0],
     [modelsWithSupport, selectedModelId],
-  );
-  const preferredModel = useMemo(
-    () => choosePreferredVideoModel(selectableModels.length ? selectableModels : modelsWithSupport, currentGenerationMode),
-    [currentGenerationMode, modelsWithSupport, selectableModels],
   );
   const allowedQualityOptions = useMemo(() => computeAllowedQualityOptions(selectedModel), [selectedModel]);
 
@@ -2089,6 +854,19 @@ export function VideoNode({ selected, data, id }: NodeProps) {
       },
     });
   }, [currentParams, data?.model, id, modelPinnedByUser, preferredModel, selectedModel.id, selectedModelActivated, updateNodeData]);
+
+  // 切换到文生视频/图生视频/首尾帧/参考生成时，按效果 + 性价比自适应推荐该模式最优（国内平台优先）模型。
+  const adaptiveVideoModeRef = useRef(currentGenerationMode);
+  useEffect(() => {
+    if (adaptiveVideoModeRef.current === currentGenerationMode) return;
+    adaptiveVideoModeRef.current = currentGenerationMode;
+    if (!preferredModel || selectedModel.id === preferredModel.id) return;
+    updateNodeData(id, {
+      model: preferredModel.id,
+      provider: preferredModel.provider,
+      params: { ...currentParams, modelPinnedByUser: false },
+    });
+  }, [currentGenerationMode, currentParams, id, preferredModel, selectedModel.id, updateNodeData]);
 
   const videoUrl = useMemo(() => {
     const directUrl = typeof data?.videoUrl === 'string' ? data.videoUrl : '';
@@ -4865,7 +3643,7 @@ export function VideoNode({ selected, data, id }: NodeProps) {
     });
 
     try {
-      let result = await generateNodeOutput({
+      let result = await generateNodeOutputWithFallback({
         nodeId: id,
         nodeType: 'video',
         prompt: executionPrompt,
@@ -5036,24 +3814,7 @@ export function VideoNode({ selected, data, id }: NodeProps) {
           {!hasVideo && data?.status ? <StatusBadge status={String(data.status) as 'idle' | 'generating' | 'completed' | 'error'} /> : null}
         </div>
 
-        {!isNodeInteractionActive && !hasVideo ? (
-          <div className="pointer-events-none absolute left-4 right-4 top-6 z-10 flex flex-wrap gap-2">
-            <span
-              data-testid={`video-capability-preview-${id}`}
-              className="rounded-full bg-[#1d2330] px-3 py-1 text-[11px] text-[#c7d6ff]"
-              title={videoCapabilityPreviewText}
-            >
-              {videoCapabilityPreviewText}
-            </span>
-            <span
-              data-testid={`video-conditioning-debug-${id}`}
-              className="rounded-full bg-[#1c2d2a] px-3 py-1 text-[11px] text-[#98ead7]"
-              title={conditioningDebugSummary.text}
-            >
-              {conditioningDebugSummary.text}
-            </span>
-          </div>
-        ) : null}
+
 {data?.status === 'generating' ? (
           <div className="rounded-lg bg-[#262626] px-7 py-9">
             <GeneratingSkeleton lines={5} />
@@ -5154,7 +3915,7 @@ export function VideoNode({ selected, data, id }: NodeProps) {
           />
         ) : null}
 
-        {effectiveVideoOutcome ? (
+        {isNodeSelected && effectiveVideoOutcome ? (
           <div className={`border-t px-4 py-3 text-[12px] ${effectiveVideoOutcome.tone === 'success' ? 'border-emerald-500/20 bg-emerald-500/8 text-emerald-200' : effectiveVideoOutcome.tone === 'warning' ? 'border-amber-500/20 bg-amber-500/10 text-amber-200' : 'border-rose-500/20 bg-rose-500/10 text-rose-200'}`}>
             <div className="font-semibold">{effectiveVideoOutcome.label}</div>
             <div className="mt-1 opacity-90">{effectiveVideoOutcome.reason}</div>
@@ -5168,18 +3929,6 @@ export function VideoNode({ selected, data, id }: NodeProps) {
             {activeRegionContractEntry ? (
               <div className="mt-2 text-sky-200/90">合同来源：{activeRegionContractEntry.sourceNodeLabel}</div>
             ) : null}
-          </div>
-        ) : null}
-
-        {currentParams.localVideoEditTool === 'parse' && localVideoAnalysis ? (
-          <div className="border-t border-cyan-500/20 bg-cyan-500/6 px-4 py-3 text-[12px] text-cyan-100" data-testid={`video-parse-analysis-${id}`}>
-            <div className="font-semibold">解析结果</div>
-            <div className="mt-1 opacity-90">{String(localVideoAnalysis.summary || '已完成本地视频解析。')}</div>
-            <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-cyan-50/85">
-              <span className="rounded-full bg-cyan-400/12 px-2 py-0.5">镜头数 {Number(localVideoAnalysis.sceneCount || 1)}</span>
-              <span className="rounded-full bg-cyan-400/12 px-2 py-0.5">抽样 {Number(localVideoAnalysis.sampleFps || 2)} fps</span>
-              <span className="rounded-full bg-cyan-400/12 px-2 py-0.5">切点 {Array.isArray(localVideoAnalysis.sceneCuts) ? localVideoAnalysis.sceneCuts.length : 0} 处</span>
-            </div>
           </div>
         ) : null}
 
@@ -5275,15 +4024,10 @@ export function VideoNode({ selected, data, id }: NodeProps) {
         <PromptPanel
           nodeId={id}
           prompt={prompt}
-          conditioningDebugText={conditioningDebugSummary.text}
-          conditioningIntent={conditioningDebugSummary.intent}
-          capabilityPreviewText={videoCapabilityPreviewText}
-          capabilityBoundaryMessage={selectedModelCapabilityBoundaryMessage}
           capabilityBoundaryRecommendedModel={selectedModelCapabilityRecommendation}
           regionContractNotice={regionContractNotice}
           canSubmit={canSubmitPrompt}
           selectedModel={selectedModel}
-          routedModel={preferredModel || selectedModel}
           models={modelsWithSupport}
           modelMenuOpen={modelMenuOpen}
           ratioText={ratioText}
@@ -5291,10 +4035,7 @@ export function VideoNode({ selected, data, id }: NodeProps) {
           selectedCount={selectedCount}
           estimatedCost={estimatedCost}
           estimatedSeconds={estimatedSeconds}
-          runtimeRecommendations={byokRuntime?.recommendations}
           identityController={identityController}
-          backendRealApiEnabled={backendRealApiEnabled}
-          backendHealthLoading={backendHealthLoading}
           linkedAudioLabel={String(currentParams.linkedAudioLabel || '')}
           linkedAudioMode={String(currentParams.linkedAudioMode || '')}
           promptAssistAction={promptAssistAction}
@@ -5849,6 +4590,10 @@ function ClipEditorPanel({
 
   function beginDrag(handle: 'start' | 'end' | 'playhead', event: ReactPointerEvent<HTMLDivElement>) {
     onPanelInteract(event);
+    // 阻止冒泡：左右手柄是轨道的子元素，若不 stopPropagation，事件会冒泡到轨道的
+    // onPointerDown(beginDrag('playhead'))，把拖拽状态覆盖成播放头、并在轨道重新捕获指针，
+    // 导致"拖手柄却只移动播放头、手柄不动"。stopPropagation 保证只有当前手柄的拖拽生效。
+    event.stopPropagation();
     dragStateRef.current = { pointerId: event.pointerId, handle };
     event.currentTarget.setPointerCapture(event.pointerId);
     updateFromPosition(event.clientX, handle);
@@ -6088,15 +4833,10 @@ function VideoToolbar({
 function PromptPanel({
   nodeId,
   prompt,
-  conditioningDebugText,
-  conditioningIntent,
-  capabilityPreviewText,
-  capabilityBoundaryMessage,
   capabilityBoundaryRecommendedModel,
   regionContractNotice,
   canSubmit,
   selectedModel,
-  routedModel,
   models,
   modelMenuOpen,
   ratioText,
@@ -6104,10 +4844,7 @@ function PromptPanel({
   selectedCount,
   estimatedCost,
   estimatedSeconds,
-  runtimeRecommendations,
   identityController,
-  backendRealApiEnabled,
-  backendHealthLoading,
   linkedAudioLabel,
   linkedAudioMode,
   promptAssistAction,
@@ -6152,15 +4889,10 @@ function PromptPanel({
 }: {
   nodeId: string;
   prompt: string;
-  conditioningDebugText: string;
-  conditioningIntent: string;
-  capabilityPreviewText: string;
-  capabilityBoundaryMessage: string;
   capabilityBoundaryRecommendedModel: string;
   regionContractNotice: string;
   canSubmit: boolean;
   selectedModel: VideoModelOption;
-  routedModel: VideoModelOption;
   models: VideoModelOption[];
   modelMenuOpen: boolean;
   ratioText: string;
@@ -6168,10 +4900,7 @@ function PromptPanel({
   selectedCount: number;
   estimatedCost: number;
   estimatedSeconds: number;
-  runtimeRecommendations?: ByokRuntimeResult['recommendations'] | null;
   identityController: IdentityControllerConfig;
-  backendRealApiEnabled: boolean | null;
-  backendHealthLoading: boolean;
   linkedAudioLabel: string;
   linkedAudioMode: string;
   promptAssistAction: PromptAssistAction | null;
@@ -6219,66 +4948,9 @@ function PromptPanel({
   const activeToolLabel = activeTool ? TOOL_LABELS[activeTool] : '未选择';
   const selectedModeBlueprint = VIDEO_MODE_BLUEPRINTS[selectedGenerationMode] || VIDEO_MODE_BLUEPRINTS.textToVideo;
   const providerText = selectedModel.providerLabel || selectedModel.provider;
-  const upstreamText = selectedModel.upstreamModel || selectedModel.id;
   const hasModeAssetActions = selectedGenerationMode !== 'textToVideo';
   const allowedQualityOptions = computeAllowedQualityOptions(selectedModel);
-  const videoRecommendationCards = useMemo(() => {
-    const generationSummary = runtimeRecommendations?.videoGeneration as ByokRuntimeRecommendationSummary | null | undefined;
-    const analysisSummary = runtimeRecommendations?.videoAnalysis as ByokRuntimeRecommendationSummary | null | undefined;
-    const generationTaskId = conditioningIntent === '保运镜换主体'
-      ? 'subjectReplaceKeepMotion'
-      : conditioningIntent === '主视频锁定 + 全能参考'
-        ? 'omniReferenceKeepMotion'
-        : conditioningIntent === '运镜与风格融合'
-          ? 'motionStyleBlend'
-          : conditioningIntent === '主体参考图生视频'
-            ? 'subjectReferenceImageToVideo'
-            : conditioningIntent === '全能参考视频生成'
-              ? 'omniReferenceVideoGeneration'
-              : 'referenceDrivenVideoGeneration';
-    const analysisTaskId = conditioningIntent === '保运镜换主体' || conditioningIntent === '运镜与风格融合'
-      ? 'shotBreakdown'
-      : conditioningIntent === '参考驱动视频生成'
-        ? 'promptInterrogation'
-        : 'semanticParse';
-    const runtimeCards = [
-      taskToRecommendationCard(findRecommendationTask(generationSummary, generationTaskId), {
-        purposeLabel: '生成',
-        purposeTone: 'recommended',
-      }) || summaryToRecommendationCard(generationSummary, {
-        purposeLabel: '生成',
-        purposeTone: 'recommended',
-      }),
-      taskToRecommendationCard(findRecommendationTask(analysisSummary, analysisTaskId), {
-        purposeLabel: '解析',
-        purposeTone: 'api',
-      }) || summaryToRecommendationCard(analysisSummary, {
-        purposeLabel: '解析',
-        purposeTone: 'api',
-      }),
-    ].filter((card): card is NonNullable<typeof card> => Boolean(card));
-    const activeProviderId = resolveProviderGuideId(selectedModel.provider)
-      || resolveProviderGuideId(selectedModel.providerLabel)
-      || resolveProviderGuideId(selectedModel.upstreamModel)
-      || resolveProviderGuideId(selectedModel.id);
-    if (!activeProviderId) return runtimeCards;
-
-    const fallbackCards = [
-      ...getDirectRecommendationCards(activeProviderId, 'video', isZh, 'video-node'),
-      ...getDirectRecommendationCards(activeProviderId, 'llm', isZh, 'video-analysis'),
-    ];
-    const merged = [...runtimeCards];
-    const seen = new Set(merged.map((card) => card.id));
-    for (const card of fallbackCards) {
-      if (seen.has(card.id)) continue;
-      seen.add(card.id);
-      merged.push(card);
-      if (merged.length >= 4) break;
-    }
-    return merged;
-  }, [conditioningIntent, isZh, runtimeRecommendations, selectedModel.id, selectedModel.provider, selectedModel.providerLabel, selectedModel.upstreamModel]);
   const videoModelSections = useMemo(() => {
-    const activatedItems = models.filter((model) => model.activated);
     const mapItem = (model: VideoModelOption) => ({
       id: model.id,
       title: model.name,
@@ -6289,28 +4961,18 @@ function PromptPanel({
       disabledReason: model.unsupportedReason || null,
       kind: 'video' as const,
       badges: [
-        model.activated ? { label: model.activationModelMatched === false ? '平台已激活' : '已验证此模型', tone: 'free' as const } : null,
-        videoModelActivationSourceLabel(model) ? { label: videoModelActivationSourceLabel(model) || '', tone: 'relay' as const } : null,
+        model.activated ? { label: '已激活', tone: 'free' as const } : null,
         model.discountLabel ? { label: model.discountLabel, tone: 'api' as const } : null,
       ].filter(Boolean),
       meta: [
         `耗时 ${model.latency || '未知'}`,
         `基准/视频 ${formatCurrency(model.cost, model.currency || 'CNY')}`,
-        model.activated && model.activationModelMatched === false && model.activationModel ? `当前激活 ${model.activationModel}` : '',
       ].filter(Boolean),
     });
     return [
       {
-        id: 'activated',
-        title: '已激活模型',
-        hint: '优先展示当前已通过 Comfly / Relay / 官方直连激活的视频模型。',
-        items: activatedItems.map(mapItem),
-        emptyMessage: '当前还没有已激活的视频模型。',
-      },
-      {
         id: 'all',
-        title: '更多模型',
-        hint: '后续新增全能参考、多模态视频生成或视频编辑模型时，这里会自动复用同一套弹层结构。',
+        title: '模型列表',
         items: models.map(mapItem),
       },
     ];
@@ -6427,16 +5089,12 @@ function PromptPanel({
             </div>
           ) : null}
         </div>
-        {capabilityBoundaryMessage ? (
+        {capabilityBoundaryRecommendedModel ? (
           <div
             data-testid={`video-model-capability-boundary-${nodeId}`}
             className="mx-4 mb-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs leading-6 text-amber-100"
           >
-            <div className="font-semibold text-amber-200">当前模型可被选中，但不满足这次任务需求</div>
-            <div className="mt-1">{capabilityBoundaryMessage}</div>
-            {capabilityBoundaryRecommendedModel ? (
-              <div className="mt-2 text-amber-300">推荐模型：{capabilityBoundaryRecommendedModel}</div>
-            ) : null}
+            <div className="text-amber-300">推荐模型：{capabilityBoundaryRecommendedModel}</div>
           </div>
         ) : null}
         {regionContractNotice ? (
@@ -6485,41 +5143,9 @@ function PromptPanel({
               <span className="rounded-full bg-black/20 px-1.5 py-0.5 text-[10px]">{referenceTotal}</span>
             </button>
             <span className="rounded-full bg-[#343434] px-3 py-1 text-[11px] text-[#d0d0d0]">平台 {providerText}</span>
-            <span className="rounded-full bg-[#343434] px-3 py-1 text-[11px] text-[#9adfd2]">上游 {upstreamText}</span>
-            <span
-              data-testid={`video-backend-route-status-${nodeId}`}
-              className={`rounded-full px-3 py-1 text-[11px] ${
-                backendHealthLoading && backendRealApiEnabled === null
-                  ? 'bg-[#343434] text-[#d0d0d0]'
-                  : backendRealApiEnabled
-                    ? 'bg-[#20342f] text-[#aaf2df]'
-                    : 'bg-amber-500/10 text-amber-300'
-              }`}
-            >
-              生成链路 {backendHealthLoading && backendRealApiEnabled === null ? '检查中' : backendRealApiEnabled ? '真实代理已就绪' : '本地兜底'}
-            </span>
             <span className={`rounded-full px-3 py-1 text-[11px] ${identityController.enabled ? 'bg-[#20342f] text-[#aaf2df]' : 'bg-[#343434] text-[#bdbdbd]'}`}>
               身份控制 {identityController.enabled ? (identityController.identityLockMode || 'reference') : '关闭'}
             </span>
-            <span
-              data-testid={`video-conditioning-debug-${nodeId}`}
-              className="rounded-full bg-[#1c2d2a] px-3 py-1 text-[11px] text-[#98ead7]"
-              title={conditioningDebugText}
-            >
-              {conditioningDebugText}
-            </span>
-            <span
-              data-testid={`video-capability-preview-${nodeId}`}
-              className="rounded-full bg-[#1d2330] px-3 py-1 text-[11px] text-[#c7d6ff]"
-              title={capabilityPreviewText}
-            >
-              {capabilityPreviewText}
-            </span>
-            {selectedModel.id !== routedModel.id ? (
-              <span className="rounded-full bg-amber-500/10 px-3 py-1 text-[11px] text-amber-300">
-                当前工作流首推 {routedModel.name}
-              </span>
-            ) : null}
             {linkedAudioLabel ? (
               <span className="rounded-full bg-[#22313f] px-3 py-1 text-[11px] text-[#cfe6ff]">
                 音频复用 {linkedAudioLabel}{linkedAudioMode ? ` · ${linkedAudioMode}` : ''}
@@ -6550,9 +5176,6 @@ function PromptPanel({
                 <input data-testid={`video-duration-${nodeId}`} type="number" min={1} max={30} value={selectedDuration} onChange={(event) => onParamsChange({ duration: Number(event.target.value) || 5 })} className="w-12 bg-transparent text-right outline-none" />
                 <span>s</span>
               </label>
-              <select data-testid={`video-motion-${nodeId}`} value={selectedMotionPreset} onChange={(event) => onToolConfigChange({ motionPreset: event.target.value })} className="rounded-md border border-[#444] bg-[#1f1f1f] px-2.5 py-1.5 text-xs text-[#e7e7e7] outline-none">
-                {VIDEO_MOTION_PRESETS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-              </select>
               <label className="flex items-center gap-2 rounded-md border border-[#434343] px-2.5 py-1.5 text-xs text-[#d7d7d7]">
                 <span>数量</span>
                 <select
@@ -6672,8 +5295,6 @@ function PromptPanel({
             <div className="absolute bottom-[52px] left-3">
               <NodeModelBrowser
                 title="视频节点模型池"
-                subtitle="共享模型弹层已接入视频节点，后续新增全能参考、多模态视频和视频编辑模型时，只需要改配置和 runtime 摘要。"
-                recommendations={videoRecommendationCards}
                 sections={videoModelSections}
                 onSelect={(item) => {
                   const model = models.find((entry) => entry.id === item.id);
@@ -6743,7 +5364,6 @@ function VideoModeControls({
           <div className="mt-1 text-xs leading-5 text-[#a9a9a9]">{blueprint.description}</div>
           <div className="mt-1 text-[11px] text-[#6fd8c4]">技术路径：{blueprint.technique}</div>
         </div>
-        <span className="rounded-full bg-[#323232] px-2.5 py-1 text-[11px] text-[#c9c9c9]">运动预设：{selectedMotionPreset}</span>
       </div>
 
       <div className="mt-3 grid gap-2 md:grid-cols-2">
@@ -6861,9 +5481,6 @@ function VideoToolControls({
           <input data-testid={`video-duration-${nodeId}`} type="number" min={1} max={30} value={selectedDuration} onChange={(event) => onParamsChange({ duration: Number(event.target.value) || 5 })} className="w-16 bg-transparent text-right outline-none" />
           <span>s</span>
         </label>
-        <select data-testid={`video-motion-${nodeId}`} value={selectedMotionPreset} onChange={(event) => onToolConfigChange({ motionPreset: event.target.value })} className="rounded-md border border-[#444] bg-[#1f1f1f] px-2 py-1 text-xs text-[#e7e7e7] outline-none">
-          {VIDEO_MOTION_PRESETS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-        </select>
       </div>
       <VideoModeControls nodeId={nodeId} mode={selectedGenerationMode} modeConfig={modeConfig} selectedMotionPreset={selectedMotionPreset} onParamsChange={onParamsChange} onModeUpload={onModeUpload} />
       <div className="grid gap-2 md:grid-cols-2">
@@ -7000,54 +5617,21 @@ function VideoToolFloatingPanel({
     () => findAnalysisEngineOption(semanticEngineOptions, String(config.semanticEngine || 'auto')),
     [config.semanticEngine, semanticEngineOptions],
   );
-  const videoAnalysisRecommendationCards = useMemo(() => {
-    const analysisSummary = byokRuntime?.recommendations?.videoAnalysis as ByokRuntimeRecommendationSummary | null | undefined;
-    const runtimeCards = [
-      taskToRecommendationCard(findRecommendationTask(analysisSummary, 'semanticParse'), {
-        purposeLabel: '语义解析',
-        purposeTone: 'recommended',
-      }) || summaryToRecommendationCard(analysisSummary, {
-        purposeLabel: '视频解析',
-        purposeTone: 'recommended',
-      }),
-      taskToRecommendationCard(findRecommendationTask(analysisSummary, 'promptInterrogation'), {
-        purposeLabel: '提示词反推',
-        purposeTone: 'api',
-      }),
-      taskToRecommendationCard(findRecommendationTask(analysisSummary, 'shotBreakdown'), {
-        purposeLabel: '分镜 / 运镜',
-        purposeTone: 'relay',
-      }),
-    ].filter((card): card is NonNullable<typeof card> => Boolean(card));
-
-    const activeProviderId = resolveProviderGuideId(byokRuntime?.selectedImageAnalysisRemote?.provider);
-    if (!activeProviderId) return runtimeCards;
-
-    const fallbackCards = [
-      ...getDirectRecommendationCards(activeProviderId, 'llm', isZh, 'video-analysis'),
-      ...getDirectRecommendationCards(activeProviderId, 'video', isZh, 'video-analysis'),
-    ];
-
-    if (runtimeCards.length >= 2) return runtimeCards;
-
-    const merged = [...runtimeCards];
-    const seen = new Set(runtimeCards.map((card) => card.id));
-    for (const card of fallbackCards) {
-      if (seen.has(card.id)) continue;
-      seen.add(card.id);
-      merged.push(card);
-      if (merged.length >= 3) break;
-    }
-    return merged;
-  }, [byokRuntime, isZh]);
-
   useEffect(() => {
     void fetchByokRuntime();
   }, [fetchByokRuntime]);
 
+  // 解析面板采用与图片节点一致的交互：点击解析按钮后，面板并排出现在视频节点右侧，
+  // 而非在节点下方展开，避免拥挤/遮挡。其余工具仍保持在节点下方展开。
+  const isParseTool = activeTool === 'parse';
+
   return (
     <div
-      className="absolute left-1/2 top-full z-30 mt-4 w-[min(96vw,860px)] -translate-x-1/2"
+      className={
+        isParseTool
+          ? 'absolute left-full top-0 z-30 ml-3 w-[min(90vw,360px)]'
+          : 'absolute left-1/2 top-full z-30 mt-4 w-[min(96vw,860px)] -translate-x-1/2'
+      }
       {...panelInteractionProps}
       onPointerDown={panelInteractionProps.onPointerDown || onPanelInteract}
       onMouseDown={panelInteractionProps.onMouseDown || onPanelInteract}
@@ -7057,7 +5641,7 @@ function VideoToolFloatingPanel({
       <div
         data-testid={`video-tool-panel-${nodeId}`}
         className="nodrag nopan nowheel max-h-[72vh] w-full overflow-y-auto rounded-2xl border border-[#424242] bg-[#202020]/96 p-4 shadow-2xl backdrop-blur"
-        style={{ transform: `scale(${viewportScale})`, transformOrigin: 'top center' }}
+        style={{ transform: `scale(${viewportScale})`, transformOrigin: isParseTool ? 'top left' : 'top center' }}
       >
         <div className="mb-3 flex flex-col gap-3">
         <div>
@@ -7128,20 +5712,19 @@ function VideoToolFloatingPanel({
             <RangeNumber label="抽样 FPS" testId={`video-parse-fps-panel-${nodeId}`} value={Number(config.sampleFps ?? 2)} min={1} max={10} step={1} onChange={(value) => onToolConfigChange({ tool: 'parse', sampleFps: value })} />
             <label className="grid gap-1">
               <ToolModelLabel label="镜头切分引擎" help={selectedSceneEngineHelp} />
-              <select data-testid={`video-parse-scene-engine-panel-${nodeId}`} value={String(config.sceneEngine || 'auto')} title={`${selectedSceneEngineHelp.label}：${selectedSceneEngineHelp.role} 优势：${selectedSceneEngineHelp.advantage}`} onChange={(event) => onToolConfigChange({ tool: 'parse', sceneEngine: event.target.value })} className="rounded-md border border-[#444] bg-[#1a1a1a] px-2 py-1 outline-none">
-                <option value="auto">自动</option>
-                <option value="scenedetect">PySceneDetect</option>
-                <option value="transnetv2">TransNetV2（已安装时）</option>
+              <select data-testid={`video-parse-scene-engine-panel-${nodeId}`} value={String(config.sceneEngine || 'auto')} title={`${selectedSceneEngineHelp.label}：${selectedSceneEngineHelp.role}`} onChange={(event) => onToolConfigChange({ tool: 'parse', sceneEngine: event.target.value })} className="rounded-md border border-[#444] bg-[#1a1a1a] px-2 py-1 outline-none">
+                <option value="auto" title="根据本机能力自动选择镜头切分方案。">自动</option>
+                <option value="scenedetect" title={`${PARSE_SCENE_ENGINE_HELP.scenedetect.role}`}>PySceneDetect</option>
+                <option value="transnetv2" title={`${PARSE_SCENE_ENGINE_HELP.transnetv2.role}`}>TransNetV2（已安装时）</option>
               </select>
-              <ToolModelHint help={selectedSceneEngineHelp} testId={`video-parse-scene-help-${nodeId}`} />
             </label>
             <label className="grid gap-1">
-              <ToolModelLabel label="语义解析引擎" help={selectedSemanticEngineHelp} />
-              <select data-testid={`video-parse-semantic-engine-panel-${nodeId}`} value={String(config.semanticEngine || 'auto')} title={`${selectedSemanticEngineHelp.label}：${selectedSemanticEngineHelp.role} 优势：${selectedSemanticEngineHelp.advantage}`} onChange={(event) => onToolConfigChange({ tool: 'parse', semanticEngine: event.target.value })} className="rounded-md border border-[#444] bg-[#1a1a1a] px-2 py-1 outline-none">
+              <ToolModelLabel label="视频分析模型" help={selectedSemanticEngineHelp} />
+              <select data-testid={`video-parse-semantic-engine-panel-${nodeId}`} value={String(config.semanticEngine || 'auto')} title={`${selectedSemanticEngineOption.label}：${selectedSemanticEngineOption.hint}`} onChange={(event) => onToolConfigChange({ tool: 'parse', semanticEngine: event.target.value })} className="rounded-md border border-[#444] bg-[#1a1a1a] px-2 py-1 outline-none">
                 {semanticEngineGroups.map((group) => (
                   <optgroup key={group.key} label={group.label}>
                     {group.options.map((option) => (
-                      <option key={option.value} value={option.value}>{option.label}</option>
+                      <option key={option.value} value={option.value} title={option.hint}>{option.label}</option>
                     ))}
                   </optgroup>
                 ))}
@@ -7157,17 +5740,7 @@ function VideoToolFloatingPanel({
                   <SourceBadge label="待激活" tone="neutral" />
                 ) : null}
               </div>
-              <ToolModelHint help={selectedSemanticEngineHelp} testId={`video-parse-semantic-help-${nodeId}`} />
             </label>
-          </div>
-          <RecommendationCardsPanel
-            testId={`video-parse-recommendations-${nodeId}`}
-            title="推荐解析链路"
-            subtitle="视频解析与提示词反推会直接消费当前运行时的首推 / 备选 / 任务标签。"
-            cards={videoAnalysisRecommendationCards}
-          />
-          <div className="rounded-lg border border-[#3d3d3d] bg-[#181818] px-3 py-2 text-[#a9a9a9]">
-            当前默认走免费本地链路：PySceneDetect + 轻量语义。若已激活云端多模态，会优先借助聚合平台视觉模型补强关键帧语义；若后续安装 CLIP Interrogator、InternVideo 或 Video-LLaVA，也会自动切到更强解析。
           </div>
           </div>
         ) : null}
@@ -7283,9 +5856,11 @@ function VideoToolPreviewOverlay({
 
   return (
     <div className={`absolute inset-0 z-20 ${cropEditing || subtitleEditing ? 'pointer-events-auto' : 'pointer-events-none'}`}>
-      <div className="absolute left-3 top-3 rounded-full bg-black/70 px-3 py-1 text-[11px] font-semibold text-[#9ee6d9] ring-1 ring-white/10">
-        {label}已激活
-      </div>
+      {activeTool !== 'parse' ? (
+        <div className="absolute left-3 top-3 rounded-full bg-black/70 px-3 py-1 text-[11px] font-semibold text-[#9ee6d9] ring-1 ring-white/10">
+          {label}已激活
+        </div>
+      ) : null}
       {activeTool === 'crop' ? (
         cropEditing ? (
           <VideoCropInteractiveOverlay

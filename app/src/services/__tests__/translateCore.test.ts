@@ -10,7 +10,7 @@
  *   ✅ max_new_tokens 随输入长度自适应，且恒定落在 [40, 256] 区间
  *   ✅ 短文本使用下限 40（避免过度解码）
  *   ✅ 传入正确的 src_lang / tgt_lang（zh↔en 双向）
- *   ✅ createTranslator 启用多线程 wasm（numThreads = min(4, 硬件并发)）以加速解码
+ *   ✅ createTranslator 强制单线程 wasm（numThreads = 1，规避 Vite 拦截 jsep/jspi 子 Worker）
  *   ✅ chunkText 长文本分块（≤400 字符/段），降低单次推理长度
  */
 
@@ -129,7 +129,7 @@ describe('问题3：翻译性能 — translateWith 解码上限', () => {
 });
 
 describe('问题3：翻译性能 — createTranslator 多线程 wasm', () => {
-  it('启用多线程 wasm，numThreads = min(4, 硬件并发)（加速解码）', async () => {
+  it('强制单线程 wasm（numThreads = 1，规避 Vite 拦截 jsep/jspi 子 Worker）', async () => {
     Object.defineProperty(navigator, 'hardwareConcurrency', {
       value: 16,
       configurable: true,
@@ -142,8 +142,9 @@ describe('问题3：翻译性能 — createTranslator 多线程 wasm', () => {
     const wasm = transformersLib.env?.backends?.onnx?.wasm;
     expect(wasm).toBeDefined();
     expect(typeof wasm.numThreads).toBe('number');
-    // 16 核 → 上限封顶为 4
-    expect(wasm.numThreads).toBe(4);
+    // translateCore 强制 numThreads=1：NLLB 串行解码多线程收益有限，
+    // 且 numThreads>1 会派生 PThread 子 Worker 被 Vite 拦截报错。
+    expect(wasm.numThreads).toBe(1);
     expect(wasm.numThreads).toBeGreaterThanOrEqual(1);
   });
 

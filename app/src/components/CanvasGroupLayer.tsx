@@ -19,6 +19,7 @@ const NODE_SIZE: Record<NodeType, { width: number; height: number }> = {
   script: { width: 420, height: 260 },
   dcc: { width: 535, height: 380 },
   region: { width: 560, height: 460 },
+  comfyui: { width: 420, height: 260 },
 };
 
 function nodeSize(node: CanvasNode) {
@@ -56,6 +57,8 @@ export function getGroupBounds(group: NodeGroup, nodes: CanvasNode[]) {
 interface CanvasGroupLayerProps {
   autoEditGroupId?: string | null;
   onAutoEditHandled?: (groupId: string) => void;
+  /** 节点正在拖动时为 true：拖拽期间被拖节点位置尚未写回 store，重算分组包围盒无意义且浪费，故跳过。 */
+  isDragging?: boolean;
 }
 
 interface DragState {
@@ -71,7 +74,7 @@ interface DragOffset {
   y: number;
 }
 
-export function CanvasGroupLayer({ autoEditGroupId = null, onAutoEditHandled }: CanvasGroupLayerProps) {
+export function CanvasGroupLayer({ autoEditGroupId = null, onAutoEditHandled, isDragging = false }: CanvasGroupLayerProps) {
   const canvas = useCanvasStore((state) => state.canvas);
   const groups = useCanvasStore((state) => state.groups);
   const selectedNodeIds = useCanvasStore((state) => state.selectedNodeIds);
@@ -93,11 +96,20 @@ export function CanvasGroupLayer({ autoEditGroupId = null, onAutoEditHandled }: 
   const pendingOffsetRef = useRef<DragOffset | null>(null);
   const previewFrameRef = useRef<number | null>(null);
 
+  // 计算每个分组的实际成员（按当前画布节点过滤，剔除 phantom ID），
+  // 并把「真实成员数」带回 items，chip 直接使用 memberCount 显示，保证与主画布节点数严格同步。
   const items = useMemo(() => {
     const nodes = canvas?.nodes || [];
+    const nodeIdSet = new Set(nodes.map((node) => node.id));
     return groups
-      .map((group) => ({ group, bounds: getGroupBounds(group, nodes) }))
-      .filter((item): item is { group: NodeGroup; bounds: NonNullable<ReturnType<typeof getGroupBounds>> } => Boolean(item.bounds));
+      .map((group) => {
+        const memberIds = group.nodeIds.filter((id) => nodeIdSet.has(id));
+        if (memberIds.length === 0) return null;
+        const bounds = getGroupBounds(group, nodes);
+        if (!bounds) return null;
+        return { group, bounds, memberCount: memberIds.length };
+      })
+      .filter((item): item is { group: NodeGroup; bounds: NonNullable<ReturnType<typeof getGroupBounds>>; memberCount: number } => item !== null);
   }, [canvas?.nodes, groups]);
 
   useEffect(() => {
@@ -234,9 +246,13 @@ export function CanvasGroupLayer({ autoEditGroupId = null, onAutoEditHandled }: 
     setEditingGroupId(null);
   }
 
+  // 节点拖动期间：被拖节点位置尚未写回 store，分组包围盒无法跟随，重算无意义；
+  // 且能顺带避免分组层在拖拽起止时的额外 DOM 协调。纯点击（isDragging=false）不受影响。
+  if (isDragging) return null;
+
   return (
     <ViewportPortal>
-      {items.map(({ group, bounds }) => {
+      {items.map(({ group, bounds, memberCount }) => {
         const selectedInGroup = selectedNodeIds.some((id) => group.nodeIds.includes(id));
         const isDragging = draggingGroupId === group.id;
         const dragCursor = isDragging ? 'cursor-grabbing' : 'cursor-grab';
@@ -326,7 +342,15 @@ export function CanvasGroupLayer({ autoEditGroupId = null, onAutoEditHandled }: 
                   {group.name}
                 </button>
               )}
-              <span className="rounded-full bg-white/10 px-1.5 py-0.5 text-[10px] text-[#b8c0cc]">{group.nodeIds.length}</span>
+              <span
+                className="rounded-full bg-white/10 px-1.5 py-0.5 text-[10px] text-[#b8c0cc]"
+                data-testid={`canvas-group-count-${group.id}`}
+                title={group.nodeIds.length !== memberCount
+                  ? `${memberCount} 个有效节点（已过滤 ${group.nodeIds.length - memberCount} 个失效 ID）`
+                  : `${memberCount} 个节点`}
+              >
+                {memberCount}
+              </span>
               <button
                 type="button"
                 onPointerDown={(event) => event.stopPropagation()}

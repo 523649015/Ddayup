@@ -1,5 +1,14 @@
 import { z } from 'zod';
 
+/**
+ * 统一邮箱归一化：去空格 + 转小写。
+ * 避免 `User@x.com` 与 `user@x.com` 被后端判为不同账号（前后端大小写歧义）。
+ * 与项目内普遍使用的 `.trim().toLowerCase()` 模式保持一致。
+ */
+export function normalizeEmail(value: string): string {
+  return String(value ?? '').trim().toLowerCase();
+}
+
 const passwordSchema = z
   .string()
   .min(8, '密码至少 8 个字符')

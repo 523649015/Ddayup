@@ -40,6 +40,8 @@ export interface DonationState {
   updateStatus: (suggestionId: string, status: Suggestion['status']) => void;
   toggleDonationPanel: () => void;
   toggleWorldChannel: () => void;
+  setShowDonationPanel: (v: boolean) => void;
+  setShowWorldChannel: (v: boolean) => void;
   setSortBy: (sort: 'likes' | 'newest' | 'highest-donation') => void;
   setFilterTag: (tag: string | null) => void;
 
@@ -145,6 +147,14 @@ export const useDonationStore = create<DonationState>()(
 
     toggleWorldChannel: () => {
       set((state) => { state.showWorldChannel = !state.showWorldChannel; });
+    },
+
+    setShowDonationPanel: (v) => {
+      set((state) => { state.showDonationPanel = v; });
+    },
+
+    setShowWorldChannel: (v) => {
+      set((state) => { state.showWorldChannel = v; });
     },
 
     setSortBy: (sort) => {

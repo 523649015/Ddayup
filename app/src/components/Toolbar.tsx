@@ -1,5 +1,6 @@
 import { useCanvasStore } from '@/store/useCanvasStore';
 import { useDonationStore } from '@/store/useDonationStore';
+import { useCobuildStore } from '@/store/useCobuildStore';
 import {
   Scissors, Camera, FileSearch, AudioLines, Wand2, Download,
   Settings, Bot, Undo2, Redo2, Sun, Moon, Heart, Globe, Loader2, Menu,
@@ -8,6 +9,7 @@ import { useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { extractAudioFromVideo, repairVideo, checkFFmpegSupport } from '@/services/ffmpegPipeline';
 import { useUILanguage } from '@/i18n/ui';
+import { ImportWorkflowModal } from '@/components/ImportWorkflowModal';
 
 interface ToolbarProps {
   isMobile?: boolean;
@@ -23,16 +25,17 @@ export function Toolbar({ isMobile = false, onMobileMenuToggle }: ToolbarProps) 
   const toggleDarkMode = useCanvasStore((s) => s.toggleDarkMode);
   const darkMode = useCanvasStore((s) => s.darkMode);
   const exportCanvas = useCanvasStore((s) => s.exportCanvas);
-  const importCanvas = useCanvasStore((s) => s.importCanvas);
+  const openImportWorkflow = useCanvasStore((s) => s.openImportWorkflow);
   const selectedNodeIds = useCanvasStore((s) => s.selectedNodeIds);
   const removeNodes = useCanvasStore((s) => s.removeNodes);
   const addNode = useCanvasStore((s) => s.addNode);
   const updateNodeData = useCanvasStore((s) => s.updateNodeData);
   const { language, setLanguage, t } = useUILanguage();
-  const { toggleDonationPanel, toggleWorldChannel, showWorldChannel, suggestions } = useDonationStore();
+  const { toggleDonationPanel, toggleWorldChannel, showWorldChannel } = useDonationStore();
+  const cobuildEntries = useCobuildStore((s) => s.entries);
   const languageToggleTitle = language === 'zh' ? '切换到英文' : 'Switch to Chinese';
 
-  const totalDonations = suggestions.reduce((sum, s) => sum + s.donation, 0);
+  const totalDonations = cobuildEntries.reduce((sum, s) => sum + (s.donation || 0), 0);
 
   const handleExport = () => {
     const json = exportCanvas();
@@ -43,24 +46,6 @@ export function Toolbar({ isMobile = false, onMobileMenuToggle }: ToolbarProps) 
     a.download = `${canvas?.title || 'canvas'}.json`;
     a.click();
     URL.revokeObjectURL(url);
-  };
-
-  const handleImport = () => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.json';
-    input.onchange = (e) => {
-      const file = (e.target as HTMLInputElement).files?.[0];
-      if (!file) return;
-      const reader = new FileReader();
-      reader.onload = () => {
-        if (typeof reader.result === 'string') {
-          importCanvas(reader.result);
-        }
-      };
-      reader.readAsText(file);
-    };
-    input.click();
   };
 
   const handleDeleteSelected = () => {
@@ -205,7 +190,7 @@ export function Toolbar({ isMobile = false, onMobileMenuToggle }: ToolbarProps) 
   const tools = [
     { icon: Scissors, label: t('删除选中', 'Delete'), action: handleDeleteSelected, loading: false },
     { icon: Camera, label: t('导出 JSON', 'Export JSON'), action: handleExport, loading: false },
-    { icon: FileSearch, label: t('导入 JSON', 'Import JSON'), action: handleImport, loading: false },
+    { icon: FileSearch, label: t('导入工作流', 'Import Workflow'), action: openImportWorkflow, loading: false },
     { icon: audioSplitLoading ? Loader2 : AudioLines, label: t('音频分离', 'Audio Split'), action: handleAudioSplit, loading: audioSplitLoading },
     { icon: videoFixLoading ? Loader2 : Wand2, label: t('视频修复', 'Video Repair'), action: handleVideoFix, loading: videoFixLoading },
     { icon: Download, label: t('下载', 'Download'), action: handleExport, loading: false },
@@ -303,7 +288,7 @@ export function Toolbar({ isMobile = false, onMobileMenuToggle }: ToolbarProps) 
           title={t('需求共建', 'Community Backlog')}
         >
           <Heart className="w-3.5 h-3.5" />
-          <span className="hidden lg:inline">{t('打赏', 'Support')}</span>
+          <span className="hidden lg:inline">{t('需求共建', 'Co-build')}</span>
           {totalDonations > 0 && (
             <span className="text-[#fbbf24] text-[10px]">¥{totalDonations}</span>
           )}
@@ -333,6 +318,7 @@ export function Toolbar({ isMobile = false, onMobileMenuToggle }: ToolbarProps) 
           <span className="hidden xl:inline">{t('加入 Agent', 'Join Agent')}</span>
         </button>
       </div>
+      <ImportWorkflowModal />
     </div>
   );
 }

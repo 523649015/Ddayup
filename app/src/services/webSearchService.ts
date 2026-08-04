@@ -10,6 +10,7 @@ import type {
   SearchPlatform,
   SearchFilters,
   SearchPlatformMeta,
+  AssetItemType,
 } from '@/types/assets';
 
 /* ===== Interface ===== */
@@ -523,7 +524,7 @@ export async function prepareImport(
   url: string;
   thumbnail: string;
   name: string;
-  type: 'image' | 'video';
+  type: AssetItemType;
   source: 'web';
   width?: number;
   height?: number;

@@ -83,16 +83,22 @@ export class StorageError extends Error {
 }
 
 // ===== 数据库单例 =====
+// 注意：挂到 globalThis，避免 storage 模块被 Vite 多实例化为多份时，
+// 各副本持有独立 dbInstance 导致「A 写入 / B 读取」互相不可见（如 Depth V3 缓存读不到 → model-not-cached）。
 
-let dbInstance: IDBDatabase | null = null;
-let dbInitPromise: Promise<IDBDatabase> | null = null;
+const _g = globalThis as unknown as { __hmdaoDBInstance?: IDBDatabase | null; __hmdaoDBInit?: Promise<IDBDatabase> | null };
+let dbInstance: IDBDatabase | null = _g.__hmdaoDBInstance ?? null;
+let dbInitPromise: Promise<IDBDatabase> | null = _g.__hmdaoDBInit ?? null;
 
 /** 获取数据库实例（懒初始化） */
 function getDB(): Promise<IDBDatabase> {
+  // 多实例场景下，从 globalThis 恢复共享连接（避免 A 写入 / B 读取互相不可见）
+  if (_g.__hmdaoDBInstance) { dbInstance = _g.__hmdaoDBInstance; return Promise.resolve(dbInstance); }
+  if (_g.__hmdaoDBInit) { dbInitPromise = _g.__hmdaoDBInit; return dbInitPromise; }
   if (dbInstance) return Promise.resolve(dbInstance);
   if (dbInitPromise) return dbInitPromise;
 
-  dbInitPromise = new Promise<IDBDatabase>((resolve, reject) => {
+  dbInitPromise = _g.__hmdaoDBInit = new Promise<IDBDatabase>((resolve, reject) => {
     if (!window.indexedDB) {
       reject(new StorageError('IndexedDB 不可用', 'db_unavailable'));
       return;
@@ -145,12 +151,15 @@ function getDB(): Promise<IDBDatabase> {
 
     request.onsuccess = (event) => {
       dbInstance = (event.target as IDBOpenDBRequest).result;
+      _g.__hmdaoDBInstance = dbInstance;
 
       // 监听数据库意外关闭
       dbInstance.onclose = () => {
         console.warn('[HMDao Storage] 数据库意外关闭');
         dbInstance = null;
         dbInitPromise = null;
+        _g.__hmdaoDBInstance = null;
+        _g.__hmdaoDBInit = null;
       };
 
       // 写入 schema 版本
@@ -164,6 +173,7 @@ function getDB(): Promise<IDBDatabase> {
       const error = (event.target as IDBOpenDBRequest).error;
       console.error('[HMDao Storage] 数据库打开失败:', error);
       dbInitPromise = null;
+      _g.__hmdaoDBInit = null;
       reject(new StorageError(`数据库打开失败: ${error?.message}`, 'db_unavailable'));
     };
 
@@ -393,6 +403,21 @@ export async function getCachedModel(modelId: string, version: string): Promise<
   }
 }
 
+/** 删除指定缓存的模型（卸载时使用） */
+export async function deleteCachedModel(modelId: string, version: string): Promise<void> {
+  try {
+    await rwTransaction('modelCache', 'readwrite', (store) => store.delete([modelId, version]));
+  } catch {
+    /* 忽略删除失败 */
+  }
+  // 同时清理可能关联的外部权重（如 V3 的 model.onnx_data）
+  try {
+    await rwTransaction('modelCache', 'readwrite', (store) => store.delete([modelId, `${version}#model.onnx_data`]));
+  } catch {
+    /* 忽略 */
+  }
+}
+
 /** 枚举已缓存的模型（用于刷新/重登后真实判定「已安装」状态） */
 export async function listModelCache(): Promise<
   Array<{ modelId: string; version: string; size: number; cachedAt: number }>
@@ -533,9 +558,11 @@ export async function pruneOpLogs(options: { maxEntries?: number; maxAgeDays?: n
 export function closeDB(): void {
   if (dbInstance) {
     dbInstance.close();
-    dbInstance = null;
-    dbInitPromise = null;
   }
+  dbInstance = null;
+  dbInitPromise = null;
+  _g.__hmdaoDBInstance = null;
+  _g.__hmdaoDBInit = null;
 }
 
 /** 检查 IndexedDB 是否可用 */

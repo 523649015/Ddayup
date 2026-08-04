@@ -25,7 +25,7 @@ describe('LightingCapabilityPanel 配置闭环', () => {
   it('渲染关键控件', () => {
     render(<LightingCapabilityPanel tool="lighting" value={{}} onChange={vi.fn()} />);
     expect(screen.getByTestId('lighting-preset-rembrandt')).toBeTruthy();
-    expect(screen.getByTestId('lighting-direction-pad')).toBeTruthy();
+    // 光位控制现为 InteractiveImageStage 拖拽区（无独立 testid），方位角滑杆可验证其存在
     expect(screen.getByTestId('lighting-azimuth-slider')).toBeTruthy();
     expect(screen.getByTestId('lighting-hdri-toggle')).toBeTruthy();
   });

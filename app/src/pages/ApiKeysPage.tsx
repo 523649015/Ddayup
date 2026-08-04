@@ -33,95 +33,20 @@ import {
   type RelayPreset,
 } from '@/config/providerGuides';
 import { useUILanguage } from '@/i18n/ui';
-import { useApiKeyStore, resolveProviderKeyStatus } from '@/store/useApiKeyStore';
+import { isUnusableProviderKeyStatus, useApiKeyStore, resolveProviderKeyStatus } from '@/store/useApiKeyStore';
 import { setVisionActivationFlag } from '@/services/visionActivation';
 import { useBackendHealthStore } from '@/store/useBackendHealthStore';
 import { useByokRuntimeStore } from '@/store/useByokRuntimeStore';
 import { useModelCatalogStore } from '@/store/useModelCatalogStore';
 import { getDirectRecommendationCards } from '@/utils/directProviderRecommendationCards';
+import { resolveHostedModelOrigin, summarizeHostedModels } from '@/utils/hostedModelOrigin';
 import { findRecommendationTask, summaryToRecommendationCard, taskToRecommendationCard } from '@/utils/runtimeRecommendationCards';
+import { sanitizeRelayPresetId, canonicalizeRelayBaseUrl, buildCustomRelayPreset, readCustomRelayPresets, writeCustomRelayPresets } from '@/services/relayPresets';
+import { FreeQuotaRoutePanel } from '@/components/apiKeys/FreeQuotaRoutePanel';
 
 type Mode = 'llm' | 'image' | 'video' | 'audio';
 type DiscoveryModeFilter = 'all' | Mode;
-const CUSTOM_RELAY_PRESETS_STORAGE_KEY = 'hmdao-custom-relay-presets-v1';
 
-function sanitizeRelayPresetId(value: string) {
-  return String(value || '')
-    .trim()
-    .toLowerCase()
-    .replace(/^https?:\/\//, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 48) || `relay-${Date.now()}`;
-}
-
-function canonicalizeRelayBaseUrl(baseUrl: string) {
-  const raw = String(baseUrl || '').trim();
-  if (!raw) return '';
-  const normalizedInput = raw.replace(/\/+$/, '');
-  if (!/^https?:\/\//i.test(normalizedInput)) return normalizedInput;
-  try {
-    const parsed = new URL(normalizedInput);
-    const hostname = parsed.hostname.replace(/^www\./i, '').toLowerCase();
-    if (hostname === 'apimart.ai' || hostname === 'api.apimart.ai') {
-      return 'https://api.apimart.ai/v1';
-    }
-    const pathname = parsed.pathname === '/' ? '' : parsed.pathname.replace(/\/+$/, '');
-    return `${parsed.protocol}//${parsed.host}${pathname}`;
-  } catch {
-    return normalizedInput;
-  }
-}
-
-function buildCustomRelayPreset(baseUrl: string): RelayPreset {
-  const normalizedBaseUrl = canonicalizeRelayBaseUrl(baseUrl);
-  let hostLabel = normalizedBaseUrl;
-  try {
-    hostLabel = new URL(normalizedBaseUrl).hostname.replace(/^www\./i, '') || normalizedBaseUrl;
-  } catch {
-    hostLabel = normalizedBaseUrl.replace(/^https?:\/\//i, '');
-  }
-  const safeId = sanitizeRelayPresetId(hostLabel);
-  return {
-    id: `custom-${safeId}`,
-    nameZh: `${hostLabel} 自定义中转`,
-    nameEn: `${hostLabel} Custom Relay`,
-    docsUrl: normalizedBaseUrl,
-    consoleUrl: normalizedBaseUrl,
-    baseUrlExample: normalizedBaseUrl,
-    descriptionZh: '本地保存的自定义中转平台，便于下次继续使用，无需重复输入 Base URL。',
-    descriptionEn: 'A locally saved custom relay so you can reuse the Base URL without entering it again.',
-    endpointHintZh: '填写该平台控制台给出的 OpenAI 兼容 Base URL，通常以 /v1 结尾。',
-    endpointHintEn: 'Use the OpenAI-compatible Base URL shown in the platform console, usually ending with /v1.',
-    recommendedProviders: [],
-    recommendedModels: {},
-  };
-}
-
-function readCustomRelayPresets(): RelayPreset[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = window.localStorage.getItem(CUSTOM_RELAY_PRESETS_STORAGE_KEY);
-    const parsed = JSON.parse(String(raw || '[]'));
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((item) => item && typeof item === 'object' && String(item.baseUrlExample || '').trim())
-      .map((item) => buildCustomRelayPreset(canonicalizeRelayBaseUrl(String(item.baseUrlExample || '').trim())));
-  } catch {
-    return [];
-  }
-}
-
-function writeCustomRelayPresets(presets: RelayPreset[]) {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(CUSTOM_RELAY_PRESETS_STORAGE_KEY, JSON.stringify(
-      presets.map((item) => ({ id: item.id, baseUrlExample: item.baseUrlExample })),
-    ));
-  } catch {
-    // Ignore localStorage write failures and continue with runtime state.
-  }
-}
 
 interface SpotlightModel {
   key: string;
@@ -216,6 +141,25 @@ function formatModeLabel(mode: Mode, label: (zh: string, en: string) => string) 
   if (mode === 'video') return label('视频', 'Video');
   if (mode === 'audio') return label('音频', 'Audio');
   return label('文本', 'Text');
+}
+
+// 任务 AM：provider key 状态徽章映射。invalid（后端校验失败，任务 AD/F）显式展示为
+// 「已失效」+ danger 红色调，与 active/expiring/expired 区分，提示用户需重新验证；
+// 单一映射避免状态文案散落在多处渲染逻辑（复用 SourceBadge 既有 tone 契约）。
+function providerKeyStatusBadge(
+  status: string | undefined,
+  label: (zh: string, en: string) => string,
+): { text: string; tone: 'recommended' | 'api' | 'neutral' | 'danger' } {
+  switch (status) {
+    case 'active':
+      return { text: label('已激活', 'Active'), tone: 'recommended' };
+    case 'expiring':
+      return { text: label('即将过期', 'Expiring'), tone: 'api' };
+    case 'invalid':
+      return { text: label('已失效', 'Invalid'), tone: 'danger' };
+    default:
+      return { text: label('已过期', 'Expired'), tone: 'neutral' };
+  }
 }
 
 function normalizeIdentifier(value: string | null | undefined) {
@@ -420,6 +364,20 @@ function catalogSourceBadge(model: CatalogModel) {
   return <SourceBadge label={label} tone="relay" />;
 }
 
+/**
+ * 借道模型徽标：把「这条模型其实是别家厂商的，只是挂在当前聚合平台下」直观标出来。
+ * 纯展示，不影响激活判定（激活仍由后端 provider 匹配决定）。
+ */
+function hostedOriginBadge(model: CatalogModel, isZh: boolean) {
+  const origin = resolveHostedModelOrigin(model);
+  if (!origin.hosted) return null;
+  return (
+    <span title={isZh ? origin.noticeZh : origin.noticeEn} className="inline-flex">
+      <SourceBadge label={isZh ? origin.badgeZh : origin.badgeEn} tone="local" />
+    </span>
+  );
+}
+
 function looksBrokenText(value: string | null | undefined) {
   const text = String(value || '').trim();
   if (!text) return false;
@@ -485,6 +443,8 @@ export default function ApiKeysPage() {
   const [mode, setMode] = useState<Mode>('image');
   const [officialModel, setOfficialModel] = useState('');
   const [officialApiKey, setOfficialApiKey] = useState('');
+  const [officialAccessKeyId, setOfficialAccessKeyId] = useState('');
+  const [officialSecretKey, setOfficialSecretKey] = useState('');
   const [officialCustomModelEnabled, setOfficialCustomModelEnabled] = useState(false);
   const [officialCustomEndpointEnabled, setOfficialCustomEndpointEnabled] = useState(false);
   const [officialEndpoint, setOfficialEndpoint] = useState('');
@@ -558,6 +518,15 @@ export default function ApiKeysPage() {
     void fetchRuntime({ force: true });
     void fetchBackendHealth({ force: true });
   }, [fetchBackendHealth, fetchCatalog, fetchRuntime]);
+
+  // 关键修复：后端已持久化的激活平台，在 runtime 变化时同步进本地 keys（metadata-only），
+  // 使刷新/重登后激活态由服务端真值驱动，不再提示「重新执行验证激活」。
+  useEffect(() => {
+    const records = runtime?.activatedProviders;
+    if (Array.isArray(records)) {
+      useApiKeyStore.getState().syncFromRuntime(records);
+    }
+  }, [runtime]);
 
   const providerOptions = useMemo(
     () => providers.map((item) => ({
@@ -637,6 +606,12 @@ export default function ApiKeysPage() {
     [activatedCanvasModels],
   );
 
+  // 借道模型统计：纯展示派生，不参与激活判定
+  const hostedModelSummary = useMemo(
+    () => summarizeHostedModels(activatedCanvasModels),
+    [activatedCanvasModels],
+  );
+
   const activatedPlatformCards = useMemo(() => {
     const platformMap = new Map<string, {
       providerId: string;
@@ -704,7 +679,8 @@ export default function ApiKeysPage() {
   // 哪些 provider 有激活 key（官方直连）和哪些聚合平台有激活记录
   const activatedProviderIds = useMemo(() => {
     const ids = new Set<string>();
-    for (const key of keyList) { if (resolveProviderKeyStatus(key.expiresAt) === 'active') ids.add(key.provider); }
+    // 任务 AM：invalid（后端校验失败，任务 AD/F）不计入已激活 provider，否则已失效 key 仍让平台显示「已激活」徽章。
+    for (const key of keyList) { if (resolveProviderKeyStatus(key.expiresAt) === 'active' && !isUnusableProviderKeyStatus(key.status)) ids.add(key.provider); }
     for (const record of (runtime?.activatedProviders || [])) { ids.add(String(record.provider || '').trim()); }
     return ids;
   }, [keyList, runtime?.activatedProviders]);
@@ -1015,19 +991,31 @@ export default function ApiKeysPage() {
         mode,
         officialCustomEndpointEnabled ? normalizedOfficialEndpoint || undefined : undefined,
         resolvedOfficialModel || undefined,
+        selectedProvider === 'volcengine' ? officialAccessKeyId.trim() : undefined,
+        selectedProvider === 'volcengine' ? officialSecretKey.trim() : undefined,
       );
       if (!result.success) {
         setError(firstCleanText(result.error?.message, result.message) || ui('官方直连激活失败。', 'Official activation failed.'));
         return;
       }
-      await setKey({
-        provider: selectedProvider,
-        apiKey: officialApiKey.trim(),
-        maskedKey: result.maskedKey,
-        mode,
-        model: resolvedOfficialModel || result.model || undefined,
-        endpoint: result.endpoint || (officialCustomEndpointEnabled ? normalizedOfficialEndpoint || undefined : undefined),
-      });
+      // 同一个官方 API Key 对该平台所有能力（llm/image/video/audio）通用。
+      // 因此一次激活即为该 provider 支持的全部 mode 写入 key，避免「激活了图片、
+      // 换到视频/音频/文本时又被要求重新激活」的重复激活问题。
+      const activationModes = (provider?.modes?.length ? provider.modes : [mode]) as Mode[];
+      const uniqueModes = Array.from(new Set<Mode>([mode, ...activationModes]));
+      const trimmedApiKey = officialApiKey.trim();
+      const resolvedEndpoint = result.endpoint || (officialCustomEndpointEnabled ? normalizedOfficialEndpoint || undefined : undefined);
+      for (const activationMode of uniqueModes) {
+        await setKey({
+          provider: selectedProvider,
+          apiKey: trimmedApiKey,
+          maskedKey: result.maskedKey,
+          mode: activationMode,
+          // 仅为当前选择的 mode 绑定具体模型；其余 mode 仅激活 provider（provider-only 兜底）。
+          model: activationMode === mode ? (resolvedOfficialModel || result.model || undefined) : undefined,
+          endpoint: resolvedEndpoint,
+        });
+      }
       await refreshRuntimeViews();
       setMessage(firstCleanText(result.message) || ui('官方直连已激活，并同步到画布模型菜单。', 'Official provider activated and synced to the canvas model menu.'));
       setVisionActivationFlag([selectedProvider]);
@@ -1122,11 +1110,11 @@ export default function ApiKeysPage() {
   }
 
   const layout = (
-    <div className="min-h-screen bg-[#0b0f14] px-4 py-6 text-[#dce5ee] md:px-6">
-      <div className="mx-auto max-w-[1600px] space-y-6">
-        <section className="rounded-[28px] border border-[#202834] bg-[radial-gradient(circle_at_top_left,_rgba(0,212,170,0.12),_transparent_38%),linear-gradient(180deg,#111821_0%,#0c1118_100%)] p-5 md:p-6">
-          <div className="flex flex-col gap-5 xl:flex-row xl:items-end xl:justify-between">
-            <div className="space-y-4">
+    <div className="min-h-screen bg-[#0b0f14] px-3 py-3 text-[#dce5ee] md:px-4">
+      <div className="mx-auto max-w-[1600px] space-y-3">
+        <section className="rounded-[28px] border border-[#202834] bg-[radial-gradient(circle_at_top_left,_rgba(0,212,170,0.12),_transparent_38%),linear-gradient(180deg,#111821_0%,#0c1118_100%)] p-2.5 md:p-3">
+          <div className="flex flex-col gap-2.5 xl:flex-row xl:items-end xl:justify-between">
+            <div className="space-y-2">
               <button
                 type="button"
                 onClick={() => navigate('/?skipLaunch=1')}
@@ -1140,10 +1128,10 @@ export default function ApiKeysPage() {
                   <Sparkles className="h-3.5 w-3.5" />
                   {ui('API 管理与模型路由', 'API Control & Model Routing')}
                 </div>
-                <h1 className="mt-4 text-2xl font-semibold tracking-tight text-white md:text-3xl">
-                  {ui('官方直连、聚合中转与画布模型在同一页打通', 'Keep direct providers, relays, and canvas models in one workspace')}
+                <h1 className="mt-2 text-2xl font-semibold tracking-tight text-white md:text-3xl">
+                  {ui('国产 / 直连、聚合中转与画布模型在同一页打通', 'Keep domestic / direct providers, relays, and canvas models in one workspace')}
                 </h1>
-                <p className="mt-3 max-w-4xl text-sm leading-7 text-[#92a4b7]">
+                <p className="mt-1.5 max-w-4xl text-sm leading-7 text-[#92a4b7]">
                   {ui(
                     '左侧先选平台，中间填写 Base URL / API Key 并验证，右侧随时查看哪些图片、视频、音频与文本模型已经真正激活到画布。重要操作放首屏，不重要信息折叠。',
                     'Pick a platform on the left, validate Base URL and API key in the middle, and inspect which image, video, audio, and text models are actually live on the canvas from the right column. Primary actions stay front and center while secondary status stays collapsible.',
@@ -1152,14 +1140,14 @@ export default function ApiKeysPage() {
               </div>
             </div>
 
-            <div className="grid gap-3 rounded-2xl border border-[#22303c] bg-[#0f151d]/95 p-4 sm:grid-cols-2 lg:grid-cols-4">
+            <div className="grid gap-1.5 rounded-2xl border border-[#22303c] bg-[#0f151d]/95 p-2 sm:grid-cols-2 lg:grid-cols-4">
               {(['image', 'video', 'llm', 'audio'] as Mode[]).map((entryMode) => (
-                <div key={entryMode} className="rounded-xl border border-[#202833] bg-[#111821] px-3 py-3">
-                  <div className="text-[11px] uppercase tracking-[0.16em] text-[#708193]">
+                <div key={entryMode} className="rounded-lg border border-[#202833] bg-[#111821] px-2 py-1.5">
+                  <div className="text-[10px] uppercase tracking-[0.16em] text-[#708193]">
                     {formatModeLabel(entryMode, ui)}
                   </div>
-                  <div className="mt-2 text-xl font-semibold text-white">{activatedSummary[entryMode]}</div>
-                  <div className="mt-1 text-[11px] text-[#7d8fa1]">
+                  <div className="mt-1 text-base font-semibold text-white">{activatedSummary[entryMode]}</div>
+                  <div className="mt-0.5 text-[10px] text-[#7d8fa1]">
                     {ui('已同步到画布', 'Synced to canvas')}
                   </div>
                 </div>
@@ -1175,12 +1163,12 @@ export default function ApiKeysPage() {
           <div className="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">{error}</div>
         ) : null}
 
-        <section className="grid gap-6 xl:grid-cols-[280px_minmax(0,1fr)_380px] xl:items-start">
-          <aside className="min-h-0 space-y-5 xl:max-h-[calc(100vh-136px)] xl:overflow-y-auto xl:pr-1">
-            <div className="rounded-[24px] border border-[#202934] bg-[#0f141b] p-5">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-sm font-semibold text-white">{ui('平台列表', 'Platform list')}</div>
+        <section className="grid gap-6 lg:grid-cols-[260px_minmax(0,1fr)_340px] lg:items-start xl:grid-cols-[280px_minmax(0,1fr)_380px]">
+          <aside className="min-h-0 space-y-5 lg:max-h-[calc(100vh-136px)] lg:overflow-y-auto lg:pr-1">
+              <div className="rounded-[24px] border border-[#202934] bg-[#0f141b] p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-white">{ui('平台列表', 'Platform list')}</div>
                   <div className="mt-1 text-xs leading-6 text-[#8ea0b2]">
                     {ui('先从左侧确定接入入口，再到中间填写 Key 和验证。', 'Choose the access path here first, then validate in the middle workspace.')}
                   </div>
@@ -1188,81 +1176,14 @@ export default function ApiKeysPage() {
                 <SourceBadge label={`${activatedPlatformCards.length} ${ui('个平台已接通', 'platforms live')}`} tone="recommended" />
               </div>
 
-              <div className="mt-5 space-y-5">
+              <div className="mt-3 space-y-2.5">
                 <div className="space-y-3">
                   <div className="flex items-center justify-between gap-2">
-                    <div className="text-[11px] uppercase tracking-[0.16em] text-[#74d8ff]">{ui('聚合中转平台', 'Relay / aggregator')}</div>
-                    <SourceBadge label={relayPresetDisplayName(currentPreset, ui)} tone="relay" />
-                  </div>
-                  <div className="space-y-2">
-                    {relayPresetOptions.map((item) => {
-                      const selected = relayPresetId === item.id;
-                      const customPreset = !RELAY_PRESETS.some((preset) => preset.id === item.id);
-                      return (
-                        <div
-                          key={item.id}
-                          className={`w-full rounded-2xl border px-4 py-3 transition ${
-                            selected
-                              ? 'border-[#5ca7ff]/45 bg-[#162232] shadow-[0_0_0_1px_rgba(92,167,255,0.12)]'
-                              : 'border-[#27313c] bg-[#111821] hover:border-[#46607a]'
-                          }`}
-                        >
-                          <div className="flex items-start justify-between gap-3">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setActiveConfigSection('relay');
-                                setRelayPresetId(item.id);
-                                setRelayBaseUrl(item.baseUrlExample);
-                                setRelayExpanded(true);
-                              }}
-                              className="min-w-0 flex-1 text-left"
-                            >
-                              <div className="text-sm font-semibold text-white">{pickLocaleText(isZh, item.nameZh, item.nameEn)}</div>
-                              <div className="mt-1 text-[11px] leading-5 text-[#8ea0b2]">
-                                {relayPresetDescription(item, ui)}
-                              </div>
-                              {item.id === 'generic-openai-relay' ? (
-                                <div className="mt-2">
-                                  <SourceBadge label={ui('自定义入口', 'Custom entry')} tone="recommended" />
-                                </div>
-                              ) : null}
-                              {customPreset ? (
-                                <div className="mt-2">
-                                  <SourceBadge label={ui('本地保存', 'Saved locally')} tone="relay" />
-                                </div>
-                              ) : null}
-                            </button>
-                            <div className="flex items-center gap-2">
-                              {customPreset ? (
-                                <button
-                                  type="button"
-                                  onClick={() => deleteCustomRelayPreset(item.id)}
-                                  className="inline-flex items-center gap-1 rounded-full border border-[#43303a] px-2.5 py-1 text-[11px] text-[#ffb5c4] transition hover:border-[#9d5167] hover:text-white"
-                                >
-                                  <Trash2 className="h-3 w-3" />
-                                  {ui('删除', 'Delete')}
-                                </button>
-                              ) : null}
-                              <SourceBadge label={selected ? ui('当前选择', 'Selected') : ui('可接入', 'Available')} tone={selected ? 'relay' : 'neutral'} />
-                              {activatedRelayPresetIds.has(item.id) ? (
-                                <SourceBadge label={ui('已激活', 'Active')} tone="recommended" />
-                              ) : null}
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="text-[11px] uppercase tracking-[0.16em] text-[#74d8ff]">{ui('官方直连', 'Official direct')}</div>
+                    <div className="text-[11px] uppercase tracking-[0.16em] text-[#74d8ff]">{ui('国产 / 直连', 'Domestic / direct')}</div>
                     <SourceBadge label={providerGuide?.officialName || selectedProvider} tone="api" />
                   </div>
                   <div className="space-y-2">
-                    {providerOptions.map((item) => {
+                    {providerOptions.filter((p) => p.domestic).map((item) => {
                       const selected = selectedProvider === item.id;
                       const guide = getProviderGuide(item.id);
                       return (
@@ -1290,7 +1211,114 @@ export default function ApiKeysPage() {
                               </div>
                             </div>
                             <SourceBadge label={selected ? ui('当前选择', 'Selected') : ui('官方', 'Direct')} tone={selected ? 'api' : 'neutral'} />
-                            {keyList.some((k) => k.provider === item.id && resolveProviderKeyStatus(k.expiresAt) === 'active') ? (
+                            {(keyList.some((k) => k.provider === item.id && resolveProviderKeyStatus(k.expiresAt) === 'active' && !isUnusableProviderKeyStatus(k.status)) || activatedProviderIds.has(item.id)) ? (
+                              <SourceBadge label={ui('已激活', 'Active')} tone="recommended" />
+                            ) : null}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-[11px] uppercase tracking-[0.16em] text-[#74d8ff]">{ui('聚合中转平台', 'Relay / aggregator')}</div>
+                    <SourceBadge label={relayPresetDisplayName(currentPreset, ui)} tone="relay" />
+                  </div>
+                  <div className="space-y-2">
+                    {relayPresetOptions.map((item) => {
+                      const selected = relayPresetId === item.id;
+                      const customPreset = !RELAY_PRESETS.some((preset) => preset.id === item.id);
+                      return (
+                        <div
+                          key={item.id}
+                          className={`group w-full rounded-2xl border px-4 py-3 transition ${
+                            selected
+                              ? 'border-[#5ca7ff]/45 bg-[#162232] shadow-[0_0_0_1px_rgba(92,167,255,0.12)]'
+                              : 'border-[#27313c] bg-[#111821] hover:border-[#46607a]'
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setActiveConfigSection('relay');
+                              setRelayPresetId(item.id);
+                              setRelayBaseUrl(item.baseUrlExample);
+                              setRelayExpanded(true);
+                            }}
+                            className="w-full text-left"
+                          >
+                            <div className="text-sm font-semibold text-white">{pickLocaleText(isZh, item.nameZh, item.nameEn)}</div>
+                            <div className="mt-1 hidden text-[11px] leading-4 text-[#8ea0b2] group-hover:block">
+                              {relayPresetDescription(item, ui)}
+                            </div>
+                            {item.id === 'generic-openai-relay' ? (
+                              <div className="mt-2">
+                                <SourceBadge label={ui('自定义入口', 'Custom entry')} tone="recommended" />
+                              </div>
+                            ) : null}
+                            {customPreset ? (
+                              <div className="mt-2">
+                                <SourceBadge label={ui('本地保存', 'Saved locally')} tone="relay" />
+                              </div>
+                            ) : null}
+                          </button>
+                          <div className="mt-2 flex items-center justify-end gap-2">
+                            {customPreset ? (
+                              <button
+                                type="button"
+                                onClick={() => deleteCustomRelayPreset(item.id)}
+                                className="inline-flex items-center gap-1 rounded-full border border-[#43303a] px-2.5 py-1 text-[11px] text-[#ffb5c4] transition hover:border-[#9d5167] hover:text-white"
+                              >
+                                <Trash2 className="h-3 w-3" />
+                                {ui('删除', 'Delete')}
+                              </button>
+                            ) : null}
+                            <SourceBadge label={selected ? ui('当前选择', 'Selected') : ui('可接入', 'Available')} tone={selected ? 'relay' : 'neutral'} />
+                            {activatedRelayPresetIds.has(item.id) ? (
+                              <SourceBadge label={ui('已激活', 'Active')} tone="recommended" />
+                            ) : null}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-[11px] uppercase tracking-[0.16em] text-[#74d8ff]">{ui('国外平台', 'International')}</div>
+                  </div>
+                  <div className="space-y-2">
+                    {providerOptions.filter((p) => !p.domestic).map((item) => {
+                      const selected = selectedProvider === item.id;
+                      const guide = getProviderGuide(item.id);
+                      return (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => {
+                            setActiveConfigSection('official');
+                            setSelectedProvider(item.id);
+                            setOfficialExpanded(true);
+                          }}
+                          className={`w-full rounded-2xl border px-4 py-3 text-left transition ${
+                            selected
+                              ? 'border-[#5ca7ff]/45 bg-[#162232] shadow-[0_0_0_1px_rgba(92,167,255,0.12)]'
+                              : 'border-[#27313c] bg-[#111821] hover:border-[#46607a]'
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="text-sm font-semibold text-white">{guide?.officialName || item.name}</div>
+                              <div className="mt-1 flex flex-wrap gap-1.5">
+                                {item.modes.map((entryMode) => (
+                                  <SourceBadge key={`${item.id}-${entryMode}`} label={formatModeLabel(entryMode as Mode, ui)} tone="neutral" />
+                                ))}
+                              </div>
+                            </div>
+                            <SourceBadge label={selected ? ui('当前选择', 'Selected') : ui('官方', 'Direct')} tone={selected ? 'api' : 'neutral'} />
+                            {(keyList.some((k) => k.provider === item.id && resolveProviderKeyStatus(k.expiresAt) === 'active' && !isUnusableProviderKeyStatus(k.status)) || activatedProviderIds.has(item.id)) ? (
                               <SourceBadge label={ui('已激活', 'Active')} tone="recommended" />
                             ) : null}
                           </div>
@@ -1303,7 +1331,7 @@ export default function ApiKeysPage() {
             </div>
           </aside>
 
-            <main className="min-h-0 min-w-0 space-y-6 xl:max-h-[calc(100vh-136px)] xl:overflow-y-auto xl:pr-1">
+            <main className="min-h-0 min-w-0 space-y-6 lg:max-h-[calc(100vh-136px)] lg:overflow-y-auto lg:pr-1">
             <div className="grid gap-3 md:grid-cols-3">
               <div className="rounded-2xl border border-[#22303c] bg-[#101720] px-4 py-3">
                 <div className="text-[11px] uppercase tracking-[0.16em] text-[#73cfe8]">{ui('第 1 步', 'Step 1')}</div>
@@ -1326,7 +1354,7 @@ export default function ApiKeysPage() {
                   <div className="mt-1 text-xs leading-6 text-[#8ea0b2]">
                     {activeConfigSection === 'relay'
                       ? ui('当前在配置聚合中转平台。填写 Base URL 和一个 API Key 后，可以统一激活多家模型。', 'You are configuring a relay / aggregator. One Base URL and key can activate multiple upstream models.')
-                      : ui('当前在配置官方直连。系统会先推荐更适合当前模式的模型，再验证 API Key。', 'You are configuring an official direct provider. The page recommends the best-fit model before validation.')}
+                      : ui('当前在配置国产 / 直连。系统会先推荐更适合当前模式的模型，再验证 API Key。', 'You are configuring a domestic / direct provider. The page recommends the best-fit model before validation.')}
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -1350,7 +1378,7 @@ export default function ApiKeysPage() {
                         : 'border-[#2a3440] bg-[#111821] text-[#9eb0c2] hover:border-[#46607a] hover:text-white'
                     }`}
                   >
-                    {ui('官方直连', 'Official direct')}
+                    {ui('国产 / 直连', 'Domestic / direct')}
                   </button>
                 </div>
               </div>
@@ -1852,6 +1880,37 @@ export default function ApiKeysPage() {
                         </div>
                       </label>
 
+                      {selectedProvider === 'volcengine' && (
+                        <div className="space-y-3 rounded-2xl border border-[#2b3440] bg-[#0f1620] p-3">
+                          <p className="text-xs leading-relaxed text-[#93a4b4]">
+                            {ui(
+                              '火山方舟的「推理调用」用上面 API Key，但「自动创建接入点」需要 AccessKey/SecretKey（控制台→访问密钥）。填了这两项将一键为每个聚合模型创建接入点并缓存，否则需你到控制台手动建好再由下拉选择。',
+                              'Ark inference uses the API Key above, but auto-creating inference endpoints requires AccessKey/SecretKey (Console → Access Keys). Provide them to auto-create + cache endpoints for one-click use.',
+                            )}
+                          </p>
+                          <label className="space-y-2">
+                            <span className="text-xs uppercase tracking-[0.16em] text-[#7f92a7]">AccessKey ID</span>
+                            <input
+                              type="password"
+                              value={officialAccessKeyId}
+                              onChange={(event) => setOfficialAccessKeyId(event.target.value)}
+                              placeholder="AK..."
+                              className="w-full rounded-2xl border border-[#2b3440] bg-[#111821] py-3 px-4 text-sm text-white outline-none transition focus:border-[#5ba4ff]"
+                            />
+                          </label>
+                          <label className="space-y-2">
+                            <span className="text-xs uppercase tracking-[0.16em] text-[#7f92a7]">SecretKey</span>
+                            <input
+                              type="password"
+                              value={officialSecretKey}
+                              onChange={(event) => setOfficialSecretKey(event.target.value)}
+                              placeholder="SK..."
+                              className="w-full rounded-2xl border border-[#2b3440] bg-[#111821] py-3 px-4 text-sm text-white outline-none transition focus:border-[#5ba4ff]"
+                            />
+                          </label>
+                        </div>
+                      )}
+
                       <button
                         type="button"
                         onClick={() => { void handleOfficialActivate(); }}
@@ -1889,9 +1948,10 @@ export default function ApiKeysPage() {
                               <div className="mt-2 text-[#72e4d2]">
                                 {pickLocaleText(isZh, selectedOfficialPreset?.noteZh, selectedOfficialPreset?.noteEn)}
                               </div>
-                            ) : null}
-                          </div>
-                          {officialRecommendationCards.length ? (
+                          ) : null}
+                        </div>
+                        <FreeQuotaRoutePanel />
+                        {officialRecommendationCards.length ? (
                             <RecommendationCardsPanel
                               testId="api-official-direct-recommendation-panel"
                               title={ui('官方直连推荐卡', 'Official direct recommendation cards')}
@@ -2046,7 +2106,7 @@ export default function ApiKeysPage() {
             </div>
           </main>
 
-          <aside className="min-h-0 space-y-5 xl:max-h-[calc(100vh-136px)] xl:overflow-y-auto xl:pr-1">
+          <aside className="min-h-0 space-y-5 lg:max-h-[calc(100vh-136px)] lg:overflow-y-auto lg:pr-1">
             <div className="rounded-[24px] border border-[#202934] bg-[#0f141b] p-5">
               <CollapseToggle
                 expanded={showActivatedCanvasModels}
@@ -2059,6 +2119,56 @@ export default function ApiKeysPage() {
 
               {showActivatedCanvasModels ? (
                 <div className="mt-4 max-h-[calc(100vh-260px)] space-y-4 overflow-y-auto pr-1" data-testid="api-activated-canvas-models-panel">
+                  {hostedModelSummary.hostedCount > 0 ? (
+                    <section
+                      className="rounded-2xl border border-[#35506b] bg-[#111c28] p-4"
+                      data-testid="api-hosted-model-summary"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="text-sm font-semibold text-[#9fd4ff]">
+                          {ui('其中含借道模型', 'Includes relayed third-party models')}
+                        </div>
+                        <SourceBadge
+                          label={`${hostedModelSummary.hostedCount} ${ui('个借道', 'relayed')} / ${hostedModelSummary.nativeCount} ${ui('个原生', 'native')}`}
+                          tone="local"
+                        />
+                      </div>
+                      <div className="mt-1.5 text-[11px] leading-5 text-[#8ea0b2]">
+                        {ui(
+                          '这些模型由聚合平台托管转发：激活该平台即可使用，无需再单独接入原厂。下方条目已标注「经 XX 托管 · 原厂」。',
+                          'These models are served through an aggregator: activating that platform is enough, no separate vendor key needed. Each entry below is tagged with its host and original vendor.',
+                        )}
+                      </div>
+                      <div className="mt-3 space-y-2">
+                        {hostedModelSummary.byPlatform.map((entry) => (
+                          <div
+                            key={entry.platformId}
+                            className="rounded-xl border border-[#25303b] bg-[#0e141b] px-3 py-2"
+                            data-testid={`api-hosted-platform-${entry.platformId}`}
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="text-xs font-semibold text-white">
+                                {isZh ? entry.platformZh : entry.platformEn}
+                              </div>
+                              <SourceBadge label={`${entry.count} ${ui('个借道模型', 'relayed')}`} tone="neutral" />
+                            </div>
+                            <div className="mt-1 text-[11px] leading-5 text-[#91a4b6]">
+                              {ui('原厂：', 'Vendors: ')}
+                              {(isZh ? entry.vendorsZh : entry.vendorsEn).join(isZh ? '、' : ', ')}
+                            </div>
+                            {entry.requiresEndpointCount > 0 ? (
+                              <div className="mt-1 text-[11px] leading-5 text-[#f2d17a]">
+                                {ui(
+                                  `其中 ${entry.requiresEndpointCount} 个需先在该平台创建推理接入点（ep-xxxx）才能调用。`,
+                                  `${entry.requiresEndpointCount} of them need an inference endpoint (ep-xxxx) created on that platform first.`,
+                                )}
+                              </div>
+                            ) : null}
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  ) : null}
                   {(['image', 'video', 'audio', 'llm'] as Mode[]).map((entryMode) => {
                     const items = activatedCanvasModelsByMode[entryMode] || [];
                     const expanded = inventoryExpandedModes[entryMode];
@@ -2087,9 +2197,22 @@ export default function ApiKeysPage() {
                                     {item.price !== undefined ? (
                                       <div className="mt-2 text-[11px] text-[#72e4d2]">{formatCurrency(item.price, item.currency)}</div>
                                     ) : null}
+                                    {(() => {
+                                      const origin = resolveHostedModelOrigin(item);
+                                      if (!origin.hosted) return null;
+                                      return (
+                                        <div
+                                          className="mt-2 text-[11px] leading-5 text-[#9fd4ff]"
+                                          data-testid={`api-hosted-notice-${item.id}`}
+                                        >
+                                          {isZh ? origin.noticeZh : origin.noticeEn}
+                                        </div>
+                                      );
+                                    })()}
                                   </div>
                                   <div className="flex flex-wrap gap-2">
                                     <SourceBadge label={formatModeLabel(item.mode as Mode, ui)} tone="neutral" />
+                                    {hostedOriginBadge(item, isZh)}
                                     {catalogSourceBadge(item)}
                                   </div>
                                 </div>
@@ -2172,7 +2295,7 @@ export default function ApiKeysPage() {
                           </div>
                         </div>
                         <div className="flex items-center gap-2">
-                          <SourceBadge label={item.status} tone={item.status === 'active' ? 'recommended' : 'neutral'} />
+                          <SourceBadge label={providerKeyStatusBadge(item.status, ui).text} tone={providerKeyStatusBadge(item.status, ui).tone} />
                           <button
                             type="button"
                             onClick={() => { void handleRemoveKey(item.provider, item.mode as Mode); }}
@@ -2186,10 +2309,10 @@ export default function ApiKeysPage() {
                     </article>
                   )) : (
                     <div className="rounded-2xl border border-dashed border-[#2a3440] bg-[#111821] px-4 py-5 text-sm text-[#93a4b4]">
-                      {runtimeActivatedProviderCount > 0
+                      {activatedProviderIds.size > 0
                         ? ui(
-                            '当前登录账号的本地 Key 还没有写入，但右侧“已激活平台 / 已激活模型”已经检测到后端可用来源。若要在这个账号下继续管理 Key，请重新执行一次验证激活。',
-                            'This signed-in account has not stored local keys yet, but the activated platform/model panels on the right already detected live backend sources. Run one activation again here if you want this account to manage those keys directly.',
+                            '已检测到后端持久化的激活来源（已激活平台 / 已激活模型）。密钥由后端本地保存，登录后即可使用，刷新页面或重新登录都无需再次激活；如需在此账号下轮换或管理 Key，可重新执行一次验证激活。',
+                            'Live backend activation sources were detected (activated platforms / models). The key is persisted by the backend locally, so once signed in it is usable — no re-activation needed after refresh or re-login. Re-run a verification activation only if you want to rotate or manage the key under this account.',
                           )
                         : ui('当前还没有激活 Key。建议先从中转聚合开始，一次同步主流模型。', 'No active keys yet. Start with relay mode to sync mainstream models in one step.')}
                     </div>

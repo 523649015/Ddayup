@@ -10,9 +10,9 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 
-import { LocalModelPanel } from '@/components/LocalModelPanel';
+import { ModelDownloadPanel } from '@/components/ModelDownloadPanel';
 import { assistPrompt } from '@/services/promptAssist';
 import {
   ensureTranslatorLoaded,
@@ -93,18 +93,19 @@ afterEach(async () => {
 // ─────────────────────────────────────────────────────────
 describe('模型下载面板：NLLB-200 安装', () => {
   it('点击「安装」后面板状态变为「已安装」', async () => {
-    render(<LocalModelPanel />);
+    render(<ModelDownloadPanel />);
 
-    // 初始：未安装，渲染「安装」按钮
-    const installBtn = screen.getByRole('button', { name: '安装' });
+    // NLLB 现统一在 ModelDownloadPanel（单一数据源 PRESET_MODELS browserRuntime:'nllb'）
+    const card = screen.getByTestId('browser-model-nllb-200-translation');
+    const installBtn = within(card).getByRole('button', { name: /安装/ });
     expect(installBtn).toBeTruthy();
 
     fireEvent.click(installBtn);
 
-    // 等待状态推进到 ready（已安装）
+    // 等待状态推进到 ready（已安装）——作用域限定在卡片内，避免文档级重复匹配
     await waitFor(
       () => {
-        expect(screen.getByText('已安装')).toBeTruthy();
+        expect(within(card).getByText('已安装 · 可用')).toBeTruthy();
       },
       { timeout: 5000 },
     );
@@ -115,9 +116,10 @@ describe('模型下载面板：NLLB-200 安装', () => {
   });
 
   it('下载过程中显示「下载中」而非页面刷新/跳转', async () => {
-    render(<LocalModelPanel />);
+    render(<ModelDownloadPanel />);
 
-    const installBtn = screen.getByRole('button', { name: '安装' });
+    const card = screen.getByTestId('browser-model-nllb-200-translation');
+    const installBtn = within(card).getByRole('button', { name: /安装/ });
     fireEvent.click(installBtn);
 
     // 在 downloading 阶段不应出现任何导航

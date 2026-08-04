@@ -22,7 +22,7 @@ import {
 } from './inferenceWorkerClient';
 import { createImglyRunner } from './imglyRunner';
 
-export type LocalRunnerKind = 'esrgan' | 'lama' | 'imgly';
+export type LocalRunnerKind = 'esrgan' | 'lama' | 'imgly' | 'depth-anything-v2' | 'depth-anything-v3' | 'rmbg' | 'raft';
 
 /** 通知 UI 本地模型运行器状态变化（如后台重建完成） */
 function emitLocalModelsChanged(): void {
@@ -50,6 +50,100 @@ export async function activateLocalModel(
     return { ok: true };
   }
 
+  // Depth Anything V2：运行在主线程（ONNX 模型通过 ortEnv 直接加载，无需 Worker）
+  if (meta.localRunner === 'depth-anything-v2') {
+    try {
+      const { loadDepthModel } = await import('@/services/depthEstimation');
+      const result = await loadDepthModel('depth-anything-v2-small');
+      if (!result.ok) return result;
+      registerLocalModelRunner(id, async (input) => ({
+        url: input.imageUrl,
+        assetId: '',
+        engine: 'depth-anything-v2',
+      }));
+      emitLocalModelsChanged();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, reason: `depth-activation-failed: ${(err as Error)?.message}` };
+    }
+  }
+
+  // Depth Anything V3：DA3，浏览器端 ONNX（postFX/depthDof）。外部权重加载失败时自动回退 V2。
+  if (meta.localRunner === 'depth-anything-v3') {
+    const { loadDepthModel } = await import('@/services/depthEstimation');
+    let result = await loadDepthModel('depth-anything-v3-base');
+    // V3 在浏览器端创建会话失败（拆分式权重 / 算子兼容 / 显存不足）时，
+    // 自动补齐并加载轻量可靠的 Depth Anything V2-small（320²，ORT Web 友好）作为兜底，
+    // 保证「一键电影感」在 V3 不可用时仍能跑通（仅景深精度略降）。
+    if (!result.ok) {
+      try {
+        const v2 = PRESET_MODELS.find((m) => m.id === 'depth-anything-v2-small');
+        if (v2) {
+          const { loadModel } = await import('@/services/modelLoader');
+          const dl = await loadModel({
+            modelId: v2.id,
+            version: v2.version,
+            url: v2.url,
+            extraFiles: v2.extraFiles,
+            timeout: 600000,
+            retries: 2,
+          });
+          if (dl.success) {
+            const { markPresetInstalled } = await import('@/services/presetModelInstall');
+            markPresetInstalled(v2.id, v2.version);
+            result = await loadDepthModel('depth-anything-v2-small');
+          }
+        }
+      } catch (fallbackErr) {
+        console.warn('[localInference] Depth V2 兜底加载失败：', fallbackErr);
+      }
+    }
+    if (!result.ok) return result;
+    registerLocalModelRunner(id, async (input) => ({
+      url: input.imageUrl,
+      assetId: '',
+      engine: result.usedId === 'depth-anything-v2-small' ? 'depth-anything-v2' : 'depth-anything-v3',
+    }));
+    emitLocalModelsChanged();
+    return { ok: true };
+  }
+
+  // RMBG-2.0 / BiRefNet：浏览器端 ONNX 抠像（postFX/matting）
+  if (meta.localRunner === 'rmbg') {
+    try {
+      const { loadMattingModel } = await import('@/services/postFX/matting');
+      const result = await loadMattingModel(id as 'birefnet-matting');
+      if (!result.ok) return result;
+      registerLocalModelRunner(id, async (input) => ({
+        url: input.imageUrl,
+        assetId: '',
+        engine: 'rmbg-matting',
+      }));
+      emitLocalModelsChanged();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, reason: `rmbg-activation-failed: ${(err as Error)?.message}` };
+    }
+  }
+
+  // RAFT 光流：浏览器端 ONNX（postFX/motionBlur），用于真实运动模糊
+  if (meta.localRunner === 'raft') {
+    try {
+      const { loadRaftModel } = await import('@/services/postFX/motionBlur');
+      const result = await loadRaftModel();
+      if (!result.ok) return result;
+      registerLocalModelRunner(id, async (input) => ({
+        url: input.imageUrl,
+        assetId: '',
+        engine: 'raft-flow',
+      }));
+      emitLocalModelsChanged();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, reason: `raft-activation-failed: ${(err as Error)?.message}` };
+    }
+  }
+
   // 缓存缺失时（如旧版残留的“已安装”标记、或点过“激活”但从未真下载），
   // 先按模型声明 URL 拉取真实权重再激活，使链路自洽。
   let sessionData: ArrayBuffer | undefined;
@@ -62,6 +156,10 @@ export async function activateLocalModel(
         modelId: id,
         version,
         url: meta.url,
+        // 与 ensurePresetModel / 面板下载对齐：拆分式权重（如 Depth V3 的 model.onnx_data）
+        // 必须在此一并下载+缓存，否则 createOrtSession 解析拆分 onnx 时会因缺外部数据而失败，
+        // 导致 isDepthModelReady() 永远 false、一键电影感挂死。
+        extraFiles: meta.extraFiles,
         timeout: 600000,
         retries: 2,
       });

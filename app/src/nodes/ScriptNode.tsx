@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { FileEdit, FileText, User } from 'lucide-react';
 import { EditableNodeTitle } from './EditableNodeTitle';
+import DispatchInfoBadge from '@/components/DispatchInfoBadge';
 
 /* ===== Storyboard Data Types ===== */
 interface StoryboardRow {
@@ -38,6 +39,8 @@ export function ScriptNode(props: NodeProps) {
       <div className="flex items-center gap-1.5 px-3 pt-2.5 pb-1">
         <EditableNodeTitle nodeId={props.id} icon={FileText} label={data?.label} fallback="脚本节点" />
       </div>
+
+      <DispatchInfoBadge data={data} />
 
       <div className="px-3 pb-3">
         {scriptedContent ? (

@@ -4,12 +4,13 @@ import { TaggingContractVerifyCanvas } from '@/components/TaggingContractVerifyC
 import { setDebugBridgeBootstrapState } from '@/services/debugBridge';
 
 async function bootstrapLocalDemoApiKeys() {
-  const { useApiKeyStore } = await import('@/store/useApiKeyStore');
+  const { useApiKeyStore, isUnusableProviderKeyStatus } = await import('@/store/useApiKeyStore');
   const apiKeyStore = useApiKeyStore.getState();
   const hasImageAccess = Object.values(apiKeyStore.keys).some((entry) => (
     entry
     && entry.mode === 'image'
-    && entry.status !== 'expired'
+    // 任务 AL：invalid 与 expired 同为不可用，避免已失效 key 让引导流误判已有图像权限。
+    && !isUnusableProviderKeyStatus(entry.status)
     && (entry.apiKey || entry.metadataOnly)
   ));
   if (hasImageAccess) return;

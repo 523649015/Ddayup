@@ -1,8 +1,15 @@
 /**
- * 本地模型插件下载面板
- * - 预设模型插件列表，每条包含功能备注、大小、来源
- * - 支持安装/更新/重试/删除
- * - 模型自动适配路径（由 localTranslate.ts 管理）
+ * 本地模型插件下载面板（统一管理预设插件模型）
+ *
+ * 覆盖后期/图片节点的所有浏览器端本地推理模型：
+ *   - Depth Anything V3（智能景深 / 3D 旋转）
+ *   - BiRefNet（智能抠像，默认引擎，已平替受限的 RMBG-2.0）
+ *   - RAFT 光流（运动模糊）
+ *   - Real-ESRGAN / LaMa / @imgly 等
+ *
+ * 每条模型支持：安装（下载权重 → 自动激活推理会话 → 标记已安装）、重试、卸载（注销会话 + 清除缓存）、
+ * 「有更新」提示（版本落后时）。下载进度实时显示。模型下载安装后即视为「已安装·可用」，
+ * 首次使用时由功能节点（PostNode 等）自动激活，无需额外手动「激活」步骤。
  */
 import { useEffect, useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
@@ -18,251 +25,342 @@ import {
   Box,
 } from 'lucide-react';
 import {
-  onLocalTranslateStateChange,
-  getLocalTranslateState,
-  MODEL_PLUGINS,
-  ensureTranslatorLoaded,
-  releaseTranslator,
-  pauseDownload,
-  getWasManuallyPaused,
-  checkForModelUpdates,
-  recheckInstalled,
-  type LocalModelPlugin,
-} from '@/services/localTranslate';
+  PRESET_MODELS,
+  type PresetModel,
+  type PresetModelCategory,
+} from '@/config/presetModels';
+import {
+  getPresetInstallHealth,
+  markPresetInstalled,
+  clearPresetInstalled,
+  getPresetUpdateInfo,
+  subscribePresetInstall,
+  initPresetInstalledState,
+} from '@/services/presetModelInstall';
+import {
+  activateLocalModel,
+  deactivateLocalModel,
+} from '@/services/localInference';
+import { hasLocalModelRunner } from '@/services/localModelRunner';
+import { loadModel, getDownloadProgress, verifyExternalWeights } from '@/services/modelLoader';
+import { deleteCachedModel } from '@/services/storage';
 
 type PanelMode = 'inline' | 'card';
 
+type ModelStatus = 'idle' | 'downloading' | 'ready' | 'repair' | 'error';
+
 export function LocalModelPanel({ mode = 'inline' }: { mode?: PanelMode }) {
-  const [plugins, setPlugins] = useState<LocalModelPlugin[]>(() => [...MODEL_PLUGINS]);
-  const [installingId, setInstallingId] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [errors, setErrors] = useState<Record<string, string>>({});
 
+  // 订阅安装状态变化 + 周期刷新下载进度 + 本地模型会话变化
   useEffect(() => {
-    // 初始同步
-    setPlugins([...MODEL_PLUGINS]);
-    const unsub = onLocalTranslateStateChange(() => {
-      setPlugins([...MODEL_PLUGINS]);
-    });
-    // 挂载时强制按 IndexedDB 实际缓存记录重新判定「已安装」（修复旧版安装的模型刷新后仍显示未安装）
-    void recheckInstalled();
-    // 检查更新（仅在模型已安装时）
-    const state = getLocalTranslateState();
-    if (state.status === 'ready') {
-      checkForModelUpdates();
-    }
-    return unsub;
+    // 挂载时从 IndexedDB 真实缓存恢复「已安装」态（与 localStorage 标记合并），
+    // 即使未打开 ModelDownloadPanel，刷新/重启后也不再回到「未安装」。
+    void initPresetInstalledState().then(() => setTick((t) => t + 1));
+    const unsub = subscribePresetInstall(() => setTick((t) => t + 1));
+    const onLocal = () => setTick((t) => t + 1);
+    window.addEventListener('hmdao-local-models-changed', onLocal);
+
+
+    let timer: number | undefined;
+    const loop = () => {
+      // 仅在有下载进行时刷新进度
+      const anyDownloading = PRESET_MODELS.some(
+        (m) => getDownloadProgress(m.id, m.version)?.status === 'downloading',
+      );
+      if (anyDownloading) setTick((t) => t + 1);
+      timer = window.setTimeout(loop, 400);
+    };
+    timer = window.setTimeout(loop, 400);
+
+    return () => {
+      unsub();
+      window.removeEventListener('hmdao-local-models-changed', onLocal);
+      if (timer) window.clearTimeout(timer);
+    };
   }, []);
 
-  const handleInstall = useCallback(async (id: string) => {
-    if (id !== 'nllb-200-translation') return;
-    setInstallingId(id);
-    try {
-      await ensureTranslatorLoaded();
-    } finally {
-      setInstallingId(null);
+  const deriveStatus = useCallback((model: PresetModel): { status: ModelStatus; progress: number; error?: string } => {
+    const prog = getDownloadProgress(model.id, model.version);
+    if (prog?.status === 'downloading') {
+      return { status: 'downloading', progress: prog.percent };
     }
+    if (prog?.status === 'error') {
+      return { status: 'error', progress: 0, error: prog.error };
+    }
+    const active = hasLocalModelRunner(model.id);
+    if (active) return { status: 'ready', progress: 100 };
+    const installHealth = getPresetInstallHealth(model.id);
+    if (installHealth.status === 'installed') {
+      return { status: 'ready', progress: 100 };
+    }
+    if (installHealth.status === 'needs-repair') {
+      return { status: 'repair', progress: 0, error: installHealth.message };
+    }
+    return { status: 'idle', progress: 0 };
   }, []);
 
-  const handleRetry = useCallback(async (id: string) => {
-    if (id !== 'nllb-200-translation') return;
-    await releaseTranslator();
-    setInstallingId(id);
-    try {
-      await ensureTranslatorLoaded();
-    } finally {
-      setInstallingId(null);
-    }
-  }, []);
+  const handleInstall = useCallback(
+    async (model: PresetModel, force = false) => {
+      setBusyId(model.id);
+      setErrors((e) => ({ ...e, [model.id]: '' }));
+      try {
+        const res = await loadModel({
+          modelId: model.id,
+          version: model.version,
+          url: model.url,
+          extraFiles: model.extraFiles,
+          timeout: 600000,
+          retries: 2,
+          force,
+        });
+        if (!res.success) {
+          setErrors((e) => ({ ...e, [model.id]: res.error || '模型下载失败' }));
+          return;
+        }
+        // 安装成功强校验：拆分式模型（如 Depth Anything V3 的 model.onnx_data）
+        // 外部权重必须齐备，否则视为安装失败，避免「装好却激活失败」。
+        if (model.extraFiles?.length) {
+          const { ok, missing } = await verifyExternalWeights(model.id, model.version, model.extraFiles);
+          if (!ok) {
+            setErrors((e) => ({ ...e, [model.id]: `外部权重缺失（${missing.join(', ')}），请重试安装` }));
+            return;
+          }
+        }
+        const act = await activateLocalModel(model.id, model.version);
+        if (!act.ok) {
+          setErrors((e) => ({ ...e, [model.id]: act.reason || '模型激活失败' }));
+          return;
+        }
+        markPresetInstalled(model.id, model.version);
+        await initPresetInstalledState();
+      } catch (err) {
+        setErrors((e) => ({ ...e, [model.id]: (err as Error)?.message || '模型下载失败' }));
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [],
+  );
 
-  const handleClearCache = useCallback(async (id: string) => {
-    if (id !== 'nllb-200-translation') return;
-    if (!confirm('确定要清除 NLLB-200 翻译模型缓存吗？下次使用需重新下载约 600MB。')) return;
+  const handleUninstall = useCallback(async (model: PresetModel) => {
+    if (!confirm(`确定要卸载「${model.name}」吗？下次使用需重新下载。`)) return;
+    setBusyId(model.id);
     try {
-      const dbs = await indexedDB.databases();
-      for (const db of dbs) {
-        if (db.name?.includes('transformers') || db.name?.includes('onnx')) {
-          indexedDB.deleteDatabase(db.name!);
+      deactivateLocalModel(model.id);
+      clearPresetInstalled(model.id);
+      await deleteCachedModel(model.id, model.version);
+      if (model.extraFiles) {
+        for (const ef of model.extraFiles) {
+          await deleteCachedModel(model.id, `${model.version}#${ef.name}`);
         }
       }
-      await releaseTranslator();
-      setPlugins([...MODEL_PLUGINS]);
-    } catch {
-      await releaseTranslator();
-      setPlugins([...MODEL_PLUGINS]);
+    } finally {
+      setBusyId(null);
     }
   }, []);
 
   const isCard = mode === 'card';
 
+  // 按分类分组展示
+  const groups: { cat: PresetModelCategory; label: string }[] = [
+    { cat: 'image-node', label: '图片 / 深度' },
+    { cat: 'post-fx', label: '后期 / 抠像 / 光流' },
+    { cat: 'video', label: '视频' },
+    { cat: 'audio', label: '音频' },
+    { cat: 'search', label: '搜索扩展' },
+    { cat: 'system', label: '系统扩展' },
+  ];
+
   return (
     <div className={isCard ? 'rounded-xl border border-[#21262d] bg-[#0d1117] p-4' : ''}>
       {isCard && (
-        <div className="mb-3 text-xs font-semibold text-[#8b949e]">
-          本地模型插件
-        </div>
+        <div className="mb-3 text-xs font-semibold text-[#8b949e]">本地模型插件</div>
       )}
 
-      <div className="space-y-2">
-        {plugins.map((plugin) => {
-          const isPaused = getWasManuallyPaused();
-
-          const statusIcon =
-            plugin.status === 'ready' ? CheckCircle :
-            plugin.status === 'error' ? AlertTriangle :
-            plugin.status === 'downloading' ? Loader2 :
-            isPaused ? PauseCircle : Download;
-
-          const statusColor =
-            plugin.status === 'ready' ? 'text-emerald-400' :
-            plugin.status === 'error' ? 'text-rose-400' :
-            plugin.status === 'downloading' ? 'text-amber-400' :
-            isPaused ? 'text-amber-400' : 'text-slate-400';
-
-          const statusText =
-            plugin.status === 'ready' ? '已安装' :
-            plugin.status === 'error' ? '安装失败' :
-            plugin.status === 'downloading' ? `下载中 ${plugin.progress}%` :
-            isPaused ? `已暂停 (${plugin.progress}%)` : '未安装';
-
-          const isBusy = plugin.status === 'downloading' || installingId === plugin.id;
-
+      <div className="space-y-4">
+        {groups.map((group) => {
+          const models = PRESET_MODELS.filter((m) => m.category === group.cat && m.browserRuntime !== 'nllb');
+          if (!models.length) return null;
           return (
-            <div
-              key={plugin.id}
-              className="rounded-lg border border-[#21262d] bg-[#161b22] p-3"
-            >
-              {/* 头部：名称 + 状态 */}
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Box className="h-4 w-4 text-[#58a6ff]" />
-                  <span className="text-sm font-medium text-[#c9d1d9]">{plugin.name}</span>
-                </div>
-                <div className={`flex items-center gap-1 text-xs font-medium ${statusColor}`}>
-                  {statusIcon === Loader2 ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <statusIcon className="h-3.5 w-3.5" />
-                  )}
-                  {statusText}
-                </div>
+            <div key={group.cat}>
+              <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[#6e7681]">
+                {group.label}
               </div>
+              <div className="space-y-2">
+                {models.map((model) => {
+                  const { status, progress, error } = deriveStatus(model);
+                  const updateInfo = getPresetUpdateInfo(model);
+                  const isBusy = busyId === model.id || status === 'downloading';
+                  const errText = error || errors[model.id];
 
-              {/* 功能备注 + 大小 */}
-              <div className="mt-1 text-[11px] leading-4 text-[#6e7681]">
-                {plugin.description}
-                <span className="mx-1 text-[#484f58]">·</span>
-                {plugin.size}
-                <span className="mx-1 text-[#484f58]">·</span>
-                {plugin.source}
-              </div>
+                  const StatusIcon =
+                    status === 'ready' ? CheckCircle :
+                    status === 'repair' ? RotateCcw :
+                    status === 'error' ? AlertTriangle :
+                    status === 'downloading' ? Loader2 : Download;
+                  const statusColor =
+                    status === 'ready' ? 'text-emerald-400' :
+                    status === 'repair' ? 'text-amber-300' :
+                    status === 'error' ? 'text-rose-400' :
+                    status === 'downloading' ? 'text-amber-400' : 'text-slate-400';
+                  const statusText =
+                    status === 'ready' ? '已安装 · 可用' :
+                    status === 'repair' ? '缓存缺失 · 待修复' :
+                    status === 'error' ? '安装失败' :
+                    status === 'downloading' ? `下载中 ${Math.round(progress)}%` : '未安装';
 
-              {/* 下载/暂停进度条 */}
-              {(plugin.status === 'downloading' || isPaused) && (
-                <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#21262d]">
-                  <div
-                    className={`h-full rounded-full transition-all duration-300 ${isPaused ? 'bg-amber-500/50' : 'bg-amber-500'}`}
-                    style={{ width: `${Math.max(plugin.progress, 5)}%` }}
-                  />
-                </div>
-              )}
+                  return (
+                    <div
+                      key={model.id}
+                      className="rounded-lg border border-[#21262d] bg-[#161b22] p-3"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <Box className="h-4 w-4 text-[#58a6ff]" />
+                          <span className="text-sm font-medium text-[#c9d1d9]">{model.name}</span>
+                          {updateInfo.updateAvailable && status !== 'downloading' && (
+                            <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300">
+                              有更新
+                            </span>
+                          )}
+                          {model.gated && (
+                            <span className="rounded-full bg-rose-500/15 px-1.5 py-0.5 text-[10px] text-rose-300">
+                              受限
+                            </span>
+                          )}
+                        </div>
+                        <div className={`flex items-center gap-1 text-xs font-medium ${statusColor}`}>
+                          {StatusIcon === Loader2 ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <StatusIcon className="h-3.5 w-3.5" />
+                          )}
+                          {statusText}
+                        </div>
+                      </div>
 
-              {/* 错误提示 */}
-              {plugin.status === 'error' && plugin.error && (
-                <div className="mt-2 rounded-lg bg-rose-500/5 px-2.5 py-1.5 text-[11px] leading-4 text-rose-300/80">
-                  {plugin.error.length > 140 ? plugin.error.slice(0, 140) + '…' : plugin.error}
-                </div>
-              )}
+                      <div className="mt-1 text-[11px] leading-4 text-[#6e7681]">
+                        {model.desc}
+                        <span className="mx-1 text-[#484f58]">·</span>
+                        {model.size}
+                      </div>
 
-              {/* 操作按钮 */}
-              <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                {plugin.status === 'idle' && !isPaused && (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => handleInstall(plugin.id)}
-                      disabled={isBusy}
-                      className="inline-flex items-center gap-1 rounded-md bg-[#21262d] px-2.5 py-1 text-[11px] text-[#c9d1d9] hover:bg-[#30363d] disabled:opacity-50"
-                    >
-                      {isBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />}
-                      安装
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void recheckInstalled()}
-                      className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[10px] text-[#484f58] hover:text-[#8b949e] transition-colors"
-                      title="按浏览器本地缓存重新检测模型是否已安装"
-                    >
-                      <RotateCcw className="h-3 w-3" />
-                      重新检测
-                    </button>
-                  </>
-                )}
-                {plugin.status === 'idle' && isPaused && (
-                  <button
-                    type="button"
-                    onClick={() => handleInstall(plugin.id)}
-                    disabled={isBusy}
-                    className="inline-flex items-center gap-1 rounded-md bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-300 hover:bg-amber-500/20 disabled:opacity-50"
-                  >
-                    {isBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />}
-                    继续下载
-                  </button>
-                )}
-                {plugin.status === 'downloading' && (
-                  <button
-                    type="button"
-                    onClick={() => pauseDownload()}
-                    className="inline-flex items-center gap-1 rounded-md bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-300 hover:bg-amber-500/20"
-                  >
-                    <PauseCircle className="h-3 w-3" />
-                    暂停
-                  </button>
-                )}
-                {plugin.status === 'error' && (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => handleRetry(plugin.id)}
-                      disabled={isBusy}
-                      className="inline-flex items-center gap-1 rounded-md bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-300 hover:bg-amber-500/20 disabled:opacity-50"
-                    >
-                      {isBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
-                      重试
-                    </button>
-                    {plugin.error?.includes('密钥') || plugin.error?.includes('API Key') ? (
-                      <Link
-                        to="/settings/api-keys"
-                        className="inline-flex items-center gap-1 rounded-md bg-rose-500/10 px-2.5 py-1 text-[11px] text-rose-300 hover:bg-rose-500/20"
-                      >
-                        <KeyRound className="h-3 w-3" />
-                        配置 API Key
-                      </Link>
-                    ) : null}
-                  </>
-                )}
-                {plugin.status === 'ready' && (
-                  <>
-                    {plugin.canUpdate && (
-                      <button
-                        type="button"
-                        onClick={() => handleInstall(plugin.id)}
-                        disabled={isBusy}
-                        className="inline-flex items-center gap-1 rounded-md bg-emerald-500/10 px-2.5 py-1 text-[11px] text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-50"
-                      >
-                        <RotateCcw className="h-3 w-3" />
-                        更新
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => handleClearCache(plugin.id)}
-                      className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[10px] text-[#484f58] hover:text-[#8b949e] transition-colors"
-                      title="清除缓存后下次使用需重新下载"
-                    >
-                      <Trash2 className="h-3 w-3" />
-                      卸载
-                    </button>
-                  </>
-                )}
+                      {model.extraFiles?.length ? (
+                        <div className="mt-1.5 flex flex-wrap items-center gap-1">
+                          <span className="text-[10px] text-[#6e7681]">拆分权重：</span>
+                          {model.extraFiles.map((ef) => (
+                            <span
+                              key={ef.name}
+                              className="rounded bg-[#0f1317] px-1.5 py-0.5 font-mono text-[9px] text-[#7cc4ff] ring-1 ring-[#21262d]"
+                              title={`外部权重文件 ${ef.name}：拆分式模型的一部分，需随主文件一并下载/缓存，否则该模型无法在浏览器端激活`}
+                            >
+                              {ef.name}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      {status === 'downloading' && (
+                        <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#21262d]">
+                          <div
+                            className="h-full rounded-full bg-amber-500 transition-all duration-300"
+                            style={{ width: `${Math.max(progress, 5)}%` }}
+                          />
+                        </div>
+                      )}
+
+                      {(status === 'error' || status === 'repair') && errText && (
+                        <div className={`mt-2 rounded-lg px-2.5 py-1.5 text-[11px] leading-4 ${
+                          status === 'repair'
+                            ? 'bg-amber-500/8 text-amber-200/90'
+                            : 'bg-rose-500/5 text-rose-300/80'
+                        }`}>
+                          {errText.length > 140 ? errText.slice(0, 140) + '…' : errText}
+                        </div>
+                      )}
+
+                      <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                        {status === 'idle' && (
+                          <button
+                            type="button"
+                            onClick={() => handleInstall(model)}
+                            disabled={isBusy}
+                            className="inline-flex items-center gap-1 rounded-md bg-[#21262d] px-2.5 py-1 text-[11px] text-[#c9d1d9] hover:bg-[#30363d] disabled:opacity-50"
+                          >
+                            {isBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />}
+                            安装
+                          </button>
+                        )}
+                        {status === 'downloading' && (
+                          <span className="inline-flex items-center gap-1 text-[11px] text-amber-300">
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                            下载中…
+                          </span>
+                        )}
+                        {status === 'repair' && (
+                          <button
+                            type="button"
+                            onClick={() => handleInstall(model, true)}
+                            disabled={isBusy}
+                            className="inline-flex items-center gap-1 rounded-md bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-300 hover:bg-amber-500/20 disabled:opacity-50"
+                          >
+                            {isBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
+                            修复 / 重下
+                          </button>
+                        )}
+                        {status === 'error' && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => handleInstall(model, true)}
+                              disabled={isBusy}
+                              className="inline-flex items-center gap-1 rounded-md bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-300 hover:bg-amber-500/20 disabled:opacity-50"
+                            >
+                              {isBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
+                              重试
+                            </button>
+                            {model.gated && (
+                              <Link
+                                to="/settings/api-keys"
+                                className="inline-flex items-center gap-1 rounded-md bg-rose-500/10 px-2.5 py-1 text-[11px] text-rose-300 hover:bg-rose-500/20"
+                              >
+                                <KeyRound className="h-3 w-3" />
+                                配置 HF_TOKEN
+                              </Link>
+                            )}
+                          </>
+                        )}
+                        {status === 'ready' && (
+                          <>
+                            {updateInfo.updateAvailable && (
+                              <button
+                                type="button"
+                                onClick={() => handleInstall(model, true)}
+                                disabled={isBusy}
+                                className="inline-flex items-center gap-1 rounded-md bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-300 hover:bg-amber-500/20 disabled:opacity-50"
+                              >
+                                <RotateCcw className="h-3 w-3" />
+                                更新
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => handleUninstall(model)}
+                              className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[10px] text-[#484f58] hover:text-[#8b949e] transition-colors"
+                              title="清除缓存后下次使用需重新下载"
+                            >
+                              <Trash2 className="h-3 w-3" />
+                              卸载
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           );

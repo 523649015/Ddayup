@@ -6,15 +6,12 @@ import { ResizableAssetPanel } from './ResizableAssetPanel';
 import { ModelDownloadPanel } from './ModelDownloadPanel';
 import {
   AudioLines,
-  BookOpen,
-  Building2,
   ChevronLeft,
   ChevronRight,
   Clapperboard,
   Clock,
   Edit3,
   FileText,
-  Film,
   FolderOpen,
   GitBranch,
   Globe,
@@ -24,16 +21,11 @@ import {
   LayoutGrid,
   Layers,
   MonitorUp,
-  Palette,
   Plus,
   RotateCcw,
-  Share2,
-  ShoppingBag,
-  Sofa,
   Tags,
   Trash2,
   Video,
-  Zap,
   type LucideIcon,
 } from 'lucide-react';
 import type { NodeType, SidebarTab } from '@/types';
@@ -47,121 +39,7 @@ const NODE_TYPE_CONFIG: Record<string, { color: string; icon: LucideIcon }> = {
   storyboard: { color: '#ec4899', icon: LayoutGrid },
 };
 
-interface WorkflowTemplate {
-  id: string;
-  name: string;
-  icon: LucideIcon;
-  color: string;
-  desc: string;
-  nodes: { type: NodeType; label: string; x: number; y: number }[];
-}
 
-const WORKFLOW_TEMPLATES: WorkflowTemplate[] = [
-  {
-    id: 'ecom',
-    name: '电商套图',
-    icon: ShoppingBag,
-    color: '#00d4aa',
-    desc: '产品文案 -> 场景图 -> 多角度 -> 视频 -> 配音',
-    nodes: [
-      { type: 'text', label: '产品文案', x: 100, y: 150 },
-      { type: 'image', label: '产品场景图', x: 500, y: 150 },
-      { type: 'image', label: '多角度展示', x: 900, y: 150 },
-      { type: 'video', label: '产品视频', x: 1300, y: 150 },
-      { type: 'audio', label: '配音', x: 1700, y: 150 },
-    ],
-  },
-  {
-    id: 'poster',
-    name: '海报设计',
-    icon: Palette,
-    color: '#1a8cff',
-    desc: '文案 -> 主视觉 -> Banner',
-    nodes: [
-      { type: 'text', label: '文案内容', x: 100, y: 150 },
-      { type: 'image', label: '主视觉海报', x: 500, y: 150 },
-      { type: 'image', label: 'Banner', x: 900, y: 150 },
-    ],
-  },
-  {
-    id: 'brand',
-    name: '品牌设计',
-    icon: Building2,
-    color: '#fbbf24',
-    desc: '品牌策略 -> 视觉 -> 脚本 -> 宣传片',
-    nodes: [
-      { type: 'text', label: '品牌策略', x: 100, y: 150 },
-      { type: 'image', label: '品牌视觉', x: 500, y: 150 },
-      { type: 'script', label: '脚本策划', x: 900, y: 150 },
-      { type: 'video', label: '宣传片', x: 1300, y: 150 },
-    ],
-  },
-  {
-    id: 'interior',
-    name: '室内设计',
-    icon: Sofa,
-    color: '#a855f7',
-    desc: '需求 -> 概念图 -> 效果图 -> 漫游',
-    nodes: [
-      { type: 'text', label: '设计需求', x: 100, y: 150 },
-      { type: 'image', label: '概念参考', x: 500, y: 150 },
-      { type: 'image', label: '效果图', x: 900, y: 150 },
-      { type: 'video', label: '空间漫游', x: 1300, y: 150 },
-    ],
-  },
-  {
-    id: 'social',
-    name: '社交媒体',
-    icon: Share2,
-    color: '#ff6b35',
-    desc: '文案 -> 竖版海报 -> 封面',
-    nodes: [
-      { type: 'text', label: '社媒文案', x: 100, y: 150 },
-      { type: 'image', label: '竖版海报', x: 500, y: 150 },
-      { type: 'image', label: '封面图', x: 900, y: 150 },
-    ],
-  },
-  {
-    id: 'shortfilm',
-    name: '剧情短片',
-    icon: Film,
-    color: '#ec4899',
-    desc: '大纲 -> 脚本 -> 分镜 -> 视频',
-    nodes: [
-      { type: 'text', label: '故事大纲', x: 100, y: 150 },
-      { type: 'script', label: '分镜脚本', x: 500, y: 150 },
-      { type: 'image', label: '分镜草图', x: 900, y: 150 },
-      { type: 'video', label: '片段预览', x: 1300, y: 150 },
-    ],
-  },
-  {
-    id: 'marketing',
-    name: '营销视频',
-    icon: Zap,
-    color: '#22c55e',
-    desc: '策略 -> 脚本 -> 素材 -> 成片',
-    nodes: [
-      { type: 'text', label: '营销策略', x: 100, y: 150 },
-      { type: 'script', label: '广告脚本', x: 500, y: 150 },
-      { type: 'image', label: '广告素材', x: 900, y: 150 },
-      { type: 'video', label: '广告成片', x: 1300, y: 150 },
-    ],
-  },
-  {
-    id: 'comic',
-    name: '智能漫剧',
-    icon: BookOpen,
-    color: '#06b6d4',
-    desc: '剧本 -> 角色 -> 场景 -> 分镜 -> 动画',
-    nodes: [
-      { type: 'text', label: '剧本故事', x: 100, y: 150 },
-      { type: 'image', label: '角色设计', x: 500, y: 150 },
-      { type: 'image', label: '场景绘制', x: 900, y: 150 },
-      { type: 'script', label: '分镜脚本', x: 1300, y: 150 },
-      { type: 'video', label: '漫剧片段', x: 1700, y: 150 },
-    ],
-  },
-];
 
 const nodeItems: { type: NodeType; icon: LucideIcon; label: string; desc: string; color: string }[] = [
   { type: 'text', icon: FileText, label: '文本', desc: '脚本、广告词、品牌文案', color: '#00d4aa' },
@@ -209,6 +87,7 @@ export function Sidebar() {
   const setSidebarTab = useCanvasStore((s) => s.setSidebarTab);
   const selectNode = useCanvasStore((s) => s.selectNode);
   const requestViewportFocus = useCanvasStore((s) => s.requestViewportFocus);
+  const openImportWorkflow = useCanvasStore((s) => s.openImportWorkflow);
 
   const [wfRenameId, setWfRenameId] = useState<string | null>(null);
   const [wfRenameVal, setWfRenameVal] = useState('');
@@ -221,13 +100,6 @@ export function Sidebar() {
   const handleAddNode = (type: NodeType) => {
     if (!canvas) return;
     addNode(type);
-  };
-
-  const handleLoadTemplate = (template: WorkflowTemplate) => {
-    if (!canvas) return;
-    template.nodes.forEach((node) => {
-      addNode(node.type, { x: node.x, y: node.y });
-    });
   };
 
   const handleLocateNode = (nodeId: string) => {
@@ -356,28 +228,17 @@ export function Sidebar() {
     <div className="flex h-full flex-col overflow-hidden">
       <div className="border-b border-[#21262d] px-4 py-3">
         <h3 className="mb-3 text-sm font-semibold text-[#e6edf3]">工作流模板</h3>
-        <div className="grid grid-cols-2 gap-1.5">
-          {WORKFLOW_TEMPLATES.map((template) => {
-            const Icon = template.icon;
-            return (
-              <button
-                type="button"
-                key={template.id}
-                onClick={() => handleLoadTemplate(template)}
-                title={template.name}
-                className="flex items-center gap-2 rounded-xl bg-[#161b22] px-2.5 py-2 text-left ring-1 ring-[#21262d] transition-all hover:bg-[#1c1c1e] hover:ring-[#3a3a3c]"
-              >
-                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg" style={iconTileStyle(template.color)}>
-                  <Icon className="h-3.5 w-3.5" />
-                </div>
-                <div className="min-w-0">
-                  <div className="truncate text-[10px] font-medium text-[#c9d1d9]">{template.name}</div>
-                  <div className="truncate text-[9px] text-[#6e7681]">{template.desc}</div>
-                </div>
-              </button>
-            );
-          })}
-        </div>
+        <p className="mb-3 text-xs leading-relaxed text-[#8b949e]">
+          模板已整合到统一「导入工作流」面板，支持 ComfyUI 导入、画布 JSON 与模板一键加载（含可绑定 ComfyUI 工作流的模板）。
+        </p>
+        <button
+          type="button"
+          onClick={openImportWorkflow}
+          className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#00d4aa]/10 px-3 py-2.5 text-sm font-medium text-[#00d4aa] ring-1 ring-[#00d4aa]/30 transition-all hover:bg-[#00d4aa]/20"
+        >
+          <Plus className="h-4 w-4" />
+          打开导入工作流面板
+        </button>
       </div>
       <div className="flex-1 overflow-y-auto p-3">
         <div className="mb-2 flex items-center justify-between">

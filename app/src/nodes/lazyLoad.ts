@@ -39,6 +39,7 @@ export const lazyNodeComponents: Record<NodeType, LazyExoticComponent<NodeCompon
   threed: lazyWithRetry(async () => ({ default: (await import('@/nodes/ThreeDNode')).ThreeDNode }), 'ThreeDNode'),
   dcc: lazyWithRetry(async () => ({ default: (await import('@/nodes/DCCCaptureNode')).DCCCaptureNode }), 'DCCCaptureNode'),
   region: lazyWithRetry(async () => ({ default: (await import('@/nodes/RegionContractNode')).RegionContractNode }), 'RegionContractNode'),
+  comfyui: lazyWithRetry(async () => ({ default: (await import('@/nodes/ComfyUiNode')).ComfyUiNode }), 'ComfyUiNode'),
 };
 
 export function preloadNodeChunk(type: NodeType): void {

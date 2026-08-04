@@ -132,7 +132,7 @@ export interface LocalVideoAudioMixConfig {
   videoGain?: number;
 }
 
-type LocalVideoEditOperation = 'crop' | 'clip' | 'hd' | 'parse' | 'removeSubtitle' | 'audioSplit' | 'audioMix';
+type LocalVideoEditOperation = 'crop' | 'clip' | 'hd' | 'parse' | 'removeSubtitle' | 'audioSplit' | 'audioMix' | 'motionblur';
 const LOCAL_VIDEO_EDIT_TIMEOUT_MS: Record<LocalVideoEditOperation, number> = {
   crop: 120_000,
   clip: 120_000,
@@ -141,6 +141,7 @@ const LOCAL_VIDEO_EDIT_TIMEOUT_MS: Record<LocalVideoEditOperation, number> = {
   removeSubtitle: 240_000,
   audioSplit: 240_000,
   audioMix: 180_000,
+  motionblur: 240_000,
 };
 const LOCAL_MEDIA_FETCH_TIMEOUT_MS = 45_000;
 
@@ -481,7 +482,7 @@ function toNamedAudioResult(result: Record<string, unknown>, prefix: string): Au
 }
 
 async function requestVideoResult(
-  operation: Extract<LocalVideoEditOperation, 'crop' | 'clip' | 'hd' | 'removeSubtitle' | 'audioMix'>,
+  operation: Extract<LocalVideoEditOperation, 'crop' | 'clip' | 'hd' | 'removeSubtitle' | 'audioMix' | 'motionblur'>,
   videoUrl: string,
   payload: Record<string, unknown>,
   onProgress?: (progress: FFmpegProgress) => void,
@@ -563,6 +564,25 @@ export async function enhanceVideoLocally(
     return {
       success: false,
       error: error instanceof Error ? error.message : '本地高清增强失败。',
+    };
+  }
+}
+
+/** 服务端 ffmpeg 真实运动模糊（电影感快门模拟）。返回带运动模糊的视频，用于后期节点的视频电影感工作流。 */
+export async function applyMotionBlurVideoLocally(
+  videoUrl: string,
+  config: { strength?: number; fps?: number; shutterFrames?: number } = {},
+  onProgress?: (progress: FFmpegProgress) => void,
+): Promise<PipelineResult<VideoTranscodeResult>> {
+  if (!videoUrl) {
+    return { success: false, error: '未找到可加运动模糊的视频素材。' };
+  }
+  try {
+    return await requestVideoResult('motionblur', videoUrl, config, onProgress);
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : '本地运动模糊失败。',
     };
   }
 }

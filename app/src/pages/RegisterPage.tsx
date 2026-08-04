@@ -63,9 +63,14 @@ export default function RegisterPage() {
       const result = await signUpWithEmail(data);
       if (result.success) {
         navigate('/login?registered=true', { replace: true });
-      } else {
-        setError(result.error || t('注册失败，请重试。', 'Sign up failed. Please try again.'));
+        return;
       }
+      // 邮箱已注册：直接带邮箱跳转到登录页，避免用户误以为未注册而重复创建账号
+      if (result.code === 'user_already_exists') {
+        navigate('/login', { state: { email: data.email, reason: 'already_registered' }, replace: true });
+        return;
+      }
+      setError(result.error || t('注册失败，请重试。', 'Sign up failed. Please try again.'));
     } catch {
       setError(t('网络连接失败，请检查网络后重试。', 'Network error. Please check your connection and try again.'));
     } finally {

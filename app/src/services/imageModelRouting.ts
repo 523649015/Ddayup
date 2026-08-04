@@ -84,6 +84,6 @@ export function wireLamaToInpaint(): void {
       imageUrl: input.imageUrl,
       options: { mask: input.mask, prompt: input.prompt },
     });
-    return { blob: out.blob, width: out.width, height: out.height, engine: out.engine };
+    return { blob: out.blob, width: out.width ?? 0, height: out.height ?? 0, engine: out.engine };
   });
 }

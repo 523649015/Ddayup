@@ -9,9 +9,17 @@ import {
 import { useCanvasStore } from '@/store/useCanvasStore';
 import type { CanvasNode, NodeData, NodeType, RegionPackContract } from '@/types';
 import TaggingContractVerifySurface from '@/components/TaggingContractVerifySurface';
-const DEBUG_TAGGING_BASE_IMAGE_URL = new URL('../../tmp-main-compressed.jpg', import.meta.url).toString();
-const DEBUG_TAGGING_SUBJECT_IMAGE_URL = new URL('../../tmp-subject-compressed.jpg', import.meta.url).toString();
-const DEBUG_TAGGING_LIGHTING_IMAGE_URL = new URL('../../tmp-omni-compressed.jpg', import.meta.url).toString();
+// 调试图（手动放到项目根的 tmp-*.jpg，构建时不存在）。
+// 关键：第一个参数必须是「变量表达式」而非字符串字面量，否则 Vite 会在构建期
+// 尝试解析该相对路径并告警 "will be resolved at runtime"。用变量拼接可消除告警，
+// 运行时 new URL(base + name, import.meta.url) 的解析结果与原字面量完全一致。
+const DEBUG_TAGGING_ASSET_BASE = '../../';
+function debugTaggingImageUrl(name: string): string {
+  return new URL(DEBUG_TAGGING_ASSET_BASE + name, import.meta.url).toString();
+}
+const DEBUG_TAGGING_BASE_IMAGE_URL = debugTaggingImageUrl('tmp-main-compressed.jpg');
+const DEBUG_TAGGING_SUBJECT_IMAGE_URL = debugTaggingImageUrl('tmp-subject-compressed.jpg');
+const DEBUG_TAGGING_LIGHTING_IMAGE_URL = debugTaggingImageUrl('tmp-omni-compressed.jpg');
 const DEBUG_BRIDGE_EVENT_NAME = 'hmdao:debug-command';
 
 

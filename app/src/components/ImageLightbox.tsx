@@ -8,13 +8,15 @@
  *   - 图片本身点击不冒泡，避免误关
  */
 import { useEffect } from 'react';
+import { toRenderableAssetUrl } from '@/services/generation';
 
 export interface ImageLightboxProps {
   url: string;
+  title?: string;
   onClose: () => void;
 }
 
-export function ImageLightbox({ url, onClose }: ImageLightboxProps) {
+export function ImageLightbox({ url, title, onClose }: ImageLightboxProps) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -43,9 +45,14 @@ export function ImageLightbox({ url, onClose }: ImageLightboxProps) {
       >
         ×
       </button>
+      {title && (
+        <div className="absolute left-4 top-4 z-[101] max-w-[80vw] truncate rounded-md bg-black/50 px-3 py-1.5 text-sm text-white">
+          {title}
+        </div>
+      )}
       <img
-        src={url}
-        alt=""
+        src={toRenderableAssetUrl(url, 'image')}
+        alt={title || ''}
         className="max-h-[90vh] max-w-[90vw] rounded-lg object-contain shadow-2xl"
         onClick={(e) => e.stopPropagation()}
         draggable={false}

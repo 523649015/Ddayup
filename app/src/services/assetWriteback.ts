@@ -65,8 +65,8 @@ export function commitResultToAsset(input: CommitAssetInput): CommitAssetResult 
     duration: input.duration,
     prompt: input.prompt,
     sourceUrl: input.sourceUrl,
-    tags: input.tags,
-    smartCategories: input.smartCategories,
+    tags: input.tags ?? [],
+    smartCategories: input.smartCategories ?? [],
     source: input.source || 'generate',
   });
 

@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import type { ToolCapabilityPanelProps } from './capabilityPanelTypes';
+import { toRenderableAssetUrl } from '@/services/generation';
 
 /**
  * 局部编辑 CapabilityPanel：在独立面板中承载 BrushEditCanvas。
@@ -87,7 +88,7 @@ export default function BrushCapabilityPanel({ sourceImageUrl, onApply, onClose 
   return (
     <div className="flex flex-col gap-3">
       <div className="relative flex-1 overflow-hidden rounded-lg bg-[#0b0b0b]" style={{ aspectRatio: '1 / 1' }}>
-        <img src={sourceImageUrl || ''} alt="" draggable={false} className="absolute inset-0 h-full w-full object-contain" />
+        <img src={toRenderableAssetUrl(sourceImageUrl || '', 'image')} alt="" draggable={false} className="absolute inset-0 h-full w-full object-contain" />
         <canvas
           ref={maskRef}
           width={512}

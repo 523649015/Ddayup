@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Shapes } from 'lucide-react';
 import type { ToolCapabilityPanelProps } from './capabilityPanelTypes';
+import { toRenderableAssetUrl } from '@/services/generation';
 
 /**
  * 智能去背 CapabilityPanel：极简确认面板，一键执行去背景。

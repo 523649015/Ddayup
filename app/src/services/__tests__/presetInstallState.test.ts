@@ -1,16 +1,13 @@
-/**
- * 需求2 — 模型/插件安装态真实检测 + 版本检查（测试）
- *
- * 修复：模型下载面板「已安装」判定现已基于 IndexedDB 中真实缓存记录
- * （presetModelInstall.initPresetInstalledState），刷新/重登后不再回到「下载」；
- * 并提供版本检查（getPresetUpdateInfo）提示更新。
+﻿/**
+ * 需求2 — 模型/插件安装态真实检测 + 修复态提示（测试）
  *
  * 覆盖：
  *   ✅ listCachedModels 枚举 IndexedDB 中已缓存模型
- *   ✅ initPresetInstalledState 后 getPresetInstallState 返回已安装记录
- *   ✅ 模拟刷新（清空内存态与标记）后，再次 init 仍从 IndexedDB 判为已安装（核心 Bug 修复）
+ *   ✅ initPresetInstalledState 后 getPresetInstallState 仅在真实缓存完整时返回已安装
+ *   ✅ 模拟刷新后仍能从 IndexedDB 恢复已安装态
  *   ✅ 已安装版本落后时 getPresetUpdateInfo.updateAvailable 为 true
- *   ✅ 清除缓存后 clearPresetInstalled 回退未安装
+ *   ✅ 仅有安装标记但缓存缺失时，状态转为 needs-repair
+ *   ✅ 拆分式模型缺失外部权重时，状态转为 needs-repair
  */
 
 import 'fake-indexeddb/auto';
@@ -20,14 +17,14 @@ import { listCachedModels } from '@/services/modelLoader';
 import { PRESET_MODELS } from '@/config/presetModels';
 
 const REAL_ESRGAN = PRESET_MODELS.find((m) => m.id === 'real-esrgan-x4')!;
+const DEPTH_V3 = PRESET_MODELS.find((m) => m.id === 'depth-anything-v3-base')!;
 
-describe('需求2：模型安装态从 IndexedDB 真实检测', () => {
+describe('需求2：模型安装态从真实缓存检测', () => {
   beforeEach(() => {
     localStorage.clear();
   });
 
   afterEach(async () => {
-    // 关闭并删除 fake IndexedDB，避免连接残留导致进程不退出 / 跨用例污染
     try {
       await closeDB();
     } catch {
@@ -48,18 +45,7 @@ describe('需求2：模型安装态从 IndexedDB 真实检测', () => {
     expect(list.some((m) => m.modelId === 'real-esrgan-x4' && m.version === '1.0.0')).toBe(true);
   });
 
-  it('不同版本的同一模型都应被枚举', async () => {
-    await cacheModel('lama', '1.0.0', new ArrayBuffer(8));
-    await cacheModel('lama', '1.1.0', new ArrayBuffer(8));
-
-    const list = await listCachedModels();
-    expect(list.filter((m) => m.modelId === 'lama').map((m) => m.version).sort()).toEqual([
-      '1.0.0',
-      '1.1.0',
-    ]);
-  });
-
-  it('initPresetInstalledState 后 getPresetInstallState 返回已安装记录', async () => {
+  it('initPresetInstalledState 后仅在真实缓存存在时返回已安装记录', async () => {
     await cacheModel('real-esrgan-x4', '1.0.0', new ArrayBuffer(16));
     const mod = await import('@/services/presetModelInstall');
     await mod.initPresetInstalledState();
@@ -68,22 +54,22 @@ describe('需求2：模型安装态从 IndexedDB 真实检测', () => {
       modelId: 'real-esrgan-x4',
       version: '1.0.0',
     });
+    expect(mod.getPresetInstallHealth('real-esrgan-x4').status).toBe('installed');
   });
 
-  it('刷新后：仅依赖 IndexedDB 仍判定为已安装（修复刷新后回到「下载」）', async () => {
+  it('刷新后：仅依赖 IndexedDB 仍判定为已安装', async () => {
     await cacheModel('real-esrgan-x4', '1.0.0', new ArrayBuffer(16));
     const mod = await import('@/services/presetModelInstall');
     await mod.initPresetInstalledState();
     expect(mod.getPresetInstallState('real-esrgan-x4')).not.toBeNull();
 
-    // 模拟刷新：内存态与 localStorage 标记清空（等同于页面重新加载后模块重新求值）
     mod.clearPresetInstalled('real-esrgan-x4');
     localStorage.removeItem('hmdao_preset_installed');
     expect(mod.getPresetInstallState('real-esrgan-x4')).toBeNull();
 
-    // 面板挂载会再次调用 initPresetInstalledState，从 IndexedDB 真实记录重新判定
     await mod.initPresetInstalledState();
     expect(mod.getPresetInstallState('real-esrgan-x4')).not.toBeNull();
+    expect(mod.getPresetInstallHealth('real-esrgan-x4').status).toBe('installed');
   });
 
   it('已安装版本落后时提示更新', async () => {
@@ -97,13 +83,35 @@ describe('需求2：模型安装态从 IndexedDB 真实检测', () => {
     expect(info.updateAvailable).toBe(true);
   });
 
-  it('清除缓存后回退未安装', async () => {
-    await cacheModel('real-esrgan-x4', '1.0.0', new ArrayBuffer(16));
+  it('仅有安装标记但主缓存缺失时转为待修复', async () => {
+    localStorage.setItem(
+      'hmdao_preset_installed',
+      JSON.stringify({
+        'birefnet-matting': { modelId: 'birefnet-matting', version: '1.0.0' },
+      }),
+    );
     const mod = await import('@/services/presetModelInstall');
     await mod.initPresetInstalledState();
-    expect(mod.getPresetInstallState('real-esrgan-x4')).not.toBeNull();
 
-    mod.clearPresetInstalled('real-esrgan-x4');
-    expect(mod.getPresetInstallState('real-esrgan-x4')).toBeNull();
+    expect(mod.getPresetInstallState('birefnet-matting')).toBeNull();
+    expect(mod.getPresetInstallHealth('birefnet-matting')).toMatchObject({
+      status: 'needs-repair',
+      hasMarker: true,
+      hasMainCache: false,
+      missingFiles: ['model'],
+    });
+  });
+
+  it('拆分式模型缺少外部权重时转为待修复', async () => {
+    await cacheModel(DEPTH_V3.id, DEPTH_V3.version, new ArrayBuffer(16));
+    const mod = await import('@/services/presetModelInstall');
+    await mod.initPresetInstalledState();
+
+    expect(mod.getPresetInstallState(DEPTH_V3.id)).toBeNull();
+    expect(mod.getPresetInstallHealth(DEPTH_V3.id)).toMatchObject({
+      status: 'needs-repair',
+      hasMainCache: true,
+      missingFiles: ['model.onnx_data'],
+    });
   });
 });

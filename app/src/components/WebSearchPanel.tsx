@@ -1,4 +1,4 @@
-﻿import { useState, useRef, useCallback, useEffect } from 'react';
+﻿import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import {
   Search, X, Download, Plus, Globe, Settings2, Image as ImageIcon,
   CheckSquare, Square, Tag, Loader2, ExternalLink,
@@ -6,7 +6,7 @@ import {
   Play, FolderPlus, AlertCircle, Copy, Check,
   Monitor, Palette,
 } from 'lucide-react';
-import { freeWebSearch, prepareFreeImport, FREE_PLATFORM_META, DEFAULT_FREE_PLATFORMS } from '@/services/freeImageSearchService';
+import { freeWebSearch, prepareFreeImport, FREE_PLATFORM_META, DEFAULT_FREE_PLATFORMS, scrapeUrl } from '@/services/freeImageSearchService';
 import { useAssetStore } from '@/store/useAssetStore';
 import { importRemoteAsset, pickAssetLibraryDirectory, saveAssetLibrarySettings, fetchAssetLibrarySettings } from '@/api/assetLibrary';
 import {
@@ -18,6 +18,7 @@ import {
   type SearchPlatform,
   type SearchPlatformMeta,
   type SearchMode,
+  type MediaType,
   SEARCH_PLATFORMS,
   TIME_RANGE_OPTIONS,
   SORT_OPTIONS,
@@ -25,12 +26,15 @@ import {
   DEFAULT_SEARCH_FILTERS,
 } from '@/types/assets';
 import { SearchBrowserView } from './SearchBrowserView';
+import { ImageLightbox } from './ImageLightbox';
 
 /* ===== Types ===== */
 
 interface WebSearchPanelProps {
   isOpen: boolean;
   onClose: () => void;
+  /** 打开时预填的检索关键词（如由智能归纳插件注入） */
+  initialQuery?: string;
   /** For reverse search: pre-populated item info */
   reverseItem?: { id: string; url: string; name: string; type: string } | null;
   onClearReverseItem?: () => void;
@@ -48,10 +52,16 @@ const RESULTS_PER_PAGE = 24;
 export function WebSearchPanel({
   isOpen,
   onClose,
+  initialQuery,
   reverseItem,
   onClearReverseItem,
 }: WebSearchPanelProps) {
   const { addItem, importTargetFolderId, storagePath, setStoragePath } = useAssetStore();
+
+  // 由智能归纳插件等外部入口注入的初始关键词
+  useEffect(() => {
+    if (isOpen && initialQuery) setSearchQuery(initialQuery);
+  }, [isOpen, initialQuery]);
   const [isPickingPath, setIsPickingPath] = useState(false);
   const [pathNotice, setPathNotice] = useState<string | null>(null);
   const [importProgress, setImportProgress] = useState<{ done: number; total: number } | null>(null);
@@ -63,6 +73,8 @@ export function WebSearchPanel({
   const [results, setResults] = useState<WebSearchResult[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
+  const [mediaType, setMediaType] = useState<MediaType | 'all'>('image');
+  const [lightbox, setLightbox] = useState<WebSearchResult | null>(null);
   const [browserMode, setBrowserMode] = useState(false);
   const [browserPlatform, setBrowserPlatform] = useState<SearchPlatformMeta>(SEARCH_PLATFORMS[0]);
   const [customPlatforms, setCustomPlatforms] = useState<SearchPlatformMeta[]>([]);
@@ -97,6 +109,17 @@ export function WebSearchPanel({
   const displaySearchQuery = isReverseItemActive && activeSearchMode === 'reverse-image'
     ? reverseSearchQuery
     : searchQuery;
+
+  const mediaTypeTabs = useMemo(() => {
+    const tabs: Array<{ id: MediaType | 'all'; label: string; icon: any }> = [
+      { id: 'image', label: '图片', icon: ImageIcon },
+      { id: 'video', label: '视频', icon: Play },
+      { id: 'audio', label: '音效', icon: Copy },
+      { id: 'model', label: '模型', icon: Monitor },
+    ];
+    if (searchMode === 'scrape') tabs.unshift({ id: 'all', label: '全部', icon: Globe });
+    return tabs;
+  }, [searchMode]);
 
   // ===== Callbacks =====
   const addCustomPlatform = useCallback(() => {
@@ -147,26 +170,65 @@ export function WebSearchPanel({
     setSelectedIds(new Set());
 
     try {
+      const effectiveType = mediaType === 'all' ? 'image' : mediaType;
+      // 音效/模型使用专属平台（无需用户在高级设置里勾选图片平台）
+      const mediaDefaultPlatforms: string[] =
+        effectiveType === 'audio' ? ['wikimedia', 'openverse', 'freesound']
+        : effectiveType === 'model' ? ['polyhaven', 'sketchfab']
+        : DEFAULT_FREE_PLATFORMS;
       const chosenFree = (filters.platforms as string[]).filter((p) => DEFAULT_FREE_PLATFORMS.includes(p));
+      const freePlatforms =
+        effectiveType === 'audio' || effectiveType === 'model'
+          ? mediaDefaultPlatforms
+          : chosenFree.length > 0 ? chosenFree : undefined;
       const response = await freeWebSearch({
         query: keywordQuery || 'trending',
         mode: activeSearchMode,
         filters,
         page: 1,
         perPage: RESULTS_PER_PAGE,
+        mediaType: effectiveType,
         // 仅当用户显式勾选了「免费图搜平台」时才限定，否则走默认全部平台
-        freePlatforms: chosenFree.length > 0 ? chosenFree : undefined,
+        freePlatforms,
       });
       setResults(response.results);
       if (response.results.length === 0) {
-        setSearchError('未找到匹配结果，请尝试更换关键词或调整筛选条件');
+        const hint = response.notice ? `（${response.notice}）` : '';
+        setSearchError(`未找到匹配结果${hint}，请尝试更换关键词或调整筛选条件`);
       }
     } catch (e) {
       setSearchError('搜索失败，请检查网络连接后重试');
       console.error('Search error:', e);
     }
     setIsSearching(false);
-  }, [searchQuery, activeSearchMode, filters]);
+  }, [searchQuery, activeSearchMode, filters, mediaType]);
+
+  // 网页直采：抓取任意公开网址上的图片/视频/音效/模型（免 Key，不限网站）。
+  const handleScrape = useCallback(async () => {
+    const target = (searchQuery || '').trim();
+    if (!target) return;
+    setIsSearching(true);
+    setSearchError(null);
+    setResults([]);
+    setSelectedIds(new Set());
+
+    try {
+      const scrapeType = (mediaType === 'all' ? 'all' : mediaType) as 'image' | 'video' | 'audio' | 'model' | 'all';
+      const response = await scrapeUrl(target, scrapeType);
+      if (response.error) {
+        setSearchError(`抓取失败：${response.error}`);
+        setResults([]);
+      } else {
+        setResults(response.results);
+        if (response.results.length === 0) {
+          setSearchError('该网址未解析到匹配的素材，可能是页面由 JS 动态加载（需登录或前端渲染），可改用关键词搜索');
+        }
+      }
+    } catch {
+      setSearchError('抓取失败，请检查网址或网络连接');
+    }
+    setIsSearching(false);
+  }, [searchQuery, mediaType]);
 
   // 反向搜图：以参考图的名称/视觉关键词，在用户所选平台上做相似检索（走后端真实代理）。
   // 不再使用 mock 假数据；必须至少选择一个平台后才允许搜索。
@@ -203,6 +265,10 @@ export function WebSearchPanel({
 
   // 提交搜索：反向搜图需先选平台（无平台时不盲目搜）。
   const handleSubmitSearch = useCallback(() => {
+    if (searchMode === 'scrape') {
+      void handleScrape();
+      return;
+    }
     if (reverseItem && activeSearchMode === 'reverse-image') {
       if (filters.platforms.length === 0) {
         setSearchError('请先选择要搜索相似的平台（参考图 → 选平台 → 搜索）。');
@@ -213,7 +279,7 @@ export function WebSearchPanel({
     }
 
     void handleSearch();
-  }, [reverseItem, activeSearchMode, filters, handleSearchWithItem, handleSearch]);
+  }, [searchMode, reverseItem, activeSearchMode, filters, handleSearchWithItem, handleSearch, handleScrape]);
 
   // 反向搜图：仅在用户已选平台时自动发起；否则展示平台选择步骤，不盲目搜索。
   useEffect(() => {
@@ -493,6 +559,17 @@ export function WebSearchPanel({
               <ImageIcon className="w-3 h-3" />
               以图搜图
             </button>
+            <button
+              onClick={() => { setSearchMode('scrape'); setResults([]); setSearchError(null); }}
+              className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-medium transition-colors ${
+                searchMode === 'scrape'
+                  ? 'bg-[#2a2a2c] text-[#00d4aa]'
+                  : 'text-[#8b949e] hover:text-[#c9d1d9]'
+              }`}
+            >
+              <Globe className="w-3 h-3" />
+              网页直采
+            </button>
           </div>
           <button
             onClick={() => setShowAdvanced(!showAdvanced)}
@@ -517,7 +594,9 @@ export function WebSearchPanel({
               onChange={(e) => setSearchQuery(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleSubmitSearch()}
               placeholder={
-                activeSearchMode === 'reverse-image'
+                searchMode === 'scrape'
+                  ? '粘贴任意网页网址，如 https://example.com/gallery'
+                  : activeSearchMode === 'reverse-image'
                   ? '输入图片URL或选择资产库中的素材进行反向搜索...'
                   : '输入关键词搜索图片素材，如"极简风格海报"...'
               }
@@ -535,22 +614,28 @@ export function WebSearchPanel({
             )}          </div>
           <button
             onClick={handleSubmitSearch}
-            disabled={isSearching || (activeSearchMode === 'keyword' && !displaySearchQuery.trim()) || (activeSearchMode === 'reverse-image' && filters.platforms.length === 0)}
+            disabled={
+              isSearching ||
+              (searchMode === 'scrape'
+                ? !searchQuery.trim()
+                : (activeSearchMode === 'keyword' && !displaySearchQuery.trim()) ||
+                  (activeSearchMode === 'reverse-image' && filters.platforms.length === 0))
+            }
             className={`px-4 py-2 rounded-lg text-xs font-medium transition-colors shrink-0 ${
-              isSearching || (!displaySearchQuery.trim() && activeSearchMode === 'keyword')
+              isSearching || (searchMode === 'scrape' ? !searchQuery.trim() : (!displaySearchQuery.trim() && activeSearchMode === 'keyword'))
                 ? 'bg-[#2a2a2c] text-[#6e7681]'
                 : 'bg-[#00d4aa] text-[#0d1117] hover:bg-[#00e5b3]'
             }`}
           >
             {isSearching ? (
               <span className="flex items-center gap-1">
-                <Loader2 className="w-3 h-3 animate-spin" /> 搜索中
+                <Loader2 className="w-3 h-3 animate-spin" /> {searchMode === 'scrape' ? '抓取中' : '搜索中'}
               </span>
             ) : (
-              '搜索'
+              searchMode === 'scrape' ? '抓取' : '搜索'
             )}          </button>
           {/* Browser mode */}
-          {searchQuery.trim() && (
+          {searchQuery.trim() && searchMode !== 'scrape' && (
             <button
               onClick={() => {
                 if (!browserMode) {
@@ -592,12 +677,12 @@ export function WebSearchPanel({
             </div>
             <div className="flex flex-wrap gap-1.5">
               {reversePlatforms.map((platform) => {
-                const isActive = filters.platforms.includes(platform.id);
+                const isActive = filters.platforms.includes(platform.id as SearchPlatform);
                 return (
                   <button
                     key={platform.id}
                     type="button"
-                    onClick={() => togglePlatform(platform.id)}
+                    onClick={() => togglePlatform(platform.id as SearchPlatform)}
                     data-testid={`web-search-reverse-platform-${platform.id}`}
                     className={`flex items-center gap-1 px-2 py-1 rounded-md text-[10px] transition-all ${
                       isActive
@@ -636,11 +721,11 @@ export function WebSearchPanel({
               </div>
               <div className="flex flex-wrap gap-1.5">
                 {allPlatforms.map((platform) => {
-                  const isActive = filters.platforms.includes(platform.id);
+                  const isActive = filters.platforms.includes(platform.id as SearchPlatform);
                   return (
                     <button
                       key={platform.id}
-                      onClick={() => togglePlatform(platform.id)}
+                      onClick={() => togglePlatform(platform.id as SearchPlatform)}
                       className={`flex items-center gap-1 px-2 py-1 rounded-md text-[10px] transition-all ${
                         isActive
                           ? 'bg-[#00d4aa]/15 text-[#00d4aa] ring-1 ring-[#00d4aa]/30'
@@ -862,6 +947,32 @@ export function WebSearchPanel({
           {pathNotice}
         </div>
       )}
+      {/* 素材类型 Tab：图片 / 视频 / 音效 / 模型 */}
+      <div className="flex items-center gap-1 px-4 py-2 border-b border-[#21262d] shrink-0 overflow-x-auto">
+        {mediaTypeTabs.map((tab) => {
+          const Icon = tab.icon;
+          const active = mediaType === tab.id;
+          return (
+            <button
+              key={tab.id}
+              onClick={() => {
+                setMediaType(tab.id);
+                setResults([]);
+                setSearchError(null);
+                setSelectedIds(new Set());
+              }}
+              className={`flex items-center gap-1 px-3 py-1.5 rounded-md text-[11px] font-medium whitespace-nowrap transition-colors ${
+                active
+                  ? 'bg-[#00d4aa] text-black'
+                  : 'text-[#8b949e] hover:text-[#e6edf3] hover:bg-[#21262d]'
+              }`}
+            >
+              <Icon size={13} />
+              {tab.label}
+            </button>
+          );
+        })}
+      </div>
       {/* Results Toolbar */}
       {results.length > 0 && (
         <div className="flex items-center justify-between px-4 py-2 border-b border-[#21262d] shrink-0">
@@ -994,12 +1105,39 @@ export function WebSearchPanel({
                           </div>
                         )}                      </div>
                     </>
+                  ) : result.type === 'audio' ? (
+                    <div className="w-full h-full flex items-center justify-center p-2" onClick={(e) => e.stopPropagation()}>
+                      {result.thumb ? (
+                        <img src={result.thumb} alt={result.title} className="absolute inset-0 w-full h-full object-cover opacity-20" />
+                      ) : null}
+                      <audio controls src={result.url} className="relative z-10 w-full max-h-10">
+                        <track kind="captions" />
+                      </audio>
+                    </div>
+                  ) : result.type === 'model' ? (
+                    <img
+                      src={result.thumb || result.url}
+                      alt={result.title}
+                      className="w-full h-full object-cover cursor-zoom-in"
+                      loading="lazy"
+                      onClick={(e) => { e.stopPropagation(); setLightbox(result); }}
+                      onError={(e) => {
+                        (e.currentTarget as HTMLImageElement).src =
+                          'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="120" height="90"><rect width="120" height="90" fill="%2321262d"/><text x="60" y="50" font-size="13" fill="%238b949e" text-anchor="middle">3D 模型</text></svg>';
+                      }}
+                    />
                   ) : (
                     <img
-                      src={result.thumb || result.previewUrl}
+                      src={result.url || result.thumb || result.previewUrl}
                       alt={result.title}
-                      className="w-full h-full object-cover"
+                      className="w-full h-full object-cover cursor-zoom-in"
                       loading="lazy"
+                      onClick={(e) => { e.stopPropagation(); setLightbox(result); }}
+                      onError={(e) => {
+                        const t = e.currentTarget as HTMLImageElement;
+                        if (t.src !== result.thumb && result.thumb) t.src = result.thumb;
+                        else if (t.src !== result.previewUrl && result.previewUrl) t.src = result.previewUrl;
+                      }}
                     />
                   )}
                   {/* Selection indicator */}
@@ -1080,7 +1218,7 @@ export function WebSearchPanel({
                       <FolderPlus className="w-2.5 h-2.5" /> 收录
                     </button>
                     <button
-                      onClick={(e) => { e.stopPropagation(); copyUrl(result.url, result.id); }}
+                      onClick={(e) => { e.stopPropagation(); copyUrl(result.downloadUrl || result.url, result.id); }}
                       className="flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[#21262d] text-[#8b949e] text-[9px] hover:text-[#c9d1d9]"
                       title="复制链接"
                     >
@@ -1094,12 +1232,12 @@ export function WebSearchPanel({
                       <Tag className="w-2.5 h-2.5" /> 标签
                     </button>
                     <a
-                      href={result.url}
+                      href={result.downloadUrl || result.url}
                       target="_blank"
                       rel="noopener noreferrer"
                       onClick={(e) => e.stopPropagation()}
                       className="flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[#21262d] text-[#8b949e] text-[9px] hover:text-[#c9d1d9]"
-                      title="查看原图"
+                      title="查看/下载原素材"
                     >
                       <ExternalLink className="w-2.5 h-2.5" />
                     </a>
@@ -1148,6 +1286,15 @@ export function WebSearchPanel({
             {filters.platforms.length} 个平台
           </div>
         </div>
+      )}
+
+      {/* 图片放大预览 */}
+      {lightbox && (
+        <ImageLightbox
+          url={lightbox.url || lightbox.thumb || ''}
+          title={lightbox.title}
+          onClose={() => setLightbox(null)}
+        />
       )}
     </div>
   );

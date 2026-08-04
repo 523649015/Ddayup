@@ -35,10 +35,11 @@ const NODE_LABELS: Record<NodeType, Record<Language, string>> = {
   post: { zh: '后期节点', en: 'Post' },
   script: { zh: '脚本节点', en: 'Script Builder' },
   storyboard: { zh: '分镜节点', en: 'Storyboard Grid' },
-  aiapp: { zh: 'AI 搴旂敤', en: 'AI App' },
+  aiapp: { zh: 'AI 应用', en: 'AI App' },
   threed: { zh: '3D 世界', en: '3D World' },
   dcc: { zh: 'DCC 捕捉', en: 'DCC Capture' },
   region: { zh: '打标签节点', en: 'Tagging Node' },
+  comfyui: { zh: 'ComfyUI 工作流', en: 'ComfyUI Workflow' },
 };
 
 const LEGACY_NODE_LABELS: Partial<Record<NodeType, string[]>> = {
@@ -146,6 +147,12 @@ const BASE_NODE_DATA: Record<NodeType, Omit<Partial<NodeData>, 'label'>> = {
         fallbackPolicy: 'reject',
       },
     },
+  },
+  comfyui: {
+    provider: 'comfyui',
+    model: 'comfyui-gateway',
+    status: 'idle',
+    cost: 0,
   },
 };
 
@@ -462,6 +469,9 @@ interface CanvasStore extends AppState {
   toggleDarkMode: () => void;
   setShowShortcuts: (show: boolean) => void;
   setLanguage: (lang: 'zh' | 'en') => void;
+  importWorkflowOpen: boolean;
+  openImportWorkflow: () => void;
+  closeImportWorkflow: () => void;
 
   // Assets
   addAsset: (asset: AssetItem) => void;
@@ -840,6 +850,30 @@ function ensureBuiltinWorkflows(workflows: Workflow[] | undefined): Workflow[] {
   return [...demoWorkflows.map(cloneWorkflow), ...custom];
 }
 
+// 把分组里的 nodeIds 对账到「当前画布真实存在的节点」，剔除 phantom ID（已删除/不存在的 id），
+// 并删除因此变空的组。用于任何会替换/恢复 canvas.nodes 的路径，从源头消除
+// 分组节点计数与主画布不一致的状态管理问题。groups 未被改动时返回原引用，避免无谓的渲染。
+function pruneGroupsToLiveNodes(groups: NodeGroup[], liveNodeIds: Set<string>): NodeGroup[] {
+  let mutated = false;
+  const pruned = groups
+    .map((group) => {
+      if (!group || !Array.isArray(group.nodeIds)) return group;
+      const filtered = group.nodeIds.filter((id) => liveNodeIds.has(id));
+      if (filtered.length === group.nodeIds.length) return group;
+      mutated = true;
+      return { ...group, nodeIds: filtered };
+    })
+    .filter((group) => {
+      if (!group) return false;
+      if (group.nodeIds.length === 0) {
+        mutated = true;
+        return false;
+      }
+      return true;
+    });
+  return mutated ? pruned : groups;
+}
+
 export const useCanvasStore = create<CanvasStore>()(
   persist(
     immer((set, get) => ({
@@ -856,6 +890,7 @@ export const useCanvasStore = create<CanvasStore>()(
     showAIPanel: true,
     showAssetPanel: false,
     showTemplatePanel: false,
+    importWorkflowOpen: false,
     showSettings: false,
     showShortcuts: false,
     darkMode: true,
@@ -888,6 +923,8 @@ export const useCanvasStore = create<CanvasStore>()(
       clearAllDeferredEdges();
       set((state) => {
         state.canvas = createNewCanvas(title, state.language);
+        // 新建画布的节点是全新的，旧分组里残留的 nodeIds 全部失效，直接清空分组。
+        state.groups = pruneGroupsToLiveNodes(state.groups, new Set(state.canvas.nodes.map((node) => node.id)));
         state.selectedNodeIds = [];
         state.floatingPanel = null;
         state.pendingViewportFocusNodeId = null;
@@ -1308,9 +1345,29 @@ export const useCanvasStore = create<CanvasStore>()(
       if (!scheduledDeferredRetry) {
         clearDeferredEdgeState(edgeKey);
       }
+      const enforceSinglePostSource = targetNode.type === 'post' && normalized.targetHandle === 'post-input';
       set((draft) => {
         if (!draft.canvas) return;
+        let changed = false;
+        if (enforceSinglePostSource) {
+          const removedEdges = draft.canvas.edges.filter((edge) => (
+            edge.target === normalized.target
+            && (edge.targetHandle || '') === (normalized.targetHandle || '')
+            && edge.id !== existingEdge?.id
+            && edge.source !== normalized.source
+          ));
+          if (removedEdges.length > 0) {
+            draft.canvas.edges = draft.canvas.edges.filter((edge) => !removedEdges.some((removed) => removed.id === edge.id));
+            removedEdges.forEach((edge) => {
+              cleanupRemovedEdgeBindings(draft.canvas!, edge as CanvasEdge);
+            });
+            changed = true;
+          }
+        }
         if (upsertCanvasEdge(draft.canvas.edges, normalized, !handlesMounted)) {
+          changed = true;
+        }
+        if (changed) {
           draft.canvas.updatedAt = Date.now();
         }
       });
@@ -1359,6 +1416,8 @@ export const useCanvasStore = create<CanvasStore>()(
         s.canvas.edges = snapshot.edges.map((e) => ({ ...e }));
         s.canvas.updatedAt = Date.now();
         s.selectedNodeIds = [...snapshot.selectedNodeIds];
+        // 历史快照不记录分组，恢复节点后需把分组对账到当前真实节点，避免 phantom ID。
+        s.groups = pruneGroupsToLiveNodes(s.groups, new Set(s.canvas.nodes.map((node) => node.id)));
         s.historyIndex = targetIndex;
       });
     },
@@ -1377,6 +1436,7 @@ export const useCanvasStore = create<CanvasStore>()(
         s.canvas.edges = snapshot.edges.map((e) => ({ ...e }));
         s.canvas.updatedAt = Date.now();
         s.selectedNodeIds = [...snapshot.selectedNodeIds];
+        s.groups = pruneGroupsToLiveNodes(s.groups, new Set(s.canvas.nodes.map((node) => node.id)));
         s.historyIndex = targetIndex;
       });
     },
@@ -1393,6 +1453,7 @@ export const useCanvasStore = create<CanvasStore>()(
           s.canvas.edges = snap.edges.map((e) => ({ ...e }));
           s.canvas.updatedAt = Date.now();
           s.selectedNodeIds = [...snap.selectedNodeIds];
+          s.groups = pruneGroupsToLiveNodes(s.groups, new Set(s.canvas.nodes.map((node) => node.id)));
         }
         s.history = [];
         s.historyIndex = -1;
@@ -1427,6 +1488,9 @@ export const useCanvasStore = create<CanvasStore>()(
         state.activeSidebarTab = tab;
       });
     },
+
+    openImportWorkflow: () => set((state) => { state.importWorkflowOpen = true; }),
+    closeImportWorkflow: () => set((state) => { state.importWorkflowOpen = false; }),
 
     toggleSidebar: () => {
       set((state) => {
@@ -1510,6 +1574,8 @@ export const useCanvasStore = create<CanvasStore>()(
       };
       set((state) => {
         state.canvas = normalizedCanvas;
+        // 导入的画布是独立文档（当前模型下不含分组），重置分组避免旧分组残留 phantom ID。
+        state.groups = pruneGroupsToLiveNodes(state.groups, new Set(normalizedCanvas.nodes.map((node) => node.id)));
         state.selectedNodeIds = [];
       });
     },
@@ -1563,6 +1629,8 @@ export const useCanvasStore = create<CanvasStore>()(
           edges: normalizeCanvasEdges(wf.edges.map((e) => ({ ...e })), workflowNodes),
           updatedAt: Date.now(),
         };
+        // 工作流载入替换了画布节点，旧分组里指向被替换节点的 id 失效，需对账。
+        state.groups = pruneGroupsToLiveNodes(state.groups, new Set(workflowNodes.map((node) => node.id)));
         state.selectedNodeIds = [];
       });
     },
@@ -1625,10 +1693,15 @@ export const useCanvasStore = create<CanvasStore>()(
       set((state) => {
         const target = state.groups.find((g) => g.id === groupId);
         if (!target) return;
+        // 防御性过滤：只接受画布上真实存在的节点，避免把已删除/不存在的 id 写入
+        // group.nodeIds 产生 phantom ID（导致小窗口计数与主画布不一致）。
+        const liveNodeIds = state.canvas ? new Set(state.canvas.nodes.map((node) => node.id)) : new Set<string>();
+        const validNodeIds = nodeIds.filter((id) => liveNodeIds.has(id));
+        if (validNodeIds.length === 0) return;
         state.groups.forEach((group) => {
-          if (group.id !== groupId) group.nodeIds = group.nodeIds.filter((nodeId) => !nodeIds.includes(nodeId));
+          if (group.id !== groupId) group.nodeIds = group.nodeIds.filter((nodeId) => !validNodeIds.includes(nodeId));
         });
-        target.nodeIds = Array.from(new Set([...target.nodeIds, ...nodeIds]));
+        target.nodeIds = Array.from(new Set([...target.nodeIds, ...validNodeIds]));
       });
     },
 
@@ -1688,6 +1761,18 @@ export const useCanvasStore = create<CanvasStore>()(
           // Apply custom data if provided
           if (step.data) {
             get().updateNodeData(nodeId, step.data);
+          }
+          // 回填手动参考输入的 sourceNodeId：规划期无法预知节点 id，而
+          // collectConnectedReferenceInputs 要求手动输入 sourceNodeId 非空才会被识别为可用主输入。
+          // 这里把空 sourceNodeId 的手动输入绑定到本节点自身，使智能体创建的媒体节点能正确以附件为主输入。
+          const rawInputs = (step.data as { inputs?: unknown } | undefined)?.inputs;
+          if (Array.isArray(rawInputs)) {
+            const normalized = (rawInputs as Array<Record<string, unknown>>).map((inp) => ({
+              ...inp,
+              sourceNodeId:
+                typeof inp.sourceNodeId === 'string' && inp.sourceNodeId ? inp.sourceNodeId : nodeId,
+            }));
+            get().updateNodeData(nodeId, { inputs: normalized } as Partial<NodeData>);
           }
           createdNodeIds.push(nodeId);
         }
@@ -1784,6 +1869,32 @@ export const useCanvasStore = create<CanvasStore>()(
           };
           next.canvas.edges = normalizeCanvasEdges(next.canvas.edges, next.canvas.nodes);
         }
+        // 防御性对账：rehydrate 时剔除 groups.nodeIds 中已不存在的 phantom ID，
+        // 避免 localStorage 旧数据导致小窗口（chip）节点数与主画布不一致。
+        if (Array.isArray(next.groups) && next.canvas?.nodes) {
+          const liveNodeIds = new Set(next.canvas.nodes.map((node) => node.id));
+          let groupsMutated = false;
+          next.groups = next.groups
+            .map((group) => {
+              if (!group || !Array.isArray(group.nodeIds)) return group;
+              const filtered = group.nodeIds.filter((id) => liveNodeIds.has(id));
+              if (filtered.length === group.nodeIds.length) return group;
+              groupsMutated = true;
+              return { ...group, nodeIds: filtered };
+            })
+            .filter((group) => {
+              if (!group) return false;
+              if (group.nodeIds.length === 0) {
+                groupsMutated = true;
+                return false;
+              }
+              return true;
+            });
+          if (groupsMutated) {
+            // 标记需要持久化（zustand persist 中间件会基于引用变化判定）
+            next.groups = [...next.groups];
+          }
+        }
         const persistedRecord = persisted && typeof persisted === 'object' ? persisted as { workflows?: unknown } : {};
         next.workflows = ensureBuiltinWorkflows(Array.isArray(persistedRecord.workflows) ? persistedRecord.workflows : current.workflows);
         return next;
@@ -1791,6 +1902,8 @@ export const useCanvasStore = create<CanvasStore>()(
     },
   )
 );
+
+
 
 
 

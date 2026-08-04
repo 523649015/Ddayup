@@ -116,8 +116,8 @@ function renderCapabilityPanel(
   if (tool === 'grid') return <GridCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
   if (tool === 'hd') return <HdCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} onCreateAsNewNode={onCreateAsNewNode} />;
   if (tool === 'split') return <SplitCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} />;
-  if (tool === 'brush') return <BrushCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} onClose={onClose} />;
-  if (tool === 'bgRemove') return <BgRemoveCapabilityPanel tool={tool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} onClose={onClose} />;
+  if (tool === 'brush') return <BrushCapabilityPanel tool={tool as ImageGenerationTool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} onClose={onClose} />;
+  if (tool === 'bgRemove') return <BgRemoveCapabilityPanel tool={tool as ImageGenerationTool} value={value} onChange={onChange} sourceImageUrl={sourceImageUrl} nodeLabel={nodeLabel} onApply={onApply} onClose={onClose} />;
   return null;
 }
 

@@ -6,6 +6,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { Image as ImageIcon, Video, Sparkles, Loader2, Plus } from 'lucide-react';
 import { findSimilarAssetsInLibrary } from '@/services/assetSimilarityService';
 import { useAssetStore } from '@/store/useAssetStore';
+import { toRenderableAssetUrl } from '@/services/generation';
 import type { AssetItem, LocalSimilarResult } from '@/types/assets';
 
 interface LocalSimilarPanelProps {
@@ -108,7 +109,7 @@ export function LocalSimilarPanel({
                   </div>
                 ) : item.thumbnail ? (
                   <img
-                    src={item.thumbnail}
+                    src={toRenderableAssetUrl(item.thumbnail, 'image')}
                     alt={item.name}
                     className="w-full h-full object-cover"
                     loading="lazy"

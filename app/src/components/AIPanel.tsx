@@ -11,12 +11,13 @@ import {
   type GenerationAccess,
 } from '@/services/generation';
 import { getSharedMemorySuggestions, type SharedAgentMemory } from '@/services/agentMemory';
-import { useApiKeyStore } from '@/store/useApiKeyStore';
+import { isUnusableProviderKeyStatus, useApiKeyStore } from '@/store/useApiKeyStore';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useCanvasStore } from '@/store/useCanvasStore';
 import { useModelCatalogStore } from '@/store/useModelCatalogStore';
 import { useUILanguage } from '@/i18n/ui';
 import type { NodeData, NodeType } from '@/types';
+import type { CatalogModel } from '@/api/models';
 
 const NODE_TYPE_LABELS: Record<NodeType, { zh: string; en: string }> = {
   text: { zh: '文本', en: 'Text' },
@@ -30,6 +31,7 @@ const NODE_TYPE_LABELS: Record<NodeType, { zh: string; en: string }> = {
   threed: { zh: '3D', en: '3D' },
   dcc: { zh: 'DCC', en: 'DCC' },
   region: { zh: '打标签节点', en: 'Tagging Node' },
+  comfyui: { zh: 'ComfyUI 工作流', en: 'ComfyUI Workflow' },
 };
 
 const SHARED_MEMORY_NODE_TYPES = new Set<NodeType>(['image', 'video', 'post']);
@@ -64,6 +66,20 @@ interface NodeGeneratePanelProps {
   embedded?: boolean;
 }
 
+const AUTO_FREE_MODEL: CatalogModel = {
+  id: 'auto-free',
+  name: '免费优先（自动轮换）',
+  provider: 'hmdao-text',
+  mode: 'llm',
+  nodeTypes: ['text', 'script', 'storyboard', 'aiapp'] as NodeType[],
+  price: 0,
+  currency: 'CNY',
+  description: '自动从免费额度池择优（Seed 2.1 / Qwen3 等），主模型失败自动轮换下一个。',
+  activated: false,
+};
+
+const FREE_FIRST_NODE_TYPES = new Set<NodeType>(['text', 'script', 'storyboard', 'aiapp']);
+
 export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) {
   const { t } = useUILanguage();
   const canvas = useCanvasStore((state) => state.canvas);
@@ -93,7 +109,11 @@ export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) 
 
   const availableModels = useMemo(() => {
     if (!nodeType) return [];
-    return catalogItems.filter((model) => model.nodeTypes.includes(nodeType));
+    const base = catalogItems.filter((model) => (model.nodeTypes || []).includes(nodeType));
+    if (FREE_FIRST_NODE_TYPES.has(nodeType)) {
+      return [AUTO_FREE_MODEL, ...base];
+    }
+    return base;
   }, [catalogItems, nodeType]);
 
   useEffect(() => {
@@ -117,8 +137,26 @@ export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) 
   );
   const suppressedByFloatingPanel = Boolean(floatingPanel);
 
-  const activeKey = selectedModel ? apiKeys[selectedModel.provider] : undefined;
-  const hasUsableActiveKey = Boolean(activeKey && activeKey.status !== 'expired' && (activeKey.apiKey || activeKey.metadataOnly));
+  // 聚合免费 provider（hmdao-*，如 auto-free）由后端免费额度分发，不需要用户 key，
+  // 也不应显示「未配置 Key」角标；这里解析出真正落地的 provider 用于 key 判断。
+  const authed = isAuthenticated();
+  const isAggregatedFree = Boolean(selectedModel?.provider?.startsWith('hmdao-'));
+  const resolvedProvider = useMemo(() => {
+    if (!selectedModel || !nodeType) return selectedModel?.provider || '';
+    const acc = resolveGenerationAccess(
+      nodeType,
+      selectedModel.id,
+      selectedModel.provider,
+      apiKeys,
+      authed,
+      Boolean(selectedModel?.activated) || isAggregatedFree,
+    );
+    return acc.provider || selectedModel.provider;
+  }, [selectedModel, nodeType, apiKeys, authed, selectedModel?.activated, isAggregatedFree]);
+
+  const activeKey = selectedModel ? apiKeys[resolvedProvider] : undefined;
+  // 任务 AL：invalid 与 expired 同为不可用，避免被吊销的 key 在面板显示「已激活」。
+  const hasUsableActiveKey = Boolean(activeKey && !isUnusableProviderKeyStatus(activeKey.status) && (activeKey.apiKey || activeKey.metadataOnly));
   const selectedModelActivated = Boolean(
     selectedModel?.activated || hasUsableActiveKey,
   );
@@ -187,8 +225,8 @@ export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) 
       selectedModel.id,
       selectedModel.provider,
       apiKeys,
-      isAuthenticated(),
-      selectedModelActivated,
+      authed,
+      isAggregatedFree || selectedModelActivated,
     );
     if (!access.ok) {
       if (access.reason === 'auth') {
@@ -314,7 +352,7 @@ export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) 
     } finally {
       setIsGenerating(false);
     }
-  }, [apiKeys, isAuthenticated, isGenerating, nodeType, prompt, selectedModel, selectedNode, updateNodeData]);
+  }, [apiKeys, authed, isAggregatedFree, isGenerating, nodeType, prompt, selectedModel, selectedNode, updateNodeData]);
 
   const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Enter' && !event.shiftKey) {
@@ -352,6 +390,8 @@ export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) 
         <div className="ml-auto flex items-center gap-2 text-xs">
           {activeKeyLabel ? (
             <span className="rounded-full bg-emerald-500/10 px-2 py-1 text-emerald-300">{t('已激活', 'Activated')} {activeKeyLabel}</span>
+          ) : isAggregatedFree ? (
+            <span className="rounded-full bg-emerald-500/10 px-2 py-1 text-emerald-300">🆓 {t('免费额度', 'Free quota')}</span>
           ) : (
             <Link
               to="/settings/api-keys"

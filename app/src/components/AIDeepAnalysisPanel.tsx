@@ -13,11 +13,14 @@ import {
   ChevronDown, ExternalLink, Zap, Brain, AlertCircle,
   RefreshCw, Plus, Languages, History,
 } from 'lucide-react';
+import { setDefaultSimilarImageModel } from '@/services/aiDeepAnalysisService';
 import { deepAnalyzeImage, generateSimilarVariants, getActiveVisionModels, loadVariantImageWithRetry } from '@/services/aiDeepAnalysisService';
+import type { ReferenceMode } from '@/services/aiDeepAnalysisService';
 import type { AIDeepAnalysis, RecommendedVLMModel } from '@/types/assets';
 import type { AssetItem } from '@/types/assets';
 import { RECOMMENDED_VLM_MODELS } from '@/types/assets';
 import { getByokRuntime } from '@/api/byok';
+import { importLocalAssetFile } from '@/api/assetLibrary';
 import { consumeVisionActivationFlag } from '@/services/visionActivation';
 
 interface AIDeepAnalysisPanelProps {
@@ -58,6 +61,10 @@ export function AIDeepAnalysisPanel({
   const [hasActivatedVision, setHasActivatedVision] = useState(false);
   const [activationToast, setActivationToast] = useState<string | null>(null);
   const [displayLang, setDisplayLang] = useState<DisplayLanguage>('zh');
+  // Phase A：参考图（支持上传多张）；首位为主参考
+  const [referenceImages, setReferenceImages] = useState<string[]>([]);
+  const [similarMode, setSimilarMode] = useState<ReferenceMode>('similar');
+  const [uploadingRef, setUploadingRef] = useState(false);
   const navigate = useNavigate();
 
   // 素材已有分析结果时自动恢复，避免重复分析
@@ -150,6 +157,12 @@ export function AIDeepAnalysisPanel({
         if (!cancelled) {
           setDynamicModels(dynamic);
 
+          // 免费/推荐图像模型优先：把运行时首推图像生成模型注入相似图生成默认模型
+          const imgPrimary = runtime?.recommendations?.imageGeneration?.primary;
+          if (imgPrimary?.provider && imgPrimary?.model) {
+            setDefaultSimilarImageModel({ provider: imgPrimary.provider, model: imgPrimary.model });
+          }
+
           // hasActivatedVision：只要有任一静态推荐模型对应的 provider 已激活，就认为可用
           const anyRecActivated = RECOMMENDED_VLM_MODELS.some((m) =>
             activatedSet.has(String(m.provider || '').trim().toLowerCase()),
@@ -226,7 +239,8 @@ export function AIDeepAnalysisPanel({
     );
 
     try {
-      const results = await generateSimilarVariants(analysis, 4, item.url);
+      // Phase A：使用参考图数组（首位为主参考）+ 模式（相似/换主体/换风格）
+      const results = await generateSimilarVariants(analysis, 4, referenceImages, { mode: similarMode });
 
       const settled = await Promise.all(
         results.map(async (result, i) => {
@@ -269,7 +283,45 @@ export function AIDeepAnalysisPanel({
       setStatus('error');
       setError(err instanceof Error ? err.message : '相似图片生成失败');
     }
-  }, [analysis, item, status]);
+  }, [analysis, item, status, referenceImages, similarMode]);
+
+  /* ===== 深度分析结果 → 机器人面板（SmartAgent）生成工作流 ===== */
+  const handleSendToRobot = useCallback(() => {
+    if (!item || !analysis) return;
+    window.dispatchEvent(
+      new CustomEvent('hmdao:deep-analysis-to-agent', {
+        detail: { item, analysis, userText: '' },
+      }),
+    );
+  }, [item, analysis]);
+
+  /* ===== 参考图：随素材切换自动重置为当前素材 URL；支持上传多张 ===== */
+  useEffect(() => {
+    if (item?.url) setReferenceImages([item.url]);
+    else setReferenceImages([]);
+  }, [item]);
+
+  /* ===== 上传参考图（多张），上传后返回托管 URL 纳入参考图集合 ===== */
+  const handleUploadRefs = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setUploadingRef(true);
+    try {
+      const urls: string[] = [];
+      for (const file of Array.from(files)) {
+        const asset = await importLocalAssetFile(file, { type: 'reference' });
+        if (asset?.item?.url) urls.push(asset.item.url);
+      }
+      if (urls.length) setReferenceImages((prev) => [...prev, ...urls]);
+    } catch {
+      setError('参考图上传失败，请重试');
+    } finally {
+      setUploadingRef(false);
+    }
+  }, []);
+
+  const removeReference = useCallback((idx: number) => {
+    setReferenceImages((prev) => prev.filter((_, i) => i !== idx));
+  }, []);
 
   /* ===== 单张变体重试（换种子重新加载） ===== */
   const handleRetryVariant = useCallback(async (variantId: string) => {
@@ -571,6 +623,66 @@ export function AIDeepAnalysisPanel({
         </div>
       </div>
 
+      {/* Phase A：参考图（支持上传多张）+ 生成模式 */}
+      <div className="rounded-xl bg-[#161b22] ring-1 ring-[#21262d] p-3 space-y-3">
+        <div className="flex items-center gap-2">
+          <ImageIcon className="w-3.5 h-3.5 text-[#00d4aa]" />
+          <span className="text-[10px] font-medium text-[#e6edf3]">参考图（首位为主参考）</span>
+          <span className="text-[9px] text-[#8b949e] ml-auto">{referenceImages.length} 张</span>
+        </div>
+
+        {/* 模式：相似 / 换主体(保构图) / 换风格 */}
+        <div className="flex gap-1.5">
+          {([['similar', '相似'], ['subject', '换主体'], ['style', '换风格']] as const).map(([m, label]) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => setSimilarMode(m)}
+              className={`flex-1 px-2 py-1.5 rounded-lg text-[10px] font-medium transition-colors ${
+                similarMode === m ? 'bg-[#00d4aa] text-[#07110e]' : 'bg-[#21262d] text-[#8b949e] hover:bg-[#30363d]'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {/* 参考图缩略图列表（首张标记为主参考） */}
+        {referenceImages.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {referenceImages.map((url, idx) => (
+              <div key={`${url}-${idx}`} className="relative w-12 h-12 rounded-lg overflow-hidden ring-1 ring-[#21262d]">
+                <img src={url} alt={`参考图 ${idx + 1}`} className="w-full h-full object-cover" />
+                <button
+                  type="button"
+                  onClick={() => removeReference(idx)}
+                  className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-[#f85149] text-white text-[9px] leading-none flex items-center justify-center"
+                  title="移除"
+                >
+                  ×
+                </button>
+                {idx === 0 && (
+                  <span className="absolute bottom-0 left-0 right-0 text-[8px] text-center bg-[#00d4aa] text-[#07110e]">主</span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* 上传多张参考图（上传后返回托管 URL，纳入参考集合） */}
+        <label className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-[#21262d] text-[#c9d1d9] text-[11px] font-medium hover:bg-[#30363d] cursor-pointer transition-colors">
+          <Plus className="w-3.5 h-3.5" />
+          {uploadingRef ? '上传中…' : '上传参考图（可多选）'}
+          <input
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={(e) => { void handleUploadRefs(e.target.files); e.target.value = ''; }}
+          />
+        </label>
+      </div>
+
       {/* 操作按钮 */}
       <div className="grid grid-cols-2 gap-2">
         <button
@@ -589,13 +701,23 @@ export function AIDeepAnalysisPanel({
         </button>
       </div>
 
+      {/* 深度分析 → 机器人面板：把分析结果丢给画布 SmartAgent 生成工作流 */}
+      <button
+        onClick={handleSendToRobot}
+        disabled={!item || !analysis}
+        className="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-gradient-to-r from-[#8b5cf6] to-[#6366f1] text-white text-[11px] font-semibold hover:from-[#9d6cf7] hover:to-[#7c6bf3] transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+      >
+        <Sparkles className="w-3.5 h-3.5" />
+        发送给机器人生成工作流
+      </button>
+
       {/* 生成的相似图片 */}
       {variants.length > 0 && (
         <div className="rounded-xl bg-[#161b22] ring-1 ring-[#21262d] p-3">
           <div className="flex items-center gap-2 mb-3">
             <Zap className="w-3.5 h-3.5 text-[#f59e0b]" />
             <span className="text-[10px] font-medium text-[#e6edf3]">AI 生成的相似图片</span>
-            <span className="text-[9px] text-[#00d4aa] bg-[#00d4aa]/10 px-1 rounded ml-auto">Pollinations · 免Key</span>
+            <span className="text-[9px] text-[#00d4aa] bg-[#00d4aa]/10 px-1 rounded ml-auto">参考图生成 · 免费优先</span>
           </div>
           <div className="grid grid-cols-2 gap-2">
             {variants.map((variant, i) => (

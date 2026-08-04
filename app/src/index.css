@@ -73,3 +73,335 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* ===== 需求共建 / 世界频道 ===== */
+.donation-panel {
+  position: absolute;
+  top: 56px;
+  right: 12px;
+  width: 340px;
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  color: #e6edf3;
+  z-index: 50;
+  font-size: 13px;
+}
+.donation-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid #21262d;
+  position: sticky;
+  top: 0;
+  background: #0d1117;
+  z-index: 1;
+}
+.donation-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: #fbbf24;
+}
+.donation-close {
+  background: transparent;
+  border: none;
+  color: #8b949e;
+  cursor: pointer;
+}
+.donation-close:hover { color: #fff; }
+.donation-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 8px 12px 0;
+}
+.donation-tab {
+  flex: 1;
+  padding: 6px 0;
+  border-radius: 8px 8px 0 0;
+  background: transparent;
+  border: none;
+  color: #8b949e;
+  cursor: pointer;
+  font-size: 12px;
+}
+.donation-tab.active {
+  color: #fbbf24;
+  background: #161b22;
+  border-bottom: 2px solid #fbbf24;
+}
+.donation-body { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+.donation-error {
+  background: rgba(248, 81, 73, 0.12);
+  color: #ff7b72;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+.donation-label { color: #8b949e; font-size: 12px; }
+.donation-textarea {
+  width: 100%;
+  background: #010409;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  color: #e6edf3;
+  padding: 8px;
+  resize: vertical;
+  font-size: 13px;
+}
+.donation-textarea:focus { outline: 1px solid #00d4aa; border-color: #00d4aa; }
+.donation-tagbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #010409;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 4px 8px;
+  color: #8b949e;
+}
+.donation-taginput {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: #e6edf3;
+  outline: none;
+  font-size: 12px;
+}
+.donation-tagadd {
+  background: #21262d;
+  color: #c9d1d9;
+  border: none;
+  border-radius: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.donation-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.donation-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(0, 212, 170, 0.1);
+  color: #00d4aa;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+}
+.donation-tag button { background: transparent; border: none; color: inherit; cursor: pointer; display: inline-flex; }
+.donation-section {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 10px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.donation-section-title { display: flex; align-items: center; gap: 6px; color: #fbbf24; font-weight: 600; font-size: 12px; }
+.donation-amounts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.donation-amount {
+  background: #0d1117;
+  border: 1px solid #30363d;
+  color: #e6edf3;
+  border-radius: 8px;
+  padding: 6px 0;
+  cursor: pointer;
+  font-size: 12px;
+  transition: all 0.15s;
+}
+.donation-amount:hover { border-color: #fbbf24; }
+.donation-amount.active { background: #fbbf24; color: #0d1117; border-color: #fbbf24; font-weight: 700; }
+.donation-amount-selected { font-size: 12px; color: #8b949e; }
+.donation-amount-selected strong { color: #fbbf24; }
+.donation-submit {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: #fbbf24;
+  color: #0d1117;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 0;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 13px;
+}
+.donation-submit:disabled { opacity: 0.6; cursor: not-allowed; }
+.donation-list { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+.donation-list-title { color: #8b949e; font-size: 12px; border-top: 1px solid #21262d; padding-top: 8px; }
+.donation-item {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 10px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.donation-item-head { display: flex; align-items: center; justify-content: space-between; }
+.donation-user { color: #58a6ff; font-size: 12px; }
+.donation-time { color: #6e7681; font-size: 11px; }
+.donation-msg { color: #e6edf3; font-size: 13px; line-height: 1.5; }
+.donation-msg-sub { color: #8b949e; font-size: 12px; }
+.donation-amount-badge { color: #fbbf24; font-size: 12px; }
+.donation-item-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.donation-item-tags span { color: #00d4aa; font-size: 11px; }
+.donation-item-actions { display: flex; align-items: center; gap: 12px; }
+.donation-like, .donation-comment-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: none;
+  color: #8b949e;
+  cursor: pointer;
+  font-size: 12px;
+}
+.donation-like.liked { color: #f85149; }
+.donation-like:hover, .donation-comment-btn:hover { color: #e6edf3; }
+.donation-world-flag { margin-left: auto; }
+.donation-comments { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid #21262d; padding-top: 8px; }
+.donation-comment { font-size: 12px; color: #c9d1d9; }
+.donation-comment-user { color: #58a6ff; margin-right: 6px; }
+.donation-comment-input { display: flex; gap: 6px; }
+.donation-comment-input input {
+  flex: 1;
+  background: #010409;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  color: #e6edf3;
+  padding: 4px 8px;
+  font-size: 12px;
+  outline: none;
+}
+.donation-comment-input button {
+  background: #21262d;
+  border: none;
+  color: #c9d1d9;
+  border-radius: 6px;
+  padding: 0 8px;
+  cursor: pointer;
+}
+.donation-world-hint {
+  background: rgba(0, 212, 170, 0.08);
+  border: 1px solid rgba(0, 212, 170, 0.2);
+  color: #7ee0c9;
+  border-radius: 8px;
+  padding: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.donation-gate {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 28px 16px;
+  text-align: center;
+  color: #8b949e;
+}
+.donation-gate-title { color: #e6edf3; font-weight: 600; font-size: 14px; }
+.donation-gate-desc { font-size: 12px; line-height: 1.6; }
+.donation-gate .donation-submit { width: 100%; }
+.donation-gate svg { color: #fbbf24; }
+
+/* ===== 世界频道 ===== */
+.world-channel {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  width: 300px;
+  background: rgba(13, 17, 23, 0.92);
+  backdrop-filter: blur(8px);
+  border: 1px solid #30363d;
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  color: #e6edf3;
+  z-index: 45;
+  font-size: 13px;
+  overflow: hidden;
+}
+.wc-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  background: #161b22;
+  border-bottom: 1px solid #21262d;
+}
+.wc-title { display: flex; align-items: center; gap: 6px; font-weight: 600; color: #00d4aa; }
+.wc-live {
+  background: #f85149;
+  color: #fff;
+  font-size: 9px;
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin-left: 2px;
+  animation: wc-pulse 1.6s infinite;
+}
+@keyframes wc-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.wc-actions { display: flex; align-items: center; gap: 6px; }
+.wc-link { background: transparent; border: none; color: #58a6ff; cursor: pointer; display: inline-flex; }
+.wc-close { background: transparent; border: none; color: #8b949e; cursor: pointer; display: inline-flex; }
+.wc-close:hover { color: #fff; }
+.wc-body { padding: 10px; cursor: pointer; display: flex; flex-direction: column; gap: 6px; }
+.wc-empty { padding: 18px 10px; text-align: center; color: #8b949e; font-size: 12px; }
+.wc-user { display: flex; align-items: center; gap: 6px; }
+.wc-avatar {
+  width: 22px; height: 22px; border-radius: 50%;
+  background: #30363d; color: #e6edf3;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 600;
+}
+.wc-name { color: #58a6ff; font-size: 12px; }
+.wc-amount-sm { color: #6e7681; font-size: 10px; font-weight: 400; }
+.wc-time { color: #6e7681; font-size: 11px; margin-left: auto; }
+.wc-message { font-size: 13px; line-height: 1.5; color: #e6edf3; display: flex; flex-direction: column; gap: 4px; }
+.wc-donation { display: inline-flex; align-items: center; gap: 4px; color: #fbbf24; font-weight: 600; }
+.wc-sub { color: #8b949e; font-size: 12px; }
+.wc-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.wc-tags span { color: #00d4aa; font-size: 11px; }
+.wc-stats { display: flex; align-items: center; gap: 12px; color: #8b949e; font-size: 12px; }
+.wc-dots { display: flex; gap: 4px; justify-content: center; padding: 6px 0 10px; }
+.wc-dot { width: 6px; height: 6px; border-radius: 50%; background: #30363d; border: none; cursor: pointer; padding: 0; }
+.wc-dot.active { background: #00d4aa; }
+
+.wc-detail-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(1, 4, 9, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 60;
+}
+.wc-detail {
+  width: 360px;
+  max-height: 80vh;
+  overflow-y: auto;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 12px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.wc-detail-head { display: flex; align-items: center; justify-content: space-between; }
+.wc-detail-user { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.wc-detail-msg { color: #e6edf3; line-height: 1.6; font-size: 13px; }
+.wc-detail-donation { display: inline-flex; align-items: center; gap: 4px; color: #fbbf24; font-weight: 600; }
+.wc-detail-actions { display: flex; gap: 12px; }
+.wc-like { display: inline-flex; align-items: center; gap: 4px; background: transparent; border: 1px solid #30363d; color: #8b949e; border-radius: 8px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+.wc-detail-comments { border-top: 1px solid #21262d; padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.wc-detail-comments-title { display: flex; align-items: center; gap: 4px; color: #8b949e; font-size: 12px; }
+.wc-comment { font-size: 12px; color: #c9d1d9; }
+.wc-comment-user { color: #58a6ff; margin-right: 6px; }
+.wc-comment-empty { color: #6e7681; font-size: 12px; }

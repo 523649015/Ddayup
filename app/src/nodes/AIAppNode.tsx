@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { Layers, Send, Sparkles, Zap } from 'lucide-react';
 import { EditableNodeTitle } from './EditableNodeTitle';
+import DispatchInfoBadge from '@/components/DispatchInfoBadge';
 
 export function AIAppNode(props: NodeProps) {
   const { selected, data } = props;
@@ -12,6 +13,8 @@ export function AIAppNode(props: NodeProps) {
       <div className="flex items-center gap-1.5 px-3 pt-2.5 pb-1">
         <EditableNodeTitle nodeId={props.id} icon={Layers} label={data?.label} fallback="AI 应用" />
       </div>
+
+      <DispatchInfoBadge data={data} />
 
       <div className="px-3 pb-3">
         <div className="flex flex-col items-center gap-1.5 py-5">

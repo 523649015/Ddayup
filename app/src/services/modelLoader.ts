@@ -31,6 +31,8 @@ export interface ModelDownloadProgress {
   error?: string;
   startedAt: number;
   lastUpdateAt: number;
+  /** 拆分式权重（如 Depth V3 的 model.onnx_data）各自的下载进度，主文件阶段为空 */
+  extraFiles?: { name: string; downloaded: number; total: number }[];
 }
 
 export interface ModelDownloadOptions {
@@ -50,6 +52,8 @@ export interface ModelDownloadOptions {
   retries?: number;
   /** 是否强制重新下载（忽略缓存） */
   force?: boolean;
+  /** 外部权重文件（拆分式 onnx 的 model.onnx_data 等），会与主文件一同下载并缓存 */
+  extraFiles?: { name: string; url: string }[];
 }
 
 export interface ModelInfo {
@@ -204,7 +208,7 @@ async function downloadToBuffer(
  * 优先从 IndexedDB 缓存读取，未命中时下载
  */
 export async function loadModel(options: ModelDownloadOptions): Promise<ServiceResult<ArrayBuffer>> {
-  const {
+    const {
     modelId,
     version,
     url,
@@ -213,6 +217,7 @@ export async function loadModel(options: ModelDownloadOptions): Promise<ServiceR
     timeout = 300000,
     retries = 2,
     force = false,
+    extraFiles,
   } = options;
 
   const key = getProgressKey(modelId, version);
@@ -307,6 +312,44 @@ export async function loadModel(options: ModelDownloadOptions): Promise<ServiceR
         console.warn('[HMDao ModelLoader] 缓存写入失败:', cacheErr);
       }
 
+      // 6. 下载并缓存外部权重文件（如 Depth Anything V3 的 model.onnx_data）
+      //    强校验：任一片外部权重下载/缓存失败，整个安装视为失败（向上抛出 error），
+      //    避免「主文件装好但外部权重缺失 → 激活时静默失败 / 回退」的边界。
+      if (extraFiles?.length) {
+        // 初始化外部权重进度（面板据此展示「主文件 + N 个外部权重」明细）
+        updateProgress(key, {
+          extraFiles: extraFiles.map((ef) => ({ name: ef.name, downloaded: 0, total: 0 })),
+        }, onProgress);
+        for (const ef of extraFiles) {
+          const efKey = `${version}#${ef.name}`;
+          try {
+            const existing = await getCachedModel(modelId, efKey);
+            if (existing && !force) continue;
+            const efBuffer = await downloadToBuffer(ef.url, {
+              timeout,
+              onProgress: (downloaded, total) => {
+                updateProgress(key, {
+                  extraFiles: extraFiles.map((x) =>
+                    x.name === ef.name ? { name: x.name, downloaded, total } : { name: x.name, downloaded: 0, total: 0 },
+                  ),
+                }, onProgress);
+              },
+            });
+            await cacheModel(modelId, efKey, efBuffer);
+            // 回读校验：确保外部权重已真实落盘（cacheModel 偶发静默失败）
+            const verify = await getCachedModel(modelId, efKey);
+            if (!verify || !verify.data || verify.data.byteLength === 0) {
+              throw new Error(`外部权重 ${ef.name} 缓存校验失败（写入为空）`);
+            }
+          } catch (efErr) {
+            const reason = efErr instanceof Error ? efErr.message : String(efErr);
+            throw new Error(
+              `外部权重 ${ef.name} 下载/缓存失败：${reason}（该模型依赖拆分权重，缺少将无法激活，请重试安装）`,
+            );
+          }
+        }
+      }
+
       updateProgress(key, {
         status: 'completed',
         totalBytes: buffer.byteLength,
@@ -351,6 +394,31 @@ export const safeLoadModel = wrapService(
     retries: 1,
   },
 );
+
+/**
+ * 校验某已安装模型的外部权重（拆分式 onnx 的 model.onnx_data 等）是否真实存在于缓存。
+ * 用于安装成功后的强校验（activateLocalModel 之前）以及启动时对已安装态的复核。
+ * @returns ok=true 表示全部就绪；missing 为缺失的外部权重大件名（空数组表示齐备）。
+ */
+export async function verifyExternalWeights(
+  modelId: string,
+  version: string,
+  extraFiles?: { name: string; url: string }[],
+): Promise<{ ok: boolean; missing: string[] }> {
+  const missing: string[] = [];
+  if (extraFiles?.length) {
+    for (const ef of extraFiles) {
+      const efKey = `${version}#${ef.name}`;
+      try {
+        const cached = await getCachedModel(modelId, efKey);
+        if (!cached || !cached.data || cached.data.byteLength === 0) missing.push(ef.name);
+      } catch {
+        missing.push(ef.name);
+      }
+    }
+  }
+  return { ok: missing.length === 0, missing };
+}
 
 /** 列出已缓存的模型（枚举 IndexedDB modelCache，使刷新后仍能判定已安装） */
 export async function listCachedModels(): Promise<ModelInfo[]> {

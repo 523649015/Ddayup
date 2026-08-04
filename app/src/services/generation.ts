@@ -15,7 +15,10 @@ import {
   readIdentityControllerConfig,
 } from '@/services/workflowGraph';
 import { buildRegionContractMediaInputs, readRegionContract, serializeRegionPack } from '@/services/regionContracts';
+import { extractFallbackChain, resolveModelForTask, type ModelCandidate } from '@/services/modelFallback';
 import { findProviderKeyState, providerKeyMatchesModel, type ProviderKeyState } from '@/store/useApiKeyStore';
+import { useModelCatalogStore } from '@/store/useModelCatalogStore';
+import { normalizeProviderId } from '@/lib/providerAlias';
 import { isLocalMediaHandle, isTransientBlobUrl, readLocalMediaBlob, resolveLocalMediaUrl } from '@/services/localMediaRegistry';
 import {
   getWorkflowClient,
@@ -25,29 +28,43 @@ import {
 } from '@/services/workflow';
 import { allowsLocalCanvasDemoAccess } from '@/utils/demoMode';
 import { z } from 'zod';
+import {
+  type GenerationMode,
+  type GenerationAccess,
+  type GenerationErrorMetadata,
+  type RenderableAssetKind,
+  type RenderableAssetIssue,
+  type CanvasMigrationIssue,
+  type ProxyGenerationResult,
+  type WorkflowGenerationResult,
+  type ProxyRoutePreviewResult,
+  type SanitizedGenerationBody,
+  type GenerationCacheEntry,
+  PROVIDER_MODE_SUPPORT,
+  PROVIDER_PRIORITY,
+  MODE_PROVIDERS,
+  GENERATION_CACHE_STORAGE_KEY,
+  GENERATION_CACHE_TTL_MS,
+  IMAGE_GENERATION_TIMEOUT_MS,
+  VIDEO_GENERATION_TIMEOUT_MS,
+  GENERATION_ASSET_MATERIALIZE_TIMEOUT_MS,
+  CONDITIONING_IMAGE_NORMALIZE_TIMEOUT_MS,
+} from './generation.shared';
 
-export type GenerationMode = 'llm' | 'image' | 'video' | 'audio';
-
-export interface GenerationAccess {
-  ok: boolean;
-  mode: GenerationMode;
-  provider: string;
-  apiKey?: string;
-  endpoint?: string;
-  reason?: 'auth' | 'api-key';
-}
-
-export interface GenerationErrorMetadata {
-  category: 'validation' | 'timeout' | 'auth' | 'quota' | 'routing' | 'upstream' | 'request' | 'render';
-  provider?: string;
-  model?: string;
-  status?: number;
-  code?: string;
-  stage?: string;
-  requestId?: string;
-  requestBody?: SanitizedGenerationBody;
-  workflowProgress?: WorkflowProgressSnapshot[];
-}
+// Re-export public types so existing importers of '@/services/generation' keep working.
+export type {
+  GenerationMode,
+  GenerationAccess,
+  GenerationErrorMetadata,
+  RenderableAssetKind,
+  RenderableAssetIssue,
+  CanvasMigrationIssue,
+  ProxyGenerationResult,
+  WorkflowGenerationResult,
+  ProxyRoutePreviewResult,
+  SanitizedGenerationBody,
+  GenerationCacheEntry,
+};
 
 export class GenerationError extends Error {
   metadata: GenerationErrorMetadata;
@@ -57,66 +74,6 @@ export class GenerationError extends Error {
     this.name = 'GenerationError';
     this.metadata = metadata;
   }
-}
-
-interface ProxyGenerationResult {
-  success?: boolean;
-  provider?: string;
-  mode?: GenerationMode;
-  content?: string;
-  progressLog?: WorkflowProgressSnapshot[];
-  asset?: {
-    id?: string;
-    type?: 'image' | 'video' | 'audio' | 'text';
-    url?: string;
-    kind?: string;
-    prompt?: string;
-    metadata?: Record<string, unknown>;
-  };
-  assets?: Array<{
-    id?: string;
-    type?: 'image' | 'video' | 'audio' | 'text';
-    url?: string;
-    kind?: string;
-    prompt?: string;
-    metadata?: Record<string, unknown>;
-  }>;
-  error?: { message?: string; category?: string; status?: number; code?: string; provider?: string };
-}
-
-interface WorkflowGenerationResult extends ProxyGenerationResult {
-  workflowId?: string;
-  requestId?: string;
-  nodeId?: string;
-  progressLog?: WorkflowProgressSnapshot[];
-  fallbackReason?: string;
-}
-
-interface ProxyRoutePreviewResult {
-  success?: boolean;
-  preview?: boolean;
-  provider?: string;
-  requestedProvider?: string;
-  effectiveProvider?: string;
-  mode?: GenerationMode;
-  endpoint?: string;
-  requestedModel?: string;
-  effectiveModel?: string;
-  dispatchMode?: string;
-  realProxyEnabled?: boolean;
-  proxyBypass?: {
-    code?: string;
-    category?: string;
-    message?: string;
-  } | null;
-  connectivityProbe?: {
-    ok?: boolean;
-    url?: string;
-    status?: number;
-    code?: string;
-    message?: string;
-    fallback?: boolean;
-  } | null;
 }
 
 function normalizeErrorCategory(value: unknown): GenerationErrorMetadata['category'] {
@@ -151,8 +108,6 @@ export function describeGenerationError(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
 }
-type SanitizedGenerationBody = Record<string, unknown>;
-
 const aspectRatioSchema = z.string().trim().regex(/^\d+:\d+$/).default('16:9');
 const resolutionSchema = z.object({
   width: z.number().int().min(256).max(4096),
@@ -331,6 +286,13 @@ function normalizeRequestedModelIdentifier(value: string | undefined | null) {
   return normalized;
 }
 
+// 模型名 → provider 提示，输出统一经 normalizeProviderId 归一化，
+// 与 store 端 providerKeyId 保持一致，避免 hint 值大小写/别名导致的 key 不匹配。
+function providerHintForModel(model?: string | null): string {
+  const hint = model ? PROVIDER_HINTS[normalizeRequestedModelIdentifier(model)] : undefined;
+  return hint ? (normalizeProviderId(hint) || hint) : '';
+}
+
 function pushGenerationTrace(stage: string, detail?: Record<string, unknown>) {
   if (typeof window === 'undefined') return;
   const target = window as typeof window & {
@@ -395,43 +357,16 @@ function modelMatchesRequestedIdentifier(
   return candidates.includes(normalizedRequested);
 }
 
-const MODE_PROVIDERS: Record<GenerationMode, string[]> = {
-  llm: ['deepseek', 'siliconflow', 'zhipu', 'bailian', 'openai'],
-  image: ['siliconflow', 'volcengine', 'bailian', 'fal', 'kling', 'replicate', 'openai'],
-  video: ['siliconflow', 'bailian', 'zhipu', 'volcengine', 'modelscope', 'kling', 'fal', 'replicate'],
-  audio: ['minimax', 'volcengine'],
-};
-
-const PROVIDER_MODE_SUPPORT: Record<string, GenerationMode[]> = {
-  deepseek: ['llm'],
-  siliconflow: ['llm', 'image', 'video'],
-  zhipu: ['llm', 'image', 'video'],
-  bailian: ['llm', 'image', 'video'],
-  minimax: ['llm', 'audio'],
-  volcengine: ['image', 'video', 'audio'],
-  kling: ['image', 'video'],
-  modelscope: ['llm', 'image', 'video'],
-  openai: ['llm', 'image'],
-  fal: ['image', 'video'],
-  replicate: ['image', 'video'],
-};
-
-const GENERATION_CACHE_STORAGE_KEY = 'hmdao-generation-cache-v1';
-const GENERATION_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
-const IMAGE_GENERATION_TIMEOUT_MS = 180000;
-const VIDEO_GENERATION_TIMEOUT_MS = 900000;
-const GENERATION_ASSET_MATERIALIZE_TIMEOUT_MS = 30000;
+// 单一数据源：MODE_PROVIDERS 直接由 PROVIDER_MODE_SUPPORT 派生，
+// 避免「两套表」漂移导致的路由遗漏（如之前 llm 漏 minimax/modelscope、
+// image 漏 zhipu/modelscope）。顺序仅影响无 key 时的回退优先级，不覆盖已存的 key 匹配。
 const generationCache = new Map<string, ProxyGenerationResult>();
-
-interface GenerationCacheEntry {
-  cachedAt: number;
-  expiresAt: number;
-  result: ProxyGenerationResult;
-}
 
 function normalizeProvider(provider?: string) {
   if (!provider || provider.startsWith('hmdao-')) return '';
-  return provider;
+  // 归一化别名/大小写（ark/doubao→volcengine、silicon-flow→siliconflow 等），
+  // 与 store 端 providerKeyId 保持同一套规则，避免校验/存储 id 不一致。
+  return normalizeProviderId(provider) || provider;
 }
 
 function supportsMode(provider: string, mode: GenerationMode) {
@@ -537,41 +472,50 @@ function shouldCacheGenerationResult(result: ProxyGenerationResult) {
   return assetUrl.startsWith('data:') || assetUrl.startsWith('http://') || assetUrl.startsWith('https://') || assetUrl.startsWith('/');
 }
 
-export function toRenderableAssetUrl(url: string, kind: 'image' | 'video' | 'audio' = 'image') {
+export function toRenderableAssetUrl(
+  url: string,
+  kind: 'image' | 'video' | 'audio' = 'image',
+  referer?: string,
+) {
   const raw = String(url || '').trim();
   if (!raw) return '';
   if (isLocalMediaHandle(raw)) {
     return resolveLocalMediaUrl(raw);
   }
+  // 同源（同主机）或站点内相对路径的资源由浏览器直接同源加载即可，
+  // 不应走 media-proxy 跨域代理：否则代理会自请求本机 URL，文件缺失时
+  // static 服务兜底返回 index.html（HTML），被 detectRemoteMediaUpstreamIssue
+  // 误判为 422；且同源资源本就无需 CORS 代理。
+  const isSameOriginOrLocal = (() => {
+    if (raw.startsWith('/')) {
+      // 站点内相对路径（如 /assets/...），但排除已是后端路由的 /api/ 路径
+      return !raw.startsWith('/api/');
+    }
+    try {
+      const u = new URL(raw);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+      const host = typeof window !== 'undefined' ? window.location.host : '';
+      return host !== '' && u.host === host;
+    } catch {
+      return false;
+    }
+  })();
+  if (isSameOriginOrLocal) return raw;
   if (raw.startsWith('/api/media-proxy?')) return raw;
+  const queryParams: Record<string, string> = { url: raw, kind };
+  // 转发来源页 URL 以绕过仅依赖 Referer 的防盗链。
+  const cleanedReferer = String(referer || '').trim();
+  if (cleanedReferer && /^https?:\/\//i.test(cleanedReferer)) {
+    queryParams.referer = cleanedReferer;
+  }
+  const query = new URLSearchParams(queryParams);
   if (raw.startsWith('file:///') || /^[a-zA-Z]:[\\/]/.test(raw) || raw.startsWith('\\\\')) {
-    const query = new URLSearchParams({ url: raw, kind });
     return `/api/media-proxy?${query.toString()}`;
   }
   if (/^https?:\/\//i.test(raw)) {
-    const query = new URLSearchParams({ url: raw, kind });
     return `/api/media-proxy?${query.toString()}`;
   }
   return raw;
-}
-
-export type RenderableAssetKind = 'image' | 'video' | 'audio';
-
-export interface RenderableAssetIssue {
-  category: 'remote-asset-expired' | 'legacy-blob' | 'render-failed';
-  summary: string;
-  detail: string;
-  provider?: string;
-  status?: number;
-  expiresAt?: number;
-}
-
-export interface CanvasMigrationIssue extends RenderableAssetIssue {
-  nodeId: string;
-  nodeLabel: string;
-  nodeType: NodeType;
-  assetKind: RenderableAssetKind;
-  assetUrl?: string;
 }
 
 function kindLabel(kind: RenderableAssetKind) {
@@ -1061,7 +1005,7 @@ export function resolveImageToolModel(
     return {
       model: fallbackCatalogItem?.id || requestedModel,
       requestModel: String(fallbackCatalogItem?.model || fallbackCatalogItem?.model || requestedModel),
-      provider: fallbackCatalogItem?.provider || requestedProvider || PROVIDER_HINTS[normalizeRequestedModelIdentifier(requestedModel)] || '',
+      provider: fallbackCatalogItem?.provider || requestedProvider || providerHintForModel(requestedModel) || '',
     };
   }
   return {
@@ -1517,7 +1461,7 @@ function buildImageConditionedPrompt(
   return lines.join('\n');
 }
 
-function buildGenerationBody(nodeType: NodeType, model: string, prompt: string, data: NodeData): SanitizedGenerationBody {
+export function buildGenerationBody(nodeType: NodeType, model: string, prompt: string, data: NodeData): SanitizedGenerationBody {
   const params = (data.params || {}) as Record<string, unknown>;
   const regionContract = readRegionContract(params.regionContract);
   const regionContractInputs = buildRegionContractMediaInputs(regionContract);
@@ -1801,8 +1745,6 @@ function isSvgConditioningUrl(value: unknown) {
 function isInlineImageDataUrl(value: unknown) {
   return typeof value === 'string' && /^data:image\//i.test(value);
 }
-
-const CONDITIONING_IMAGE_NORMALIZE_TIMEOUT_MS = 10000;
 
 async function withTimeoutFallback<T>(
   task: Promise<T>,
@@ -2336,7 +2278,7 @@ export function resolveGenerationAccess(
   },
 ): GenerationAccess {
   const mode = generationModeForNode(nodeType);
-  const preferredProvider = normalizeProvider(provider) || PROVIDER_HINTS[normalizeRequestedModelIdentifier(String(model || ''))] || MODE_PROVIDERS[mode][0];
+  const preferredProvider = normalizeProvider(provider) || providerHintForModel(String(model || '')) || MODE_PROVIDERS[mode][0];
   const allowProviderOnlyActivation = options?.allowProviderOnlyActivation ?? true;
   const allowLocalDemoAccess = allowsLocalCanvasDemoAccess();
   const candidates = options?.strictProvider
@@ -2701,6 +2643,22 @@ export async function generateNodeOutput({
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
   async function executeAttempt(): Promise<WorkflowGenerationResult> {
+    // 火山方舟接入点拦截：provider 为 volcengine 且目录中该模型尚无可用推理接入点（endpointId）时，
+    // 直接拦截，避免向上游发送裸模型名导致 404（图像/视频）或被静默 fallback 掩盖（文本），引导用户配置接入点。
+    // 注意：routedModel 始终是裸目录 id（后端控制器层才会解析为 ep-xxxx），故以目录 endpointId 为准判断可用性。
+    if (routedProvider === 'volcengine' && !/^ep-/.test(routedModel)) {
+      const catalogEntry = useModelCatalogStore
+        .getState()
+        .models.find((m) => m.id === model || m.model === model || m.upstreamModel === model);
+      const hasEndpoint = Boolean(catalogEntry?.endpointId);
+      if (catalogEntry && catalogEntry.requiresEndpoint && !hasEndpoint) {
+        throw new GenerationError(
+          '火山方舟模型需要推理接入点（ep-xxxx）才能调用。若已在 API Keys 页填写火山 AccessKey/SecretKey，'
+          + '请稍候系统自动创建接入点（可在模型目录查看该模型的 endpointId 状态）；否则请前往火山方舟控制台手动创建推理接入点后重试。',
+          { category: 'routing', provider: 'volcengine', model: routedModel, stage: 'ark-endpoint', code: 'ark-endpoint-required' },
+        );
+      }
+    }
     let result: WorkflowGenerationResult;
     let workflowFailure: Error | null = null;
     try {
@@ -2882,5 +2840,74 @@ export async function generateNodeOutput({
       mediaIntegrity: output?.metadata || result.asset?.metadata || {},
     },
   };
+}
+
+/**
+ * 运行期「免费额度模型优先 → 不行则按优先级切换付费 API 模型」封装。
+ *
+ * - 若节点 data 携带 modelFallbackChain（智能体「免费优先路线」写入），则依次尝试每条候选：
+ *   免费模型生成失败（配额耗尽 / 403 / 超时等）时自动切换到按优先级排列的下一条（付费）模型。
+ * - 若未携带回退链，则回退到普通的 generateNodeOutput 行为（不破坏既有节点逻辑）。
+ *
+ * 返回的结果会附带 modelFallbackUsedProvider / modelFallbackUsedModel / modelFallbackAutoSwitched /
+ * modelFallbackReason，便于 UI 显示「免费优先 / 已自动切换模型」。
+ */
+export async function generateNodeOutputWithFallback(
+  params: Parameters<typeof generateNodeOutput>[0] & { freeFirst?: boolean },
+): Promise<Partial<NodeData>> {
+  const dataType = (params.data ?? {}) as unknown as Record<string, unknown>;
+  const fromPlan = extractFallbackChain(dataType);
+
+  let candidates: ModelCandidate[] | null = fromPlan;
+  if (!candidates && params.freeFirst) {
+    const res = resolveModelForTask(params.nodeType, { preferFree: true });
+    if (res) candidates = res.fallbackChain;
+  }
+
+  // 无回退链：保持原有行为
+  if (!candidates || candidates.length === 0) {
+    return generateNodeOutput(params);
+  }
+
+  let lastError: unknown = null;
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    if (!c.provider || !c.model) continue;
+    try {
+      const result = await generateNodeOutput({
+        ...(params as Parameters<typeof generateNodeOutput>[0]),
+        // 切换候选模型：清空显式 apiKey/baseUrl，让 generateNodeOutput 按候选 provider 重新解析密钥与端点
+        apiKey: '',
+        baseUrl: undefined,
+        provider: c.provider,
+        model: c.model,
+        persistedModel: c.model,
+        data: {
+          ...(params.data ?? {}),
+          model: c.model,
+          provider: c.provider,
+          status: 'generating',
+        } as NodeData,
+      });
+      return {
+        ...result,
+        model: c.model,
+        provider: c.provider,
+        modelFallbackUsedProvider: c.provider,
+        modelFallbackUsedModel: c.model,
+        modelFallbackAutoSwitched: i > 0,
+        modelFallbackReason:
+          i > 0
+            ? `免费模型生成失败，已按优先级切换到 ${c.provider}/${c.model}`
+            : (dataType.modelFallbackReason as string) || '',
+      };
+    } catch (err) {
+      lastError = err;
+      // 继续尝试下一条候选
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(lastError ? String(lastError) : '所有候选模型均生成失败');
 }
 

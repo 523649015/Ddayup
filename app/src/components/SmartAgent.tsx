@@ -4,6 +4,7 @@
   useMemo,
   useRef,
   useState,
+  type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type RefObject,
@@ -19,8 +20,12 @@ import {
   Clock3,
   Eye,
   EyeOff,
+  Film,
   GitBranch,
+  Image as ImageIcon,
   Key,
+  Paperclip,
+  Upload,
   Loader2,
   PackageSearch,
   PauseCircle,
@@ -44,628 +49,87 @@ import {
   useSharedAgentMemoryGraph,
 } from '@/services/agentMemory';
 import { useCanvasStore, type WorkflowPlan } from '@/store/useCanvasStore';
+import { importLocalAssetFile } from '@/api/assetLibrary';
+import type { AssetItem } from '@/types/assets';
+import { analyzeAssetImage } from '@/services/assetImageAnalysis';
+import { deepAnalyzeImage } from '@/services/aiDeepAnalysisService';
+import type { AIDeepAnalysis } from '@/types/assets';
+import { reasonAboutVideo, extractVideoFrames } from '@/services/assetVideoReasoning';
+import { buildMediaAwarePlan, wantGenerationFromMedia } from '@/services/agentMediaWorkflow';
+import { formatReferenceAnalysisMessage } from '@/services/agentAnalysisChat';
+import { onRunAgentWorkflow, onDeepAnalysisToAgent, type AgentWorkflowRef, type DeepAnalysisToAgentRef } from '@/services/extensionBridge';
+import {
+  resolveModelForTask,
+  withReferenceRequirements,
+  defaultRequirementsForTask,
+  type ModelResolution,
+  type ModelCandidate,
+} from '@/services/modelFallback';
 import type { NodeType } from '@/types';
 
-type WorkflowStepState = {
-  label: string;
-  status: 'pending' | 'running' | 'done' | 'error';
-};
-
-type ChatMessage = {
-  id: string;
-  role: 'user' | 'assistant' | 'system';
-  content: string;
-  timestamp: number;
-  workflowStatus?: 'planning' | 'awaiting-approval' | 'creating' | 'completed' | 'failed' | 'paused';
-  workflowSteps?: WorkflowStepState[];
-};
-
-type AgentModel = {
-  id: string;
-  name: string;
-  desc: string;
-  icon: LucideIcon;
-  color: string;
-};
-
-type AgentSkill = {
-  id: string;
-  name: string;
-  desc: string;
-};
-
-type WorkflowTemplate = {
-  id: string;
-  skillId: string;
-  name: string;
-  keywords: string[];
-  description: string;
-  steps: Array<{
-    type: NodeType;
-    label: string;
-    buildData: (input: string) => Record<string, unknown>;
-  }>;
-};
-
-type CheckpointStage = 'plan' | 'execute' | 'deliver';
-
-type ExecutionArtifact = {
-  id: string;
-  title: string;
-  detail: string;
-  status: 'pending' | 'ready' | 'error';
-  nodeId?: string;
-  sourceStep: string;
-  provider: string;
-  model: string;
-  etaSeconds: number;
-  estimatedCost: number;
-  version: string;
-};
-
-type ExecutionState = {
-  status: 'idle' | 'planning' | 'awaiting-approval' | 'creating' | 'completed' | 'failed' | 'paused';
-  currentStep: string;
-  summary: string;
-  steps: WorkflowStepState[];
-  artifacts: ExecutionArtifact[];
-  updatedAt: number;
-};
-
-type AgentTraceEvent = {
-  id: string;
-  kind: 'router' | 'checkpoint' | 'plan' | 'step' | 'artifact' | 'deliver' | 'memory' | 'rollback' | 'replay' | 'error';
-  label: string;
-  detail: string;
-  status: 'info' | 'running' | 'done' | 'warning' | 'error';
-  at: number;
-};
-
-type AgentTraceRun = {
-  id: string;
-  input: string;
-  planName: string;
-  skillId: string;
-  skillName: string;
-  templateId: string;
-  routeId: string;
-  routeName: string;
-  status: 'draft' | 'awaiting-plan' | 'awaiting-execute' | 'running' | 'awaiting-deliver' | 'completed' | 'failed' | 'rolled-back';
-  checkpointMode: boolean;
-  createdAt: number;
-  updatedAt: number;
-  nodeIds: string[];
-  events: AgentTraceEvent[];
-  artifacts: ExecutionArtifact[];
-  planSnapshot: WorkflowPlan;
-  routeSnapshot: RouteRecommendation;
-  replaySourceTraceId?: string;
-  version: number;
-};
-
-type RouteRecommendation = {
-  id: 'balanced' | 'speed' | 'quality';
-  name: string;
-  providerLabel: string;
-  etaLabel: string;
-  costLabel: string;
-  fitLabel: string;
-  summary: string;
-  capabilities: string[];
-  textProvider: string;
-  textModel: string;
-  imageProvider: string;
-  imageModel: string;
-  videoProvider: string;
-  videoModel: string;
-  estimatedCost: number;
-  estimatedEtaSeconds: number;
-  recommended: boolean;
-};
-
-type PendingRun = {
-  traceId: string;
-  templateId: string;
-  input: string;
-  detectedIntent: IntentResult;
-  plan: WorkflowPlan;
-  route: RouteRecommendation;
-  checkpointStage: CheckpointStage;
-  beforeSnapshot: string;
-  createdNodeIds: string[];
-  replaySourceTraceId?: string;
-};
-
-const NODE_WIDTH = 380;
-const NODE_GAP_X = 120;
-const NODE_GAP_Y = 60;
-const SMART_AGENT_LAUNCHER_SIZE = 36;
-const TRACE_STORAGE_KEY = 'hmdao-smart-agent-traces';
-const MAX_TRACE_RUNS = 8;
-
-const MODELS: AgentModel[] = [
-  { id: 'workflow', name: 'Workflow', desc: '适合工作流规划、批量节点编排和自动执行。', icon: Sparkles, color: '#00d4aa' },
-  { id: 'vision', name: 'Vision', desc: '适合理解图片、视频与参考素材之间的关系。', icon: Bot, color: '#1a8cff' },
-  { id: 'planning', name: 'Planner', desc: '适合复杂多阶段执行、检查点和人工确认。', icon: GitBranch, color: '#f59e0b' },
-];
-
-const SKILLS: AgentSkill[] = [
-  { id: 'poster', name: '海报创作', desc: '海报、KV、活动主视觉' },
-  { id: 'product', name: '电商物料', desc: '商品图、卖点图、短视频' },
-  { id: 'brand', name: '品牌内容', desc: '品牌视觉、脚本、宣传片' },
-  { id: 'story', name: '叙事短片', desc: '故事设定、分镜与预演视频' },
-];
-
-const WORKFLOW_TEMPLATES: WorkflowTemplate[] = [
-  {
-    id: 'poster',
-    skillId: 'poster',
-    name: '海报创作流程',
-    description: '从创意文案到主视觉海报的自动化工作流。',
-    keywords: ['海报', '主视觉', 'banner', '封面', '活动图'],
-    steps: [
-      {
-        type: 'text',
-        label: '创意文案',
-        buildData: (input) => ({
-          label: '创意文案',
-          prompt: input,
-          content: `主题：${input}\n卖点：\n风格：\n品牌语气：`,
-        }),
-      },
-      {
-        type: 'image',
-        label: '视觉参考',
-        buildData: (input) => ({
-          label: '视觉参考',
-          prompt: `${input}，输出情绪板、配色方向与构图参考`,
-          provider: 'fal',
-          model: 'flux-pro',
-        }),
-      },
-      {
-        type: 'image',
-        label: '成品海报',
-        buildData: (input) => ({
-          label: '成品海报',
-          prompt: `${input}，高质量海报，画面完整，排版清晰，品牌感强`,
-          provider: 'fal',
-          model: 'flux-pro',
-        }),
-      },
-    ],
-  },
-  {
-    id: 'product',
-    skillId: 'product',
-    name: '电商物料流程',
-    description: '从商品卖点到主图和短视频的自动化工作流。',
-    keywords: ['电商', '商品', '卖点', '主图', '详情页', '短视频'],
-    steps: [
-      {
-        type: 'text',
-        label: '卖点提炼',
-        buildData: (input) => ({
-          label: '卖点提炼',
-          prompt: input,
-          content: `商品：${input}\n核心卖点：\n目标人群：\n使用场景：`,
-        }),
-      },
-      {
-        type: 'image',
-        label: '商品主图',
-        buildData: (input) => ({
-          label: '商品主图',
-          prompt: `${input}，电商主图，突出材质、卖点和购买冲动`,
-          provider: 'fal',
-          model: 'flux-pro',
-        }),
-      },
-      {
-        type: 'video',
-        label: '产品短视频',
-        buildData: (input) => ({
-          label: '产品短视频',
-          prompt: `${input}，产品展示短视频，镜头利落，节奏干净`,
-          provider: 'fal',
-          model: 'seedance-v2',
-          duration: 5,
-        }),
-      },
-    ],
-  },
-  {
-    id: 'brand',
-    skillId: 'brand',
-    name: '品牌内容流程',
-    description: '从品牌定位到宣传片和视觉内容的自动化工作流。',
-    keywords: ['品牌', '宣传', 'vi', 'campaign', 'logo'],
-    steps: [
-      {
-        type: 'text',
-        label: '品牌策略',
-        buildData: (input) => ({
-          label: '品牌策略',
-          prompt: input,
-          content: `品牌主题：${input}\n目标受众：\n调性关键词：\n传播场景：`,
-        }),
-      },
-      {
-        type: 'script',
-        label: '宣传脚本',
-        buildData: (input) => ({
-          label: '宣传脚本',
-          prompt: `${input}，输出宣传片脚本与镜头建议`,
-        }),
-      },
-      {
-        type: 'video',
-        label: '品牌宣传片',
-        buildData: (input) => ({
-          label: '品牌宣传片',
-          prompt: `${input}，品牌宣传片，镜头流畅，质感高级`,
-          provider: 'fal',
-          model: 'seedance-v2',
-          duration: 8,
-        }),
-      },
-    ],
-  },
-  {
-    id: 'story',
-    skillId: 'story',
-    name: '叙事短片流程',
-    description: '从故事设定到分镜和预演视频的自动化工作流。',
-    keywords: ['剧情', '短片', '故事', '分镜', '脚本'],
-    steps: [
-      {
-        type: 'text',
-        label: '故事设定',
-        buildData: (input) => ({
-          label: '故事设定',
-          prompt: input,
-          content: `主题：${input}\n人物：\n场景：\n情绪走向：`,
-        }),
-      },
-      {
-        type: 'storyboard',
-        label: '分镜规划',
-        buildData: (input) => ({
-          label: '分镜规划',
-          prompt: `${input}，输出镜头顺序、氛围与节奏建议`,
-        }),
-      },
-      {
-        type: 'video',
-        label: '预演视频',
-        buildData: (input) => ({
-          label: '预演视频',
-          prompt: `${input}，电影感预演视频，情绪完整，镜头明确`,
-          provider: 'fal',
-          model: 'seedance-v2',
-          duration: 5,
-        }),
-      },
-    ],
-  },
-];
-
-function parseStorage<T>(key: string, fallback: T): T {
-  if (typeof window === 'undefined') return fallback;
-  try {
-    const raw = window.localStorage.getItem(key);
-    if (!raw) return fallback;
-    return JSON.parse(raw) as T;
-  } catch {
-    return fallback;
+/** 把 AIDeepAnalysisPanel 的深度分析结果，转成 SmartAgent 媒体工作流需要的分析/推理文案 */
+function deepAnalysisToMediaText(analysis: AIDeepAnalysis): { analysisText: string; reasoningText: string } {
+  const parts = [
+    analysis.compositePrompt,
+    analysis.subject && `主体：${analysis.subject}`,
+    analysis.style && `风格：${analysis.style}`,
+    analysis.scene && `场景：${analysis.scene}`,
+    analysis.lighting && `光影：${analysis.lighting}`,
+    analysis.composition && `构图：${analysis.composition}`,
+    analysis.camera && `镜头/运镜：${analysis.camera}`,
+    analysis.subjectColors && `主体颜色：${analysis.subjectColors}`,
+    analysis.subjectDetails && `主体细节：${analysis.subjectDetails}`,
+    analysis.action && `动作：${analysis.action}`,
+    analysis.expression && `表情：${analysis.expression}`,
+    analysis.vfx && `特效：${analysis.vfx}`,
+    analysis.mood && `情绪：${analysis.mood}`,
+  ].filter(Boolean);
+  const analysisText = parts.join('；') || '已深度分析图片';
+  const promptZh = (analysis.promptZh || '').trim();
+  const promptEn = (analysis.promptEn || '').trim();
+  let analysisTextFinal = analysisText;
+  if (promptZh || promptEn) {
+    analysisTextFinal += `\n\n📋 可复制提示词（用于复现/生成同样的画面）：`;
+    if (promptZh) analysisTextFinal += `\n中文：${promptZh}`;
+    if (promptEn) analysisTextFinal += `\n英文：${promptEn}`;
   }
+  const reasoningText = analysis.compositePrompt || analysisTextFinal;
+  return { analysisText: analysisTextFinal, reasoningText };
 }
 
-function persistStorage(key: string, value: unknown) {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(key, JSON.stringify(value));
-  } catch {
-    // Ignore storage errors and keep the runtime usable.
-  }
-}
-
-function detectIntent(input: string): IntentResult | null {
-  const normalized = input.toLowerCase();
-  const template = WORKFLOW_TEMPLATES.find((item) => item.keywords.some((keyword) => normalized.includes(keyword.toLowerCase())));
-  if (!template) return null;
-  return {
-    skillId: template.skillId,
-    skillName: template.name,
-    confidence: 0.78,
-    extractedParams: { raw: input },
-    suggestedSteps: template.steps.map((step) => ({ type: step.type, label: step.label, prompt: input })),
-  };
-}
-
-function buildPlan(name: string, description: string, steps: WorkflowTemplate['steps'], input: string): WorkflowPlan {
-  const yBase = 200;
-  return {
-    id: `plan-${Date.now()}`,
-    name,
-    description,
-    steps: steps.map((step, index) => ({
-      type: step.type,
-      label: step.label,
-      position: {
-        x: 120 + index * (NODE_WIDTH + NODE_GAP_X),
-        y: yBase + (index % 2 === 0 ? 0 : NODE_GAP_Y),
-      },
-      data: step.buildData(input),
-    })),
-    connections: steps.slice(0, -1).map((_, index) => ({ from: index, to: index + 1 })),
-  };
-}
-
-function cloneWorkflowPlan(plan: WorkflowPlan): WorkflowPlan {
-  return JSON.parse(JSON.stringify(plan)) as WorkflowPlan;
-}
-
-function cloneRouteRecommendation(route: RouteRecommendation): RouteRecommendation {
-  return {
-    ...route,
-    capabilities: [...route.capabilities],
-  };
-}
-
-function clampValue(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, value));
-}
-
-function getCanvasHostBounds(canvasHostRef?: RefObject<HTMLDivElement | null>) {
-  const hostRect = canvasHostRef?.current?.getBoundingClientRect();
-  if (hostRect) {
-    return hostRect;
-  }
-  if (typeof window === 'undefined') {
-    return {
-      left: 0,
-      top: 0,
-      width: 1280,
-      height: 720,
-      right: 1280,
-      bottom: 720,
-      x: 0,
-      y: 0,
-      toJSON: () => ({}),
-    } as DOMRect;
-  }
-  return {
-    left: 0,
-    top: 0,
-    width: window.innerWidth,
-    height: window.innerHeight,
-    right: window.innerWidth,
-    bottom: window.innerHeight,
-    x: 0,
-    y: 0,
-    toJSON: () => ({}),
-  } as DOMRect;
-}
-
-function clampLauncherPosition(
-  x: number,
-  y: number,
-  canvasHostRef?: RefObject<HTMLDivElement | null>,
-  size = SMART_AGENT_LAUNCHER_SIZE,
-) {
-  const host = getCanvasHostBounds(canvasHostRef);
-  const paddingX = 12;
-  const paddingTop = 12;
-  const paddingBottom = 20;
-  return {
-    x: clampValue(x, paddingX, Math.max(paddingX, host.width - size - paddingX)),
-    y: clampValue(y, paddingTop, Math.max(paddingTop, host.height - size - paddingBottom)),
-  };
-}
-
-function inferNeeds(plan: WorkflowPlan) {
-  return {
-    hasVideo: plan.steps.some((step) => step.type === 'video'),
-    hasImage: plan.steps.some((step) => step.type === 'image'),
-    hasStoryboard: plan.steps.some((step) => step.type === 'storyboard'),
-    hasScript: plan.steps.some((step) => step.type === 'script' || step.type === 'text'),
-  };
-}
-
-function buildRouteRecommendations(plan: WorkflowPlan, skillId: string): RouteRecommendation[] {
-  const needs = inferNeeds(plan);
-  const qualityRecommended = skillId === 'brand' || skillId === 'poster';
-  const speedRecommended = skillId === 'product';
-  return [
-    {
-      id: 'balanced',
-      name: '平衡路线',
-      providerLabel: 'OpenAI / Fal / Seedance',
-      etaLabel: '约 2 - 4 分钟',
-      costLabel: '成本中等',
-      fitLabel: '综合推荐',
-      summary: '兼顾速度、稳定性和画质，适合大多数海报、脚本与短视频任务。',
-      capabilities: [
-        needs.hasScript ? '脚本与文案稳定' : '规划过程稳定',
-        needs.hasImage ? '图片节点默认可用' : '流程整体更轻量',
-        needs.hasVideo ? '视频节点质量均衡' : '交付节奏自然',
-      ],
-      textProvider: 'openai',
-      textModel: 'gpt-4o',
-      imageProvider: 'fal',
-      imageModel: 'flux-pro',
-      videoProvider: 'fal',
-      videoModel: 'seedance-v2',
-      estimatedCost: needs.hasVideo ? 8.4 : 2.1,
-      estimatedEtaSeconds: needs.hasVideo ? 210 : 95,
-      recommended: !qualityRecommended && !speedRecommended,
-    },
-    {
-      id: 'speed',
-      name: '极速路线',
-      providerLabel: 'DeepSeek / SiliconFlow / Wan',
-      etaLabel: '约 1 - 2 分钟',
-      costLabel: '成本较低',
-      fitLabel: '适合快速试稿',
-      summary: '优先缩短等待时间，适合电商试稿、预演和批量打样。',
-      capabilities: [
-        '出结果更快',
-        needs.hasVideo ? '适合视频预演' : '适合多轮尝试',
-        '适合先做草稿再细修',
-      ],
-      textProvider: 'deepseek',
-      textModel: 'deepseek-chat',
-      imageProvider: 'siliconflow',
-      imageModel: 'Qwen/Qwen-Image',
-      videoProvider: 'siliconflow',
-      videoModel: 'Wan-AI/Wan2.2-I2V-A14B',
-      estimatedCost: needs.hasVideo ? 4.6 : 1.2,
-      estimatedEtaSeconds: needs.hasVideo ? 110 : 55,
-      recommended: speedRecommended,
-    },
-    {
-      id: 'quality',
-      name: '高保真路线',
-      providerLabel: 'OpenAI / Fal 高质量 / Seedance 高质量',
-      etaLabel: '约 3 - 6 分钟',
-      costLabel: '成本较高',
-      fitLabel: '适合正式交付',
-      summary: '优先保证画面一致性和观感，适合品牌主视觉、海报和宣传片。',
-      capabilities: [
-        '适合品牌一致性',
-        needs.hasImage ? '海报与主视觉质量更稳' : '故事表达更完整',
-        needs.hasVideo ? '更适合正式宣传视频' : '更适合交付前精修',
-      ],
-      textProvider: 'openai',
-      textModel: 'gpt-4.1',
-      imageProvider: 'fal',
-      imageModel: 'flux-pro',
-      videoProvider: 'fal',
-      videoModel: 'seedance-v2',
-      estimatedCost: needs.hasVideo ? 11.8 : 3.4,
-      estimatedEtaSeconds: needs.hasVideo ? 320 : 150,
-      recommended: qualityRecommended,
-    },
-  ];
-}
-
-function applyRouteToPlan(plan: WorkflowPlan, route: RouteRecommendation): WorkflowPlan {
-  return {
-    ...plan,
-    steps: plan.steps.map((step) => {
-      const data = { ...(step.data || {}) };
-      if (step.type === 'text' || step.type === 'script' || step.type === 'storyboard') {
-        return {
-          ...step,
-          data: {
-            ...data,
-            provider: route.textProvider,
-            model: route.textModel,
-            routeName: route.name,
-            routeId: route.id,
-          },
-        };
-      }
-      if (step.type === 'image') {
-        return {
-          ...step,
-          data: {
-            ...data,
-            provider: route.imageProvider,
-            model: route.imageModel,
-            routeName: route.name,
-            routeId: route.id,
-          },
-        };
-      }
-      if (step.type === 'video') {
-        return {
-          ...step,
-          data: {
-            ...data,
-            provider: route.videoProvider,
-            model: route.videoModel,
-            routeName: route.name,
-            routeId: route.id,
-          },
-        };
-      }
-      return step;
-    }),
-  };
-}
-
-function estimateStepCost(stepType: NodeType, route: RouteRecommendation) {
-  if (stepType === 'video') return route.id === 'quality' ? 8.8 : route.id === 'speed' ? 3.6 : 6.2;
-  if (stepType === 'image') return route.id === 'quality' ? 1.4 : route.id === 'speed' ? 0.55 : 0.9;
-  if (stepType === 'text' || stepType === 'script' || stepType === 'storyboard') return route.id === 'speed' ? 0.12 : 0.25;
-  return 0;
-}
-
-function estimateStepEtaSeconds(stepType: NodeType, route: RouteRecommendation) {
-  if (stepType === 'video') return route.id === 'quality' ? 145 : route.id === 'speed' ? 55 : 95;
-  if (stepType === 'image') return route.id === 'quality' ? 32 : route.id === 'speed' ? 12 : 22;
-  if (stepType === 'text' || stepType === 'script' || stepType === 'storyboard') return route.id === 'speed' ? 8 : 14;
-  return 10;
-}
-
-function describeExecutionStep(steps: WorkflowStepState[], status: ExecutionState['status'], pendingCheckpoint?: CheckpointStage | null) {
-  if (status === 'awaiting-approval' && pendingCheckpoint === 'plan') return '等待人工确认：计划完成';
-  if (status === 'awaiting-approval' && pendingCheckpoint === 'execute') return '等待人工确认：准备执行';
-  if (status === 'awaiting-approval' && pendingCheckpoint === 'deliver') return '等待人工确认：准备交付';
-  const running = steps.find((step) => step.status === 'running');
-  if (running) return `当前步骤：${running.label}`;
-  const pending = steps.find((step) => step.status === 'pending');
-  if (pending) return `下一步：${pending.label}`;
-  const failed = steps.find((step) => step.status === 'error');
-  if (failed) return `失败步骤：${failed.label}`;
-  const lastDone = [...steps].reverse().find((step) => step.status === 'done');
-  if (lastDone) return `已完成：${lastDone.label}`;
-  return '等待新的工作流指令';
-}
-
-function buildExecutionArtifacts(plan: WorkflowPlan, statuses: WorkflowStepState[], route: RouteRecommendation, nodeIds: string[] = []): ExecutionArtifact[] {
-  return plan.steps.map((step, index) => {
-    const stepStatus = statuses[index]?.status || 'pending';
-    const provider = String((step.data as Record<string, unknown>)?.provider || (
-      step.type === 'image' ? route.imageProvider : step.type === 'video' ? route.videoProvider : route.textProvider
-    ));
-    const model = String((step.data as Record<string, unknown>)?.model || (
-      step.type === 'image' ? route.imageModel : step.type === 'video' ? route.videoModel : route.textModel
-    ));
-    return {
-      id: `${plan.id}-artifact-${index}`,
-      title: step.label,
-      detail: stepStatus === 'done'
-        ? `已生成 ${step.type} 节点${nodeIds[index] ? ` · ${nodeIds[index]}` : ''}`
-        : stepStatus === 'running'
-          ? '正在生成节点'
-          : stepStatus === 'error'
-            ? '生成失败，等待重试'
-            : `待生成 ${step.type} 节点`,
-      status: stepStatus === 'done' ? 'ready' : stepStatus === 'error' ? 'error' : 'pending',
-      nodeId: nodeIds[index],
-      sourceStep: step.label,
-      provider,
-      model,
-      etaSeconds: estimateStepEtaSeconds(step.type, route),
-      estimatedCost: estimateStepCost(step.type, route),
-      version: `${route.id}-v${index + 1}`,
-    };
-  });
-}
-
-function formatRelativeTime(timestamp: number) {
-  const deltaMinutes = Math.max(0, Math.round((Date.now() - timestamp) / 60000));
-  if (deltaMinutes < 1) return '刚刚';
-  if (deltaMinutes < 60) return `${deltaMinutes} 分钟前`;
-  const hours = Math.round(deltaMinutes / 60);
-  if (hours < 24) return `${hours} 小时前`;
-  const days = Math.round(hours / 24);
-  return `${days} 天前`;
-}
-
+import {
+  applyRouteToPlan,
+  buildExecutionArtifacts,
+  buildPlan,
+  buildRouteRecommendations,
+  clampLauncherPosition,
+  clampValue,
+  cloneRouteRecommendation,
+  cloneWorkflowPlan,
+  describeExecutionStep,
+  detectIntent,
+  formatRelativeTime,
+  getCanvasHostBounds,
+  MAX_TRACE_RUNS,
+  MODELS,
+  parseSseBlock,
+  parseStorage,
+  persistStorage,
+  SKILLS,
+  SMART_AGENT_LAUNCHER_SIZE,
+  TRACE_STORAGE_KEY,
+  WORKFLOW_TEMPLATES,
+  type AgentModel,
+  type AgentTraceEvent,
+  type AgentTraceRun,
+  type ChatMessage,
+  type CheckpointStage,
+  type ExecutionArtifact,
+  type ExecutionState,
+  type PendingRun,
+  type RouteRecommendation,
+  type WorkflowStepState,
+} from './SmartAgent.shared';
 interface SmartAgentProps {
   isMobile?: boolean;
   canvasHostRef?: RefObject<HTMLDivElement | null>;
@@ -697,8 +161,23 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
   const [byokResult, setByokResult] = useState<{ success: boolean; message: string } | null>(null);
   const [checkpointMode, setCheckpointMode] = useState(true);
   const [routeRecommendations, setRouteRecommendations] = useState<RouteRecommendation[]>([]);
-  const [selectedRouteId, setSelectedRouteId] = useState<RouteRecommendation['id']>('balanced');
+  const [selectedRouteId, setSelectedRouteId] = useState<RouteRecommendation['id']>('free');
   const [pendingRun, setPendingRun] = useState<PendingRun | null>(null);
+
+  /** 智能体面板当前附带的媒体（图片/视频）：由上传或拖拽进入，分析/推理后成为工作流主输入 */
+  type AttachedMediaState = {
+    kind: 'image' | 'video';
+    fileName: string;
+    asset: AssetItem;
+    status: 'ready' | 'error';
+    analysis?: string;
+    reasoning?: string;
+    error?: string;
+  };
+  const [attachedMedia, setAttachedMedia] = useState<AttachedMediaState | null>(null);
+  const [mediaProcessing, setMediaProcessing] = useState(false);
+  const [mediaDragOver, setMediaDragOver] = useState(false);
+  const mediaFileInputRef = useRef<HTMLInputElement | null>(null);
   const [traceRuns, setTraceRuns] = useState<AgentTraceRun[]>(() => parseStorage<AgentTraceRun[]>(TRACE_STORAGE_KEY, []));
   const memoryGraph = useSharedAgentMemoryGraph();
   const [activeTraceId, setActiveTraceId] = useState<string>('');
@@ -1088,6 +567,7 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
   }, [appendTraceEvent, pendingRun, updateTraceRun]);
 
   const runWorkflowPlan = useCallback(async (run: PendingRun) => {
+   try {
     const workflowSteps: WorkflowStepState[] = run.plan.steps.map((step) => ({ label: step.label, status: 'pending' }));
     appendTraceEvent(run.traceId, {
       kind: 'checkpoint',
@@ -1274,7 +754,13 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
       nodeIds: result.nodeIds,
       artifacts: nextArtifacts,
     } as AgentTraceRun;
-    rememberRun(finishedTrace);
+    // 后置副作用（写入长期记忆/存档）失败不得阻塞「已完成」状态，
+    // 否则异常会冒泡到外层 catch，执行浮层永远停在「正在创建节点」。
+    try {
+      rememberRun(finishedTrace);
+    } catch (memErr) {
+      console.warn('[runWorkflowPlan] 写入长期记忆失败（不影响已创建节点）:', memErr);
+    }
     setExecutionState({
       status: 'completed',
       currentStep: describeExecutionStep(completedSteps, 'completed'),
@@ -1283,6 +769,30 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
       artifacts: nextArtifacts,
       updatedAt: Date.now(),
     });
+   } catch (wfErr) {
+    // R6：任何未预期异常都让执行浮层进入 failed，绝不永久停在「正在创建节点」。
+    const msg = wfErr instanceof Error ? wfErr.message : String(wfErr);
+    console.error('[runWorkflowPlan] 执行异常：', wfErr);
+    const failedSteps = run.plan.steps.map((step) => ({ ...step, status: 'error' as const }));
+    setExecutionState({
+      status: 'failed',
+      currentStep: describeExecutionStep(failedSteps, 'failed'),
+      summary: `工作流执行异常：${msg}`,
+      steps: failedSteps,
+      artifacts: buildExecutionArtifacts(run.plan, failedSteps, run.route),
+      updatedAt: Date.now(),
+    });
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `wf-error-${Date.now()}`,
+        role: 'assistant',
+        content: `工作流执行出现异常：${msg}`,
+        timestamp: Date.now(),
+      },
+    ]);
+    setPendingRun(null);
+  }
   }, [
     appendTraceEvent,
     checkpointMode,
@@ -1337,7 +847,13 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
       updatedAt: Date.now(),
     } as AgentTraceRun;
     updateTraceRun(pendingRun.traceId, () => nextTrace);
-    rememberRun(nextTrace);
+    // 后置副作用（写入长期记忆/存档）失败不得阻塞「已完成」状态，
+    // 否则异常会冒泡到外层 catch，执行浮层永远停在中间态。
+    try {
+      rememberRun(nextTrace);
+    } catch (memErr) {
+      console.warn('[finalizeDelivery] 写入长期记忆失败（不影响已交付节点）:', memErr);
+    }
     setExecutionState({
       status: 'completed',
       currentStep: describeExecutionStep(completedSteps, 'completed'),
@@ -1501,20 +1017,498 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
     rememberRun(trace);
   }, [rememberRun]);
 
+  const handleMediaFiles = useCallback(async (fileList: FileList | File[]) => {
+    const file = Array.from(fileList)[0];
+    if (!file) return;
+    const isVideo = file.type.startsWith('video/') || /\.(mp4|webm|mov|m4v|avi|mkv|flv|wmv)$/i.test(file.name);
+    const kind: 'image' | 'video' = isVideo ? 'video' : 'image';
+    setMediaProcessing(true);
+    try {
+      const asset = await importLocalAssetFile(file, { type: kind });
+      // 注意：importLocalAssetFile 返回 { item, duplicate } 包装对象，
+      // analyzeAssetImage / reasonAboutVideo 需要的是内部真实素材 asset.item。
+      const realItem = asset.item;
+      if (kind === 'image') {
+        const a = await analyzeAssetImage({ item: realItem });
+        const parts = [
+          a.summary,
+          a.subject && `主体：${a.subject}`,
+          a.style && `风格：${a.style}`,
+          a.scene && `场景：${a.scene}`,
+          a.lighting && `光影：${a.lighting}`,
+          a.composition && `构图：${a.composition}`,
+          a.camera && `镜头/运镜：${a.camera}`,
+          a.subjectColors && `主体颜色：${a.subjectColors}`,
+          a.subjectDetails && `主体细节：${a.subjectDetails}`,
+          a.action && `动作：${a.action}`,
+          a.expression && `表情：${a.expression}`,
+          a.vfx && `特效：${a.vfx}`,
+          a.mood && `情绪：${a.mood}`,
+        ].filter(Boolean);
+        let analysisText = parts.join('；') || '已分析图片内容';
+        const promptZh = (a.promptZh || '').trim();
+        const promptEn = (a.promptEn || '').trim();
+        if (promptZh || promptEn) {
+          analysisText += `\n\n📋 可复制提示词（用于复现/生成同样的画面）：`;
+          if (promptZh) analysisText += `\n中文：${promptZh}`;
+          if (promptEn) analysisText += `\n英文：${promptEn}`;
+        }
+        // R5：后端分析失败时（如 Florence-2 崩溃回退）透传 warnings，让用户在面板可见。
+        if (a?.warnings?.length) analysisText += `\n⚠️ ${a.warnings.join('；')}`;
+        setAttachedMedia({ kind, fileName: file.name, asset: realItem, status: 'ready', analysis: analysisText });
+      } else {
+        const frames = await extractVideoFrames(file);
+        const r = await reasonAboutVideo({ asset: realItem, frames });
+        setAttachedMedia({ kind, fileName: file.name, asset: realItem, status: 'ready', reasoning: r.reasoning });
+      }
+    } catch (err) {
+      setAttachedMedia({
+        kind,
+        fileName: file.name,
+        asset: { id: '', type: kind, url: '', name: file.name } as AssetItem,
+        status: 'error',
+        error: err instanceof Error ? err.message : '媒体处理失败',
+      });
+    } finally {
+      setMediaProcessing(false);
+    }
+  }, []);
+
+  const handleRemoveMedia = useCallback(() => {
+    setAttachedMedia(null);
+  }, []);
+
+  const handleMediaDrop = useCallback(
+    async (e: ReactDragEvent) => {
+      e.preventDefault();
+      setMediaDragOver(false);
+      if (mediaProcessing) return;
+      const files = e.dataTransfer?.files;
+      if (files && files.length) await handleMediaFiles(files);
+    },
+    [handleMediaFiles, mediaProcessing],
+  );
+
+  const handleMediaDragOver = useCallback((e: ReactDragEvent) => {
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+    setMediaDragOver(true);
+  }, []);
+
+  const handleMediaDragLeave = useCallback((e: ReactDragEvent) => {
+    e.preventDefault();
+    setMediaDragOver(false);
+  }, []);
+
+  /** 媒体工作流核心：分析/推理文本 + 资产 → 规划 plan → 建 PendingRun → 视检查点模式执行。
+   *  供「面板内上传/拖拽」与「扩展机器人上传」两条路径复用。 */
+  const runMediaPlan = useCallback(
+    async (opts: {
+      kind: 'image' | 'video';
+      asset: { id: string; url: string; name: string };
+      fileName: string;
+      analysisText?: string;
+      reasoningText?: string;
+      userText: string;
+    }) => {
+      const { kind, asset, fileName, analysisText, reasoningText, userText } = opts;
+      const mediaPlan = buildMediaAwarePlan({
+        kind,
+        asset: { id: asset.id, url: asset.url, name: asset.name },
+        analysisText: kind === 'image' ? analysisText : undefined,
+        reasoningText: kind === 'video' ? reasoningText : undefined,
+        userText,
+      });
+      const mediaIntent: IntentResult = {
+        skillId: kind === 'image' ? 'media-image' : 'media-video',
+        skillName: kind === 'image' ? '图片分析工作流' : '视频推理工作流',
+        confidence: 1,
+        extractedParams: { attachedMedia: 'true', kind },
+        suggestedSteps: mediaPlan.steps.map((s) => ({ type: s.type, label: s.label, prompt: '' })),
+      };
+      const mediaRoutes = buildRouteRecommendations(mediaPlan, mediaIntent.skillId);
+      const mediaRoute = mediaRoutes.find((r) => r.recommended) || mediaRoutes[0];
+      const mediaRoutedPlan = applyRouteToPlan(mediaPlan, mediaRoute);
+      const mediaTraceId = createTraceRun(userText, mediaRoutedPlan, mediaIntent, mediaRoute, {
+        templateId: 'media-' + kind,
+      });
+      const beforeSnapshot = exportCanvas();
+      snapshotVaultRef.current[mediaTraceId] = { beforeSnapshot };
+      const workflowSteps: WorkflowStepState[] = mediaRoutedPlan.steps.map((step) => ({ label: step.label, status: 'pending' }));
+      const mediaPendingRun: PendingRun = {
+        traceId: mediaTraceId,
+        templateId: 'media-' + kind,
+        input: userText,
+        detectedIntent: mediaIntent,
+        plan: mediaRoutedPlan,
+        route: mediaRoute,
+        checkpointStage: checkpointMode ? 'plan' : 'execute',
+        beforeSnapshot,
+        createdNodeIds: [],
+      };
+      setPendingRun(mediaPendingRun);
+      appendTraceEvent(mediaTraceId, {
+        kind: 'router',
+        label: '媒体路线推荐',
+        detail: `${mediaRoute.name} 路 ${mediaRoute.summary}`,
+        status: 'done',
+      });
+      appendTraceEvent(mediaTraceId, {
+        kind: 'plan',
+        label: '已生成媒体工作流',
+        detail: `识别为 ${mediaIntent.skillName}，共 ${mediaRoutedPlan.steps.length} 个步骤。`,
+        status: 'done',
+      });
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `user-${Date.now()}`,
+          role: 'user',
+          content: `📎 ${kind === 'image' ? '图片' : '视频'}附件：${fileName}${userText ? '\n' + userText : ''}`,
+          timestamp: Date.now(),
+        },
+        {
+          id: `intent-${Date.now()}`,
+          role: 'system',
+          content: `已${kind === 'image' ? '分析图片' : '推理视频'}（${fileName}），识别为 ${mediaIntent.skillName}（置信度 100%）`,
+          timestamp: Date.now(),
+          workflowStatus: checkpointMode ? 'awaiting-approval' : 'planning',
+          workflowSteps,
+        },
+        {
+          // 关键修复：把 Florence-2（免费）视觉分析结果直接返回到聊天面板，
+          // 否则用户只看到「正在创建节点」而永远看不到真实风格分析。
+          id: `analysis-${Date.now()}`,
+          role: 'assistant',
+          content: formatReferenceAnalysisMessage({ kind, analysisText, reasoningText, fileName }),
+          timestamp: Date.now(),
+        },
+      ]);
+      const isMediaGen = wantGenerationFromMedia(userText, kind);
+      setExecutionState({
+        status: checkpointMode && isMediaGen ? 'awaiting-approval' : 'planning',
+        currentStep: describeExecutionStep(workflowSteps, checkpointMode && isMediaGen ? 'awaiting-approval' : 'planning', checkpointMode && isMediaGen ? 'plan' : null),
+        summary: checkpointMode && isMediaGen
+          ? '媒体计划和推荐路线已就绪，等待你确认后再继续。'
+          : `已为你选择 ${mediaRoute.name}，马上开始执行。`,
+        steps: workflowSteps,
+        artifacts: buildExecutionArtifacts(mediaRoutedPlan, workflowSteps, mediaRoute),
+        updatedAt: Date.now(),
+      });
+      if (!checkpointMode) {
+        // R4：纯分析意图（如「分析参考图风格」）只把分析结果返回聊天面板，不创建任何节点，
+        // 避免用户看到「正在创建节点」却永远卡住、且拿不到分析结果。
+        if (wantGenerationFromMedia(userText, kind)) {
+          await runWorkflowPlan(mediaPendingRun);
+        } else {
+          setExecutionState({
+            status: 'completed',
+            currentStep: '已完成素材分析',
+            summary: `已分析${kind === 'image' ? '图片' : '视频'}（${fileName}），分析结果已返回聊天面板，未创建生成节点。`,
+            steps: workflowSteps.map((s) => ({ ...s, status: 'done' as const })),
+            artifacts: [],
+            updatedAt: Date.now(),
+          });
+        }
+      }
+    },
+    [checkpointMode, runWorkflowPlan],
+  );
+
+  // 扩展机器人上传的素材 → 复用画布媒体工作流（与面板内上传同一条链路）
+  useEffect(() => {
+    const off = onRunAgentWorkflow(async (ref: AgentWorkflowRef) => {
+      if (isLoading || mediaProcessing) return;
+      const asset = ref.asset;
+      if (!asset || !asset.url) return;
+      const kind: 'image' | 'video' = asset.type === 'video' ? 'video' : 'image';
+      const fileName = asset.name || (kind === 'image' ? '图片' : '视频');
+      setIsLoading(true);
+      try {
+        if (kind === 'image') {
+          let analysisText: string | undefined;
+          let reasoningText: string | undefined;
+          // 扩展机器人若请求「深度分析」，复用 AIDeepAnalysisPanel 同款 VLM 管线，效果等同面板「发送给机器人」
+          if (ref.deepAnalyze) {
+            try {
+              const itemToAnalyze: AssetItem = {
+                id: asset.id || '',
+                url: asset.url,
+                name: fileName,
+                type: 'image',
+                thumbnail: asset.url,
+                folderId: 'web',
+                size: 0,
+                tags: [],
+                smartCategories: [],
+                source: 'upload',
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+              };
+              const deep = await deepAnalyzeImage(itemToAnalyze, {});
+              const t = deepAnalysisToMediaText(deep);
+              analysisText = t.analysisText;
+              reasoningText = t.reasoningText;
+            } catch {
+              analysisText = '已上传图片（深度分析失败，使用基础分析）';
+            }
+          }
+          if (!analysisText) {
+            try {
+              const a = await analyzeAssetImage({ item: { id: asset.id || '', url: asset.url, name: fileName } as AssetItem });
+              const parts = [
+                a.summary,
+                a.subject && `主体：${a.subject}`,
+                a.style && `风格：${a.style}`,
+                a.scene && `场景：${a.scene}`,
+                a.lighting && `光影：${a.lighting}`,
+              a.composition && `构图：${a.composition}`,
+              a.camera && `镜头/运镜：${a.camera}`,
+              a.subjectColors && `主体颜色：${a.subjectColors}`,
+              a.subjectDetails && `主体细节：${a.subjectDetails}`,
+              a.action && `动作：${a.action}`,
+              a.expression && `表情：${a.expression}`,
+              a.vfx && `特效：${a.vfx}`,
+              a.mood && `情绪：${a.mood}`,
+              ].filter(Boolean);
+              analysisText = parts.join('；') || '已分析图片内容';
+              const promptZh = (a.promptZh || '').trim();
+              const promptEn = (a.promptEn || '').trim();
+              if (promptZh || promptEn) {
+                analysisText += `\n\n📋 可复制提示词（用于复现/生成同样的画面）：`;
+                if (promptZh) analysisText += `\n中文：${promptZh}`;
+                if (promptEn) analysisText += `\n英文：${promptEn}`;
+              }
+              // R5：透传后端回退 warnings（如 Florence-2 调用失败已用基础分析兜底）。
+              if (a?.warnings?.length) analysisText += `\n⚠️ ${a.warnings.join('；')}`;
+            } catch (anaErr) {
+              // R5：分析请求本身失败要明确提示，而不是静默落到「已上传图片」。
+              analysisText = `参考图分析失败：${anaErr instanceof Error ? anaErr.message : '未知错误'}（可能 Florence-2 未配置或调用出错）`;
+            }
+          }
+          await runMediaPlan({
+            kind,
+            asset: { id: asset.id || '', url: asset.url, name: fileName },
+            fileName,
+            analysisText,
+            reasoningText,
+            userText: ref.userText || (ref.deepAnalyze ? '深度分析这张图片并生成工作流' : '分析这张图片'),
+          });
+        } else {
+          let reasoningText: string | undefined;
+          try {
+            const resp = await fetch(asset.url);
+            const blob = await resp.blob();
+            const file = new File([blob], fileName, { type: blob.type || 'video/mp4' });
+            const frames = await extractVideoFrames(file);
+            const r = await reasonAboutVideo({ asset: { id: asset.id || '', url: asset.url, name: fileName } as AssetItem, frames });
+            reasoningText = r.reasoning;
+          } catch {
+            reasoningText = undefined;
+          }
+          await runMediaPlan({
+            kind,
+            asset: { id: asset.id || '', url: asset.url, name: fileName },
+            fileName,
+            reasoningText,
+            userText: ref.userText || '分析这段视频',
+          });
+        }
+      } catch (error) {
+        setMessages((prev) => [
+          ...prev,
+          { id: `error-${Date.now()}`, role: 'system', content: `扩展素材触发工作流失败：${error instanceof Error ? error.message : '未知错误'}`, timestamp: Date.now() },
+        ]);
+      } finally {
+        setIsLoading(false);
+      }
+    });
+    return off;
+  }, [isLoading, mediaProcessing, runMediaPlan]);
+
+  // AIDeepAnalysisPanel「发送给机器人」：把已算好的深度分析结果直接生成媒体工作流
+  useEffect(() => {
+    const off = onDeepAnalysisToAgent(async (ref: DeepAnalysisToAgentRef) => {
+      if (isLoading || mediaProcessing) return;
+      const { item, analysis } = ref;
+      if (!item || !analysis) return;
+      setIsLoading(true);
+      try {
+        const asset = { id: item.id || '', url: item.url || '', name: item.name || '图片' };
+        const { analysisText, reasoningText } = deepAnalysisToMediaText(analysis);
+        await runMediaPlan({
+          kind: 'image',
+          asset,
+          fileName: asset.name,
+          analysisText,
+          reasoningText,
+          userText: ref.userText || '基于深度分析结果生成工作流',
+        });
+      } catch (error) {
+        setMessages((prev) => [
+          ...prev,
+          { id: `error-${Date.now()}`, role: 'system', content: `深度分析联动失败：${error instanceof Error ? error.message : '未知错误'}`, timestamp: Date.now() },
+        ]);
+      } finally {
+        setIsLoading(false);
+      }
+    });
+    return off;
+  }, [isLoading, mediaProcessing, runMediaPlan]);
+
+  // P2.b：调用后端流式智能体（SSE，/api/agent/chat）。失败/超时抛错，由 handleSend 回退到本地规则。
+  // 仅依赖稳定的 setMessages；历史与画布摘要由调用方传入，避免闭包陈旧。
+  const runBackendAgent = useCallback(async (
+    userInput: string,
+    history: { role: 'user' | 'assistant'; content: string }[],
+    canvasSummary: string,
+  ): Promise<{ intent: IntentResult; assistantId: string }> => {
+    const assistantId = `agent-${Date.now()}`;
+    const thinkingParts: string[] = [];
+    const textParts: string[] = [];
+    let planObj: any = null;
+    const render = () => {
+      const thinking = thinkingParts.join('');
+      const text = textParts.join('');
+      const content = (thinking ? '💭 ' + thinking + '\n' : '') + text;
+      setMessages((prev) => {
+        const exists = prev.find((m) => m.id === assistantId);
+        if (exists) {
+          return prev.map((m) => (m.id === assistantId
+            ? { ...m, content, workflowStatus: planObj ? 'completed' : 'planning' }
+            : m));
+        }
+        return [...prev, { id: assistantId, role: 'assistant', content, timestamp: Date.now(), workflowStatus: 'planning' }];
+      });
+    };
+    render();
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
+    try {
+      const resp = await fetch('/api/agent/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: userInput, history: history.slice(-6), canvasSummary, scope: 'global' }),
+        signal: controller.signal,
+      });
+      if (!resp.ok || !resp.body) throw new Error('智能体端点返回 ' + resp.status);
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buffer.indexOf('\n\n')) >= 0) {
+          const raw = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          const ev = parseSseBlock(raw);
+          if (!ev) continue;
+          if (ev.event === 'thinking') thinkingParts.push((ev.data?.delta as string) || '');
+          else if (ev.event === 'message') textParts.push((ev.data?.delta as string) || '');
+          else if (ev.event === 'plan') planObj = ev.data;
+          else if (ev.event === 'error') throw new Error((ev.data?.message as string) || '智能体出错');
+          render();
+        }
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!planObj) throw new Error('智能体未返回计划');
+    const extractedParams: Record<string, string> = {};
+    const rp = (planObj.extractedParams || {}) as Record<string, unknown>;
+    for (const [k, v] of Object.entries(rp)) extractedParams[k] = typeof v === 'string' ? v : JSON.stringify(v);
+    const intent: IntentResult = {
+      skillId: planObj.skillId,
+      skillName: planObj.skillName,
+      confidence: typeof planObj.confidence === 'number' ? planObj.confidence : 0.6,
+      extractedParams,
+      suggestedSteps: Array.isArray(planObj.suggestedSteps)
+        ? planObj.suggestedSteps.map((s: Record<string, unknown>) => ({
+            type: (s.type as NodeType) || ('text' as NodeType),
+            label: typeof s.label === 'string' ? s.label : '',
+            prompt: typeof s.prompt === 'string' ? s.prompt : '',
+          }))
+        : [],
+    };
+    return { intent, assistantId };
+  }, [setMessages]);
+
   const handleSend = useCallback(async () => {
     const userInput = input.trim();
-    if (!userInput || isLoading) return;
+    if ((!userInput && !attachedMedia) || isLoading || mediaProcessing) return;
 
-    setMessages((prev) => [...prev, { id: `user-${Date.now()}`, role: 'user', content: userInput, timestamp: Date.now() }]);
     setInput('');
     setIsLoading(true);
 
-    try {
-      let detectedIntent: IntentResult | null = null;
-      let plan: WorkflowPlan | null = null;
-      let detectorLabel = '本地模板';
-
+    // 媒体优先：用户上传/拖入了图片或视频 → 分析/推理后规划媒体工作流
+    if (attachedMedia) {
+      if (attachedMedia.status === 'error') {
+        setMessages((prev) => [
+          ...prev,
+          { id: `error-${Date.now()}`, role: 'system', content: `媒体处理失败：${attachedMedia.error || '未知错误'}`, timestamp: Date.now() },
+        ]);
+        setIsLoading(false);
+        return;
+      }
+      const mediaText = userInput || (attachedMedia.kind === 'image' ? '分析这张图片' : '分析这段视频');
       try {
+        await runMediaPlan({
+          kind: attachedMedia.kind,
+          asset: { id: attachedMedia.asset.id, url: attachedMedia.asset.url, name: attachedMedia.asset.name },
+          fileName: attachedMedia.fileName,
+          analysisText: attachedMedia.kind === 'image' ? attachedMedia.analysis : undefined,
+          reasoningText: attachedMedia.kind === 'video' ? attachedMedia.reasoning : undefined,
+          userText: mediaText,
+        });
+      } catch (error) {
+        setMessages((prev) => [
+          ...prev,
+          { id: `error-${Date.now()}`, role: 'system', content: `处理媒体请求时出错：${error instanceof Error ? error.message : '未知错误'}`, timestamp: Date.now() },
+        ]);
+      } finally {
+        setAttachedMedia(null);
+        setIsLoading(false);
+      }
+      return;
+    }
+
+    setMessages((prev) => [...prev, { id: `user-${Date.now()}`, role: 'user', content: userInput, timestamp: Date.now() }]);
+    setIsLoading(true);
+
+    let detectedIntent: IntentResult | null = null;
+    let plan: WorkflowPlan | null = null;
+    let detectorLabel = '本地模板';
+
+    try {
+      // P2.b：优先走后端流式智能体（无需用户 key，含思考流式展示）；失败/超时完整回退既有路径
+      try {
+        const history = messages
+          .filter((m) => m.role === 'user' || m.role === 'assistant')
+          .slice(-6)
+          .map((m) => ({ role: (m.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant', content: m.content }));
+        const st = useCanvasStore.getState().canvas;
+        const nodeCounts: Record<string, number> = {};
+        (st?.nodes || []).forEach((n: any) => { const t = n?.type || 'unknown'; nodeCounts[t] = (nodeCounts[t] || 0) + 1; });
+        const canvasSummary = `节点数 ${st?.nodes?.length || 0}（${Object.entries(nodeCounts).map(([k, v]) => `${k}:${v}`).join(', ')}），连线 ${(st?.edges || []).length}`;
+        const { intent: backendIntent } = await runBackendAgent(userInput, history, canvasSummary);
+        if (backendIntent) {
+          detectedIntent = backendIntent;
+          detectorLabel = '智能体';
+        }
+      } catch (e) {
+        console.warn('[SmartAgent] 后端智能体不可用，回退本地规则：', e);
+      }
+      if (detectedIntent && !plan) {
+        try {
+          const agentService = await import('@/services/agentService');
+          plan = agentService.intentToWorkflowPlan(detectedIntent);
+        } catch { /* ignore */ }
+      }
+
+      if (!detectedIntent) {
         const agentService = await import('@/services/agentService');
         const agentConfig = agentService.getAgentConfig();
         const remoteIntent = await agentService.detectIntent(userInput, agentConfig);
@@ -1523,8 +1517,6 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
           plan = agentService.intentToWorkflowPlan(remoteIntent);
           detectorLabel = '智能规划';
         }
-      } catch {
-        // Fallback to local planning to keep the panel responsive.
       }
 
       if (!plan) {
@@ -1606,7 +1598,7 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
         {
           id: `intent-${Date.now()}`,
           role: 'system',
-          content: `${detectorLabel}已识别：${detectedIntent.skillName}（置信度 ${Math.round(detectedIntent.confidence * 100)}%）`,
+          content: `${detectorLabel}已识别：${detectedIntent!.skillName}（置信度 ${Math.round(detectedIntent!.confidence * 100)}%）`,
           timestamp: Date.now(),
           workflowStatus: checkpointMode ? 'awaiting-approval' : 'planning',
           workflowSteps,
@@ -1645,6 +1637,8 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
     exportCanvas,
     input,
     isLoading,
+    messages,
+    runBackendAgent,
     runWorkflowPlan,
   ]);
 
@@ -2230,6 +2224,13 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
                                 <div>来源：{artifact.sourceStep}</div>
                                 <div>版本：{artifact.version}</div>
                                 <div>模型：{artifact.provider} / {artifact.model}</div>
+                                {artifact.autoSwitched ? (
+                                  <div className="col-span-2 mt-1 rounded bg-[#9e6a03]/15 px-1.5 py-0.5 text-[9px] text-[#e3b341]">
+                                    已自动切换模型：免费模型不支持该任务，按优先级切到能支持的模型
+                                  </div>
+                                ) : (
+                                  <div className="text-[#3fb950]">免费优先</div>
+                                )}
                                 <div>耗时：约 {artifact.etaSeconds}s</div>
                                 <div>成本：约 ¥{artifact.estimatedCost.toFixed(2)}</div>
                                 <div>节点：{artifact.nodeId || '待生成'}</div>
@@ -2373,7 +2374,28 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
                         </button>
                       </div>
                     ) : null}
-                    <div className="flex items-end gap-2 rounded-xl border border-[#3a3a3c] bg-[#2a2a2c] px-3 py-2 transition-colors focus-within:border-[#00d4aa]">
+                    <div
+                      className={`relative flex items-end gap-2 rounded-xl border bg-[#2a2a2c] px-3 py-2 transition-colors focus-within:border-[#00d4aa] ${
+                        mediaDragOver ? 'border-[#00d4aa]' : 'border-[#3a3a3c]'
+                      }`}
+                      onDragOver={handleMediaDragOver}
+                      onDragLeave={handleMediaDragLeave}
+                      onDrop={handleMediaDrop}
+                    >
+                      {mediaDragOver ? (
+                        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-[#0d1117]/80 text-[11px] text-[#00d4aa]">
+                          松开以添加图片 / 视频
+                        </div>
+                      ) : null}
+                      <button
+                        type="button"
+                        onClick={() => mediaFileInputRef.current?.click()}
+                        disabled={mediaProcessing}
+                        title="上传图片或视频"
+                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[#21262d] text-[#8b949e] hover:text-[#c9d1d9] disabled:opacity-50"
+                      >
+                        <Paperclip className="h-3.5 w-3.5" />
+                      </button>
                       <textarea
                         value={input}
                         onChange={(event) => setInput(event.target.value)}
@@ -2383,7 +2405,7 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
                             void handleSend();
                           }
                         }}
-                        placeholder="描述你想创建的内容，例如：做一张品牌海报，并在执行前让我确认路线和交付。"
+                        placeholder="描述你想创建的内容，或拖入 / 上传图片、视频让我分析。"
                         rows={1}
                         aria-label="输入工作流需求"
                         className="max-h-[96px] flex-1 resize-none bg-transparent text-xs text-[#e6edf3] outline-none placeholder:text-[#5a5a5c]"
@@ -2391,16 +2413,56 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
                       <button
                         type="button"
                         onClick={() => void handleSend()}
-                        disabled={!input.trim() || isLoading}
+                        disabled={(attachedMedia?.status !== 'ready' && !input.trim()) || isLoading || mediaProcessing}
                         className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg transition-colors ${
-                          input.trim() && !isLoading ? 'bg-[#00d4aa] text-[#0d1117] hover:bg-[#00e5b3]' : 'bg-[#21262d] text-[#6e7681]'
+                          (input.trim() || attachedMedia?.status === 'ready') && !isLoading && !mediaProcessing
+                            ? 'bg-[#00d4aa] text-[#0d1117] hover:bg-[#00e5b3]'
+                            : 'bg-[#21262d] text-[#6e7681]'
                         }`}
                         title="发送"
                       >
                         <Send className="h-3.5 w-3.5" />
                       </button>
                     </div>
-                    <p className="mt-1 text-center text-[10px] text-[#5a5a5c]">Shift+Enter 换行，Enter 发送</p>
+                    <input
+                      ref={mediaFileInputRef}
+                      type="file"
+                      accept="image/*,video/*"
+                      className="hidden"
+                      onChange={(event) => {
+                        const files = event.target.files;
+                        if (files && files.length) void handleMediaFiles(files);
+                        event.target.value = '';
+                      }}
+                    />
+                    {attachedMedia ? (
+                      <div className="mt-1 flex items-center gap-2 rounded-lg border border-[#2a2a2c] bg-[#1c1c1e] px-2 py-1">
+                        {attachedMedia.kind === 'image' ? (
+                          <ImageIcon className="h-3.5 w-3.5 shrink-0 text-[#00d4aa]" />
+                        ) : (
+                          <Film className="h-3.5 w-3.5 shrink-0 text-[#00d4aa]" />
+                        )}
+                        <span className="max-w-[180px] truncate text-[10px] text-[#c9d1d9]">{attachedMedia.fileName}</span>
+                        {mediaProcessing ? (
+                          <Loader2 className="h-3 w-3 animate-spin text-[#8b949e]" />
+                        ) : attachedMedia.status === 'ready' ? (
+                          <span className="text-[10px] text-[#3fb950]">{attachedMedia.kind === 'image' ? '已分析' : '已推理'}</span>
+                        ) : (
+                          <span className="text-[10px] text-[#f85149]">失败</span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={handleRemoveMedia}
+                          className="ml-auto text-[#6e7681] hover:text-[#c9d1d9]"
+                          title="移除"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    ) : null}
+                    <p className="mt-1 text-center text-[10px] text-[#5a5a5c]">
+                      可拖入或上传图片 / 视频 · Shift+Enter 换行，Enter 发送
+                    </p>
                   </div>
             </>
 

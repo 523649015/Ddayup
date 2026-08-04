@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { useCanvasStore } from '@/store/useCanvasStore';
 import { EditableNodeTitle } from './EditableNodeTitle';
+import DispatchInfoBadge from '@/components/DispatchInfoBadge';
 
 interface TextModelOption {
   id: string;
@@ -23,6 +24,12 @@ interface TextModelOption {
 }
 
 const TEXT_MODEL_OPTIONS: TextModelOption[] = [
+  {
+    id: 'auto-free',
+    name: '免费优先（自动轮换）',
+    description: '自动从免费额度池择优（Seed 2.1 / Qwen3 等），主模型失败自动轮换下一个',
+    latency: '2s',
+  },
   {
     id: 'gvlm-3.1',
     name: 'GVLM 3.1',
@@ -141,6 +148,8 @@ export function TextNode(props: NodeProps) {
               aria-label="文本提示词"
               className="min-h-[96px] w-full resize-none bg-transparent px-4 py-4 text-sm text-[#e6e6e6] outline-none placeholder:text-[#9a9a9a]"
             />
+
+            <DispatchInfoBadge data={data} />
 
             <div className="relative flex items-center gap-3 border-t border-[#3a3a3a] px-4 py-3">
               <button

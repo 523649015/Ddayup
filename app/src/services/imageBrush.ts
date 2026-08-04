@@ -12,7 +12,8 @@ export interface BrushEditInput {
 }
 
 export interface BrushEditOutput {
-  blob: Blob;
+  /** LaMa 等本地运行器在个别情况下可能未产出 blob，调用方需做兜底 */
+  blob?: Blob;
   width: number;
   height: number;
   engine: string;

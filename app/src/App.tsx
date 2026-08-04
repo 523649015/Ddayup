@@ -1,6 +1,8 @@
-import { Suspense, lazy } from 'react';
+import { Suspense, lazy, useEffect } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { AuthGuard } from '@/components/AuthGuard';
+import { initExtensionAiBridge } from '@/services/extensionBridge';
+import { useCanvasStore } from '@/store/useCanvasStore';
 import './App.css';
 
 const LaunchCanvasPage = lazy(() => import('@/pages/LaunchCanvasPage'));
@@ -12,6 +14,22 @@ const DispatchSettingsPage = lazy(() => import('@/pages/DispatchSettingsPage'));
 const PosterEditorPage = lazy(() => import('@/pages/PosterEditorPage'));
 
 function App() {
+  // 始终注册扩展 AI 助手桥接监听（hmdao:ai-chat -> /api/extension-ai -> hmdao:ai-chat-reply），
+  // 确保任何路由下扩展侧栏都能调用 Ddayup 智能机器人。
+  useEffect(() => {
+    initExtensionAiBridge();
+    // 扩展侧栏深链：访问 http://127.0.0.1:3000/#models 时自动切到「模型下载」面板
+    const applyHashRoute = () => {
+      if (window.location.hash === '#models') {
+        useCanvasStore.getState().setSidebarTab('models');
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+      }
+    };
+    applyHashRoute();
+    window.addEventListener('hashchange', applyHashRoute);
+    return () => window.removeEventListener('hashchange', applyHashRoute);
+  }, []);
+
   return (
     <Suspense fallback={<div className="flex min-h-screen items-center justify-center bg-[#111] text-sm text-[#d6d6d6]">正在加载 DDUp...</div>}>
       <Routes>

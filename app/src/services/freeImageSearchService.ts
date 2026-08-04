@@ -13,8 +13,8 @@ import { classifyFromSearchKeywords } from './autoClassifier';
 
 export const FREE_PLATFORM_META: Record<string, FreeSearchPlatform> = {
   openverse: {
-    id: 'openverse', name: 'Openverse', supports: ['image'],
-    description: '开源免版权媒体库，完全免费', requiresKey: false,
+    id: 'openverse', name: 'Openverse', supports: ['image', 'audio'],
+    description: '开源免版权媒体库（图/音频），完全免费', requiresKey: false,
     freeQuota: '无限制', baseUrl: 'https://api.openverse.org/v1', color: '#ffe033', enabled: true,
   },
   wikimedia: {
@@ -42,6 +42,21 @@ export const FREE_PLATFORM_META: Record<string, FreeSearchPlatform> = {
     description: '全球摄影师社区', requiresKey: true,
     freeQuota: '3600次/小时', baseUrl: 'https://api.flickr.com', color: '#ff0084', enabled: false,
   },
+  freesound: {
+    id: 'freesound', name: 'Freesound', supports: ['audio'],
+    description: 'CC0 音效库，需 API Key（环境变量 HMDAO_FREESOUND_API_KEY）', requiresKey: true,
+    freeQuota: '需 API Key', baseUrl: 'https://freesound.org/apiv2', color: '#ff8800', enabled: true,
+  },
+  polyhaven: {
+    id: 'polyhaven', name: 'Poly Haven', supports: ['model'],
+    description: '免费 3D 模型/HDRI，完全免 Key', requiresKey: false,
+    freeQuota: '无限制', baseUrl: 'https://api.polyhaven.com', color: '#a78bfa', enabled: true,
+  },
+  sketchfab: {
+    id: 'sketchfab', name: 'Sketchfab', supports: ['model'],
+    description: '3D 模型库，需 API Key（环境变量 HMDAO_SKETCHFAB_API_KEY）', requiresKey: true,
+    freeQuota: '需 API Key', baseUrl: 'https://api.sketchfab.com/v3', color: '#1caad9', enabled: true,
+  },
 };
 
 export const DEFAULT_FREE_PLATFORMS = ['openverse', 'wikimedia', 'unsplash', 'pexels', 'pixabay'];
@@ -53,7 +68,7 @@ export async function proxyFreeSearch(
   platform: FreeSearchPlatform,
   page = 1,
   perPage = 24,
-  mediaType: 'image' | 'video' = 'image',
+  mediaType: 'image' | 'video' | 'audio' | 'model' = 'image',
 ): Promise<{ results: WebSearchResult[]; total: number }> {
   try {
     const resp = await fetch('/api/search/free-images', {
@@ -83,7 +98,7 @@ export async function proxyFreeSearch(
 /* ===== 统一免费搜索入口 ===== */
 
 export async function freeWebSearch(
-  request: WebSearchRequest & { freePlatforms?: string[]; mediaType?: 'image' | 'video' },
+  request: WebSearchRequest & { freePlatforms?: string[]; mediaType?: 'image' | 'video' | 'audio' | 'model' },
 ): Promise<WebSearchResponse> {
   const { query, filters, page = 1, perPage = 24, freePlatforms, mediaType = 'image' } = request;
   const platformsToUse = (freePlatforms && freePlatforms.length ? freePlatforms : DEFAULT_FREE_PLATFORMS)
@@ -136,7 +151,7 @@ export async function prepareFreeImport(
   url: string;
   thumbnail: string;
   name: string;
-  type: 'image' | 'video';
+  type: 'image' | 'video' | 'audio' | 'model';
   source: 'web';
   width?: number;
   height?: number;
@@ -149,7 +164,7 @@ export async function prepareFreeImport(
   );
 
   return {
-    url: result.url,
+    url: result.downloadUrl || result.url,
     thumbnail: result.thumb || result.previewUrl || result.url,
     name: result.title || `web_${Date.now()}`,
     type: result.type,
@@ -159,4 +174,25 @@ export async function prepareFreeImport(
     tags: allTags,
     smartCategories: smartCategories.length > 0 ? smartCategories : ['素材', '网络采集'],
   };
+}
+
+export async function scrapeUrl(
+  url: string,
+  mediaType: 'image' | 'video' | 'audio' | 'model' | 'all' = 'all',
+): Promise<{ results: WebSearchResult[]; source: string; error?: string }> {
+  try {
+    const resp = await fetch('/api/search/scrape-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, mediaType }),
+    });
+    const data = await resp.json().catch(() => ({} as any));
+    return {
+      results: (data.results || []) as WebSearchResult[],
+      source: data.source || '',
+      error: data.success === false ? data.error || '抓取失败' : undefined,
+    };
+  } catch {
+    return { results: [], source: '', error: '请求失败' };
+  }
 }

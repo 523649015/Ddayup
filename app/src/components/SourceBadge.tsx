@@ -1,6 +1,6 @@
 interface SourceBadgeProps {
   label: string;
-  tone?: 'relay' | 'free' | 'local' | 'api' | 'recommended' | 'neutral';
+  tone?: 'relay' | 'free' | 'local' | 'api' | 'recommended' | 'neutral' | 'danger';
   className?: string;
 }
 
@@ -13,6 +13,8 @@ const SOURCE_BADGE_STYLES: Record<SourceBadgeTone, string> = {
   api: 'border-[#5a4a1f] bg-[#2b2410] text-[#f2d17a]',
   recommended: 'border-[#5d3dd8]/35 bg-[#3a2876]/18 text-[#d4c6ff]',
   neutral: 'border-[#30363d] bg-[#161b22] text-[#9fb0c3]',
+  // 任务 AM：danger 复用页面既有错误色系（与删除按钮 #ffb5c4 / #9d5167 一致），用于 invalid 已失效状态。
+  danger: 'border-[#9d5167] bg-[#3a1822] text-[#ffb5c4]',
 };
 
 export function SourceBadge({ label, tone = 'neutral', className = '' }: SourceBadgeProps) {

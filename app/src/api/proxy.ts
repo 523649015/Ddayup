@@ -77,7 +77,10 @@ export async function testApiKey(
   const testModel = modelOverride || platform.defaultTestModel;
 
   try {
-    if (platform.type === 'llm') {
+    // 依据平台能力（modes）选择测试端点；用「端点确实存在」作为守卫，
+    // 以精确还原旧的 type 维度路由（llm→chat、video→video、其余→image），
+    // 避免 volcengine/fal/replicate 这类有 image 端点但无 video 端点的平台被误路由到 video。
+    if (platform.modes.includes('llm') && platform.chatEndpoint) {
       await proxyRequest(platformId, {
         endpoint: platform.chatEndpoint || '/chat/completions',
         method: 'POST',
@@ -89,7 +92,7 @@ export async function testApiKey(
         apiKey,
         timeout: 15000,
       });
-    } else if (platform.type === 'video') {
+    } else if (platform.modes.includes('video') && platform.videoEndpoint) {
       await proxyRequest(platformId, {
         endpoint: platform.videoEndpoint || '/videos/generations',
         method: 'POST',

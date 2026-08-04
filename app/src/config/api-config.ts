@@ -24,7 +24,13 @@ export type PlatformType = 'llm' | 'image' | 'video' | 'audio';
 export interface PlatformConfig {
   id: string;
   name: string;
-  type: PlatformType;
+  /**
+   * 该平台支持的能力列表（与 generation.ts 的 PROVIDER_MODE_SUPPORT 保持对齐）。
+   * 取代旧的单值 `type` 字段：单值会丢失多能力信息（如硅基流动同时支持
+   * llm/image/video、火山方舟支持 image/video/audio），导致与 mode 体系出现
+   * 平行/重复的维度定义。
+   */
+  modes: PlatformType[];
   domestic: boolean;
   baseUrl: string;
   chatEndpoint?: string;
@@ -68,7 +74,7 @@ const config: ApiConfig = {
     {
       id: 'deepseek',
       name: 'DeepSeek',
-      type: 'llm',
+      modes: ['llm'],
       domestic: true,
       baseUrl: 'https://api.deepseek.com/v1',
       chatEndpoint: '/chat/completions',
@@ -78,7 +84,7 @@ const config: ApiConfig = {
     {
       id: 'siliconflow',
       name: '硅基流动',
-      type: 'llm',
+      modes: ['llm', 'image', 'video'],
       domestic: true,
       baseUrl: 'https://api.siliconflow.cn/v1',
       chatEndpoint: '/chat/completions',
@@ -89,7 +95,7 @@ const config: ApiConfig = {
     {
       id: 'zhipu',
       name: '智谱 AI',
-      type: 'llm',
+      modes: ['llm', 'image', 'video'],
       domestic: true,
       baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
       chatEndpoint: '/chat/completions',
@@ -100,7 +106,7 @@ const config: ApiConfig = {
     {
       id: 'bailian',
       name: '阿里云百炼',
-      type: 'llm',
+      modes: ['llm', 'image', 'video'],
       domestic: true,
       baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
       chatEndpoint: '/chat/completions',
@@ -111,7 +117,7 @@ const config: ApiConfig = {
     {
       id: 'minimax',
       name: 'MiniMax',
-      type: 'llm',
+      modes: ['llm', 'audio'],
       domestic: true,
       baseUrl: 'https://api.minimax.chat/v1',
       chatEndpoint: '/chat/completions',
@@ -122,7 +128,7 @@ const config: ApiConfig = {
     {
       id: 'volcengine',
       name: '火山方舟',
-      type: 'image',
+      modes: ['image', 'video', 'audio'],
       domestic: true,
       baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
       imageEndpoint: '/images/generations',
@@ -132,7 +138,7 @@ const config: ApiConfig = {
     {
       id: 'kling',
       name: 'Kling AI',
-      type: 'video',
+      modes: ['image', 'video'],
       domestic: true,
       baseUrl: 'https://api.klingai.com/v1',
       imageEndpoint: '/images/generations',
@@ -143,7 +149,7 @@ const config: ApiConfig = {
     {
       id: 'modelscope',
       name: 'ModelScope',
-      type: 'llm',
+      modes: ['llm', 'image', 'video'],
       domestic: true,
       baseUrl: 'https://api-inference.modelscope.cn/v1',
       chatEndpoint: '/chat/completions',
@@ -154,7 +160,7 @@ const config: ApiConfig = {
     {
       id: 'openai',
       name: 'OpenAI',
-      type: 'llm',
+      modes: ['llm', 'image'],
       domestic: false,
       baseUrl: 'https://api.openai.com/v1',
       chatEndpoint: '/chat/completions',
@@ -165,7 +171,7 @@ const config: ApiConfig = {
     {
       id: 'fal',
       name: 'fal.ai',
-      type: 'image',
+      modes: ['image', 'video'],
       domestic: false,
       baseUrl: 'https://fal.run',
       imageEndpoint: '/fal-ai/flux-pro/v1',
@@ -175,7 +181,7 @@ const config: ApiConfig = {
     {
       id: 'replicate',
       name: 'Replicate',
-      type: 'image',
+      modes: ['image', 'video'],
       domestic: false,
       baseUrl: 'https://api.replicate.com/v1',
       imageEndpoint: '/models/black-forest-labs/flux-schnell/predictions',
@@ -213,7 +219,7 @@ export function getDomesticPlatforms(): PlatformConfig[] {
 }
 
 export function getPlatformsByType(type: PlatformType): PlatformConfig[] {
-  return config.platforms.filter((platform) => platform.type === type);
+  return config.platforms.filter((platform) => platform.modes.includes(type));
 }
 
 let cachedGeo: GeoInfo | null = null;

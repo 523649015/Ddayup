@@ -1,6 +1,7 @@
 import { lazy, startTransition, Suspense, useEffect, useMemo, useState } from 'react';
-import { ArrowRight, Sparkles } from 'lucide-react';
+import { ArrowRight } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
+import { RobotElfIcon } from '@/components/RobotElfIcon';
 
 const CanvasBoard = lazy(() => import('@/components/CanvasBoard').then((module) => ({ default: module.CanvasBoard })));
 
@@ -94,12 +95,7 @@ export function LaunchCanvasPage() {
       <div className="relative z-10 mx-auto flex w-full max-w-[1040px] flex-col items-center gap-10 text-center">
         <div className="space-y-6 animate-[fadeIn_600ms_ease-out]">
           <div className="mx-auto flex h-24 w-24 items-center justify-center rounded-[28px] border border-white/10 bg-white/5 shadow-[0_30px_80px_rgba(0,0,0,0.35)] backdrop-blur-xl">
-            <div className="relative flex h-16 w-16 items-center justify-center rounded-[22px] bg-[linear-gradient(135deg,#00d4aa_0%,#18b7ff_55%,#ff7a1a_100%)] text-[#07110e] shadow-[0_18px_45px_rgba(0,212,170,0.24)]">
-              <Sparkles className="h-8 w-8" />
-              <span className="absolute -right-2 -top-2 rounded-full border border-white/15 bg-[#07110e] px-2 py-0.5 text-[10px] font-semibold tracking-[0.24em] text-[#7cf7d4]">
-                UP
-              </span>
-            </div>
+            <RobotElfIcon size={64} />
           </div>
 
           <div className="space-y-4">

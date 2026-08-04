@@ -45,6 +45,12 @@ export interface AssetImportResponse {
   duplicate?: boolean;
 }
 
+/** importLocalAssetFile 的返回结构（含导入结果是否为重复的标记） */
+export interface AssetImportResult {
+  item: AssetItem;
+  duplicate: boolean;
+}
+
 interface ImportAssetOptions {
   folderId?: string;
   tags?: string[];
@@ -53,6 +59,9 @@ interface ImportAssetOptions {
   height?: number;
   duration?: number;
   sourceUrl?: string;
+  type?: string;
+  source?: string;
+  size?: number;
 }
 
 function assertOk(response: Response, fallback: string) {
@@ -148,6 +157,24 @@ export async function fetchPersistedAssetCatalog() {
   });
   assertOk(response, 'Failed to load persisted asset catalog');
   return await response.json() as AssetLibraryCatalogResponse;
+}
+
+export interface PruneMissingResult {
+  success: boolean;
+  removedCount: number;
+  removedIds: string[];
+  keptCount: number;
+}
+
+// 清理素材目录中“本地文件已缺失”的死引用条目（磁盘上的素材被删除/移动后，
+// 目录项仍存在会导致 /api/assets/content/<id> 反复 404）。
+export async function pruneMissingAssets(): Promise<PruneMissingResult> {
+  const response = await fetch('/api/assets/prune-missing', {
+    method: 'POST',
+    credentials: 'include',
+  });
+  assertOk(response, 'Failed to prune missing assets');
+  return await response.json() as PruneMissingResult;
 }
 
 export interface AssetDuplicateGroup {
@@ -266,7 +293,7 @@ export async function repairPersistedAsset(assetId: string) {
   return data as AssetRepairResponse;
 }
 
-export async function importLocalAssetFile(file: File, options: ImportAssetOptions = {}) {
+export async function importLocalAssetFile(file: File, options: ImportAssetOptions = {}): Promise<AssetImportResult> {
   const form = new FormData();
   form.append('file', file, file.name);
   form.append('name', file.name);

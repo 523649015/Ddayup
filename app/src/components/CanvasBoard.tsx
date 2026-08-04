@@ -1,12 +1,12 @@
-﻿import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent } from 'react';
+﻿import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type DragEvent as ReactDragEvent } from 'react';
 import {
   ReactFlow,
   ReactFlowProvider,
   Background,
   Controls,
-  MiniMap,
   BackgroundVariant,
   SelectionMode,
+  applyNodeChanges,
   useReactFlow,
   useNodesInitialized,
   type Node,
@@ -19,6 +19,8 @@ import '@xyflow/react/dist/style.css';
 import { z } from 'zod';
 import { importReferencedLocalAsset } from '@/api/assetLibrary';
 import { nodeTypes } from '@/nodes';
+import { preloadAllNodeChunks } from '@/nodes/lazyLoad';
+import { ComfyUiStatusBanner } from './comfyui/ComfyUiStatusBanner';
 import { patchDebugBridge } from '@/services/debugBridge';
 import { scanCanvasMigrationIssues, type CanvasMigrationIssue } from '@/services/generation';
 import { collectConnectedReferenceInputs } from '@/lib/nodeReferenceGraph';
@@ -27,6 +29,7 @@ import { enqueueLocalAssetPersistence } from '@/services/localAssetPersistenceQu
 import { clipVideoLocallyStable, cropVideoLocally, enhanceVideoLocally, parseVideoLocallyEnhanced, removeSubtitleLocally, splitVideoAudioLocally } from '@/services/ffmpegPipeline';
 import { useAssetStore } from '@/store/useAssetStore';
 import { useCanvasStore } from '@/store/useCanvasStore';
+import { useDonationStore } from '@/store/useDonationStore';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { useModelCatalogSync } from '@/hooks/useModelCatalogSync';
 import { useUILanguage } from '@/i18n/ui';
@@ -43,607 +46,239 @@ import { GroupToolbar } from './GroupToolbar';
 import { CanvasGroupLayer, getGroupBounds } from './CanvasGroupLayer';
 
 /* ===== Clipboard Node Schema ===== */
-const clipboardNodeSchema = z.object({
-  type: z.enum(['text', 'image', 'video', 'audio', 'storyboard', 'aiapp', 'threed', 'script', 'dcc', 'post', 'region']).catch('text'),
-  position: z.object({
-    x: z.number().catch(400),
-    y: z.number().catch(300),
-  }).catch({ x: 400, y: 300 }),
-  data: z.record(z.string(), z.unknown()).optional(),
-});
-
-type ClipboardNode = z.infer<typeof clipboardNodeSchema>;
-
-const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.svg', '.avif']);
-const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v']);
-const FLOW_PAN_ON_DRAG = [1];
-const FLOW_VIEWPORT_STYLE: CSSProperties = { width: '100%', height: '100%', minWidth: '1px', minHeight: '1px' };
-const MINIMAP_STYLE: CSSProperties = { width: 160, height: 100 };
-const getMiniMapNodeColor = () => '#00d4aa';
-const DEBUG_VIDEO_DEMO_URL = 'https://placeholdervideo.dev/1280x720';
-const DEBUG_REMOTE_IMAGE_URL = 'https://images.unsplash.com/photo-1519389950473-47ba0277781c?auto=format&fit=crop&w=1280&q=80';
-const DEBUG_REMOTE_VIDEO_URL = DEBUG_VIDEO_DEMO_URL;
-const DEBUG_TAGGING_BASE_IMAGE_URL = new URL('../../tmp-main-compressed.jpg', import.meta.url).toString();
-const DEBUG_TAGGING_SUBJECT_IMAGE_URL = new URL('../../tmp-subject-compressed.jpg', import.meta.url).toString();
-const DEBUG_TAGGING_LIGHTING_IMAGE_URL = new URL('../../tmp-omni-compressed.jpg', import.meta.url).toString();
-
-function buildDebugFixtureImageUrl(text: string, fill = '#0f766e') {
-  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="960" height="640" viewBox="0 0 960 640"><rect width="960" height="640" fill="${fill}"/><text x="80" y="360" fill="#ffffff" font-size="72" font-family="Arial, sans-serif">${text}</text></svg>`,
-  )}`;
+import {
+  buildDebugFixtureImageUrl,
+  clipboardNodeSchema,
+  cloneNodeData,
+  DEBUG_REMOTE_IMAGE_URL,
+  DEBUG_REMOTE_VIDEO_URL,
+  DEBUG_TAGGING_BASE_IMAGE_URL,
+  DEBUG_TAGGING_LIGHTING_IMAGE_URL,
+  DEBUG_TAGGING_SUBJECT_IMAGE_URL,
+  DEBUG_VIDEO_DEMO_URL,
+  FLOW_PAN_ON_DRAG,
+  FLOW_VIEWPORT_STYLE,
+  getDragVersion,
+  getIsDragging,
+  getMediaNodeType,
+  getMediaNodeTypeFromPath,
+  isLikelyLocalMediaPath,
+  normalizeClipboardLocalPath,
+  readImageMetadata,
+  readVideoMetadata,
+  setDragging,
+  subscribeDragTick,
+  uploadComfyTempUrl,
+  type CachedRfNode,
+} from './CanvasBoard.shared';
+import {
+  blurActiveEditableElement,
+  hasMountedRenderableEdgeHandles,
+  MigrationIssuesBanner,
+  MigrationIssuesToggle,
+  normalizeRenderableEdgeHandle,
+  orderNodeIdsByCanvas,
+  resolveRenderableEdgeStyle,
+  sameNodeIdArray,
+  type MigrationIssueFilter,
+} from './CanvasBoard.parts';
+interface FlowCanvasProps {
+  isFlowViewportReady: boolean;
+  onEdgesChange: (changes: EdgeChange[]) => void;
+  onEdgeClick: (event: React.MouseEvent, edge: Edge) => void;
+  onConnect: (connection: Connection) => void;
+  onNodeClick: (event: React.MouseEvent, node: Node) => void;
+  onPaneClick: () => void;
+  onSelectionChange: (params?: { nodes?: Node[] | null }) => void;
+  onMove: () => void;
+  syncDraggedNodeGroups: (node: Node) => void;
+  commitMoveHistory: () => void;
+  autoEditGroupId: string | null;
+  onAutoEditHandled: (groupId: string) => void;
+  flowAriaLabelConfig: React.ComponentProps<typeof ReactFlow>['ariaLabelConfig'];
 }
 
-function getMediaNodeType(file: File): NodeType | null {
-  const mimeType = file.type.toLowerCase();
-  if (mimeType.startsWith('image/')) return 'image';
-  if (mimeType.startsWith('video/')) return 'video';
+// 独立的轻量画布组件：拖拽节点时通过外部 dragStore（useSyncExternalStore）订阅位置覆盖，
+// 每帧只重渲染本组件 + ReactFlow，而不触发外层巨型 CanvasFlow 组件，
+// 从而避免 Toolbar/Sidebar/各种 Panel 等重型子树随拖拽每帧重渲染造成的卡顿。
+function FlowCanvasImpl(props: FlowCanvasProps) {
+  const canvas = useCanvasStore((s) => s.canvas);
+  const canvasVersion = canvas?.updatedAt || 0;
+  // 订阅拖动状态回流（供 CanvasGroupLayer 在拖动期间跳过包围盒重算）；getIsDragging 仅在
+  // onNodeDragStart/Stop 时翻转，纯点击（无移动）不会置 true —— 即「按住左键不松且移动」才算拖动。
+  useSyncExternalStore(subscribeDragTick, getDragVersion);
+  const dragging = getIsDragging();
 
-  const dotIndex = file.name.lastIndexOf('.');
-  const extension = dotIndex >= 0 ? file.name.slice(dotIndex).toLowerCase() : '';
-  if (IMAGE_EXTENSIONS.has(extension)) return 'image';
-  if (VIDEO_EXTENSIONS.has(extension)) return 'video';
-  return null;
-}
+  const rfNodeCacheRef = useRef(new Map<string, CachedRfNode>());
+  // 拖拽进行中的标志（ref，避免进入 React 依赖）：拖拽期间即使全局 canvas 引用因其他
+  // 写入而变化，也绝不把 rfNodes 重置回旧坐标 —— 否则节点会被每帧拽回起点，表现为不跟手。
+  const draggingRef = useRef(false);
 
-function getMediaNodeTypeFromPath(filePath: string): 'image' | 'video' | null {
-  const normalized = String(filePath || '').trim().replace(/^file:\/\/\/?/i, '');
-  if (!normalized) return null;
-  const withoutQuery = normalized.split('#')[0]?.split('?')[0] || normalized;
-  const dotIndex = withoutQuery.lastIndexOf('.');
-  const extension = dotIndex >= 0 ? withoutQuery.slice(dotIndex).toLowerCase() : '';
-  if (IMAGE_EXTENSIONS.has(extension)) return 'image';
-  if (VIDEO_EXTENSIONS.has(extension)) return 'video';
-  return null;
-}
-
-function normalizeClipboardLocalPath(value: string) {
-  const trimmed = String(value || '').trim().replace(/^["']|["']$/g, '');
-  if (!trimmed) return '';
-  if (/^file:\/\//i.test(trimmed)) {
-    try {
-      return decodeURIComponent(trimmed.replace(/^file:\/\/\/?/i, '').replace(/\//g, '\\'));
-    } catch {
-      return trimmed.replace(/^file:\/\/\/?/i, '').replace(/\//g, '\\');
+  // 从全局 canvas 构建 ReactFlow 节点数组，带 data 引用记忆化：node.data 未变时复用旧对象，
+  // 避免节点内部（视频/图片预览等重型组件）重渲染。拖拽期间的实时位置不走这里，而是由本地
+  // rfNodes state + applyNodeChanges 驱动（见 onNodesChange）。
+  const buildRfNodesFromCanvas = useCallback((): Node[] => {
+    if (!canvas) {
+      rfNodeCacheRef.current.clear();
+      return [];
     }
-  }
-  return trimmed;
-}
-
-function isLikelyLocalMediaPath(value: string) {
-  const normalized = normalizeClipboardLocalPath(value);
-  return Boolean(normalized) && (/^[a-zA-Z]:[\\/]/.test(normalized) || normalized.startsWith('\\\\')) && Boolean(getMediaNodeTypeFromPath(normalized));
-}
-
-function cloneNodeData(value: unknown): Partial<NodeData> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  if (typeof structuredClone === 'function') {
-    try {
-      return structuredClone(value) as Partial<NodeData>;
-    } catch {
-      // fall through
+    const cache = rfNodeCacheRef.current;
+    const seen = new Set<string>();
+    const built = canvas.nodes.map((n) => {
+      seen.add(n.id);
+      const prev = cache.get(n.id);
+      const data =
+        prev && prev.dataSrc === n.data
+          ? prev.node.data
+          : ({ ...n.data, __nodeType: n.type, __src: n.data } as Record<string, unknown>);
+      // data 引用与位置都未变 → 复用旧节点对象引用，ReactFlow 不重测/不重渲该节点
+      if (prev && prev.dataSrc === n.data && prev.posX === n.position.x && prev.posY === n.position.y) {
+        return prev.node as Node;
+      }
+      const node = {
+        id: n.id,
+        type: n.type,
+        className: `hmdao-node hmdao-node-${n.type}`,
+        position: n.position,
+        selectable: true,
+        draggable: true,
+        data,
+      };
+      cache.set(n.id, { node, dataSrc: n.data, posX: n.position.x, posY: n.position.y });
+      return node as Node;
+    });
+    for (const id of Array.from(cache.keys())) {
+      if (!seen.has(id)) cache.delete(id);
     }
-  }
-  try {
-    return JSON.parse(JSON.stringify(value)) as Partial<NodeData>;
-  } catch {
-    return {};
-  }
-}
+    return built;
+  }, [canvas, canvasVersion]);
 
-function readImageMetadata(url: string): Promise<{ width: number; height: number } | null> {
-  return new Promise((resolve) => {
-    const image = new window.Image();
-    image.onload = () => {
-      resolve({
-        width: image.naturalWidth || image.width || 1024,
-        height: image.naturalHeight || image.height || 1024,
+  // 本地受控节点 state —— ReactFlow 官方标准受控用法。拖拽时 onNodesChange 用 applyNodeChanges
+  // 同步更新本地 state，ReactFlow 立即用新位置渲染节点 wrapper transform → 实时跟随鼠标。
+  const [rfNodes, setRfNodes] = useState<Node[]>(() => buildRfNodesFromCanvas());
+  const rfNodesRef = useRef(rfNodes);
+  rfNodesRef.current = rfNodes;
+
+  // 全局 canvas 变化（新增/删除节点、data 更新、外部改位置）时重建本地节点。
+  // 拖拽期间用 draggingRef 直接跳过重建（即使 canvas 引用因其他写入变化也不重置），
+  // 本地 state 完全由 applyNodeChanges 驱动，位置不会被拉回起点。
+  useEffect(() => {
+    if (draggingRef.current) return;
+    setRfNodes(buildRfNodesFromCanvas());
+  }, [buildRfNodesFromCanvas]);
+
+  const rfEdges = useMemo(() => {
+    if (!canvas) return [];
+    const nodeIds = new Set(canvas.nodes.map((node) => node.id));
+    return canvas.edges.reduce<Edge[]>((edges, e) => {
+      if (e.pending || !hasMountedRenderableEdgeHandles(e)) {
+        return edges;
+      }
+      if (!nodeIds.has(e.source) || !nodeIds.has(e.target)) {
+        return edges;
+      }
+      const sourceHandle = normalizeRenderableEdgeHandle(e.sourceHandle, 'source');
+      const targetHandle = normalizeRenderableEdgeHandle(e.targetHandle, 'target');
+      const style = resolveRenderableEdgeStyle(targetHandle);
+      edges.push({
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        ...(sourceHandle ? { sourceHandle } : {}),
+        ...(targetHandle ? { targetHandle } : {}),
+        type: 'smoothstep',
+        animated: Boolean(targetHandle && (targetHandle.startsWith('image-reference') || targetHandle.startsWith('video-image-reference') || targetHandle.startsWith('video-video-reference'))),
+        style,
       });
-    };
-    image.onerror = () => resolve(null);
-    image.src = url;
-  });
-}
+      return edges;
+    }, []);
+  }, [canvas, canvasVersion]);
 
-function readVideoMetadata(url: string): Promise<{ width: number; height: number; duration: number } | null> {
-  return new Promise((resolve) => {
-    const video = document.createElement('video');
-    video.preload = 'metadata';
+  // ReactFlow 受控模式下拖拽跟手的官方标准写法：所有节点变更（拖拽位置、选中、删除等）
+  // 用 applyNodeChanges 同步应用到本地 rfNodes state。setRfNodes 触发的重渲染只发生在
+  // 本 FlowCanvas 组件内（已 memo，与 CanvasFlow 解耦），因此既实时跟手又不卡顿。
+  const onNodesChange = useCallback((changes: NodeChange[]) => {
+    // remove 变更同时同步到全局 store（持久化删除）
+    const removeNode = useCanvasStore.getState().removeNode;
+    for (const c of changes) {
+      if (c.type === 'remove') removeNode(c.id);
+    }
+    setRfNodes((nds) => applyNodeChanges(changes, nds));
+  }, []);
 
-    const cleanup = () => {
-      video.removeAttribute('src');
-      video.load();
-    };
+  // 仅在指针真正移动（超过 ReactFlow 拖拽阈值）后才算拖动 —— 纯点击不会触发本回调，
+  // 因此 isDragging 不会在点击时被置位，天然区分「按住左键拖动」与「点击」。
+  const onNodeDragStart = useCallback((_event: MouseEvent | TouchEvent, _node: Node) => {
+    draggingRef.current = true;
+    setDragging(true);
+  }, []);
 
-    video.onloadedmetadata = () => {
-      resolve({
-        width: video.videoWidth || 1280,
-        height: video.videoHeight || 720,
-        duration: Number.isFinite(video.duration) ? video.duration : 0,
-      });
-      cleanup();
-    };
-    video.onerror = () => {
-      resolve(null);
-      cleanup();
-    };
-    video.src = url;
-  });
-}
+  const onNodeDragStopEnhanced = useCallback((_event: MouseEvent | TouchEvent, node: Node) => {
+    draggingRef.current = false;
+    // 松手时把本地 rfNodes 中位置已变化的节点一次性写回全局 store（持久化拖拽结果）。
+    const canvasNodes = useCanvasStore.getState().canvas?.nodes || [];
+    const posMap = new Map(canvasNodes.map((n) => [n.id, n.position]));
+    const overrides: Record<string, { x: number; y: number }> = {};
+    for (const rn of rfNodesRef.current) {
+      const prev = posMap.get(rn.id);
+      if (prev && (prev.x !== rn.position.x || prev.y !== rn.position.y)) {
+        overrides[rn.id] = { x: rn.position.x, y: rn.position.y };
+      }
+    }
+    if (Object.keys(overrides).length > 0) {
+      useCanvasStore.getState().moveNodes(overrides);
+    }
+    props.syncDraggedNodeGroups(node);
+    props.commitMoveHistory();
+    setDragging(false);
+  }, [props.syncDraggedNodeGroups, props.commitMoveHistory]);
 
-function LegacyMigrationIssuesBanner({
-  issues,
-  onDismiss,
-  onFocusNode,
-  onFocusNext,
-  onSelectAll,
-  onExportJson,
-  onExportCsv,
-  onBatchRegenerate,
-  batchRegenerateCount,
-  t,
-}: {
-  issues: CanvasMigrationIssue[];
-  onDismiss: () => void;
-  onFocusNode: (nodeId: string) => void;
-  onFocusNext: () => void;
-  onSelectAll: () => void;
-  onExportJson: () => void;
-  onExportCsv: () => void;
-  onBatchRegenerate: () => void;
-  batchRegenerateCount: number;
-  t: (zh: string, en: string) => string;
-}) {
-  const visibleIssues = issues.slice(0, 6);
-  const expiredCount = issues.filter((item) => item.category === 'remote-asset-expired').length;
-  const legacyCount = issues.filter((item) => item.category === 'legacy-blob').length;
+  if (!props.isFlowViewportReady) {
+    return <div className="absolute inset-0 bg-[#0d1117]" aria-hidden="true" />;
+  }
+
   return (
-    <div
-      data-testid="canvas-migration-banner"
-      className="pointer-events-auto absolute left-1/2 top-4 z-30 w-[min(760px,calc(100%-32px))] -translate-x-1/2 rounded-2xl border border-amber-500/30 bg-[#17130c]/95 shadow-2xl backdrop-blur"
+    <ReactFlow
+      nodes={rfNodes}
+      edges={rfEdges}
+      onNodesChange={onNodesChange}
+      onEdgesChange={props.onEdgesChange}
+      onEdgeClick={props.onEdgeClick}
+      onConnect={props.onConnect}
+      onNodeClick={props.onNodeClick}
+      onPaneClick={props.onPaneClick}
+      onNodeDragStop={onNodeDragStopEnhanced}
+      onNodeDragStart={onNodeDragStart}
+      onSelectionChange={props.onSelectionChange}
+      onMove={props.onMove}
+      nodeTypes={nodeTypes}
+      fitView
+      minZoom={0.1}
+      maxZoom={2}
+      elevateNodesOnSelect={false}
+      panOnScroll={true}
+      panOnDrag={FLOW_PAN_ON_DRAG}
+      selectionOnDrag={true}
+      selectionMode={SelectionMode.Partial}
+      multiSelectionKeyCode="Shift"
+      deleteKeyCode={null}
+      zoomOnDoubleClick={false}
+      selectNodesOnDrag={true}
+      className="bg-[#0d1117] touch-none"
+      style={FLOW_VIEWPORT_STYLE}
+      ariaLabelConfig={props.flowAriaLabelConfig}
     >
-      <div className="flex items-start justify-between gap-4 px-4 py-3">
-        <div className="min-w-0">
-          <div className="text-sm font-semibold text-amber-100">
-            {t(`检测到 ${issues.length} 个历史素材节点需要迁移`, `${issues.length} historical media nodes need migration`)}
-          </div>
-          <div className="mt-1 text-xs text-amber-100/80">
-            {t('旧的 SiliconFlow 临时签名链接过期后将无法继续渲染；历史 blob 素材在浏览器重启后也会失效。建议重新生成、重新上传，或从最新结果节点重新取用素材。', 'Expired SiliconFlow signed URLs and old blob-backed assets can no longer render. Regenerate, re-upload, or reuse the latest result nodes.')}
-          </div>
-          <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
-            {expiredCount > 0 ? (
-              <span className="rounded-full bg-amber-500/15 px-2.5 py-1 text-amber-100">
-                {t(`SiliconFlow 过期链接 ${expiredCount} 个`, `${expiredCount} expired SiliconFlow assets`)}
-              </span>
-            ) : null}
-            {legacyCount > 0 ? (
-              <span className="rounded-full bg-rose-500/15 px-2.5 py-1 text-rose-100">
-                {t(`历史本地素材 ${legacyCount} 个`, `${legacyCount} legacy local assets`)}
-              </span>
-            ) : null}
-          </div>
-        </div>
-        <button
-          type="button"
-          data-testid="canvas-migration-dismiss"
-          onClick={onDismiss}
-          className="rounded-md border border-white/10 px-2.5 py-1 text-xs text-[#ececec] hover:bg-white/8"
-        >
-          {t('暂时隐藏', 'Dismiss')}
-        </button>
-      </div>
-      <div className="border-t border-white/8 px-4 py-3">
-        <div className="mb-2 flex items-center justify-between gap-2">
-          <div className="text-xs font-medium text-[#f3ead1]">{t('需要处理的节点', 'Affected nodes')}</div>
-          <div className="flex flex-wrap items-center justify-end gap-2">
-            <button
-              type="button"
-              data-testid="canvas-migration-focus-next"
-              onClick={onFocusNext}
-              className="rounded-md border border-white/10 px-2.5 py-1 text-xs text-[#f1f1f1] hover:bg-white/8"
-            >
-              {t('定位下一个', 'Next issue')}
-            </button>
-            <button
-              type="button"
-              data-testid="canvas-migration-select-all"
-              onClick={onSelectAll}
-              className="rounded-md border border-amber-500/20 bg-amber-500/10 px-2.5 py-1 text-xs text-amber-100 hover:bg-amber-500/16"
-            >
-              {t('选中这些节点', 'Select nodes')}
-            </button>
-          </div>
-        </div>
-        <div className="mb-3 flex flex-wrap gap-2">
-          <button
-            type="button"
-            data-testid="canvas-migration-export-json"
-            onClick={onExportJson}
-            className="rounded-md border border-white/10 px-2.5 py-1 text-xs text-[#ececec] hover:bg-white/8"
-          >
-            {t('导出 JSON 清单', 'Export JSON')}
-          </button>
-          <button
-            type="button"
-            data-testid="canvas-migration-export-csv"
-            onClick={onExportCsv}
-            className="rounded-md border border-white/10 px-2.5 py-1 text-xs text-[#ececec] hover:bg-white/8"
-          >
-            {t('导出 CSV 清单', 'Export CSV')}
-          </button>
-          <button
-            type="button"
-            data-testid="canvas-migration-batch-regenerate"
-            onClick={onBatchRegenerate}
-            disabled={batchRegenerateCount <= 0}
-            className="rounded-md border border-emerald-500/20 bg-emerald-500/12 px-2.5 py-1 text-xs text-emerald-100 hover:bg-emerald-500/18 disabled:cursor-not-allowed disabled:opacity-45"
-          >
-            {batchRegenerateCount > 0
-              ? t(`批量重新生成 ${batchRegenerateCount} 个节点`, `Regenerate ${batchRegenerateCount} nodes`)
-              : t('没有可批量重新生成的节点', 'No regeneratable nodes')}
-          </button>
-        </div>
-        <div className="max-h-[220px] space-y-2 overflow-y-auto pr-1">
-          {visibleIssues.map((issue) => (
-            <div
-              key={`${issue.nodeId}-${issue.category}-${issue.assetKind}`}
-              data-testid={`canvas-migration-issue-${issue.nodeId}`}
-              className="flex items-start justify-between gap-3 rounded-xl border border-white/8 bg-white/[0.03] px-3 py-2"
-            >
-              <div className="min-w-0">
-                <div className="truncate text-sm text-[#f7f7f7]">
-                  {issue.nodeLabel}
-                  <span className="ml-2 text-[11px] text-[#b9b9b9]">#{issue.nodeId.slice(0, 6)}</span>
-                </div>
-                <div className="mt-1 text-xs text-[#e6c98f]">{issue.summary}</div>
-                <div className="mt-1 line-clamp-2 text-[11px] text-[#cfcfcf]">{issue.detail}</div>
-              </div>
-              <button
-                type="button"
-                data-testid={`canvas-migration-focus-${issue.nodeId}`}
-                onClick={() => onFocusNode(issue.nodeId)}
-                className="shrink-0 rounded-md border border-white/10 px-2.5 py-1 text-xs text-[#f1f1f1] hover:bg-white/8"
-              >
-                {t('定位', 'Focus')}
-              </button>
-            </div>
-          ))}
-          {issues.length > visibleIssues.length ? (
-            <div className="text-center text-[11px] text-[#bba882]">
-              {t(`还有 ${issues.length - visibleIssues.length} 个节点未展开显示`, `${issues.length - visibleIssues.length} more nodes are hidden`)}
-            </div>
-          ) : null}
-        </div>
-      </div>
-    </div>
+      <CanvasGroupLayer autoEditGroupId={props.autoEditGroupId} onAutoEditHandled={props.onAutoEditHandled} isDragging={dragging} />
+      <Background color="#21262d" gap={20} size={1} variant={BackgroundVariant.Dots} />
+      <Controls className="!bg-[#161b22] !border-[#30363d]" showInteractive={false} />
+    </ReactFlow>
   );
 }
 
-type MigrationIssueFilter = 'all' | 'remote-asset-expired' | 'legacy-blob';
-
-function sameNodeIdArray(left: string[], right: string[]) {
-  return left.length === right.length && left.every((id, index) => id === right[index]);
-}
-
-function orderNodeIdsByCanvas(nodes: Array<{ id: string }> | undefined, nodeIds: string[]) {
-  const uniqueIds = Array.from(new Set(nodeIds)).filter(Boolean);
-  if (!nodes || nodes.length === 0 || uniqueIds.length <= 1) return uniqueIds;
-  const order = new Map(nodes.map((node, index) => [node.id, index]));
-  return [...uniqueIds].sort((a, b) => (order.get(a) ?? Number.MAX_SAFE_INTEGER) - (order.get(b) ?? Number.MAX_SAFE_INTEGER));
-}
-
-function blurActiveEditableElement() {
-  if (typeof document === 'undefined') return;
-  const activeElement = document.activeElement as HTMLElement | null;
-  if (!activeElement) return;
-  const tag = activeElement.tagName.toLowerCase();
-  const isEditable = activeElement.isContentEditable || tag === 'input' || tag === 'textarea' || tag === 'select';
-  if (isEditable && typeof activeElement.blur === 'function') {
-    activeElement.blur();
-  }
-}
-
-function normalizeRenderableEdgeHandle(handleId: unknown, kind: 'source' | 'target') {
-  if (typeof handleId !== 'string') return undefined;
-  const trimmed = handleId.trim();
-  if (!trimmed || trimmed === 'null' || trimmed === 'undefined') return undefined;
-  return trimmed;
-}
-
-function hasMountedRenderableEdgeHandles(edge: { source: string; target: string; sourceHandle?: string; targetHandle?: string }) {
-  if (typeof document === 'undefined') return true;
-  const sourceHandle = normalizeRenderableEdgeHandle(edge.sourceHandle, 'source');
-  const targetHandle = normalizeRenderableEdgeHandle(edge.targetHandle, 'target');
-  const sourceSelector = sourceHandle
-    ? `.react-flow__handle.source[data-nodeid="${edge.source}"][data-handleid="${sourceHandle}"]`
-    : `.react-flow__handle.source[data-nodeid="${edge.source}"]`;
-  const targetSelector = targetHandle
-    ? `.react-flow__handle.target[data-nodeid="${edge.target}"][data-handleid="${targetHandle}"]`
-    : `.react-flow__handle.target[data-nodeid="${edge.target}"]`;
-  return Boolean(document.querySelector(sourceSelector) && document.querySelector(targetSelector));
-}
-
-function resolveRenderableEdgeStyle(targetHandle: string | undefined) {
-  if (!targetHandle) {
-    return { stroke: '#39d2c0', strokeWidth: 2.2, opacity: 0.96 };
-  }
-  if (targetHandle === 'image-main' || targetHandle === 'video-main' || targetHandle === 'audio-input' || targetHandle === 'post-input') {
-    return { stroke: '#39d2c0', strokeWidth: 2.2, opacity: 0.96 };
-  }
-  if (targetHandle.startsWith('image-reference') || targetHandle.startsWith('video-image-reference')) {
-    return { stroke: '#f6b84c', strokeWidth: 2.2, opacity: 0.98 };
-  }
-  if (targetHandle.startsWith('video-video-reference')) {
-    return { stroke: '#68a8ff', strokeWidth: 2.2, opacity: 0.98 };
-  }
-  return { stroke: '#39d2c0', strokeWidth: 2.2, opacity: 0.96 };
-}
-
-function MigrationIssuesBanner({
-  issues,
-  allIssueCount,
-  expiredCount,
-  legacyCount,
-  filter,
-  onFilterChange,
-  onDismiss,
-  onFocusNode,
-  onOpenNodePanel,
-  onFocusNext,
-  onSelectAll,
-  onExportJson,
-  onExportCsv,
-  onBatchRegenerate,
-  onBatchReupload,
-  batchRegenerateCount,
-  batchReuploadCount,
-  batchReuploadActive,
-  batchReuploadCurrentIndex,
-  batchReuploadTotalCount,
-  onCollapse,
-  t,
-}: {
-  issues: CanvasMigrationIssue[];
-  allIssueCount: number;
-  expiredCount: number;
-  legacyCount: number;
-  filter: MigrationIssueFilter;
-  onFilterChange: (filter: MigrationIssueFilter) => void;
-  onDismiss: () => void;
-  onFocusNode: (nodeId: string) => void;
-  onOpenNodePanel: (nodeId: string) => void;
-  onFocusNext: () => void;
-  onSelectAll: () => void;
-  onExportJson: () => void;
-  onExportCsv: () => void;
-  onBatchRegenerate: () => void;
-  onBatchReupload: () => void;
-  batchRegenerateCount: number;
-  batchReuploadCount: number;
-  batchReuploadActive: boolean;
-  batchReuploadCurrentIndex: number;
-  batchReuploadTotalCount: number;
-  onCollapse: () => void;
-  t: (zh: string, en: string) => string;
-}) {
-  const visibleIssues = issues.slice(0, 6);
-  const batchReuploadRemainingCount = Math.max(batchReuploadTotalCount - batchReuploadCurrentIndex, 0);
-  const batchReuploadProgressPercent = batchReuploadTotalCount > 0
-    ? Math.min(100, Math.max(0, Math.round((batchReuploadCurrentIndex / batchReuploadTotalCount) * 100)))
-    : 0;
-  return (
-    <div
-      data-testid="canvas-migration-banner"
-      onMouseLeave={onCollapse}
-      onPointerDown={(event) => {
-        event.stopPropagation();
-      }}
-      onClick={(event) => {
-        event.stopPropagation();
-      }}
-      className="pointer-events-auto absolute right-4 top-16 z-30 w-[min(420px,calc(100%-24px))] rounded-2xl border border-rose-500/30 bg-[#1a1111]/96 shadow-2xl backdrop-blur"
-    >
-      <div className="flex items-start justify-between gap-4 px-4 py-3">
-        <div className="min-w-0">
-          <div className="text-sm font-semibold text-rose-100">
-            {t(`检测到 ${allIssueCount} 个历史素材节点需要迁移`, `${allIssueCount} historical media nodes need migration`)}
-          </div>
-          <div className="mt-1 text-xs text-rose-100/80">
-            {t('旧的 SiliconFlow 临时签名链接过期后将无法继续渲染；历史 blob 素材在浏览器重启后也会失效。建议重新生成、重新上传，或复用最新结果节点。', 'Expired SiliconFlow signed URLs and old blob-backed assets can no longer render. Regenerate, re-upload, or reuse the latest result nodes.')}
-          </div>
-          <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
-            <button
-              type="button"
-              data-testid="canvas-migration-filter-all"
-              onClick={() => onFilterChange('all')}
-              className={`rounded-full px-2.5 py-1 transition ${filter === 'all' ? 'bg-white/18 text-white' : 'bg-white/6 text-[#e5dcc6] hover:bg-white/10'}`}
-            >
-              {t(`全部 ${allIssueCount}`, `All ${allIssueCount}`)}
-            </button>
-            <button
-              type="button"
-              data-testid="canvas-migration-filter-expired"
-              onClick={() => onFilterChange('remote-asset-expired')}
-              className={`rounded-full px-2.5 py-1 transition ${filter === 'remote-asset-expired' ? 'bg-amber-500/24 text-amber-50' : 'bg-amber-500/10 text-amber-100 hover:bg-amber-500/16'}`}
-            >
-              {t(`只看过期链接 ${expiredCount}`, `Expired only ${expiredCount}`)}
-            </button>
-            <button
-              type="button"
-              data-testid="canvas-migration-filter-legacy"
-              onClick={() => onFilterChange('legacy-blob')}
-              className={`rounded-full px-2.5 py-1 transition ${filter === 'legacy-blob' ? 'bg-rose-500/24 text-rose-50' : 'bg-rose-500/10 text-rose-100 hover:bg-rose-500/16'}`}
-            >
-              {t(`只看历史 blob ${legacyCount}`, `Legacy blob only ${legacyCount}`)}
-            </button>
-          </div>
-        </div>
-        <button
-          type="button"
-          data-testid="canvas-migration-dismiss"
-          onClick={onCollapse}
-          className="rounded-md border border-white/10 px-2.5 py-1 text-xs text-[#ececec] hover:bg-white/8"
-        >
-          {t('收起', 'Collapse')}
-        </button>
-      </div>
-      <div className="border-t border-white/8 px-4 py-3">
-        <div className="mb-2 flex items-center justify-between gap-2">
-          <div className="text-xs font-medium text-[#f3ead1]">{t('需要处理的节点', 'Affected nodes')}</div>
-          <div className="flex flex-wrap items-center justify-end gap-2">
-            <button
-              type="button"
-              data-testid="canvas-migration-focus-next"
-              onClick={onFocusNext}
-              className="rounded-md border border-white/10 px-2.5 py-1 text-xs text-[#f1f1f1] hover:bg-white/8"
-            >
-              {t('定位下一个', 'Next issue')}
-            </button>
-            <button
-              type="button"
-              data-testid="canvas-migration-select-all"
-              onClick={onSelectAll}
-              className="rounded-md border border-amber-500/20 bg-amber-500/10 px-2.5 py-1 text-xs text-amber-100 hover:bg-amber-500/16"
-            >
-              {t('选中这些节点', 'Select nodes')}
-            </button>
-          </div>
-        </div>
-        <div className="mb-3 flex flex-wrap gap-2">
-          <button
-            type="button"
-            data-testid="canvas-migration-export-json"
-            onClick={onExportJson}
-            className="rounded-md border border-white/10 px-2.5 py-1 text-xs text-[#ececec] hover:bg-white/8"
-          >
-            {t('导出 JSON 清单', 'Export JSON')}
-          </button>
-          <button
-            type="button"
-            data-testid="canvas-migration-export-csv"
-            onClick={onExportCsv}
-            className="rounded-md border border-white/10 px-2.5 py-1 text-xs text-[#ececec] hover:bg-white/8"
-          >
-            {t('导出 CSV 清单', 'Export CSV')}
-          </button>
-          <button
-            type="button"
-            data-testid="canvas-migration-batch-regenerate"
-            onClick={onBatchRegenerate}
-            disabled={batchRegenerateCount <= 0}
-            className="rounded-md border border-emerald-500/20 bg-emerald-500/12 px-2.5 py-1 text-xs text-emerald-100 hover:bg-emerald-500/18 disabled:cursor-not-allowed disabled:opacity-45"
-          >
-            {batchRegenerateCount > 0
-              ? t(`批量重新生成 ${batchRegenerateCount} 个节点`, `Regenerate ${batchRegenerateCount} nodes`)
-              : t('没有可批量重新生成的节点', 'No regeneratable nodes')}
-          </button>
-          <button
-            type="button"
-            data-testid="canvas-migration-batch-reupload"
-            onClick={onBatchReupload}
-            disabled={batchReuploadCount <= 0}
-            className="rounded-md border border-sky-500/20 bg-sky-500/12 px-2.5 py-1 text-xs text-sky-100 hover:bg-sky-500/18 disabled:cursor-not-allowed disabled:opacity-45"
-          >
-            {batchReuploadCount > 0
-              ? batchReuploadActive
-                ? t(`打开下一个待重传节点 ${batchReuploadCount} 个`, `Open next re-upload ${batchReuploadCount}`)
-                : t(`批量重新上传 ${batchReuploadCount} 个节点`, `Batch re-upload ${batchReuploadCount} nodes`)
-              : t('没有可批量重新上传的节点', 'No re-uploadable nodes')}
-          </button>
-        </div>
-        {batchReuploadActive && batchReuploadTotalCount > 0 ? (
-          <div className="mb-3 rounded-xl border border-sky-500/20 bg-sky-500/10 px-3 py-2 text-[11px] text-sky-100">
-            <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-[10px] text-sky-50">
-              <span>{t(`当前第 ${batchReuploadCurrentIndex} 项，还剩 ${batchReuploadRemainingCount} 项`, `Item ${batchReuploadCurrentIndex}, ${batchReuploadRemainingCount} remaining`)}</span>
-              <span className="rounded-full bg-sky-500/18 px-2 py-0.5">{batchReuploadCurrentIndex}/{batchReuploadTotalCount}</span>
-            </div>
-            <div className="mb-2 h-1.5 overflow-hidden rounded-full bg-black/25">
-              <div className="h-full rounded-full bg-sky-400 transition-[width] duration-200" style={{ width: `${batchReuploadProgressPercent}%` }} />
-            </div>
-            {t('已进入批量重传队列。每次点击“打开下一个待重传节点”都会自动定位并打开对应节点面板，随后可在节点上重新上传本地文件或从素材库替换。', 'Batch re-upload queue is active. Each click on "Open next re-upload" focuses the next node and opens its panel so you can upload or replace media.')}
-          </div>
-        ) : null}
-        <div className="max-h-[220px] space-y-2 overflow-y-auto pr-1">
-          {visibleIssues.map((issue) => (
-            <div
-              key={`${issue.nodeId}-${issue.category}-${issue.assetKind}`}
-              data-testid={`canvas-migration-issue-${issue.nodeId}`}
-              className="flex items-start justify-between gap-3 rounded-xl border border-white/8 bg-white/[0.03] px-3 py-2"
-            >
-              <div className="min-w-0">
-                <div className="truncate text-sm text-[#f7f7f7]">
-                  {issue.nodeLabel}
-                  <span className="ml-2 text-[11px] text-[#b9b9b9]">#{issue.nodeId.slice(0, 6)}</span>
-                </div>
-                <div className="mt-1 text-xs text-[#e6c98f]">{issue.summary}</div>
-                <div className="mt-1 line-clamp-2 text-[11px] text-[#cfcfcf]">{issue.detail}</div>
-              </div>
-              <div className="flex shrink-0 items-center gap-2">
-                <button
-                  type="button"
-                  data-testid={`canvas-migration-focus-${issue.nodeId}`}
-                  onClick={() => onFocusNode(issue.nodeId)}
-                  className="rounded-md border border-white/10 px-2.5 py-1 text-xs text-[#f1f1f1] hover:bg-white/8"
-                >
-                  {t('定位', 'Focus')}
-                </button>
-                <button
-                  type="button"
-                  data-testid={`canvas-migration-open-panel-${issue.nodeId}`}
-                  onPointerDown={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    onOpenNodePanel(issue.nodeId);
-                  }}
-                  onClick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    onOpenNodePanel(issue.nodeId);
-                  }}
-                  className="rounded-md border border-sky-500/20 bg-sky-500/10 px-2.5 py-1 text-xs text-sky-100 hover:bg-sky-500/16"
-                >
-                  {t('打开面板', 'Open panel')}
-                </button>
-              </div>
-            </div>
-          ))}
-          {issues.length > visibleIssues.length ? (
-            <div className="text-center text-[11px] text-[#bba882]">
-              {t(`还有 ${issues.length - visibleIssues.length} 个节点未展开显示`, `${issues.length - visibleIssues.length} more nodes are hidden`)}
-            </div>
-          ) : null}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function MigrationIssuesToggle({
-  count,
-  onExpand,
-  t,
-}: {
-  count: number;
-  onExpand: () => void;
-  t: (zh: string, en: string) => string;
-}) {
-  return (
-    <button
-      type="button"
-      data-testid="canvas-migration-toggle"
-      onClick={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        onExpand();
-      }}
-      className="pointer-events-auto absolute right-4 top-24 z-30 flex items-center gap-2 rounded-l-2xl rounded-r-xl border border-rose-500/35 bg-[#2a1212]/95 px-3 py-2 text-xs text-rose-100 shadow-xl transition hover:bg-[#341616]"
-    >
-      <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-500/25 px-1.5 text-[11px] font-semibold text-rose-50">
-        {count}
-      </span>
-      <span>{t('异常素材', 'Media issues')}</span>
-    </button>
-  );
-}
+// 用 memo 包裹：FlowCanvas 的内部拖拽重渲染由 dragStore（useSyncExternalStore）驱动，
+// 与外部父组件 CanvasFlow 的解耦进一步加固 —— 即使 CanvasFlow 因 selectedNodeIds /
+// autoEditGroupId 等状态变化而重渲染，也不会级联重渲染整个 ReactFlow 画布。
+const FlowCanvas = memo(FlowCanvasImpl);
 
 function CanvasFlow() {
   useModelCatalogSync();
@@ -691,8 +326,6 @@ function CanvasFlow() {
   const lastDeleteRef = useRef(0);
   const lastSelectionChangeRef = useRef(0);
   const suppressNodeInteractionUntilRef = useRef(0);
-  const pendingPositionsRef = useRef<Record<string, { x: number; y: number }>>({});
-  const moveFrameRef = useRef<number | null>(null);
   const lastClipboardPasteHandledAtRef = useRef(0);
   const DELETE_THROTTLE_MS = 200;
   const [isFileDragOver, setIsFileDragOver] = useState(false);
@@ -712,17 +345,33 @@ function CanvasFlow() {
     });
   }, [getViewport, setCanvasViewport]);
 
+  // 视口/尺寸同步做防抖：避免在平移、缩放、面板切换触发的 resize 期间每帧写回 zustand，
+  // 否则 canvas 引用每帧变化会强制所有订阅 state.canvas 的节点组件重渲染，造成拖拽/平移卡顿。
+  const viewportSyncTimerRef = useRef<number | null>(null);
+  const scheduleViewportSync = useCallback(() => {
+    if (viewportSyncTimerRef.current != null) return;
+    viewportSyncTimerRef.current = window.setTimeout(() => {
+      viewportSyncTimerRef.current = null;
+      syncCanvasViewport();
+    }, 180);
+  }, [syncCanvasViewport]);
+
   useEffect(() => {
     if (!isFlowViewportReady) return;
     syncCanvasViewport();
     const host = flowHostRef.current;
     if (!host || typeof ResizeObserver === 'undefined') return;
     const observer = new ResizeObserver(() => {
-      syncCanvasViewport();
+      scheduleViewportSync();
     });
     observer.observe(host);
     return () => observer.disconnect();
-  }, [isFlowViewportReady, syncCanvasViewport]);
+  }, [isFlowViewportReady, syncCanvasViewport, scheduleViewportSync]);
+
+  // 预加载所有节点 chunk，避免画布首次铺开大量节点时再逐个等动态 import 阻塞。
+  useEffect(() => {
+    preloadAllNodeChunks();
+  }, []);
   const [collapsedMigrationSignature, setCollapsedMigrationSignature] = useState('');
   const [migrationCursor, setMigrationCursor] = useState(0);
   const [migrationIssueFilter, setMigrationIssueFilter] = useState<MigrationIssueFilter>('all');
@@ -732,46 +381,8 @@ function CanvasFlow() {
   const nodesInitialized = useNodesInitialized();
   const canvasVersion = canvas?.updatedAt || 0;
 
-  // Derive ReactFlow nodes and edges directly from the store to avoid setState-in-effect warnings.
-  const rfNodes = useMemo(() => {
-    if (!canvas) return [];
-    return canvas.nodes.map((n) => ({
-      id: n.id,
-      type: n.type,
-      className: `hmdao-node hmdao-node-${n.type}`,
-      position: n.position,
-      selectable: true,
-      draggable: true,
-      data: { ...n.data, __nodeType: n.type },
-    }));
-  }, [canvas, canvasVersion]);
-
-  const rfEdges = useMemo(() => {
-    if (!canvas) return [];
-    const nodeIds = new Set(canvas.nodes.map((node) => node.id));
-    return canvas.edges.reduce<Edge[]>((edges, e) => {
-      if (e.pending || !hasMountedRenderableEdgeHandles(e)) {
-        return edges;
-      }
-      if (!nodeIds.has(e.source) || !nodeIds.has(e.target)) {
-        return edges;
-      }
-      const sourceHandle = normalizeRenderableEdgeHandle(e.sourceHandle, 'source');
-      const targetHandle = normalizeRenderableEdgeHandle(e.targetHandle, 'target');
-      const style = resolveRenderableEdgeStyle(targetHandle);
-      edges.push({
-        id: e.id,
-        source: e.source,
-        target: e.target,
-        ...(sourceHandle ? { sourceHandle } : {}),
-        ...(targetHandle ? { targetHandle } : {}),
-        type: 'smoothstep',
-        animated: Boolean(targetHandle && (targetHandle.startsWith('image-reference') || targetHandle.startsWith('video-image-reference') || targetHandle.startsWith('video-video-reference'))),
-        style,
-      });
-      return edges;
-    }, []);
-  }, [canvas, canvasVersion]);
+  // RF 节点/边及其拖拽位置覆盖已迁移到独立的 <FlowCanvas> 组件（见文件顶部 dragStore），
+  // 通过 useSyncExternalStore 订阅拖拽位置，使拖拽每帧只重渲染 FlowCanvas 而非整个 CanvasFlow。
   const pendingCanvasEdges = useMemo(
     () => (canvas?.edges || []).filter((edge) => edge.pending),
     [canvas?.edges],
@@ -835,7 +446,17 @@ function CanvasFlow() {
       });
     }
   }, [addEdge, canvas, pendingCanvasEdges]);
-  const migrationIssues = useMemo(() => scanCanvasMigrationIssues(canvas?.nodes), [canvas?.nodes]);
+  // 拖动每帧都会产生新的 canvas.nodes 引用，但迁移扫描只关心节点结构与参数（不关心坐标）；
+  // 用忽略坐标的稳定签名作为依赖，避免 drag 过程中每帧都跑一遍全量扫描。
+  const canvasNodesRef = useRef(canvas?.nodes);
+  canvasNodesRef.current = canvas?.nodes;
+  const migrationScanKey = useMemo(() => {
+    const nodes = canvasNodesRef.current || [];
+    return nodes
+      .map((n) => `${n.id}|${n.type}|${JSON.stringify((n.data as unknown as Record<string, unknown>)?.params ?? n.data ?? '')}`)
+      .join('|');
+  }, [canvas?.nodes]);
+  const migrationIssues = useMemo(() => scanCanvasMigrationIssues(canvasNodesRef.current), [migrationScanKey]);
   const migrationExpiredCount = useMemo(
     () => migrationIssues.filter((issue) => issue.category === 'remote-asset-expired').length,
     [migrationIssues],
@@ -950,22 +571,7 @@ function CanvasFlow() {
     setCenter,
   ]);
 
-  const onNodesChange = useCallback((changes: NodeChange[]) => {
-    for (const c of changes) {
-      if (c.type === 'remove') removeNode(c.id);
-      if (c.type === 'position' && c.position) {
-        pendingPositionsRef.current[c.id] = c.position;
-      }
-    }
-    if (Object.keys(pendingPositionsRef.current).length > 0 && moveFrameRef.current === null) {
-      moveFrameRef.current = requestAnimationFrame(() => {
-        moveFrameRef.current = null;
-        const next = pendingPositionsRef.current;
-        pendingPositionsRef.current = {};
-        moveNodes(next);
-      });
-    }
-  }, [moveNodes, removeNode]);
+
 
   const onEdgesChange = useCallback((changes: EdgeChange[]) => {
     for (const c of changes) { if (c.type === 'remove') removeEdge(c.id); }
@@ -2505,7 +2111,6 @@ function CanvasFlow() {
     'controls.zoomIn.ariaLabel': t('放大', 'Zoom in'),
     'controls.zoomOut.ariaLabel': t('缩小', 'Zoom out'),
     'controls.fitView.ariaLabel': t('适配视图', 'Fit view'),
-    'minimap.ariaLabel': t('画布缩略图', 'Canvas minimap'),
   }), [t]);
 
   const onCanvasDragOver = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
@@ -2536,12 +2141,19 @@ function CanvasFlow() {
 
     const basePosition = screenToFlowPosition({ x: event.clientX, y: event.clientY });
     for (const [index, file] of files.entries()) {
-      await importMediaFile(file, {
+      const nodeId = await importMediaFile(file, {
         x: basePosition.x + index * 36,
         y: basePosition.y + index * 28,
       });
+      if (!nodeId) continue;
+      // 拖放素材自动生成临时 URL，供 ComfyUI 工作流远程注入（不传本地路径）
+      uploadComfyTempUrl(file)
+        .then((tmpUrl) => {
+          if (tmpUrl) updateNodeData(nodeId, { comfyTempUrl: tmpUrl });
+        })
+        .catch(() => {});
     }
-  }, [importMediaFile, screenToFlowPosition]);
+  }, [importMediaFile, screenToFlowPosition, updateNodeData]);
 
   const writeMigrationDebugState = useCallback((patch: Record<string, unknown>) => {
     if (typeof window === 'undefined') return;
@@ -2771,16 +2383,17 @@ function CanvasFlow() {
     }
   }, [addNodesToGroup, canvas, groups, removeNodesFromGroup, selectedNodeIds]);
 
+  // 稳定的回调，避免作为 prop 传入 memo(FlowCanvas) 时因引用变化导致画布每帧重渲染。
+  const handleAutoEditHandled = useCallback((groupId: string) => {
+    setAutoEditingGroupId((current) => (current === groupId ? null : current));
+  }, [setAutoEditingGroupId]);
+
   // Persist move history on drag end so we do not push snapshots for every pixel movement.
   const onNodeDragStop = useCallback(() => {
     commitMoveHistory();
   }, [commitMoveHistory]);
 
-  // ReactFlow box selection bypasses onNodesChange, so we sync grouping separately here.
-  const onNodeDragStopEnhanced = useCallback((_event: MouseEvent | TouchEvent, node: Node) => {
-    syncDraggedNodeGroups(node);
-    commitMoveHistory();
-  }, [commitMoveHistory, syncDraggedNodeGroups]);
+
 
   const onSelectionChange = useCallback((params?: { nodes?: Node[] | null }) => {
     const selected = Array.isArray(params?.nodes) ? params.nodes : [];
@@ -2947,9 +2560,7 @@ function CanvasFlow() {
     return () => window.removeEventListener('keydown', h, true);
   }, [addNode, applyFlowSelection, canvas, deselectAll, exportCanvas, fitView, handleGroupSelection, handleUngroupSelection, redo, removeNodes, safeDeselectAll, selectedNodeIds, setShowShortcuts, showShortcuts, undo, updateNodeData]);
 
-  useEffect(() => () => {
-    if (moveFrameRef.current !== null) cancelAnimationFrame(moveFrameRef.current);
-  }, []);
+
 
   const getCanvasPastePosition = useCallback((index = 0) => {
     const host = flowHostRef.current;
@@ -3199,48 +2810,21 @@ function CanvasFlow() {
         onDrop={onCanvasDrop}
       >
       {isFlowViewportReady ? (
-      <ReactFlow
-        nodes={rfNodes}
-        edges={rfEdges}
-        onNodesChange={onNodesChange}
+      <FlowCanvas
+        isFlowViewportReady={isFlowViewportReady}
         onEdgesChange={onEdgesChange}
         onEdgeClick={onEdgeClick}
         onConnect={onConnect}
         onNodeClick={onNodeClick}
         onPaneClick={onPaneClick}
-        onNodeDragStop={onNodeDragStopEnhanced}
         onSelectionChange={onSelectionChange}
-        onMove={(_, viewport) => {
-          syncCanvasViewport(viewport);
-        }}
-        nodeTypes={nodeTypes}
-        fitView
-        minZoom={0.1}
-        maxZoom={2}
-        onlyRenderVisibleElements={false}
-        elevateNodesOnSelect={false}
-        panOnScroll={true}
-        panOnDrag={FLOW_PAN_ON_DRAG}
-        selectionOnDrag={true}
-        selectionMode={SelectionMode.Partial}
-        multiSelectionKeyCode="Shift"
-        deleteKeyCode={null}
-        zoomOnDoubleClick={false}
-        selectNodesOnDrag={true}
-        className="bg-[#0d1117] touch-none"
-        style={FLOW_VIEWPORT_STYLE}
-        ariaLabelConfig={flowAriaLabelConfig}
-      >
-        <CanvasGroupLayer
-          autoEditGroupId={autoEditingGroupId}
-          onAutoEditHandled={(groupId) => {
-            setAutoEditingGroupId((current) => (current === groupId ? null : current));
-          }}
-        />
-        <Background color="#21262d" gap={20} size={1} variant={BackgroundVariant.Dots} />
-        <Controls className="!bg-[#161b22] !border-[#30363d]" showInteractive={false} />
-        <MiniMap className="!bg-[#161b22] !border-[#30363d] !rounded-xl" style={MINIMAP_STYLE} nodeColor={getMiniMapNodeColor} />
-      </ReactFlow>
+        onMove={scheduleViewportSync}
+        syncDraggedNodeGroups={syncDraggedNodeGroups}
+        commitMoveHistory={commitMoveHistory}
+        autoEditGroupId={autoEditingGroupId}
+        onAutoEditHandled={handleAutoEditHandled}
+        flowAriaLabelConfig={flowAriaLabelConfig}
+      />
       ) : (
         <div className="absolute inset-0 bg-[#0d1117]" aria-hidden="true" />
       )}
@@ -3249,6 +2833,7 @@ function CanvasFlow() {
           拖拽图片或视频到画布导入
         </div>
       ) : null}
+      {<ComfyUiStatusBanner />}
       {showMigrationBanner ? (
         <MigrationIssuesBanner
           issues={filteredMigrationIssues}
@@ -3329,6 +2914,12 @@ export function CanvasBoard() {
   const isMobile = useIsMobile();
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const canvasShellRef = useRef<HTMLDivElement | null>(null);
+
+  // 默认不自动弹出「需求共建 / 世界频道」面板，仅用户点击工具栏按钮时打开。
+  useEffect(() => {
+    useDonationStore.getState().setShowDonationPanel(false);
+    useDonationStore.getState().setShowWorldChannel(false);
+  }, []);
 
   return (
     <div className="flex flex-col h-screen w-screen bg-[#0d1117] overflow-hidden">

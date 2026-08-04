@@ -1,9 +1,10 @@
-import { useMemo, type CSSProperties } from 'react';
+import { useMemo, useRef, useState, type CSSProperties } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
-import { FileJson, FileSpreadsheet, LayoutGrid, ScrollText } from 'lucide-react';
+import { Check, Copy, FileJson, FileSpreadsheet, LayoutGrid, ScrollText } from 'lucide-react';
 import { useCanvasStore } from '@/store/useCanvasStore';
 import { EditableNodeTitle } from './EditableNodeTitle';
 import { ErrorDetailBlock, StatusBadge } from './NodeShellShared';
+import DispatchInfoBadge from '@/components/DispatchInfoBadge';
 
 interface StoryboardRow {
   shotNumber: number;
@@ -106,6 +107,41 @@ function buildScriptContent(summary: string, analysisEngine: string, rows: Story
   ].filter(Boolean).join('\n\n');
 }
 
+function buildRemixPrompt(summary: string, rows: StoryboardTableRow[]) {
+  const totalDuration = rows.reduce((sum, row) => sum + Number(row.duration || 0), 0);
+  const globalStyle = rows[0]?.styleDescription || '';
+  const globalLighting = rows[0]?.lightingMood || rows[0]?.lighting || '';
+  const globalAtmosphere = rows[0]?.atmosphere || '';
+
+  // 每个镜头一个独立段落：镜头/场景不同则自动断行、跳到下一个镜头描述
+  const shotSections = rows.map((row) => [
+    `## 镜头 ${row.shotNumber}（${formatTime(row.startTime)} - ${formatTime(row.endTime)}，时长 ${formatTime(row.duration)}）`,
+    row.subjectText ? `主体：${row.subjectText}` : '',
+    row.motionText ? `动作：${row.motionText}` : '',
+    row.sceneSetting ? `场景：${row.sceneSetting}` : '',
+    `景别/角度/运镜/景深：${[row.sceneType, row.cameraAngle, row.cameraMovement, row.focusDepth].filter(Boolean).join('、') || '标准取景'}`,
+    row.lighting ? `光影：${row.lighting}` : '',
+    row.frameDescription ? `画面描述：${row.frameDescription}` : '',
+    row.imagePrompt ? `画面提示词：${row.imagePrompt}` : '',
+    row.cameraPrompt ? `运镜提示词：${row.cameraPrompt}` : '',
+    row.soundDesign ? `声音：${row.soundDesign}` : '',
+  ].filter(Boolean).join('\n'));
+
+  return [
+    '# 视频复刻分镜提示词',
+    `总镜头数：${rows.length} | 总时长：${formatTime(totalDuration)}`,
+    [
+      globalStyle ? `整体风格：${globalStyle}` : '',
+      globalLighting ? `整体光影：${globalLighting}` : '',
+      globalAtmosphere ? `整体氛围：${globalAtmosphere}` : '',
+    ].filter(Boolean).join('\n'),
+    summary ? `解析摘要：${summary}` : '',
+    ...shotSections,
+    '# 生成要求',
+    '严格按镜头顺序生成：每个镜头保持对应的景别、角度、运镜、景深与光影；镜头之间按时间点切换场景，保持主体形象与整体风格一致。',
+  ].filter(Boolean).join('\n\n');
+}
+
 function downloadBlob(blob: Blob, fileName: string) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
@@ -131,6 +167,8 @@ export function StoryboardNode(props: NodeProps) {
   const summary = String(params.parseSummary || data?.content || '');
   const analysisEngine = String(params.analysisEngine || '');
   const status = (data?.status || 'idle') as 'idle' | 'generating' | 'completed' | 'error';
+  const [copied, setCopied] = useState(false);
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const tableRows = useMemo<StoryboardTableRow[]>(() => rows.map((row) => ({
     ...row,
@@ -153,6 +191,16 @@ export function StoryboardNode(props: NodeProps) {
     totalDuration: tableRows.reduce((sum, row) => sum + Number(row.duration || 0), 0),
     keyframeCount: tableRows.filter((row) => row.keyframeSrc).length,
   }), [tableRows]);
+
+  function copyRemixPrompt() {
+    if (!tableRows.length) return;
+    const text = buildRemixPrompt(summary, tableRows);
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {});
+  }
 
   function exportJson() {
     const payload = {
@@ -209,9 +257,14 @@ export function StoryboardNode(props: NodeProps) {
   }
 
   function exportScriptNode() {
+    // 节点 memo 比较器会忽略 positionAbsoluteX/Y（拖拽时这些 props 不更新），
+    // 所以从 store 读取该节点拖拽后的真实位置，避免导出落点停留在旧坐标。
+    const canvasNode = useCanvasStore.getState().canvas?.nodes.find((n) => n.id === id);
+    const baseX = canvasNode ? canvasNode.position.x : (props.positionAbsoluteX || 0);
+    const baseY = canvasNode ? canvasNode.position.y : (props.positionAbsoluteY || 0);
     const nextNodeId = addNode('script', {
-      x: (props.positionAbsoluteX || 0) + 980,
-      y: props.positionAbsoluteY || 0,
+      x: baseX + 980,
+      y: baseY,
     });
     updateNodeData(nextNodeId, {
       label: `${String(data?.label || '解析分镜')} · 分镜脚本`,
@@ -237,7 +290,23 @@ export function StoryboardNode(props: NodeProps) {
       >
         <div className="flex items-center justify-between gap-3 px-3 pb-2 pt-2.5">
           <EditableNodeTitle nodeId={id} icon={LayoutGrid} label={data?.label} fallback="分镜节点" />
+          <DispatchInfoBadge data={data} />
           <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onPointerDown={stopCanvasInteraction}
+              onClick={copyRemixPrompt}
+              className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-[12px] transition ${
+                copied
+                  ? 'border-emerald-500/40 bg-emerald-500/12 text-emerald-300'
+                  : 'border-[#3b3b3b] text-[#d0d0d0] hover:bg-[#2b2b2b]'
+              }`}
+              title="一键复制复刻提示词：按镜头分段断行，可直接粘贴给视频生成模型复刻相似视频"
+              data-testid={`storyboard-copy-remix-${id}`}
+            >
+              {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+              {copied ? '已复制' : '复制复刻提示词'}
+            </button>
             <button
               type="button"
               onPointerDown={stopCanvasInteraction}
@@ -294,7 +363,7 @@ export function StoryboardNode(props: NodeProps) {
         {summary ? (
           <div className="border-t border-cyan-500/20 bg-cyan-500/6 px-4 py-3 text-[12px] leading-6 text-cyan-100" data-testid={`storyboard-summary-${id}`}>
             <div className="font-semibold">解析摘要</div>
-            <div className="mt-1 opacity-90">{summary}</div>
+            <div className="mt-1 whitespace-pre-line opacity-90">{summary}</div>
           </div>
         ) : null}
 

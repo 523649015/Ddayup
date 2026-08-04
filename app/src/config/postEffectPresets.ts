@@ -1,4 +1,4 @@
-﻿export type PostEffectId = 'color' | 'upscale' | 'bloom' | 'dof' | 'grain' | 'matting' | 'tracking';
+﻿export type PostEffectId = 'color' | 'upscale' | 'bloom' | 'dof' | 'grain' | 'matting' | 'tracking' | 'motionBlur';
 
 export type PostMediaKind = 'image' | 'video';
 
@@ -95,7 +95,7 @@ export interface PostDofConfig {
   depthPreview: boolean;
   maskMode: 'focus-box' | 'paint-mask';
   depthBlend: number;
-  engine: 'depth-anything-v2-small' | 'manual-focus-box';
+  engine: 'depth-anything-v3-base' | 'manual-focus-box';
   autoDepthStrength: number;
   transitionPreset: 'hard' | 'soft' | 'cinematic';
   brushSize: number;
@@ -158,6 +158,18 @@ export interface PostTrackingConfig {
   tracks: PostTrackingTrack[];
 }
 
+export interface PostMotionBlurConfig {
+  enabled: boolean;
+  /** 模糊长度（强度） */
+  length: number;
+  /** 模糊角度（度） */
+  angle: number;
+  /** 是否使用 RAFT 光流做逐帧方向性模糊（视频更真实） */
+  useOpticalFlow: boolean;
+  /** 执行引擎 */
+  engine: 'kornia-motion' | 'raft-flow';
+}
+
 export interface PostEffectsState {
   color: PostColorConfig;
   upscale: PostUpscaleConfig;
@@ -166,6 +178,7 @@ export interface PostEffectsState {
   grain: PostGrainConfig;
   matting: PostMattingConfig;
   tracking: PostTrackingConfig;
+  motionBlur: PostMotionBlurConfig;
 }
 
 export interface PostEffectDescriptor {
@@ -185,7 +198,7 @@ export interface PostPatchPreset<T extends string, P> extends PostPresetOption<T
   patch: Partial<P>;
 }
 
-export const POST_EFFECT_ORDER: PostEffectId[] = ['color', 'upscale', 'dof', 'bloom', 'grain', 'matting', 'tracking'];
+export const POST_EFFECT_ORDER: PostEffectId[] = ['color', 'upscale', 'dof', 'bloom', 'grain', 'matting', 'tracking', 'motionBlur'];
 
 export const POST_EFFECT_DESCRIPTORS: Record<PostEffectId, PostEffectDescriptor> = {
   color: {
@@ -236,6 +249,13 @@ export const POST_EFFECT_DESCRIPTORS: Record<PostEffectId, PostEffectDescriptor>
     shortLabel: '跟踪',
     description: '为贴图、视频叠加和运动绑定提供基础参数，并兼容后续 CoTracker3 自动跟踪执行。',
     latestRoute: 'Manual Composite / CoTracker3 Adapter',
+  },
+  motionBlur: {
+    id: 'motionBlur',
+    label: '运动模糊',
+    shortLabel: '运动模糊',
+    description: '基于 RAFT 光流与 Kornia 运动核的方向性电影感模糊，可全局角度模糊或由光流逐帧驱动。',
+    latestRoute: 'RAFT Optical Flow / Kornia Motion Kernel',
   },
 };
 
@@ -430,6 +450,13 @@ export function createDefaultPostEffects(): PostEffectsState {
       occlusionAware: false,
       tracks: [],
     },
+    motionBlur: {
+      enabled: false,
+      length: 18,
+      angle: 0,
+      useOpticalFlow: false,
+      engine: 'kornia-motion',
+    },
   };
 }
 
@@ -480,6 +507,7 @@ export function mergePostEffects(partial: Partial<PostEffectsState> | null | und
           }))
         : defaults.tracking.tracks,
     },
+    motionBlur: { ...defaults.motionBlur, ...(partial.motionBlur || {}) },
   };
 }
 

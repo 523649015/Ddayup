@@ -1,6 +1,6 @@
-﻿import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type CSSProperties, type ReactNode } from 'react';
+﻿import { useCallback, useEffect, useMemo, useRef, useState, createContext, useContext, lazy, Suspense, memo, type ChangeEvent, type CSSProperties, type ReactNode } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
-import { Activity, Aperture, BarChart3, ChevronDown, ChevronRight, Clapperboard, Layers3, Link2, Loader2, RotateCcw, Settings2, Sparkles } from 'lucide-react';
+import { Activity, Aperture, BarChart3, ChevronDown, ChevronRight, Clapperboard, Layers3, Link2, Loader2, RotateCcw, Settings2, Sparkles, Wand2 } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import {
   POST_BLOOM_PRESETS,
@@ -25,6 +25,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { useNodeFloatingPanel } from '@/hooks/useNodeFloatingPanel';
 import { toRenderableAssetUrl } from '@/services/generation';
 import {
@@ -32,1735 +33,65 @@ import {
   buildPostPreviewDescriptor,
   validateMattingSetup,
 } from '@/services/localPostProcessing';
-import { readLocalMediaBlob, registerLocalMedia } from '@/services/localMediaRegistry';
+import {
+  applyCinematicOneClick,
+  type CinematicStrength,
+} from '@/services/postFX/pipeline';
+import { applyMotionBlur, loadRaftModel, estimateOpticalFlowRAFT, isRaftReady, propagateAlphaByFlow } from '@/services/postFX/motionBlur';
+import { applyCinematicFrame } from '@/services/postFX/pipeline';
+import { removeBackground, composeRgbaFromAlpha, type MattingModelId } from '@/services/postFX/matting';
+import { clamp } from '@/services/postFX/util';
+
+// 多主体抠图面板按需加载（不打进主包，避免画布操作卡顿）
+const MattingCapabilityPanel = lazy(() => import('@/components/image-tools/panels/MattingCapabilityPanel'));
+import type { MattingExtractResult } from '@/components/image-tools/panels/MattingCapabilityPanel';
+import { isDepthModelReady } from '@/services/depthEstimation';
+import { analyzeAutoGrade } from '@/services/postFX/autoGrade';
+import { readLocalMediaBlob, registerLocalMedia, ensureLocalMediaUrl, isLocalMediaHandle } from '@/services/localMediaRegistry';
+import { loadModel } from '@/services/modelLoader';
+import { applyMotionBlurVideoLocally } from '@/services/ffmpegPipeline';
+import { applyGpuMotionBlurVideoLocally, isGpuMotionBlurSupported } from '@/services/postFX/gpuMotionBlur';
+import { hasLocalModelRunner } from '@/services/localModelRunner';
+import { activateLocalModel } from '@/services/localInference';
+import { PRESET_MODELS } from '@/config/presetModels';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useCanvasStore } from '@/store/useCanvasStore';
 import { EditableNodeTitle } from './EditableNodeTitle';
 import { ErrorDetailBlock, ProgressBadge, StatusBadge } from './NodeShellShared';
 
-type PostPanelKind = 'post-panel';
-type PostFieldTestId = string | undefined;
-type CurveChannelKey = 'master' | 'red' | 'green' | 'blue';
-type ColorPanelSectionId = 'console' | 'wheels' | 'workspace';
-
-const CURVE_EDITOR_SIZE = { width: 176, height: 132 };
-const CURVE_CHANNEL_COLORS: Record<CurveChannelKey, string> = {
-  master: '#e7e7e7',
-  red: '#f87171',
-  green: '#4ade80',
-  blue: '#60a5fa',
-};
-
-function stopCanvasPointer(event: { stopPropagation: () => void }) {
-  event.stopPropagation();
-}
-
-function preventCanvasPointer(event: { preventDefault: () => void; stopPropagation: () => void }) {
-  event.preventDefault();
-  event.stopPropagation();
-}
-
-function sliderTrackClass() {
-  return 'nodrag nopan nowheel h-2 w-full cursor-ew-resize touch-none appearance-none rounded-full bg-[#20252b] accent-[#00d4aa]';
-}
-
-function workspaceTabClass(active: boolean) {
-  return active
-    ? 'border-[#5d827d] bg-[#17312b] text-[#d8fff7] shadow-[0_0_0_1px_rgba(0,212,170,0.12)]'
-    : 'border-[#34383d] bg-[#1a1d21] text-[#cfd8e1] hover:border-[#46515d] hover:bg-[#23282d]';
-}
-
-function cloneCurvePoints(points: PostCurvePoint[]) {
-  return points.map((point) => ({ x: point.x, y: point.y }));
-}
-
-function sanitizeCurvePoints(points: PostCurvePoint[] | undefined, fallback: PostCurvePoint[]) {
-  if (!Array.isArray(points) || points.length < 2) {
-    return cloneCurvePoints(fallback);
-  }
-  const normalized = points
-    .map((point, index) => ({
-      x: index === 0 ? 0 : index === points.length - 1 ? 1 : Math.min(1, Math.max(0, Number(point?.x ?? 0))),
-      y: index === 0 ? 0 : index === points.length - 1 ? 1 : Math.min(1, Math.max(0, Number(point?.y ?? 0))),
-    }))
-    .sort((left, right) => left.x - right.x);
-  normalized[0] = { x: 0, y: 0 };
-  normalized[normalized.length - 1] = { x: 1, y: 1 };
-  for (let index = 1; index < normalized.length - 1; index += 1) {
-    const prev = normalized[index - 1];
-    const next = normalized[index + 1];
-    normalized[index].x = Math.min(next.x - 0.04, Math.max(prev.x + 0.04, normalized[index].x));
-  }
-  return normalized;
-}
-
-function presetCurvePoints(preset: string, channel: CurveChannelKey): PostCurvePoint[] {
-  if (preset === 'soft-contrast') return [{ x: 0, y: 0 }, { x: 0.2, y: 0.14 }, { x: 0.5, y: 0.54 }, { x: 0.76, y: 0.88 }, { x: 1, y: 1 }];
-  if (preset === 'film-s') return [{ x: 0, y: 0 }, { x: 0.18, y: 0.1 }, { x: 0.4, y: 0.44 }, { x: 0.74, y: 0.88 }, { x: 1, y: 1 }];
-  if (preset === 'lifted-matte') return [{ x: 0, y: 0.06 }, { x: 0.22, y: 0.2 }, { x: 0.55, y: 0.58 }, { x: 0.78, y: 0.84 }, { x: 1, y: 0.97 }];
-  if (preset === 'film-warm' && channel === 'red') return [{ x: 0, y: 0.01 }, { x: 0.45, y: 0.48 }, { x: 0.82, y: 0.9 }, { x: 1, y: 1 }];
-  if (preset === 'teal-shadows') {
-    if (channel === 'blue') return [{ x: 0, y: 0.07 }, { x: 0.3, y: 0.34 }, { x: 0.72, y: 0.8 }, { x: 1, y: 1 }];
-    if (channel === 'red') return [{ x: 0, y: 0 }, { x: 0.28, y: 0.22 }, { x: 0.68, y: 0.66 }, { x: 1, y: 1 }];
-  }
-  if (preset === 'crisp-highlights') return [{ x: 0, y: 0 }, { x: 0.6, y: 0.62 }, { x: 0.86, y: 0.92 }, { x: 1, y: 1 }];
-  if (preset === 'film-balance' && channel === 'green') return [{ x: 0, y: 0 }, { x: 0.22, y: 0.2 }, { x: 0.7, y: 0.74 }, { x: 1, y: 1 }];
-  if (preset === 'lift-shadows') return [{ x: 0, y: 0.05 }, { x: 0.16, y: 0.18 }, { x: 0.62, y: 0.66 }, { x: 1, y: 1 }];
-  if (preset === 'cool-highlights' && channel === 'blue') return [{ x: 0, y: 0 }, { x: 0.66, y: 0.72 }, { x: 1, y: 1 }];
-  return [{ x: 0, y: 0 }, { x: 0.25, y: 0.25 }, { x: 0.5, y: 0.5 }, { x: 0.75, y: 0.75 }, { x: 1, y: 1 }];
-}
-
-function readSourceAssetFromNode(node: { type: string; data: Record<string, unknown> } | null) {
-  if (!node) return null;
-
-  const outputs = Array.isArray(node.data.outputs) ? node.data.outputs as Array<Record<string, unknown>> : [];
-  const outputImage = outputs.find((item) => item?.type === 'image' && typeof item.url === 'string');
-  const outputVideo = outputs.find((item) => item?.type === 'video' && typeof item.url === 'string');
-
-  if (outputImage?.url) return { kind: 'image' as const, url: String(outputImage.url) };
-  if (outputVideo?.url) return { kind: 'video' as const, url: String(outputVideo.url) };
-
-  if (node.type === 'image' && typeof node.data.imageUrl === 'string' && node.data.imageUrl.trim()) {
-    return { kind: 'image' as const, url: node.data.imageUrl.trim() };
-  }
-  if (node.type === 'video' && typeof node.data.videoUrl === 'string' && node.data.videoUrl.trim()) {
-    return { kind: 'video' as const, url: node.data.videoUrl.trim() };
-  }
-
-  return null;
-}
-
-function normalizePostLabel(value: unknown, fallback = '后期节点') {
-  const text = String(value || '').trim();
-  if (!text) return fallback;
-  const normalized = text.toLowerCase();
-  if (
-    normalized === 'post'
-    || normalized === 'post node'
-    || normalized === 'post-production'
-    || normalized === 'post production'
-    || normalized === '后期'
-    || normalized === '后期节点'
-  ) {
-    return fallback;
-  }
-  return text;
-}
-
-function useMediaNaturalSize(kind: PostMediaKind | null, url: string) {
-  const [meta, setMeta] = useState<{ width: number; height: number; duration: number }>({
-    width: 1280,
-    height: 720,
-    duration: 0,
-  });
-
-  useEffect(() => {
-    let disposed = false;
-    const nextUrl = String(url || '').trim();
-    if (!kind || !nextUrl) return;
-
-    if (kind === 'image') {
-      const image = new window.Image();
-      image.onload = () => {
-        if (disposed) return;
-        setMeta({
-          width: image.naturalWidth || image.width || 1280,
-          height: image.naturalHeight || image.height || 720,
-          duration: 0,
-        });
-      };
-      image.src = nextUrl;
-      return () => {
-        disposed = true;
-      };
-    }
-
-    const video = document.createElement('video');
-    video.preload = 'metadata';
-    video.onloadedmetadata = () => {
-      if (disposed) return;
-      setMeta({
-        width: video.videoWidth || 1280,
-        height: video.videoHeight || 720,
-        duration: Number.isFinite(video.duration) ? video.duration : 0,
-      });
-      video.removeAttribute('src');
-      video.load();
-    };
-    video.src = nextUrl;
-    return () => {
-      disposed = true;
-      video.removeAttribute('src');
-      video.load();
-    };
-  }, [kind, url]);
-
-  return meta;
-}
-
-function previewViewportSize(kind: PostMediaKind | null, meta: { width: number; height: number }) {
-  const ratio = kind && meta.height > 0 ? meta.width / meta.height : 16 / 9;
-  if (ratio >= 1) {
-    const width = 504;
-    return { width, height: Math.max(252, Math.round(width / ratio)) };
-  }
-  const height = 330;
-  return { width: Math.max(220, Math.round(height * ratio)), height };
-}
-
-function FieldLabel({ title, note }: { title: string; note?: string }) {
-  return (
-    <div className="mb-1 flex items-center justify-between gap-3 text-[11px] text-[#cfcfcf]">
-      <span>{title}</span>
-      {note ? null : null}
-    </div>
-  );
-}
-
-function PanelSection({
-  title,
-  note,
-  children,
-  className = '',
-}: {
-  title: string;
-  note?: string;
-  children: any;
-  className?: string;
-}) {
-  return (
-    <section className={`rounded-[24px] border border-[#2d3236] bg-[linear-gradient(180deg,#161a1e_0%,#0f1215_100%)] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] ${className}`}>
-      <div className="mb-3 flex items-start justify-between gap-3">
-        <div>
-          <div className="text-sm font-medium text-[#eef3f8]">{title}</div>
-          {note ? null : null}
-        </div>
-      </div>
-      {children}
-    </section>
-  );
-}
-
-function CollapsiblePanelSection({
-  title,
-  note,
-  collapsed,
-  onToggle,
-  children,
-  className = '',
-  actions,
-}: {
-  title: string;
-  note?: string;
-  collapsed: boolean;
-  onToggle: () => void;
-  children: ReactNode;
-  className?: string;
-  actions?: ReactNode;
-}) {
-  return (
-    <section className={`rounded-[24px] border border-[#2d3236] bg-[linear-gradient(180deg,#161a1e_0%,#0f1215_100%)] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] ${className}`}>
-      <div className="flex items-start justify-between gap-3">
-        <button
-          type="button"
-          className="nodrag flex flex-1 items-start gap-3 text-left"
-          onPointerDown={stopCanvasPointer}
-          onClick={onToggle}
-        >
-          <span className="mt-0.5 rounded-full border border-[#2d3236] bg-[#11161a] p-1 text-[#c7d2da]">
-            {collapsed ? <ChevronRight className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-          </span>
-          <span>
-            <span className="block text-sm font-medium text-[#eef3f8]">{title}</span>
-            {note ? null : null}
-          </span>
-        </button>
-        {actions ? <div className="shrink-0">{actions}</div> : null}
-      </div>
-      {!collapsed ? <div className="mt-3">{children}</div> : null}
-    </section>
-  );
-}
-
-function WheelCard({
-  title,
-  color,
-  onColorChange,
-  amount,
-  onAmountChange,
-  colorTestId,
-  amountTestId,
-}: {
-  title: string;
-  color: string;
-  onColorChange: (value: string) => void;
-  amount: number;
-  onAmountChange: (value: number) => void;
-  colorTestId?: PostFieldTestId;
-  amountTestId?: PostFieldTestId;
-}) {
-  return (
-    <div className="rounded-[18px] border border-[#2d3236] bg-[#121518] p-3">
-      <ColorSwatchField title={title} value={color} onChange={onColorChange} testId={colorTestId} />
-      <div className="mt-3">
-        <SliderField title={`${title}权重`} value={amount} min={0} max={1} step={0.01} onChange={onAmountChange} testId={amountTestId} />
-      </div>
-    </div>
-  );
-}
-
-function SliderField({
-  title,
-  value,
-  min,
-  max,
-  step = 0.01,
-  format,
-  onChange,
-  testId,
-}: {
-  title: string;
-  value: number;
-  min: number;
-  max: number;
-  step?: number;
-  format?: (value: number) => string;
-  onChange: (value: number) => void;
-  testId?: PostFieldTestId;
-}) {
-  const [draftValue, setDraftValue] = useState(value);
-  const draggingRef = useRef(false);
-  const syncDraftValue = useCallback((nextRawValue: string | number) => {
-    const nextValue = Number(nextRawValue);
-    if (!Number.isFinite(nextValue)) return;
-    setDraftValue(nextValue);
-    if (!draggingRef.current) {
-      onChange(nextValue);
-    }
-  }, [onChange]);
-
-  useEffect(() => {
-    if (!draggingRef.current) {
-      setDraftValue(value);
-    }
-  }, [value]);
-
-  const note = format ? format(draftValue) : draftValue.toFixed(step >= 1 ? 0 : 2);
-  const commitDraft = useCallback(() => {
-    if (!draggingRef.current) return;
-    draggingRef.current = false;
-    onChange(draftValue);
-  }, [draftValue, onChange]);
-
-  return (
-    <label className="block rounded-2xl border border-[#2d3236] bg-[#121518] px-3 py-3 text-xs text-[#c9d2db]">
-      <FieldLabel title={title} note={note} />
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={Number.isFinite(draftValue) ? draftValue : min}
-        onPointerDown={(event) => {
-          stopCanvasPointer(event);
-          draggingRef.current = true;
-        }}
-        onMouseDown={stopCanvasPointer}
-        onTouchStart={stopCanvasPointer}
-        onInput={(event) => syncDraftValue((event.target as HTMLInputElement).value)}
-        onChange={(event) => syncDraftValue(event.target.value)}
-        onPointerUp={() => commitDraft()}
-        onMouseUp={() => commitDraft()}
-        onTouchEnd={() => commitDraft()}
-        onBlur={() => commitDraft()}
-        aria-valuetext={note}
-        data-testid={testId}
-        className={sliderTrackClass()}
-      />
-    </label>
-  );
-}
-
-function ToggleField({
-  title,
-  checked,
-  onChange,
-  testId,
-}: {
-  title: string;
-  checked: boolean;
-  onChange: (value: boolean) => void;
-  testId?: PostFieldTestId;
-}) {
-  return (
-    <label className="flex items-center justify-between rounded-2xl border border-[#2d3236] bg-[#121518] px-3 py-3 text-sm text-[#eef3f8]">
-      <span>{title}</span>
-      <input
-        type="checkbox"
-        checked={checked}
-        onChange={(event) => onChange(event.target.checked)}
-        onPointerDown={stopCanvasPointer}
-        data-testid={testId}
-        className="nodrag h-4 w-4 accent-[#00d4aa]"
-      />
-    </label>
-  );
-}
-
-function SelectField({
-  title,
-  value,
-  options,
-  onChange,
-  testId,
-}: {
-  title: string;
-  value: string;
-  options: Array<{ value: string; label: string }>;
-  onChange: (value: string) => void;
-  testId?: PostFieldTestId;
-}) {
-  const selectedLabel = options.find((option) => option.value === value)?.label;
-  return (
-    <div className="block">
-      <FieldLabel title={title} note={selectedLabel} />
-      <Select value={value} onValueChange={onChange}>
-        <SelectTrigger
-          onPointerDown={stopCanvasPointer}
-          onClick={stopCanvasPointer}
-          data-testid={testId}
-          className="nodrag nopan nowheel h-11 w-full rounded-2xl border border-[#2d3236] bg-[#121518] px-3 text-sm text-[#eef3f8] shadow-none hover:border-[#46515d] hover:bg-[#1b2024] focus:border-[#00d4aa]/45 focus:ring-0"
-        >
-          <SelectValue placeholder="请选择" />
-        </SelectTrigger>
-        <SelectContent
-          position="popper"
-          align="start"
-          onPointerDown={stopCanvasPointer}
-          className="nodrag nopan nowheel z-[1200] min-w-[var(--radix-select-trigger-width)] rounded-2xl border border-[#2d3236] bg-[#15191d] text-[#eef3f8]"
-        >
-        {options.map((option) => (
-          <SelectItem
-            key={option.value}
-            value={option.value}
-            onPointerDown={stopCanvasPointer}
-            data-option-value={option.value}
-            className="nodrag text-[#eef3f8] focus:bg-[#1d2427] focus:text-white data-[state=checked]:bg-[#163730] data-[state=checked]:text-[#dffff5]"
-          >
-            {option.label}
-          </SelectItem>
-        ))}
-        </SelectContent>
-      </Select>
-    </div>
-  );
-}
-
-function ColorSwatchField({
-  title,
-  value,
-  onChange,
-  testId,
-}: {
-  title: string;
-  value: string;
-  onChange: (value: string) => void;
-  testId?: PostFieldTestId;
-}) {
-  const normalized = String(value || '#ffffff');
-  const hex = normalized.startsWith('#') ? normalized : `#${normalized}`;
-  return (
-    <label className="block">
-      <FieldLabel title={title} note={hex.toUpperCase()} />
-      <div className="flex items-center gap-4 rounded-2xl border border-[#2d3236] bg-[#121518] px-3 py-3">
-        <div className="relative h-24 w-24 shrink-0">
-          <div className="absolute inset-0 rounded-full bg-[conic-gradient(from_180deg,rgba(255,0,0,1),rgba(255,255,0,1),rgba(0,255,0,1),rgba(0,255,255,1),rgba(0,0,255,1),rgba(255,0,255,1),rgba(255,0,0,1))]" />
-          <div className="absolute inset-[12%] rounded-full bg-[radial-gradient(circle_at_center,rgba(255,255,255,1)_0%,rgba(255,255,255,0.96)_20%,rgba(255,255,255,0)_72%)]" />
-          <div className="absolute inset-[28%] rounded-full border border-white/12 shadow-[inset_0_0_24px_rgba(255,255,255,0.18)]" style={{ backgroundColor: hex }} />
-          <div className="pointer-events-none absolute left-1/2 top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/90 shadow-[0_0_0_2px_rgba(0,0,0,0.35)]" style={{ backgroundColor: hex }} />
-          <input
-            type="color"
-            value={hex}
-            onChange={(event) => onChange(event.target.value)}
-            onPointerDown={stopCanvasPointer}
-            data-testid={testId}
-            className="nodrag absolute inset-0 cursor-pointer rounded-full opacity-0"
-          />
-        </div>
-        <div className="space-y-2 text-xs leading-5 text-[#95a1ac]">
-          <div>点击圆盘挑色，色轮偏色会参与 lift / gamma / gain / offset 的实际调色矩阵。</div>
-          <div className="inline-flex rounded-full border border-[#2d3236] bg-[#0f1317] px-2.5 py-1 font-medium tracking-[0.12em] text-[#dfe7ee]">
-            {hex.toUpperCase()}
-          </div>
-        </div>
-      </div>
-    </label>
-  );
-}
-
-function CurveEditorField({
-  title,
-  channel,
-  points,
-  onChange,
-  onReset,
-  testId,
-}: {
-  title: string;
-  channel: CurveChannelKey;
-  points: PostCurvePoint[];
-  onChange: (value: PostCurvePoint[]) => void;
-  onReset: () => void;
-  testId?: PostFieldTestId;
-}) {
-  const svgRef = useRef<SVGSVGElement | null>(null);
-  const dragIndexRef = useRef<number | null>(null);
-  const safePoints = useMemo(() => sanitizeCurvePoints(points, presetCurvePoints('linear', channel)), [points, channel]);
-  const stroke = CURVE_CHANNEL_COLORS[channel];
-  const chartWidth = CURVE_EDITOR_SIZE.width;
-  const chartHeight = CURVE_EDITOR_SIZE.height;
-
-  const commitPoint = useCallback((clientX: number, clientY: number) => {
-    const dragIndex = dragIndexRef.current;
-    const svg = svgRef.current;
-    if (dragIndex === null || !svg) return;
-    const rect = svg.getBoundingClientRect();
-    const nextX = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
-    const nextY = Math.min(1, Math.max(0, 1 - (clientY - rect.top) / rect.height));
-    const nextPoints = safePoints.map((point, index) => {
-      if (index !== dragIndex) return { ...point };
-      if (index === 0) return { x: 0, y: 0 };
-      if (index === safePoints.length - 1) return { x: 1, y: 1 };
-      const prev = safePoints[index - 1];
-      const next = safePoints[index + 1];
-      return {
-        x: Math.min(next.x - 0.04, Math.max(prev.x + 0.04, nextX)),
-        y: nextY,
-      };
-    });
-    onChange(sanitizeCurvePoints(nextPoints, presetCurvePoints('linear', channel)));
-  }, [channel, onChange, safePoints]);
-
-  useEffect(() => {
-    function handlePointerMove(event: PointerEvent) {
-      if (dragIndexRef.current === null) return;
-      commitPoint(event.clientX, event.clientY);
-    }
-    function handlePointerUp() {
-      dragIndexRef.current = null;
-    }
-    window.addEventListener('pointermove', handlePointerMove);
-    window.addEventListener('pointerup', handlePointerUp);
-    return () => {
-      window.removeEventListener('pointermove', handlePointerMove);
-      window.removeEventListener('pointerup', handlePointerUp);
-    };
-  }, [commitPoint]);
-
-  const pathD = safePoints
-    .map((point, index) => {
-      const x = point.x * chartWidth;
-      const y = (1 - point.y) * chartHeight;
-      return `${index === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
-    })
-    .join(' ');
-
-  return (
-    <div className="rounded-xl border border-white/8 bg-[#0f0f10] p-3" data-testid={testId}>
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <div>
-          <div className="text-xs font-medium text-[#ececec]">{title}</div>
-          <div className="text-[11px] text-[#8f8f8f]">拖动控制点会直接写入真实曲线，不再只靠预设名称。</div>
-        </div>
-        <button
-          type="button"
-          className="rounded-lg border border-white/10 px-2 py-1 text-[11px] text-[#d8d8d8] hover:bg-white/8"
-          onPointerDown={stopCanvasPointer}
-          onClick={onReset}
-        >
-          重置
-        </button>
-      </div>
-      <svg
-        ref={svgRef}
-        width={chartWidth}
-        height={chartHeight}
-        viewBox={`0 0 ${chartWidth} ${chartHeight}`}
-        onPointerDown={stopCanvasPointer}
-        className="nodrag block w-full overflow-visible rounded-lg border border-white/8 bg-[#090909]"
-      >
-        {[0.25, 0.5, 0.75].map((mark) => (
-          <g key={mark}>
-            <line x1={mark * chartWidth} y1={0} x2={mark * chartWidth} y2={chartHeight} stroke="rgba(255,255,255,0.08)" strokeWidth="1" />
-            <line x1={0} y1={mark * chartHeight} x2={chartWidth} y2={mark * chartHeight} stroke="rgba(255,255,255,0.08)" strokeWidth="1" />
-          </g>
-        ))}
-        <line x1={0} y1={chartHeight} x2={chartWidth} y2={0} stroke="rgba(255,255,255,0.18)" strokeWidth="1" strokeDasharray="4 4" />
-        <path d={pathD} fill="none" stroke={stroke} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
-        {safePoints.map((point, index) => {
-          const x = point.x * chartWidth;
-          const y = (1 - point.y) * chartHeight;
-          const locked = index === 0 || index === safePoints.length - 1;
-          return (
-            <g key={`${channel}-${index}`} transform={`translate(${x}, ${y})`}>
-              <circle r="7" fill="rgba(0,0,0,0.72)" stroke={stroke} strokeWidth="1.5" />
-              <circle
-                r="11"
-                fill="transparent"
-                className={locked ? 'cursor-default' : 'cursor-grab'}
-                onPointerDown={(event) => {
-                  stopCanvasPointer(event);
-                  if (locked) return;
-                  dragIndexRef.current = index;
-                  commitPoint(event.clientX, event.clientY);
-                }}
-              />
-            </g>
-          );
-        })}
-      </svg>
-      <div className="mt-2 flex items-center justify-between text-[11px] text-[#8f8f8f]">
-        <span>阴影</span>
-        <span>中间调</span>
-        <span>高光</span>
-      </div>
-    </div>
-  );
-}
-
-type ScopeStats = {
-  histR: number[];
-  histG: number[];
-  histB: number[];
-  histLuma: number[];
-  waveformMin: number[];
-  waveformMax: number[];
-  waveformAvg: number[];
-  paradeR: number[];
-  paradeG: number[];
-  paradeB: number[];
-  vectorscopePoints: Array<{ x: number; y: number; color: string; alpha: number }>;
-  sampleLabel: string;
-  sampleMoments: number[];
-  sampleMode: 'image' | 'video';
-};
-
-type ScopeSampleDensity = 'sparse' | 'standard' | 'dense';
-
-type LocalPostBackendStatus = {
-  configured: boolean;
-  commandConfigured: boolean;
-  detectedPath: string;
-  detectedConfigPath?: string;
-  wrapperScript: string;
-  exampleRuntimePath: string;
-  runtimeName?: string;
-  envPath?: string;
-  envCommand?: string;
-  docsUrl?: string;
-  downloadUrl?: string;
-  installHint?: string;
-  successHint?: string;
-  commonInstallPaths?: string[];
-  supportsImage?: boolean;
-  supportsVideo?: boolean;
-};
-
-type RuntimeUpdateStatus = {
-  supported: boolean;
-  checkedAt: string;
-  sourceLabel: string;
-  releaseUrl: string;
-  latestVersion: string;
-  installedVersion: string;
-  updateAvailable: boolean;
-  status: 'error' | 'unknown' | 'latest-known' | 'up-to-date' | 'update-available';
-  summary: string;
-  error: string;
-};
-
-type LocalPostDoctorRuntime = {
-  runtimeKey: string;
-  runtimeName: string;
-  status: 'ok' | 'warn' | 'error';
-  summary: string;
-  detectedPath?: string;
-  detectedConfigPath?: string;
-  executableVerified?: boolean;
-  runtimeConfigured?: boolean;
-  commandConfigured?: boolean;
-  installedVersion?: string;
-  checkedCommand?: string[];
-  stdout?: string;
-  stderr?: string;
-  elapsedMs?: number;
-  configVerified?: boolean;
-  configReadable?: boolean;
-  configSummary?: string;
-  configStdout?: string;
-  configStderr?: string;
-  suggestions?: string[];
-  update?: RuntimeUpdateStatus;
-};
-
-type LocalPostDoctorReport = {
-  checkedAt: string;
-  runtimes: {
-    ocio?: LocalPostDoctorRuntime;
-    oiio?: LocalPostDoctorRuntime;
-    gmic?: LocalPostDoctorRuntime;
-  };
-};
-
-type PostHealthStatus = {
-  ocio: LocalPostBackendStatus | null;
-  oiio: LocalPostBackendStatus | null;
-  gmic: LocalPostBackendStatus | null;
-  upscale: Record<string, LocalPostBackendStatus>;
-};
-
-type OcioSetupValidation = {
-  severity: 'ok' | 'warn' | 'error';
-  title: string;
-  details: string[];
-};
-
-type OcioConfigInspection = {
-  status: 'idle' | 'loading' | 'ok' | 'warn' | 'error';
-  title: string;
-  details: string[];
-  detectedSections: string[];
-  profileVersion: string;
-  formatLabel: string;
-};
-
-const SUPPORTED_OCIO_CONFIG_EXTENSIONS = ['.ocio', '.yaml', '.yml', '.json', '.cfg', '.txt'] as const;
-const VECTORSCOPE_HUE_TARGET_PRESETS = {
-  'rec709': [
-    { label: 'R', degrees: 0, color: 'rgba(248,113,113,0.92)' },
-    { label: 'Mg', degrees: 58, color: 'rgba(217,70,239,0.92)' },
-    { label: 'B', degrees: 122, color: 'rgba(96,165,250,0.92)' },
-    { label: 'Cy', degrees: 180, color: 'rgba(34,211,238,0.92)' },
-    { label: 'G', degrees: 238, color: 'rgba(74,222,128,0.92)' },
-    { label: 'Yl', degrees: 302, color: 'rgba(250,204,21,0.92)' },
-  ],
-  'ebu': [
-    { label: 'R', degrees: 0, color: 'rgba(248,113,113,0.92)' },
-    { label: 'Mg', degrees: 63, color: 'rgba(217,70,239,0.92)' },
-    { label: 'B', degrees: 128, color: 'rgba(96,165,250,0.92)' },
-    { label: 'Cy', degrees: 186, color: 'rgba(34,211,238,0.92)' },
-    { label: 'G', degrees: 246, color: 'rgba(74,222,128,0.92)' },
-    { label: 'Yl', degrees: 309, color: 'rgba(250,204,21,0.92)' },
-  ],
-  'smpte-c': [
-    { label: 'R', degrees: 0, color: 'rgba(248,113,113,0.92)' },
-    { label: 'Mg', degrees: 54, color: 'rgba(217,70,239,0.92)' },
-    { label: 'B', degrees: 117, color: 'rgba(96,165,250,0.92)' },
-    { label: 'Cy', degrees: 175, color: 'rgba(34,211,238,0.92)' },
-    { label: 'G', degrees: 233, color: 'rgba(74,222,128,0.92)' },
-    { label: 'Yl', degrees: 296, color: 'rgba(250,204,21,0.92)' },
-  ],
-} as const;
-
-function rgbToHsl(red: number, green: number, blue: number) {
-  const max = Math.max(red, green, blue);
-  const min = Math.min(red, green, blue);
-  let hue = 0;
-  let saturation = 0;
-  const lightness = (max + min) / 2;
-  const delta = max - min;
-  if (delta > 0.00001) {
-    saturation = lightness > 0.5 ? delta / (2 - max - min) : delta / (max + min);
-    switch (max) {
-      case red:
-        hue = ((green - blue) / delta + (green < blue ? 6 : 0)) / 6;
-        break;
-      case green:
-        hue = ((blue - red) / delta + 2) / 6;
-        break;
-      default:
-        hue = ((red - green) / delta + 4) / 6;
-        break;
-    }
-  }
-  return { hue, saturation, lightness };
-}
-
-function hueToRgb(partial1: number, partial2: number, hue: number) {
-  let nextHue = hue;
-  if (nextHue < 0) nextHue += 1;
-  if (nextHue > 1) nextHue -= 1;
-  if (nextHue < 1 / 6) return partial1 + (partial2 - partial1) * 6 * nextHue;
-  if (nextHue < 1 / 2) return partial2;
-  if (nextHue < 2 / 3) return partial1 + (partial2 - partial1) * (2 / 3 - nextHue) * 6;
-  return partial1;
-}
-
-function hslToRgb(hue: number, saturation: number, lightness: number) {
-  if (saturation <= 0.00001) {
-    return { red: lightness, green: lightness, blue: lightness };
-  }
-  const partial2 = lightness < 0.5 ? lightness * (1 + saturation) : lightness + saturation - lightness * saturation;
-  const partial1 = 2 * lightness - partial2;
-  return {
-    red: hueToRgb(partial1, partial2, hue + 1 / 3),
-    green: hueToRgb(partial1, partial2, hue),
-    blue: hueToRgb(partial1, partial2, hue - 1 / 3),
-  };
-}
-
-function applyScopeLook(redByte: number, greenByte: number, blueByte: number, color: PostEffectsState['color']) {
-  let red = redByte / 255;
-  let green = greenByte / 255;
-  let blue = blueByte / 255;
-  const exposure = 1 + color.exposure * 0.7;
-  red *= exposure;
-  green *= exposure;
-  blue *= exposure;
-  const contrast = 1 + color.contrast * 0.85;
-  red = (red - 0.5) * contrast + 0.5;
-  green = (green - 0.5) * contrast + 0.5;
-  blue = (blue - 0.5) * contrast + 0.5;
-
-  const { hue, saturation, lightness } = rgbToHsl(red, green, blue);
-  const shiftedHue = (hue + color.hue / 360 + 1) % 1;
-  const nextSaturation = Math.max(0, Math.min(1.8, saturation * color.saturation + color.vibrance * 0.16));
-  const nextLightness = Math.max(0, Math.min(1, lightness));
-  const hslRgb = hslToRgb(shiftedHue, nextSaturation, nextLightness);
-  red = hslRgb.red;
-  green = hslRgb.green;
-  blue = hslRgb.blue;
-
-  red += color.temperature * 0.08 + color.tint * 0.02;
-  green += color.tint < 0 ? -color.tint * 0.03 : -color.tint * 0.015;
-  blue += -color.temperature * 0.08 - color.tint * 0.02;
-  red = Math.pow(Math.max(0, red + color.lift * 0.08), 1 / Math.max(0.2, color.gamma)) * color.gain;
-  green = Math.pow(Math.max(0, green + color.lift * 0.05), 1 / Math.max(0.2, color.gamma)) * color.gain;
-  blue = Math.pow(Math.max(0, blue + color.lift * 0.08), 1 / Math.max(0.2, color.gamma)) * color.gain;
-  red += color.offset * 0.06;
-  green += color.offset * 0.04;
-  blue += color.offset * 0.06;
-
-  return {
-    red: Math.max(0, Math.min(1, red)),
-    green: Math.max(0, Math.min(1, green)),
-    blue: Math.max(0, Math.min(1, blue)),
-  };
-}
-
-function buildScopeStats(imageData: ImageData, color: PostEffectsState['color']): ScopeStats {
-  const bins = 64;
-  const columns = 96;
-  const histR = Array.from({ length: bins }, () => 0);
-  const histG = Array.from({ length: bins }, () => 0);
-  const histB = Array.from({ length: bins }, () => 0);
-  const histLuma = Array.from({ length: bins }, () => 0);
-  const waveformMin = Array.from({ length: columns }, () => 1);
-  const waveformMax = Array.from({ length: columns }, () => 0);
-  const waveformSum = Array.from({ length: columns }, () => 0);
-  const waveformCount = Array.from({ length: columns }, () => 0);
-  const paradeR = Array.from({ length: columns }, () => 0);
-  const paradeG = Array.from({ length: columns }, () => 0);
-  const paradeB = Array.from({ length: columns }, () => 0);
-  const paradeCount = Array.from({ length: columns }, () => 0);
-  const vectorscopePoints: Array<{ x: number; y: number; color: string; alpha: number }> = [];
-  const { data, width, height } = imageData;
-
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const index = (y * width + x) * 4;
-      const adjusted = applyScopeLook(data[index], data[index + 1], data[index + 2], color);
-      const luma = adjusted.red * 0.2126 + adjusted.green * 0.7152 + adjusted.blue * 0.0722;
-      histR[Math.min(bins - 1, Math.floor(adjusted.red * bins))] += 1;
-      histG[Math.min(bins - 1, Math.floor(adjusted.green * bins))] += 1;
-      histB[Math.min(bins - 1, Math.floor(adjusted.blue * bins))] += 1;
-      histLuma[Math.min(bins - 1, Math.floor(luma * bins))] += 1;
-      const column = Math.min(columns - 1, Math.floor((x / Math.max(1, width - 1)) * columns));
-      waveformMin[column] = Math.min(waveformMin[column], luma);
-      waveformMax[column] = Math.max(waveformMax[column], luma);
-      waveformSum[column] += luma;
-      waveformCount[column] += 1;
-      paradeR[column] += adjusted.red;
-      paradeG[column] += adjusted.green;
-      paradeB[column] += adjusted.blue;
-      paradeCount[column] += 1;
-
-      if (x % 6 === 0 && y % 6 === 0) {
-        const u = (adjusted.blue - luma) * 0.492;
-        const v = (adjusted.red - luma) * 0.877;
-        vectorscopePoints.push({
-          x: Math.max(0.06, Math.min(0.94, 0.5 + v * 0.62)),
-          y: Math.max(0.06, Math.min(0.94, 0.5 - u * 0.62)),
-          color: `rgb(${Math.round(adjusted.red * 255)}, ${Math.round(adjusted.green * 255)}, ${Math.round(adjusted.blue * 255)})`,
-          alpha: Math.max(0.16, Math.min(0.72, 0.22 + (Math.max(adjusted.red, adjusted.green, adjusted.blue) - Math.min(adjusted.red, adjusted.green, adjusted.blue)) * 0.4)),
-        });
-      }
-    }
-  }
-
-  const normalize = (values: number[]) => {
-    const max = Math.max(1, ...values);
-    return values.map((value) => value / max);
-  };
-
-  return {
-    histR: normalize(histR),
-    histG: normalize(histG),
-    histB: normalize(histB),
-    histLuma: normalize(histLuma),
-    waveformMin,
-    waveformMax,
-    waveformAvg: waveformSum.map((value, index) => waveformCount[index] > 0 ? value / waveformCount[index] : 0),
-    paradeR: paradeR.map((value, index) => paradeCount[index] > 0 ? value / paradeCount[index] : 0),
-    paradeG: paradeG.map((value, index) => paradeCount[index] > 0 ? value / paradeCount[index] : 0),
-    paradeB: paradeB.map((value, index) => paradeCount[index] > 0 ? value / paradeCount[index] : 0),
-    vectorscopePoints,
-    sampleLabel: `${width} x ${height}`,
-    sampleMoments: [0],
-    sampleMode: 'image',
-  };
-}
-
-function mergeScopeStats(statsList: ScopeStats[], options: { sampleLabel: string; sampleMoments: number[]; sampleMode: 'image' | 'video' }): ScopeStats {
-  const fallback = statsList[0];
-  if (!fallback) {
-    return {
-      histR: [],
-      histG: [],
-      histB: [],
-      histLuma: [],
-      waveformMin: [],
-      waveformMax: [],
-      waveformAvg: [],
-      paradeR: [],
-      paradeG: [],
-      paradeB: [],
-      vectorscopePoints: [],
-      sampleLabel: options.sampleLabel,
-      sampleMoments: options.sampleMoments,
-      sampleMode: options.sampleMode,
-    };
-  }
-  const mean = (key: keyof ScopeStats) => {
-    const source = fallback[key] as unknown as number[];
-    return source.map((_, index) => statsList.reduce((sum, item) => sum + (((item[key] as unknown as number[])[index]) || 0), 0) / Math.max(1, statsList.length));
-  };
-  const waveformMin = fallback.waveformMin.map((_, index) => Math.min(...statsList.map((item) => item.waveformMin[index] ?? 1)));
-  const waveformMax = fallback.waveformMax.map((_, index) => Math.max(...statsList.map((item) => item.waveformMax[index] ?? 0)));
-  const vectorscopePoints = statsList.flatMap((item, frameIndex) =>
-    item.vectorscopePoints.filter((_, index) => (index + frameIndex) % 2 === 0),
-  ).slice(0, 2600);
-  return {
-    histR: mean('histR'),
-    histG: mean('histG'),
-    histB: mean('histB'),
-    histLuma: mean('histLuma'),
-    waveformMin,
-    waveformMax,
-    waveformAvg: mean('waveformAvg'),
-    paradeR: mean('paradeR'),
-    paradeG: mean('paradeG'),
-    paradeB: mean('paradeB'),
-    vectorscopePoints,
-    sampleLabel: options.sampleLabel,
-    sampleMoments: options.sampleMoments,
-    sampleMode: options.sampleMode,
-  };
-}
-
-function formatScopeMoment(seconds: number) {
-  if (!Number.isFinite(seconds) || seconds <= 0) return '0.0s';
-  return `${seconds.toFixed(seconds >= 10 ? 0 : 1)}s`;
-}
-
-function isSupportedOcioConfigName(name: string) {
-  const normalized = String(name || '').trim().toLowerCase();
-  return SUPPORTED_OCIO_CONFIG_EXTENSIONS.some((ext) => normalized.endsWith(ext));
-}
-
-function buildSampleMoments(duration: number, density: ScopeSampleDensity) {
-  if (!(duration > 0)) return [0];
-  const ratios = density === 'sparse'
-    ? [0, 0.5, 0.999]
-    : density === 'dense'
-      ? [0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 0.999]
-      : [0, 0.25, 0.5, 0.75, 0.999];
-  return Array.from(new Set(
-    ratios.map((ratio) => Number((ratio >= 0.999 ? Math.max(0, duration - 0.04) : duration * ratio).toFixed(3))),
-  )).sort((left, right) => left - right);
-}
-
-function inspectOcioConfigText(fileName: string, source: string): OcioConfigInspection {
-  const text = String(source || '');
-  const normalizedName = String(fileName || '').trim();
-  const lowerName = normalizedName.toLowerCase();
-  const formatLabel = lowerName.endsWith('.json')
-    ? 'JSON Config'
-    : lowerName.endsWith('.yaml') || lowerName.endsWith('.yml')
-      ? 'YAML Config'
-      : lowerName.endsWith('.cfg') || lowerName.endsWith('.txt')
-        ? '文本 Config'
-        : 'OCIO Config';
-  if (!text.trim()) {
-    return {
-      status: 'error',
-      title: '当前 OCIO Config 文件为空，无法建立可执行结构。',
-      details: ['请导入包含 ocio_profile_version、colorspaces 等结构的有效配置文件。'],
-      detectedSections: [],
-      profileVersion: '',
-      formatLabel,
-    };
-  }
-
-  const sectionLabels = [
-    { key: 'roles', label: 'roles' },
-    { key: 'displays', label: 'displays' },
-    { key: 'views', label: 'views' },
-    { key: 'looks', label: 'looks' },
-    { key: 'colorspaces', label: 'colorspaces' },
-  ] as const;
-
-  let profileVersion = '';
-  let detectedSections: string[] = [];
-  let parseError = '';
-
-  if (lowerName.endsWith('.json')) {
-    try {
-      const parsed = JSON.parse(text) as Record<string, unknown>;
-      const readField = (value: unknown) => {
-        if (typeof value === 'string' || typeof value === 'number') return String(value);
-        return '';
-      };
-      profileVersion = readField(parsed.ocio_profile_version ?? parsed.ocioProfileVersion);
-      detectedSections = sectionLabels
-        .filter(({ key }) => {
-          const value = parsed[key];
-          if (Array.isArray(value)) return value.length > 0;
-          if (value && typeof value === 'object') return Object.keys(value).length > 0;
-          return false;
-        })
-        .map(({ label }) => label);
-    } catch (error) {
-      parseError = error instanceof Error ? error.message : 'json-parse-failed';
-    }
-  } else {
-    const sectionRegex = {
-      roles: /^\s*roles\s*:/im,
-      displays: /^\s*displays\s*:/im,
-      views: /^\s*views\s*:/im,
-      looks: /^\s*looks\s*:/im,
-      colorspaces: /^\s*colorspaces\s*:/im,
-    } as const;
-    const versionMatch = text.match(/^\s*ocio_profile_version\s*:\s*("?)([0-9A-Za-z._-]+)\1/im);
-    profileVersion = versionMatch?.[2] || '';
-    detectedSections = sectionLabels.filter(({ key }) => sectionRegex[key].test(text)).map(({ label }) => label);
-  }
-
-  if (parseError) {
-    return {
-      status: 'error',
-      title: '当前 JSON 版 OCIO Config 解析失败。',
-      details: [
-        `解析错误：${parseError}`,
-        '请确认文件是可读的 JSON，并包含 ocio_profile_version、colorspaces 等必要字段。',
-      ],
-      detectedSections: [],
-      profileVersion: '',
-      formatLabel,
-    };
-  }
-
-  const hasProfile = Boolean(profileVersion);
-  const hasColorspaces = detectedSections.includes('colorspaces');
-  const hasExecutionRouting = detectedSections.some((item) => item === 'roles' || item === 'displays' || item === 'views');
-  if (!hasProfile || !hasColorspaces) {
-    return {
-      status: 'error',
-      title: '当前 OCIO Config 缺少可执行的基础结构。',
-      details: [
-        hasProfile ? `已检测到 profile 版本：${profileVersion}` : '未检测到 ocio_profile_version。',
-        hasColorspaces ? '已检测到 colorspaces。' : '未检测到 colorspaces，外部 Wrapper 无法建立颜色空间映射。',
-        detectedSections.length ? `已识别结构：${detectedSections.join(' / ')}` : '尚未识别到 roles / displays / colorspaces / views 等核心结构。',
-      ],
-      detectedSections,
-      profileVersion,
-      formatLabel,
-    };
-  }
-  if (!hasExecutionRouting) {
-    return {
-      status: 'warn',
-      title: '当前 OCIO Config 具备基础色彩空间定义，但执行路由信息不完整。',
-      details: [
-        `已检测到 profile 版本：${profileVersion}`,
-        '已识别 colorspaces，但缺少 roles / displays / views 之一；可用于基础转换，不利于完整工作室视图链路。',
-        `已识别结构：${detectedSections.join(' / ')}`,
-      ],
-      detectedSections,
-      profileVersion,
-      formatLabel,
-    };
-  }
-  return {
-    status: 'ok',
-    title: '当前 OCIO Config 结构完整，可进入真实执行链路。',
-    details: [
-      `已检测到 profile 版本：${profileVersion}`,
-      `已识别结构：${detectedSections.join(' / ')}`,
-    ],
-    detectedSections,
-    profileVersion,
-    formatLabel,
-  };
-}
-
-function ScopeWorkbench({
-  sourceKind,
-  sourceUrl,
-  color,
-  linkedChannel = 'master',
-  onLinkedChannelChange,
-  testId,
-}: {
-  sourceKind: PostMediaKind | null;
-  sourceUrl: string;
-  color: PostEffectsState['color'];
-  linkedChannel?: CurveChannelKey;
-  onLinkedChannelChange?: (channel: CurveChannelKey) => void;
-  testId?: string;
-}) {
-  const [scopeStats, setScopeStats] = useState<ScopeStats | null>(null);
-  const [frozenScopeStats, setFrozenScopeStats] = useState<ScopeStats | null>(null);
-  const [scopeError, setScopeError] = useState('');
-  const [sampleDensity, setSampleDensity] = useState<ScopeSampleDensity>('standard');
-  const [scopeDuration, setScopeDuration] = useState(0);
-  const [liveFrameMoment, setLiveFrameMoment] = useState(0);
-  const [frozenFrameMoment, setFrozenFrameMoment] = useState<number | null>(null);
-  const [scopeViewMode, setScopeViewMode] = useState<'aggregate' | 'freeze'>('aggregate');
-  const [vectorscopeTargetPreset, setVectorscopeTargetPreset] = useState<'rec709' | 'ebu' | 'smpte-c'>('rec709');
-
-  useEffect(() => {
-    if (sourceKind !== 'video' || !sourceUrl) {
-      setScopeDuration(0);
-      setLiveFrameMoment(0);
-      setFrozenFrameMoment(null);
-      setFrozenScopeStats(null);
-      setScopeViewMode('aggregate');
-      return;
-    }
-    let disposed = false;
-    const video = document.createElement('video');
-    video.crossOrigin = 'anonymous';
-    video.muted = true;
-    video.loop = true;
-    video.playsInline = true;
-    video.preload = 'auto';
-    const handleTime = () => {
-      if (disposed) return;
-      const nextMoment = Number((video.currentTime || 0).toFixed(3));
-      setLiveFrameMoment((current) => Math.abs(current - nextMoment) >= 0.08 ? nextMoment : current);
-    };
-    video.addEventListener('timeupdate', handleTime);
-    video.addEventListener('loadeddata', () => {
-      void video.play().catch(() => undefined);
-    }, { once: true });
-    video.src = sourceUrl;
-    return () => {
-      disposed = true;
-      video.pause();
-      video.removeEventListener('timeupdate', handleTime);
-      video.removeAttribute('src');
-      video.load();
-    };
-  }, [sourceKind, sourceUrl]);
-
-  useEffect(() => {
-    if (!frozenScopeStats && scopeViewMode === 'freeze') {
-      setScopeViewMode('aggregate');
-    }
-  }, [frozenScopeStats, scopeViewMode]);
-
-  useEffect(() => {
-    let disposed = false;
-    async function collectScope() {
-      if (!sourceKind || !sourceUrl) {
-        setScopeStats(null);
-        setScopeError('');
-        setScopeDuration(0);
-        return;
-      }
-      try {
-        const canvas = document.createElement('canvas');
-        canvas.width = 256;
-        canvas.height = 144;
-        const context = canvas.getContext('2d', { willReadFrequently: true });
-        if (!context) throw new Error('canvas-context-missing');
-
-        if (sourceKind === 'image') {
-          const image = new window.Image();
-          image.crossOrigin = 'anonymous';
-          await new Promise<void>((resolve, reject) => {
-            image.onload = () => resolve();
-            image.onerror = () => reject(new Error('scope-image-load-failed'));
-            image.src = sourceUrl;
-          });
-          context.drawImage(image, 0, 0, canvas.width, canvas.height);
-          const stats = buildScopeStats(context.getImageData(0, 0, canvas.width, canvas.height), color);
-          if (disposed) return;
-          setScopeDuration(0);
-          setScopeStats({
-            ...stats,
-            sampleMode: 'image',
-            sampleMoments: [0],
-          });
-        } else {
-          const video = document.createElement('video');
-          video.crossOrigin = 'anonymous';
-          video.muted = true;
-          video.preload = 'auto';
-          await new Promise<void>((resolve, reject) => {
-            video.onloadeddata = () => resolve();
-            video.onerror = () => reject(new Error('scope-video-load-failed'));
-            video.src = sourceUrl;
-          });
-          const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
-          setScopeDuration(duration);
-          const sampleMoments = buildSampleMoments(duration, sampleDensity);
-          const frameStats: ScopeStats[] = [];
-          const frameStatsByMoment = new Map<number, ScopeStats>();
-          for (const moment of sampleMoments) {
-            await new Promise<void>((resolve, reject) => {
-              const targetTime = Math.max(0, Math.min(duration || 0, moment));
-              if (Math.abs((video.currentTime || 0) - targetTime) < 0.02) {
-                resolve();
-                return;
-              }
-              const handleSeeked = () => {
-                video.removeEventListener('seeked', handleSeeked);
-                video.removeEventListener('error', handleError);
-                resolve();
-              };
-              const handleError = () => {
-                video.removeEventListener('seeked', handleSeeked);
-                video.removeEventListener('error', handleError);
-                reject(new Error('scope-video-seek-failed'));
-              };
-              video.addEventListener('seeked', handleSeeked, { once: true });
-              video.addEventListener('error', handleError, { once: true });
-              try {
-                video.currentTime = targetTime;
-              } catch {
-                video.removeEventListener('seeked', handleSeeked);
-                video.removeEventListener('error', handleError);
-                resolve();
-              }
-            });
-            context.clearRect(0, 0, canvas.width, canvas.height);
-            context.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const stats = buildScopeStats(context.getImageData(0, 0, canvas.width, canvas.height), color);
-            frameStats.push(stats);
-            frameStatsByMoment.set(moment, stats);
-          }
-          let frozenStats: ScopeStats | null = null;
-          if (frozenFrameMoment !== null) {
-            const frozenMoment = Number(Math.max(0, Math.min(duration || 0, frozenFrameMoment)).toFixed(3));
-            frozenStats = frameStatsByMoment.get(frozenMoment) || null;
-            if (!frozenStats) {
-              await new Promise<void>((resolve, reject) => {
-                if (Math.abs((video.currentTime || 0) - frozenMoment) < 0.02) {
-                  resolve();
-                  return;
-                }
-                const handleSeeked = () => {
-                  video.removeEventListener('seeked', handleSeeked);
-                  video.removeEventListener('error', handleError);
-                  resolve();
-                };
-                const handleError = () => {
-                  video.removeEventListener('seeked', handleSeeked);
-                  video.removeEventListener('error', handleError);
-                  reject(new Error('scope-video-freeze-seek-failed'));
-                };
-                video.addEventListener('seeked', handleSeeked, { once: true });
-                video.addEventListener('error', handleError, { once: true });
-                try {
-                  video.currentTime = frozenMoment;
-                } catch {
-                  video.removeEventListener('seeked', handleSeeked);
-                  video.removeEventListener('error', handleError);
-                  resolve();
-                }
-              });
-              context.clearRect(0, 0, canvas.width, canvas.height);
-              context.drawImage(video, 0, 0, canvas.width, canvas.height);
-              frozenStats = buildScopeStats(context.getImageData(0, 0, canvas.width, canvas.height), color);
-            }
-          }
-          video.removeAttribute('src');
-          video.load();
-          if (disposed) return;
-          setFrozenScopeStats(frozenStats ? {
-            ...frozenStats,
-            sampleLabel: `${canvas.width} x ${canvas.height} · 冻结帧 ${formatScopeMoment(frozenFrameMoment ?? 0)}`,
-            sampleMoments: frozenFrameMoment === null ? [] : [Number(frozenFrameMoment.toFixed(3))],
-            sampleMode: 'video',
-          } : null);
-          setScopeStats(mergeScopeStats(frameStats, {
-            sampleLabel: `${canvas.width} x ${canvas.height} · ${frameStats.length} 帧`,
-            sampleMoments,
-            sampleMode: 'video',
-          }));
-        }
-        setScopeError('');
-      } catch (error) {
-        if (disposed) return;
-        setScopeStats(null);
-        setScopeError(error instanceof Error ? error.message : 'scope-unavailable');
-      }
-    }
-    void collectScope();
-    return () => {
-      disposed = true;
-    };
-  }, [color, frozenFrameMoment, sampleDensity, sourceKind, sourceUrl]);
-
-  const histogramPath = useCallback((values: number[]) => values.map((value, index) => {
-    const x = (index / Math.max(1, values.length - 1)) * 320;
-    const y = 120 - value * 112;
-    return `${index === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
-  }).join(' '), []);
-
-  const waveformPath = useCallback((values: number[]) => values.map((value, index) => {
-    const x = (index / Math.max(1, values.length - 1)) * 320;
-    const y = 120 - value * 112;
-    return `${index === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
-  }).join(' '), []);
-  const skinToneAngle = -33 * Math.PI / 180;
-  const skinToneX = 160 + Math.cos(skinToneAngle) * 58;
-  const skinToneY = 60 + Math.sin(skinToneAngle) * 42;
-  const displayedScopeStats = scopeViewMode === 'freeze' && frozenScopeStats ? frozenScopeStats : scopeStats;
-  const vectorscopeTargets = VECTORSCOPE_HUE_TARGET_PRESETS[vectorscopeTargetPreset];
-  const linkedChannelLabel = linkedChannel === 'red'
-    ? '红通道'
-    : linkedChannel === 'green'
-      ? '绿通道'
-      : linkedChannel === 'blue'
-        ? '蓝通道'
-        : '主曲线';
-  const channelTone = {
-    master: {
-      hist: ['rgba(255,255,255,0.72)', 'rgba(248,113,113,0.95)', 'rgba(74,222,128,0.95)', 'rgba(96,165,250,0.95)'],
-      paradeOpacity: [1, 1, 1],
-      paradeStrokeWidth: [1.6, 1.6, 1.6],
-    },
-    red: {
-      hist: ['rgba(255,255,255,0.18)', 'rgba(248,113,113,0.98)', 'rgba(74,222,128,0.22)', 'rgba(96,165,250,0.22)'],
-      paradeOpacity: [1, 0.16, 0.16],
-      paradeStrokeWidth: [2.4, 1, 1],
-    },
-    green: {
-      hist: ['rgba(255,255,255,0.18)', 'rgba(248,113,113,0.22)', 'rgba(74,222,128,0.98)', 'rgba(96,165,250,0.22)'],
-      paradeOpacity: [0.16, 1, 0.16],
-      paradeStrokeWidth: [1, 2.4, 1],
-    },
-    blue: {
-      hist: ['rgba(255,255,255,0.18)', 'rgba(248,113,113,0.22)', 'rgba(74,222,128,0.22)', 'rgba(96,165,250,0.98)'],
-      paradeOpacity: [0.16, 0.16, 1],
-      paradeStrokeWidth: [1, 1, 2.4],
-    },
-  }[linkedChannel];
-
-  return (
-    <div className="rounded-[22px] border border-[#2d3236] bg-[#121518] p-4" data-testid={testId}>
-      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <div className="text-sm font-medium text-[#eef3f8]">专业示波器</div>
-          <div className="mt-1 text-[11px] text-[#94a0aa]">
-            {displayedScopeStats ? `基于 ${displayedScopeStats.sampleLabel} 采样，按当前调色参数实时重算。` : '正在采样当前素材首帧。'}
-          </div>
-          <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
-            <span className="rounded-full border border-[#325a63] bg-[#112026] px-2.5 py-1 text-[#a9e9dc]">当前联动：{linkedChannelLabel}</span>
-            {([
-              { id: 'master' as const, label: '主曲线' },
-              { id: 'red' as const, label: 'R' },
-              { id: 'green' as const, label: 'G' },
-              { id: 'blue' as const, label: 'B' },
-            ]).map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                className={`rounded-full border px-2.5 py-1 transition ${linkedChannel === item.id ? 'border-[#4e8477] bg-[#17312b] text-[#d8fff7]' : 'border-[#2d3236] bg-[#11161a] text-[#bac6cf] hover:border-[#46515d] hover:bg-[#151a1f]'}`}
-                onPointerDown={stopCanvasPointer}
-                onClick={() => onLinkedChannelChange?.(item.id)}
-                data-testid={testId ? `${testId}-linked-channel-${item.id}` : undefined}
-              >
-                {item.label}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="flex flex-wrap items-center justify-end gap-2">
-          <div className="rounded-full border border-[#2d3236] bg-[#0f1317] px-2.5 py-1 text-[11px] text-[#8fdcca]">
-            {displayedScopeStats?.sampleMode === 'video' ? (scopeViewMode === 'freeze' && frozenScopeStats ? '冻结帧对比' : '视频时间轴抽样') : '图片单帧采样'}
-          </div>
-          {sourceKind === 'video' ? (
-            <>
-              <div className="flex items-center gap-1 rounded-full border border-[#2d3236] bg-[#0f1317] p-1 text-[11px] text-[#b9c5ce]" data-testid={testId ? `${testId}-sample-density` : undefined}>
-                {[
-                  { value: 'sparse' as const, label: '稀疏' },
-                  { value: 'standard' as const, label: '标准' },
-                  { value: 'dense' as const, label: '精细' },
-                ].map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={`rounded-full px-2.5 py-1 transition ${sampleDensity === option.value ? 'bg-[#17312b] text-[#d8fff7]' : 'text-[#b9c5ce] hover:bg-[#161c21] hover:text-[#eef3f8]'}`}
-                    onPointerDown={stopCanvasPointer}
-                    onClick={() => setSampleDensity(option.value)}
-                  >
-                    {option.label}
-                  </button>
-                ))}
-              </div>
-              {frozenScopeStats ? (
-                <button
-                  type="button"
-                  className="rounded-full border border-[#2d3236] bg-[#0f1317] px-2.5 py-1 text-[11px] text-[#d3e4ef] transition hover:border-[#46515d] hover:bg-[#151a1f]"
-                  onPointerDown={stopCanvasPointer}
-                  onClick={() => setScopeViewMode((current) => current === 'freeze' ? 'aggregate' : 'freeze')}
-                  data-testid={testId ? `${testId}-freeze-toggle` : undefined}
-                >
-                  {scopeViewMode === 'freeze' ? '查看时间轴汇总' : '查看冻结帧'}
-                </button>
-              ) : null}
-              {frozenFrameMoment !== null ? (
-                <button
-                  type="button"
-                  className="rounded-full border border-[#2d3236] bg-[#0f1317] px-2.5 py-1 text-[11px] text-[#9fb0bc] transition hover:border-[#46515d] hover:bg-[#151a1f] hover:text-[#eef3f8]"
-                  onPointerDown={stopCanvasPointer}
-                  onClick={() => {
-                    setFrozenFrameMoment(null);
-                    setFrozenScopeStats(null);
-                    setScopeViewMode('aggregate');
-                  }}
-                >
-                  清除冻结
-                </button>
-              ) : null}
-            </>
-          ) : null}
-        </div>
-      </div>
-      {displayedScopeStats ? (
-        <div className="space-y-4">
-          {scopeStats?.sampleMode === 'video' ? (
-            <div className="rounded-2xl border border-[#2d3236] bg-[#0f1317] px-3 py-3 text-xs text-[#9fb0bc]">
-              <div className="mb-2 flex items-center justify-between gap-3 text-[#e6edf3]">
-                <span>时间轴抽样</span>
-                <span>{scopeStats.sampleMoments.length} 个采样点</span>
-              </div>
-              <div className="mb-3 flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  className="rounded-full border border-[#2d3236] bg-[#11161a] px-2.5 py-1 text-[11px] text-[#d3e4ef] transition hover:border-[#46515d] hover:bg-[#151a1f]"
-                  onPointerDown={stopCanvasPointer}
-                  onClick={() => {
-                    setFrozenFrameMoment(Number(liveFrameMoment.toFixed(3)));
-                    setScopeViewMode('freeze');
-                  }}
-                  data-testid={testId ? `${testId}-freeze-frame` : undefined}
-                >
-                  冻结当前帧 {formatScopeMoment(liveFrameMoment)}
-                </button>
-                <span className="rounded-full border border-[#2d3236] bg-[#11161a] px-2.5 py-1 text-[11px] text-[#c8d2da]">
-                  当前播放位置 {formatScopeMoment(liveFrameMoment)}
-                </span>
-              </div>
-              <div className="relative mb-3 rounded-2xl border border-[#2d3236] bg-[#0d1013] px-3 py-3" data-testid={testId ? `${testId}-freeze-timeline` : undefined}>
-                <div className="mb-2 flex items-center justify-between gap-3 text-[11px] text-[#dce5ec]">
-                  <span>冻结帧时间条</span>
-                  <span>{scopeDuration > 0 ? `总时长 ${formatScopeMoment(scopeDuration)}` : '等待时长元数据'}</span>
-                </div>
-                <div
-                  className="relative h-8 rounded-full border border-[#23282d] bg-[#12171b]"
-                  onPointerDown={(event) => {
-                    stopCanvasPointer(event);
-                    const rect = event.currentTarget.getBoundingClientRect();
-                    if (!rect.width || scopeDuration <= 0) return;
-                    const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
-                    setFrozenFrameMoment(Number((scopeDuration * ratio).toFixed(3)));
-                    setScopeViewMode('freeze');
-                  }}
-                >
-                  <div className="absolute inset-y-0 left-0 rounded-full bg-[linear-gradient(90deg,rgba(0,212,170,0.08),rgba(0,212,170,0.22))]" style={{ width: `${Math.max(4, Math.min(100, scopeDuration > 0 ? (liveFrameMoment / scopeDuration) * 100 : 0))}%` }} />
-                  {scopeStats.sampleMoments.map((moment, index) => {
-                    const ratio = scopeDuration > 0 ? moment / scopeDuration : 0;
-                    return (
-                      <button
-                        key={`${moment}-${index}`}
-                        type="button"
-                        className={`absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border transition ${frozenFrameMoment !== null && Math.abs(frozenFrameMoment - moment) < 0.03 ? 'border-[#d8fff7] bg-[#00d4aa]' : 'border-[#6f7a83] bg-[#12171b] hover:border-[#8fdcca] hover:bg-[#17312b]'}`}
-                        style={{ left: `${ratio * 100}%` }}
-                        onPointerDown={stopCanvasPointer}
-                        onClick={() => {
-                          setFrozenFrameMoment(moment);
-                          setScopeViewMode('freeze');
-                        }}
-                        title={`冻结到 ${formatScopeMoment(moment)}`}
-                        data-testid={testId ? `${testId}-freeze-sample-${index}` : undefined}
-                      />
-                    );
-                  })}
-                  <div className="pointer-events-none absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border border-[#8fdcca] bg-[#0f1317]" style={{ left: `${Math.max(0, Math.min(100, scopeDuration > 0 ? (liveFrameMoment / scopeDuration) * 100 : 0))}%` }} />
-                  {frozenFrameMoment !== null ? (
-                    <div className="pointer-events-none absolute top-1/2 h-5 w-[2px] -translate-x-1/2 -translate-y-1/2 bg-[#ffd479]" style={{ left: `${Math.max(0, Math.min(100, scopeDuration > 0 ? (frozenFrameMoment / scopeDuration) * 100 : 0))}%` }} />
-                  ) : null}
-                </div>
-                <div className="mt-2 flex items-center justify-between text-[10px] text-[#7f8c96]">
-                  <span>起点</span>
-                  <span>点采样点或时间条即可冻结对应帧</span>
-                  <span>终点</span>
-                </div>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {scopeStats.sampleMoments.map((moment, index) => (
-                  <span key={`${moment}-${index}`} className="rounded-full border border-[#2d3236] bg-[#11161a] px-2.5 py-1 text-[11px] text-[#c8d2da]">
-                    {formatScopeMoment(moment)}
-                  </span>
-                ))}
-              </div>
-              {frozenFrameMoment !== null ? (
-                <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px]">
-                  <span className="rounded-full border border-[#325a63] bg-[#112026] px-2.5 py-1 text-[#a9e9dc]">冻结帧：{formatScopeMoment(frozenFrameMoment)}</span>
-                  <span className="rounded-full border border-[#2d3236] bg-[#11161a] px-2.5 py-1 text-[#d1dae2]">{scopeViewMode === 'freeze' ? '当前示波器显示冻结帧' : '当前示波器显示时间轴汇总'}</span>
-                </div>
-              ) : null}
-            </div>
-          ) : null}
-          <div className="grid gap-4 2xl:grid-cols-2">
-          <div className="rounded-2xl border border-[#2d3236] bg-[#0d1013] p-3">
-            <div className="mb-2 flex items-center justify-between text-[11px] text-[#aab5bf]">
-              <span>RGB 直方图</span>
-              <span>亮度 + 通道分布</span>
-            </div>
-            <svg viewBox="0 0 320 120" className="block w-full rounded-xl bg-[#080a0d]">
-              {[0.25, 0.5, 0.75].map((mark) => (
-                <line key={mark} x1="0" y1={120 - mark * 120} x2="320" y2={120 - mark * 120} stroke="rgba(255,255,255,0.08)" strokeWidth="1" />
-              ))}
-              <path d={histogramPath(displayedScopeStats.histLuma)} fill="none" stroke={channelTone.hist[0]} strokeWidth={linkedChannel === 'master' ? '1.8' : '1.1'} />
-              <path d={histogramPath(displayedScopeStats.histR)} fill="none" stroke={channelTone.hist[1]} strokeWidth={linkedChannel === 'red' ? '2.2' : '1.4'} />
-              <path d={histogramPath(displayedScopeStats.histG)} fill="none" stroke={channelTone.hist[2]} strokeWidth={linkedChannel === 'green' ? '2.2' : '1.4'} />
-              <path d={histogramPath(displayedScopeStats.histB)} fill="none" stroke={channelTone.hist[3]} strokeWidth={linkedChannel === 'blue' ? '2.2' : '1.4'} />
-            </svg>
-          </div>
-          <div className="rounded-2xl border border-[#2d3236] bg-[#0d1013] p-3">
-            <div className="mb-2 flex items-center justify-between text-[11px] text-[#aab5bf]">
-              <span>Vectorscope</span>
-              <span>色相 / 饱和 + 肤色线 + 广播参考点</span>
-            </div>
-            <div className="mb-2 flex flex-wrap items-center gap-1 rounded-2xl border border-[#23282d] bg-[#101418] p-1 text-[11px] text-[#b9c5ce]" data-testid={testId ? `${testId}-vectorscope-standard` : undefined}>
-              {[
-                { value: 'rec709' as const, label: 'Rec.709' },
-                { value: 'ebu' as const, label: 'EBU' },
-                { value: 'smpte-c' as const, label: 'SMPTE-C' },
-              ].map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  className={`rounded-full px-2.5 py-1 transition ${vectorscopeTargetPreset === option.value ? 'bg-[#17312b] text-[#d8fff7]' : 'text-[#b9c5ce] hover:bg-[#161c21] hover:text-[#eef3f8]'}`}
-                  onPointerDown={stopCanvasPointer}
-                  onClick={() => setVectorscopeTargetPreset(option.value)}
-                >
-                  {option.label}
-                </button>
-              ))}
-            </div>
-            <svg viewBox="0 0 320 120" className="block w-full rounded-xl bg-[#080a0d]">
-              {[18, 32, 46].map((radius) => (
-                <ellipse key={radius} cx="160" cy="60" rx={radius} ry={radius * 0.92} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="1" />
-              ))}
-              <line x1="160" y1="8" x2="160" y2="112" stroke="rgba(255,255,255,0.08)" strokeWidth="1" />
-              <line x1="52" y1="60" x2="268" y2="60" stroke="rgba(255,255,255,0.08)" strokeWidth="1" />
-              <line x1="160" y1="60" x2={skinToneX.toFixed(1)} y2={skinToneY.toFixed(1)} stroke="rgba(255,184,108,0.78)" strokeWidth="1.2" strokeDasharray="4 4" />
-              <text x={(skinToneX + 8).toFixed(1)} y={(skinToneY - 4).toFixed(1)} fill="rgba(255,184,108,0.92)" fontSize="10">Skin tone</text>
-              {vectorscopeTargets.map((target) => {
-                const angle = target.degrees * Math.PI / 180;
-                const x = 160 + Math.cos(angle) * 46;
-                const y = 60 - Math.sin(angle) * 42;
-                const labelX = 160 + Math.cos(angle) * 58;
-                const labelY = 60 - Math.sin(angle) * 54;
-                return (
-                  <g key={target.label}>
-                    <circle cx={x.toFixed(1)} cy={y.toFixed(1)} r="2.2" fill="none" stroke={target.color} strokeWidth="1.1" />
-                    <line x1={(x - 5).toFixed(1)} y1={y.toFixed(1)} x2={(x + 5).toFixed(1)} y2={y.toFixed(1)} stroke={target.color} strokeWidth="0.8" />
-                    <line x1={x.toFixed(1)} y1={(y - 5).toFixed(1)} x2={x.toFixed(1)} y2={(y + 5).toFixed(1)} stroke={target.color} strokeWidth="0.8" />
-                    <text x={labelX.toFixed(1)} y={labelY.toFixed(1)} fill={target.color} fontSize="9">{target.label}</text>
-                  </g>
-                );
-              })}
-              {displayedScopeStats.vectorscopePoints.map((point, index) => (
-                <circle key={`vector-${index}`} cx={(point.x * 320).toFixed(1)} cy={(point.y * 120).toFixed(1)} r="1.15" fill={point.color} fillOpacity={point.alpha} />
-              ))}
-            </svg>
-          </div>
-          <div className="rounded-2xl border border-[#2d3236] bg-[#0d1013] p-3">
-            <div className="mb-2 flex items-center justify-between text-[11px] text-[#aab5bf]">
-              <span>RGB Parade</span>
-              <span>通道波形 + IRE 标尺</span>
-            </div>
-            <svg viewBox="0 0 320 120" className="block w-full rounded-xl bg-[#080a0d]" data-testid={testId ? `${testId}-parade` : undefined}>
-              {[0.25, 0.5, 0.75].map((mark) => (
-                <line key={mark} x1="0" y1={120 - mark * 120} x2="320" y2={120 - mark * 120} stroke="rgba(255,255,255,0.08)" strokeWidth="1" />
-              ))}
-              {[0, 25, 50, 75, 100].map((ire) => (
-                <text key={ire} x="2" y={(120 - ire * 1.12 + 3).toFixed(1)} fill="rgba(255,255,255,0.42)" fontSize="8">{ire}</text>
-              ))}
-              {[106.6, 213.3].map((divider) => (
-                <line key={divider} x1={divider} y1="0" x2={divider} y2="120" stroke="rgba(255,255,255,0.06)" strokeWidth="1" />
-              ))}
-              <path d={waveformPath(displayedScopeStats.paradeR)} fill="none" stroke="rgba(248,113,113,0.95)" strokeOpacity={channelTone.paradeOpacity[0]} strokeWidth={channelTone.paradeStrokeWidth[0]} transform="scale(0.3333 1)" />
-              <path d={waveformPath(displayedScopeStats.paradeG)} fill="none" stroke="rgba(74,222,128,0.95)" strokeOpacity={channelTone.paradeOpacity[1]} strokeWidth={channelTone.paradeStrokeWidth[1]} transform="translate(106.6 0) scale(0.3333 1)" />
-              <path d={waveformPath(displayedScopeStats.paradeB)} fill="none" stroke="rgba(96,165,250,0.95)" strokeOpacity={channelTone.paradeOpacity[2]} strokeWidth={channelTone.paradeStrokeWidth[2]} transform="translate(213.3 0) scale(0.3333 1)" />
-              <text x="18" y="16" fill="rgba(248,113,113,0.95)" fillOpacity={channelTone.paradeOpacity[0]} fontSize="10">R</text>
-              <text x="125" y="16" fill="rgba(74,222,128,0.95)" fillOpacity={channelTone.paradeOpacity[1]} fontSize="10">G</text>
-              <text x="232" y="16" fill="rgba(96,165,250,0.95)" fillOpacity={channelTone.paradeOpacity[2]} fontSize="10">B</text>
-            </svg>
-          </div>
-          <div className="rounded-2xl border border-[#2d3236] bg-[#0d1013] p-3">
-            <div className="mb-2 flex items-center justify-between text-[11px] text-[#aab5bf]">
-              <span>亮度波形</span>
-              <span>0-100 IRE 标尺</span>
-            </div>
-            <svg viewBox="0 0 320 120" className="block w-full rounded-xl bg-[#080a0d]">
-              {[0.25, 0.5, 0.75].map((mark) => (
-                <line key={mark} x1="0" y1={120 - mark * 120} x2="320" y2={120 - mark * 120} stroke="rgba(255,255,255,0.08)" strokeWidth="1" />
-              ))}
-              {[0, 25, 50, 75, 100].map((ire) => (
-                <text key={ire} x="2" y={(120 - ire * 1.12 + 3).toFixed(1)} fill="rgba(255,255,255,0.42)" fontSize="8">{ire}</text>
-              ))}
-              {displayedScopeStats.waveformAvg.map((value, index) => {
-                const x = (index / Math.max(1, displayedScopeStats.waveformAvg.length - 1)) * 320;
-                const minY = 120 - displayedScopeStats.waveformMin[index] * 120;
-                const maxY = 120 - displayedScopeStats.waveformMax[index] * 120;
-                const avgY = 120 - value * 120;
-                return (
-                  <g key={`wave-${index}`}>
-                    <line x1={x} y1={minY} x2={x} y2={maxY} stroke="rgba(0,212,170,0.22)" strokeWidth="2" />
-                    <circle cx={x} cy={avgY} r="1.2" fill="rgba(141,220,202,0.95)" />
-                  </g>
-                );
-              })}
-            </svg>
-          </div>
-        </div>
-        </div>
-      ) : (
-        <div className="rounded-2xl border border-dashed border-[#2d3236] bg-[#0f1317] px-4 py-8 text-sm text-[#95a1ac]">
-          {scopeError ? `示波器暂时无法读取当前素材：${scopeError}` : '正在建立示波器抽样...'}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function PreviewOverlay({
-  descriptor,
-  mediaKind,
-}: {
-  descriptor: ReturnType<typeof buildPostPreviewDescriptor>;
-  mediaKind: PostMediaKind | null;
-}) {
-  return (
-    <>
-      {descriptor.bloomOpacity > 0 ? (
-        <div
-          className="pointer-events-none absolute inset-0"
-          style={{ boxShadow: `inset 0 0 120px rgba(255,245,220,${descriptor.bloomOpacity})` }}
-        />
-      ) : null}
-
-      {descriptor.focusBox ? (
-        <div
-          className="pointer-events-none absolute rounded-[20px] border border-cyan-200/60 bg-cyan-200/6 shadow-[0_0_0_1px_rgba(125,211,252,0.18),0_0_24px_rgba(34,211,238,0.18)]"
-          style={{
-            left: descriptor.focusBox.left,
-            top: descriptor.focusBox.top,
-            width: descriptor.focusBox.width,
-            height: descriptor.focusBox.height,
-          }}
-        />
-      ) : null}
-
-      {descriptor.grainOpacity > 0 ? (
-        <div
-          className="pointer-events-none absolute inset-0"
-          style={{
-            opacity: descriptor.grainOpacity,
-            mixBlendMode: descriptor.grainBlendMode,
-            backgroundImage: `url("${descriptor.grainTexture}")`,
-            backgroundSize: descriptor.grainScale,
-            backgroundPosition: 'center center',
-          }}
-        />
-      ) : null}
-
-      {descriptor.tracks.map((track) => (
-        <div
-          key={track.id}
-          className="pointer-events-none absolute"
-          style={{
-            left: `${track.x}%`,
-            top: `${track.y}%`,
-            transform: `translate(-50%, -50%) rotate(${track.rotation}deg) scale(${track.scale})`,
-            opacity: track.opacity,
-          }}
-        >
-          {track.overlayKind === 'video' ? (
-            <video
-              src={toRenderableAssetUrl(track.overlayUrl, 'video')}
-              className="max-h-32 max-w-32 rounded-lg shadow-xl"
-              muted
-              playsInline
-              autoPlay
-              loop
-              preload="metadata"
-            />
-          ) : (
-            <img
-              src={toRenderableAssetUrl(track.overlayUrl, 'image')}
-              alt={track.label}
-              className="max-h-32 max-w-32 rounded-lg shadow-xl"
-            />
-          )}
-        </div>
-      ))}
-
-      {mediaKind === 'image' && descriptor.matteMaskUrl ? (
-        <div className="pointer-events-none absolute bottom-3 left-3 rounded-full bg-black/60 px-2.5 py-1 text-[11px] text-white">
-          蒙版预览已接入
-        </div>
-      ) : null}
-    </>
-  );
-}
-
-function EmptySourceCard() {
-  return (
-    <div
-      className="flex h-[280px] w-full items-center justify-center rounded-[24px] border border-dashed border-white/12 bg-[#101010] text-[#b8b8b8]"
-      data-testid="post-empty-source"
-    >
-      <div className="max-w-[340px] text-center">
-        <Link2 className="mx-auto mb-3 h-8 w-8 text-[#00d4aa]" />
-        <div className="text-sm font-medium text-white">请先把图片节点或视频节点连接到后期节点</div>
-        <div className="mt-2 text-xs leading-6 text-[#8c8c8c]">
-          后期节点不再单独上传主素材，当前会直接从左侧输入端继承图片或视频素材。
-      </div>
-    </div>
-    </div>
-  );
-}
-
+import {
+  CollapsiblePanelSection,
+  ControlsDisabledContext,
+  CurveEditorField,
+  EmptySourceCard,
+  FieldLabel,
+  inspectOcioConfigText,
+  isSupportedOcioConfigName,
+  normalizePostLabel,
+  PanelSection,
+  PreviewOverlay,
+  presetCurvePoints,
+  previewViewportSize,
+  readSourceAssetFromNode,
+  ScopeWorkbench,
+  SelectField,
+  SliderField,
+  stopCanvasPointer,
+  SUPPORTED_OCIO_CONFIG_EXTENSIONS,
+  ToggleField,
+  useMediaNaturalSize,
+  WheelCard,
+  workspaceTabClass,
+  type ColorPanelSectionId,
+  type CurveChannelKey,
+  type LocalPostBackendStatus,
+  type LocalPostDoctorReport,
+  type LocalPostDoctorRuntime,
+  type OcioConfigInspection,
+  type OcioSetupValidation,
+  type PostHealthStatus,
+  type PostPanelKind,
+} from './PostNode.parts';
 export function PostNode({ id, data, selected }: NodeProps) {
   const canvas = useCanvasStore((state) => state.canvas);
   const addConnectedNode = useCanvasStore((state) => state.addConnectedNode);
@@ -1793,6 +124,8 @@ export function PostNode({ id, data, selected }: NodeProps) {
   });
   const [compareEnabled, setCompareEnabled] = useState(true);
   const [isApplying, setIsApplying] = useState(false);
+  const [mattingPanelOpen, setMattingPanelOpen] = useState(false);
+  const [mattingSourceUrl, setMattingSourceUrl] = useState('');
   const [localError, setLocalError] = useState('');
   const [activation, setActivation] = useState<{ mode: 'image' | 'video'; provider: string; reason: 'auth' } | null>(null);
   const [warnings, setWarnings] = useState<string[]>(
@@ -1842,6 +175,17 @@ export function PostNode({ id, data, selected }: NodeProps) {
   const sourceKind = sourceAsset?.kind || null;
   const sourceUrl = sourceAsset ? toRenderableAssetUrl(sourceAsset.url, sourceAsset.kind) : '';
   const sourceInherited = Boolean(connectedSource);
+
+  // 一键功能对各素材类型的支持矩阵：用于按钮置灰 + 调用前拦截，避免无效调用/报错。
+  // 两者均支持图片与视频；若某功能未来不支持某类型，在此移除即可自动置灰并拒绝。
+  const ONE_CLICK_SUPPORT: Record<'cinematic' | 'matting', Array<'image' | 'video'>> = {
+    cinematic: ['image', 'video'],
+    matting: ['image', 'video'],
+  };
+  const cinematicDisabled =
+    isApplying || !sourceAsset || !ONE_CLICK_SUPPORT.cinematic.includes(sourceAsset.kind);
+  const mattingDisabled =
+    isApplying || !sourceAsset || !ONE_CLICK_SUPPORT.matting.includes(sourceAsset.kind);
 
   const outputKind = params.lastResultKind === 'video' ? 'video' : 'image';
   const resultUrlRaw = typeof params.lastResultUrl === 'string' ? params.lastResultUrl : '';
@@ -2500,6 +844,640 @@ export function PostNode({ id, data, selected }: NodeProps) {
     }
   }
 
+  /** 把客户端处理后得到的 Blob 注册为本地媒体并产出结果节点。 */
+  function emitClientResultNode(
+    blob: Blob,
+    kind: 'image' | 'video',
+    width: number,
+    height: number,
+    labelSuffix: string,
+    extraMeta: Record<string, unknown> = {},
+  ): void {
+    const handle = registerLocalMedia(blob);
+    const nextLabel = `${normalizePostLabel(data.label, '后期结果')} ${labelSuffix}`;
+    if (kind === 'image') {
+      addConnectedNode({
+        type: 'image',
+        position: { x: nodePosition.x + 700, y: nodePosition.y + 20 },
+        sourceId: id,
+        sourceHandle: 'post-output',
+        data: {
+          label: nextLabel,
+          imageUrl: handle,
+          status: 'completed',
+          outputs: [{
+            id: `post-output-${Date.now()}`,
+            type: 'image',
+            url: handle,
+            metadata: {
+              managedUrl: true,
+              originalUrl: handle,
+              width,
+              height,
+              processingEngine: 'postfx-client-pipeline',
+              ...extraMeta,
+            },
+          }],
+          params: { sourceNodeId: id, imageMeta: { width, height }, sourceMediaType: 'image' },
+        },
+      });
+    }
+  }
+
+  /** 解析源素材为可直接用于 <img>/<video> 的真实 URL（hmdao-local:// 句柄 → blob URL）。 */
+  async function resolveSourceMediaUrl(): Promise<string> {
+    if (!sourceAsset) return '';
+    if (isLocalMediaHandle(sourceAsset.url)) {
+      const resolved = await ensureLocalMediaUrl(sourceAsset.url);
+      return resolved || '';
+    }
+    return sourceAsset.url;
+  }
+
+  /** 取源素材为图片：图片直接加载；视频抽取首帧。 */
+  async function loadSourceAsImage(): Promise<HTMLImageElement> {
+    if (!sourceAsset) throw new Error('缺少素材');
+    const srcUrl = await resolveSourceMediaUrl();
+    if (!srcUrl) throw new Error('素材链接解析失败（本地媒体句柄无效或已被清理）');
+    if (sourceAsset.kind === 'image') return loadImageFromUrlSafe(srcUrl);
+    // 视频：抽取首帧
+    const video = document.createElement('video');
+    video.src = srcUrl;
+    video.muted = true;
+    video.crossOrigin = 'anonymous';
+    await new Promise<void>((resolve, reject) => {
+      video.onloadeddata = () => resolve();
+      video.onerror = () => reject(new Error('video-frame-extract-failed'));
+      video.load();
+    });
+    video.currentTime = 0;
+    await new Promise<void>((resolve) => {
+      video.onseeked = () => resolve();
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d')!.drawImage(video, 0, 0);
+    return loadImageFromUrlSafe(canvas.toDataURL('image/png'));
+  }
+
+  function loadImageFromUrlSafe(url: string): Promise<HTMLImageElement> {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error(`postFX-load-failed:${url}`));
+      img.src = url;
+    });
+  }
+
+  function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function yieldToUI(): Promise<void> {
+    return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  }
+
+  /**
+   * 按需确保某个后期模型就绪：已激活直接返回；已安装则激活；否则下载并激活。
+   * 这样「一键电影感 / 一键抠像」等按钮在模型缺失时会自动拉取权重，而不是只抛错（空壳）。
+   */
+  async function ensurePresetModel(modelId: string): Promise<{ ok: boolean; reason?: string }> {
+    const meta = PRESET_MODELS.find((m) => m.id === modelId);
+    if (!meta) return { ok: false, reason: `unknown-model:${modelId}` };
+    if (hasLocalModelRunner(modelId)) return { ok: true };
+    // 不信任“已安装”标记：直接确保真实权重已在缓存（loadModel 对已缓存文件幂等，
+    // 并会自动补齐缺失的外部权重，如 Depth Anything V3 的 model.onnx_data）。
+    // 这样即便标记过期/缓存部分缺失，点击一键功能时也能自愈，避免只报 model-not-cached。
+    setLocalError(`正在准备模型「${meta.name}」…`);
+    const res = await loadModel({
+      modelId,
+      version: meta.version,
+      url: meta.url,
+      extraFiles: meta.extraFiles,
+      timeout: 600000,
+      retries: 2,
+    });
+    if (!res.success) return { ok: false, reason: res.error || '模型下载失败' };
+    const act = await activateLocalModel(modelId, meta.version);
+    if (!act.ok) return act;
+    return { ok: true };
+  }
+
+  /** 把视频成片（Blob）注册为本地媒体并产出视频结果节点。 */
+  function emitClientVideoResultNode(
+    blob: Blob,
+    width: number,
+    height: number,
+    duration: number,
+    labelSuffix: string,
+  ): void {
+    const handle = registerLocalMedia(blob);
+    const nextLabel = `${normalizePostLabel(data.label, '后期结果')} ${labelSuffix}`;
+    addConnectedNode({
+      type: 'video',
+      position: { x: nodePosition.x + 700, y: nodePosition.y + 20 },
+      sourceId: id,
+      sourceHandle: 'post-output',
+      data: {
+        label: nextLabel,
+        videoUrl: handle,
+        quality: `${width}x${height}`,
+        duration,
+        status: 'completed',
+        outputs: [{
+          id: `post-output-${Date.now()}`,
+          type: 'video',
+          url: handle,
+          metadata: {
+            managedUrl: true,
+            originalUrl: handle,
+            width,
+            height,
+            duration,
+            processingEngine: 'postfx-video-pipeline',
+          },
+        }],
+        params: {
+          sourceNodeId: id,
+          videoMeta: { width, height, duration },
+          sourceMediaType: 'video',
+        },
+      },
+    });
+  }
+
+  function pickVideoMime(): string {
+    if (typeof MediaRecorder === 'undefined') return 'video/webm';
+    const candidates = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+    for (const c of candidates) {
+      if (MediaRecorder.isTypeSupported(c)) return c;
+    }
+    return 'video/webm';
+  }
+
+  /** 抽取视频在指定时间的帧到指定尺寸的画布（用于逐帧处理）。 */
+  function grabVideoFrame(
+    video: HTMLVideoElement,
+    time: number,
+    w: number,
+    h: number,
+  ): Promise<HTMLCanvasElement> {
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        video.onseeked = null;
+        video.onerror = null;
+      };
+      video.onseeked = () => {
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        c.getContext('2d')!.drawImage(video, 0, 0, w, h);
+        cleanup();
+        resolve(c);
+      };
+      video.onerror = () => {
+        cleanup();
+        reject(new Error('video-seek-failed'));
+      };
+      video.currentTime = time;
+    });
+  }
+
+  async function handleApplyMotionBlur() {
+    if (!sourceAsset) {
+      setLocalError('请先连接图片或视频素材。');
+      return;
+    }
+    setLocalError('');
+    setIsApplying(true);
+    try {
+      const img = await loadSourceAsImage();
+      const canvas = applyMotionBlur(img, {
+        length: effects.motionBlur.length,
+        angle: effects.motionBlur.angle,
+      });
+      const blob = await new Promise<Blob>((resolve, reject) =>
+        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('to-blob-failed'))), 'image/png'),
+      );
+      emitClientResultNode(blob, 'image', canvas.width, canvas.height, '运动模糊', {
+        engine: 'kornia-motion',
+      });
+    } catch (err) {
+      setLocalError((err as Error)?.message || '运动模糊处理失败');
+    } finally {
+      setIsApplying(false);
+    }
+  }
+
+  async function handleOneClickCinematic(strength: CinematicStrength = 'auto') {
+    if (!sourceAsset) {
+      setLocalError('请先连接图片或视频素材。');
+      return;
+    }
+    if (!ONE_CLICK_SUPPORT.cinematic.includes(sourceAsset.kind)) {
+      setLocalError('一键电影感仅支持图片或视频素材。');
+      return;
+    }
+    setLocalError('');
+    setIsApplying(true);
+    updateNodeData(id, {
+      status: 'generating',
+      error: '',
+      params: { ...params, generationProgress: [{ progress: 10, message: '一键电影感：智能分析自动调色 → 辉光 → 颗粒 → 智能运动模糊 → 智能景深（保留主体清晰）→ 智能锐化 → 发光智能光晕', stage: 'postfx' }] },
+    });
+    try {
+      // 智能景深需要深度模型：按需下载并激活（默认 V3，已作为标准深度引擎）
+      if (!isDepthModelReady()) {
+        const ensured = await ensurePresetModel('depth-anything-v3-base');
+        if (!ensured.ok) {
+          setLocalError(`智能景深所需深度模型未就绪：${ensured.reason ?? ''}（请到模型下载面板安装 Depth Anything V3）`);
+          return;
+        }
+      }
+      if (sourceAsset.kind === 'video') {
+        await handleOneClickCinematicVideo(strength);
+        return;
+      }
+      const img = await loadSourceAsImage();
+      const result = await applyCinematicOneClick(img, { strength });
+      emitClientResultNode(result.blob, 'image', result.width, result.height, '一键电影感', {
+        engines: result.engines,
+        postEffects: effects,
+      });
+    } catch (err) {
+      setLocalError((err as Error)?.message || '一键电影感处理失败（请确认景深模型已安装）');
+    } finally {
+      setIsApplying(false);
+    }
+  }
+
+  /** 视频逐帧处理：自动调色 → 辉光 → 颗粒 → 运动模糊 → 智能景深，再重编码为 webm。 */
+  async function handleOneClickCinematicVideo(strength: CinematicStrength = 'auto') {
+    if (!sourceAsset || sourceAsset.kind !== 'video') return;
+    const srcUrl = await resolveSourceMediaUrl();
+    if (!srcUrl) throw new Error('视频素材链接解析失败（本地媒体句柄无效）');
+    const MAX_SIDE = 720; // 处理分辨率上限，保证浏览器内重编码速度
+    const FPS = 12; // 抽帧/重编码帧率（兼顾速度与流畅）
+
+    // 视频电影感的运动模糊（顺序：源视频先做运动模糊 → 再逐帧调色/景深，这是最稳最真实的顺序，
+    // 因为运动模糊与景深都是「拍摄期」镜头效果，应在调色前完成）。
+    // 优先层级：
+    //   1) 客户端 GPU 运动模糊（WebGPU + RAFT 光流 / RIFE 插帧后累积）——最真实、零服务端依赖；
+    //   2) 服务端 ffmpeg 真实运动模糊（tblend / minterpolate 快门拖影）——稳定兜底；
+    //   3) 服务端/客户端均不可用时，回退到客户端 RAFT 光流逐帧模糊（下方循环内处理）。
+    const motionEnabled = strength !== 'light';
+    let sourceForFrames = srcUrl;
+    let blurEngine: 'gpu' | 'server' | '' = '';
+    if (motionEnabled) {
+      if (isGpuMotionBlurSupported()) {
+        try {
+          const gpu = await applyGpuMotionBlurVideoLocally(srcUrl, {
+            strength,
+            fps: FPS,
+            useRife: true,
+          });
+          if (gpu.ok && gpu.url) {
+            sourceForFrames = gpu.url;
+            blurEngine = 'gpu';
+          }
+        } catch {
+          /* 回退服务端 ffmpeg */
+        }
+      }
+      if (!blurEngine) {
+        try {
+          const mb = await applyMotionBlurVideoLocally(srcUrl, {
+            strength: strength === 'strong' ? 0.85 : 0.5,
+            fps: FPS,
+          });
+          if (mb.success && mb.data?.url) {
+            sourceForFrames = mb.data.url;
+            blurEngine = 'server';
+          }
+        } catch {
+          /* 回退客户端 RAFT 光流模糊 */
+        }
+      }
+    }
+    const serverBlurred = blurEngine !== '';
+
+    const video = document.createElement('video');
+    video.src = sourceForFrames;
+    video.muted = true;
+    video.crossOrigin = 'anonymous';
+    video.playsInline = true;
+    await new Promise<void>((resolve, reject) => {
+      video.onloadedmetadata = () => resolve();
+      video.onerror = () => reject(new Error('video-load-failed'));
+    });
+
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    const scale = Math.min(1, MAX_SIDE / Math.max(vw, vh));
+    const pw = Math.max(2, Math.round(vw * scale));
+    const ph = Math.max(2, Math.round(vh * scale));
+
+    // 用首帧计算一次色调（时域一致），逐帧复用
+    const firstFrame = await grabVideoFrame(video, 0, pw, ph);
+    const grade = analyzeAutoGrade(firstFrame);
+
+    // 运动模糊：服务端已做真实运动模糊时，客户端不再叠加（避免重复模糊）；
+    // 否则优先用 RAFT 光流做逐帧方向性真实运动模糊（物体越动越糊、静止越清），
+    // RAFT 模型缺失/加载失败时自动回退到全局角度模糊，保证一键可用。
+    let useOpticalFlow = false;
+    if (!serverBlurred) {
+      try {
+        if (!isRaftReady()) {
+          const ensured = await ensurePresetModel('raft-optical-flow');
+          if (ensured.ok) {
+            const raftResult = await loadRaftModel();
+            useOpticalFlow = raftResult.ok;
+          }
+        } else {
+          useOpticalFlow = true;
+        }
+      } catch {
+        useOpticalFlow = false;
+      }
+    }
+
+    const out = document.createElement('canvas');
+    out.width = pw;
+    out.height = ph;
+    const octx = out.getContext('2d')!;
+    const stream = out.captureStream(FPS);
+    const mime = pickVideoMime();
+
+    let recorder: MediaRecorder;
+    try {
+      recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
+    } catch {
+      throw new Error('当前浏览器不支持 MediaRecorder 视频重编码');
+    }
+    const chunks: Blob[] = [];
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size) chunks.push(e.data);
+    };
+    const encodeDone = new Promise<Blob>((resolve) => {
+      recorder.onstop = () => resolve(new Blob(chunks, { type: mime }));
+    });
+
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    const totalFrames = Math.max(1, Math.floor(duration * FPS));
+    const step = 1000 / FPS;
+
+    recorder.start();
+    let prevFrame: HTMLCanvasElement | null = null;
+    for (let i = 0; i < totalFrames; i++) {
+      const t = i / FPS;
+      const frame = await grabVideoFrame(video, t, pw, ph);
+      // 用上一帧 → 当前帧的 RAFT 光流驱动方向性运动模糊
+      let opticalFlow;
+      if (useOpticalFlow && prevFrame) {
+        try {
+          const flow = await estimateOpticalFlowRAFT(prevFrame, frame);
+          if (flow) opticalFlow = flow;
+        } catch {
+          opticalFlow = undefined;
+        }
+      }
+      const processed = await applyCinematicFrame(frame, {
+        strength,
+        grade,
+        opticalFlow: serverBlurred ? undefined : opticalFlow,
+        motionBlur: !serverBlurred,
+      });
+      octx.drawImage(processed, 0, 0);
+      updateNodeData(id, {
+        status: 'generating',
+        error: '',
+        params: {
+          ...params,
+          generationProgress: [{
+            progress: Math.round(((i + 1) / totalFrames) * 100),
+            message: `一键电影感·视频 ${i + 1}/${totalFrames}${
+              blurEngine === 'gpu'
+                ? '（客户端 GPU 真实运动模糊）'
+                : blurEngine === 'server'
+                  ? '（服务端真实运动模糊）'
+                  : useOpticalFlow
+                    ? '（RAFT 光流运动模糊）'
+                    : ''
+            }`,
+            stage: 'postfx-video',
+          }],
+        },
+      });
+      await sleep(step);
+      if (i % 4 === 0) await yieldToUI();
+      prevFrame = frame;
+    }
+    recorder.stop();
+    const blob = await encodeDone;
+    emitClientVideoResultNode(blob, pw, ph, duration, '一键电影感·视频');
+  }
+
+  async function handleOneClickMatting() {
+    if (!sourceAsset) {
+      setLocalError('请先连接图片或视频素材。');
+      return;
+    }
+    if (!ONE_CLICK_SUPPORT.matting.includes(sourceAsset.kind)) {
+      setLocalError('一键智能抠图仅支持图片或视频素材。');
+      return;
+    }
+    setLocalError('');
+
+    // 视频素材走「逐帧视频抠像」（RAFT 光流时域连贯，减少边缘闪烁）
+    if (sourceAsset.kind === 'video') {
+      setIsApplying(true);
+      try {
+        await handleOneClickMattingVideo();
+      } catch (err) {
+        setLocalError((err as Error)?.message || '视频抠像失败');
+      } finally {
+        setIsApplying(false);
+      }
+      return;
+    }
+
+    // 图片素材打开多主体智能抠图面板（自动检测→选择→修正→批量出图）
+    const srcUrl = await resolveSourceMediaUrl();
+    if (!srcUrl) {
+      setLocalError('素材链接解析失败。');
+      return;
+    }
+    setMattingSourceUrl(srcUrl);
+    setMattingPanelOpen(true);
+  }
+
+  /** 视频跟踪模式：面板选主体后→输出跟踪视频 */
+  async function handleMattingTrack(subjectIds: number[], _srcUrl: string) {
+    if (!sourceAsset || sourceAsset.kind !== 'video') return;
+    setIsApplying(true); setLocalError('');
+    try {
+      // 调用已有的逐帧视频抠像(RAFT光流+BiRefNet)
+      await handleOneClickMattingVideo();
+    } catch (err) {
+      setLocalError((err as Error)?.message || '视频跟踪失败');
+    } finally {
+      setIsApplying(false);
+      setMattingPanelOpen(false);
+    }
+  }
+
+  /** 面板确认提取→批量输出带透明通道的 PNG 结果节点 */
+  async function handleMattingExtract(results: MattingExtractResult[]) {
+    if (!sourceAsset) return;
+    setIsApplying(true);
+    setLocalError('');
+    try {
+      for (const r of results) {
+        emitClientResultNode(r.blob, 'image', r.width, r.height, `抠图·${r.name}`, {
+          engine: 'birefnet-matting',
+          subjectId: r.id,
+        });
+      }
+    } catch (err) {
+      setLocalError((err as Error)?.message || '批量抠图输出失败');
+    } finally {
+      setIsApplying(false);
+      setMattingPanelOpen(false);
+    }
+  }
+
+  /** 确保抠像模型就绪：默认 BiRefNet。返回模型 id 或 null。 */
+  async function ensureMattingModel(): Promise<MattingModelId | null> {
+    if ((await ensurePresetModel('birefnet-matting')).ok) return 'birefnet-matting';
+    setLocalError(
+      '智能抠像模型未就绪：BiRefNet 下载/加载失败。请到模型下载面板重试安装。',
+    );
+    return null;
+  }
+
+  /**
+   * 逐帧视频抠像（RAFT 光流时域连贯版）：
+   * 每帧用本地抠像模型得到 alpha，并用「上一帧→当前帧」的 RAFT 光流把上一帧 alpha 反向变形、
+   * 与当前帧 alpha 轻度混合，显著减少逐帧独立抠像带来的边缘闪烁/抖动。RAFT 缺失时退化为逐帧独立抠像。
+   */
+  async function handleOneClickMattingVideo(): Promise<void> {
+    if (!sourceAsset || sourceAsset.kind !== 'video') return;
+    const srcUrl = await resolveSourceMediaUrl();
+    if (!srcUrl) throw new Error('视频素材链接解析失败（本地媒体句柄无效）');
+    const MAX_SIDE = 720;
+    const FPS = 12;
+
+    const video = document.createElement('video');
+    video.src = srcUrl;
+    video.muted = true;
+    video.crossOrigin = 'anonymous';
+    video.playsInline = true;
+    await new Promise<void>((resolve, reject) => {
+      video.onloadedmetadata = () => resolve();
+      video.onerror = () => reject(new Error('video-load-failed'));
+    });
+
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    const scale = Math.min(1, MAX_SIDE / Math.max(vw, vh));
+    const pw = Math.max(2, Math.round(vw * scale));
+    const ph = Math.max(2, Math.round(vh * scale));
+
+    const modelId = await ensureMattingModel();
+    if (!modelId) return;
+
+    // RAFT 光流用于时域连贯（失败则退化为逐帧独立抠像，仍可用）
+    let useFlow = false;
+    try {
+      if (!isRaftReady()) {
+        const ensured = await ensurePresetModel('raft-optical-flow');
+        if (ensured.ok) {
+          const raftResult = await loadRaftModel();
+          useFlow = raftResult.ok;
+        }
+      } else {
+        useFlow = true;
+      }
+    } catch {
+      useFlow = false;
+    }
+
+    const out = document.createElement('canvas');
+    out.width = pw;
+    out.height = ph;
+    const octx = out.getContext('2d')!;
+    const stream = out.captureStream(FPS);
+    const mime = pickVideoMime();
+
+    let recorder: MediaRecorder;
+    try {
+      recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
+    } catch {
+      throw new Error('当前浏览器不支持 MediaRecorder 视频重编码');
+    }
+    const chunks: Blob[] = [];
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size) chunks.push(e.data);
+    };
+    const encodeDone = new Promise<Blob>((resolve) => {
+      recorder.onstop = () => resolve(new Blob(chunks, { type: mime }));
+    });
+
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    const totalFrames = Math.max(1, Math.floor(duration * FPS));
+    const step = 1000 / FPS;
+
+    recorder.start();
+    let prevAlpha: Float32Array | null = null;
+    let prevFrame: HTMLCanvasElement | null = null;
+    for (let i = 0; i < totalFrames; i++) {
+      const t = i / FPS;
+      const frame = await grabVideoFrame(video, t, pw, ph);
+      const mres = await removeBackground(frame, {
+        modelId,
+        edgeFeather: effects.matting.edgeFeather / 32,
+        despill: effects.matting.despill,
+      });
+      let alpha = mres.alpha;
+      if (useFlow && prevAlpha && prevFrame) {
+        try {
+          const flow = await estimateOpticalFlowRAFT(prevFrame, frame);
+          if (flow) {
+            const warped = propagateAlphaByFlow(prevAlpha, flow, pw, ph);
+            const blended = new Float32Array(pw * ph);
+            for (let k = 0; k < pw * ph; k++) blended[k] = clamp(alpha[k] * 0.7 + warped[k] * 0.3, 0, 1);
+            alpha = blended;
+          }
+        } catch {
+          /* 光流失败则沿用当前帧 alpha */
+        }
+      }
+      const rgba = composeRgbaFromAlpha(frame, alpha);
+      octx.drawImage(rgba, 0, 0);
+      updateNodeData(id, {
+        status: 'generating',
+        error: '',
+        params: {
+          ...params,
+          generationProgress: [{
+            progress: Math.round(((i + 1) / totalFrames) * 100),
+            message: `一键抠图·视频 ${i + 1}/${totalFrames}${useFlow ? '（RAFT 时域连贯）' : ''}`,
+            stage: 'matting-video',
+          }],
+        },
+      });
+      await sleep(step);
+      if (i % 4 === 0) await yieldToUI();
+      prevAlpha = mres.alpha;
+      prevFrame = frame;
+    }
+    recorder.stop();
+    const blob = await encodeDone;
+    emitClientVideoResultNode(blob, pw, ph, duration, '一键抠图·视频');
+  }
+
   function renderColorPanelBroken() {
     return null;
   }
@@ -3130,7 +2108,7 @@ export function PostNode({ id, data, selected }: NodeProps) {
         <PanelSection title="焦区与深度" note="左侧放焦区、深度引擎和过渡逻辑，便于先定清晰区域。">
           <div className="grid gap-3 lg:grid-cols-2">
             <ToggleField title="启用景深" checked={effects.dof.enabled} onChange={(value) => patchEffect('dof', { enabled: value })} testId={`post-field-${id}-dof-enabled`} />
-            <SelectField title="景深模式" value={effects.dof.engine} options={[{ value: 'manual-focus-box', label: '手动焦区' }, { value: 'depth-anything-v2-small', label: 'Depth Anything V2 自动深度' }]} onChange={(value) => patchEffect('dof', { enabled: true, engine: value as PostEffectsState['dof']['engine'] })} testId={`post-field-${id}-dof-engine`} />
+            <SelectField title="景深模式" value={effects.dof.engine} options={[{ value: 'manual-focus-box', label: '手动焦区' }, { value: 'depth-anything-v3-base', label: 'Depth Anything V3 自动深度' }]} onChange={(value) => patchEffect('dof', { enabled: true, engine: value as PostEffectsState['dof']['engine'] })} testId={`post-field-${id}-dof-engine`} />
             <SelectField
               title="蒙版模式"
               value={effects.dof.maskMode}
@@ -3334,6 +2312,53 @@ export function PostNode({ id, data, selected }: NodeProps) {
     );
   }
 
+  function renderMotionBlurPanel() {
+    return (
+      <div className="grid gap-4 xl:grid-cols-[0.96fr_1.04fr]">
+        <PanelSection title="运动模糊引擎" note="基于 RAFT 光流与 Kornia 运动核，按钮只是调取入口，算法在 postFX 模块。">
+          <div className="grid gap-3 lg:grid-cols-2">
+            <ToggleField title="启用运动模糊" checked={effects.motionBlur.enabled} onChange={(value) => patchEffect('motionBlur', { enabled: value })} testId={`post-field-${id}-motionblur-enabled`} />
+            <SelectField
+              title="执行引擎"
+              value={effects.motionBlur.engine}
+              options={[
+                { value: 'kornia-motion', label: 'Kornia 运动核（角度模糊）' },
+                { value: 'raft-flow', label: 'RAFT 光流（逐帧方向性）' },
+              ]}
+              onChange={(value) => patchEffect('motionBlur', { enabled: true, engine: value as PostEffectsState['motionBlur']['engine'] })}
+              testId={`post-field-${id}-motionblur-engine`}
+            />
+            <ToggleField title="使用光流驱动" checked={effects.motionBlur.useOpticalFlow} onChange={(value) => patchEffect('motionBlur', { enabled: true, useOpticalFlow: value, engine: value ? 'raft-flow' : 'kornia-motion' })} testId={`post-field-${id}-motionblur-flow`} />
+          </div>
+          <div className="mt-3 rounded-xl border border-dashed border-white/10 bg-[#111] px-3 py-3 text-xs leading-5 text-[#9f9f9f]">
+            <div className="font-medium text-[#e7e7e7]">实现说明</div>
+            <div className="mt-1">
+              Kornia 运动核：生成沿角度均布的运动核，旋转画布后做可分离 1D 卷积，等价 Kornia 的 motion_blur / filter2d。
+              RAFT 光流：估计相邻帧运动矢量，沿光流方向做方向性模糊（需本地 RAFT 模型，缺失时自动回退角度模糊）。
+            </div>
+          </div>
+        </PanelSection>
+        <PanelSection title="模糊参数" note="长度与角度控制电影感拖影方向与强度。">
+          <div className="grid gap-3">
+            <SliderField title="模糊长度" value={effects.motionBlur.length} min={2} max={120} step={1} onChange={(value) => patchEffect('motionBlur', { enabled: true, length: value })} testId={`post-field-${id}-motionblur-length`} />
+            <SliderField title="模糊角度" value={effects.motionBlur.angle} min={0} max={360} step={1} onChange={(value) => patchEffect('motionBlur', { enabled: true, angle: value })} testId={`post-field-${id}-motionblur-angle`} />
+          </div>
+          <button
+            type="button"
+            className="nodrag mt-3 inline-flex items-center gap-2 rounded-xl border border-[#00d4aa]/30 bg-[#0e2f2a] px-3 py-2 text-sm text-[#d8fff4] hover:bg-[#113a33]"
+            onPointerDown={stopCanvasPointer}
+            disabled={isApplying || !sourceAsset}
+            onClick={() => void handleApplyMotionBlur()}
+            data-testid={`post-motionblur-apply-${id}`}
+          >
+            {isApplying ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wand2 className="h-4 w-4" />}
+            应用运动模糊
+          </button>
+        </PanelSection>
+      </div>
+    );
+  }
+
   function renderActivePanel() {
     switch (activeEffect) {
       case 'color':
@@ -3350,6 +2375,8 @@ export function PostNode({ id, data, selected }: NodeProps) {
         return renderMattingPanel();
       case 'tracking':
         return renderTrackingPanel();
+      case 'motionBlur':
+        return renderMotionBlurPanel();
       default:
         return null;
     }
@@ -3369,6 +2396,7 @@ export function PostNode({ id, data, selected }: NodeProps) {
       : 'idle';
 
   return (
+    <ControlsDisabledContext.Provider value={isApplying}>
     <div className="relative overflow-visible" data-testid={`post-node-wrap-${id}`}>
       <div
         className={`group relative rounded-[28px] border border-white/10 bg-[#161616] shadow-[0_20px_60px_rgba(0,0,0,0.36)] transition-all ${selected ? 'ring-1 ring-[#00d4aa]/40' : ''}`}
@@ -3486,6 +2514,7 @@ export function PostNode({ id, data, selected }: NodeProps) {
               <button
                 key={effectId}
                 type="button"
+                disabled={isApplying}
                 onPointerDown={stopCanvasPointer}
                 onClick={() => handleOpenEffect(effectId)}
                 data-testid={`post-tool-${id}-${effectId}`}
@@ -3506,7 +2535,8 @@ export function PostNode({ id, data, selected }: NodeProps) {
         <div className="mt-4 flex flex-wrap items-center gap-2">
           <button
             type="button"
-            className="nodrag inline-flex items-center gap-2 rounded-2xl border border-white/10 bg-[#111] px-3 py-2 text-sm text-[#ececec] hover:bg-[#1a1a1a]"
+            className="nodrag inline-flex items-center gap-2 rounded-2xl border border-white/10 bg-[#111] px-3 py-2 text-sm text-[#ececec] hover:bg-[#1a1a1a] disabled:opacity-50"
+            disabled={isApplying}
             onPointerDown={stopCanvasPointer}
             onClick={() => handleOpenEffect('matting')}
             data-testid={`post-matting-open-${id}`}
@@ -3524,6 +2554,31 @@ export function PostNode({ id, data, selected }: NodeProps) {
           >
             {isApplying ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
             生成结果节点
+          </button>
+        </div>
+
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            className="nodrag inline-flex items-center gap-2 rounded-2xl border border-[#ff9f52]/25 bg-[#271b11] px-3 py-2 text-xs font-medium text-[#ffe6d1] hover:bg-[#33220f] disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={cinematicDisabled}
+            onPointerDown={stopCanvasPointer}
+            onClick={() => void handleOneClickCinematic('auto')}
+            data-testid={`post-oneclick-cinematic-${id}`}
+          >
+            <Wand2 className="h-4 w-4" />
+            一键电影感
+          </button>
+          <button
+            type="button"
+            className="nodrag inline-flex items-center gap-2 rounded-2xl border border-[#00d4aa]/25 bg-[#0e2f2a] px-3 py-2 text-xs font-medium text-[#d8fff4] hover:bg-[#113a33] disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={mattingDisabled}
+            onPointerDown={stopCanvasPointer}
+            onClick={() => void handleOneClickMatting()}
+            data-testid={`post-oneclick-matting-${id}`}
+          >
+            <Layers3 className="h-4 w-4" />
+            一键智能抠图
           </button>
         </div>
 
@@ -3553,6 +2608,37 @@ export function PostNode({ id, data, selected }: NodeProps) {
         </div>
       </div>
 
+      <Sheet
+        open={mattingPanelOpen && Boolean(mattingSourceUrl)}
+        onOpenChange={(openState) => {
+          if (!openState) {
+            setMattingPanelOpen(false);
+            setMattingSourceUrl('');
+          }
+        }}
+      >
+        <SheetContent
+          side="right"
+          className="w-[min(980px,calc(100vw-48px))] max-w-none border-l border-white/10 bg-[#0c0f13] p-0 text-white sm:max-w-none"
+        >
+          <SheetHeader className="sr-only">
+            <SheetTitle>一键智能抠图</SheetTitle>
+            <SheetDescription>在右侧面板里完成主体识别、手动补选与透明 PNG 批量导出。</SheetDescription>
+          </SheetHeader>
+          {mattingSourceUrl ? (
+            <Suspense fallback={null}>
+              <MattingCapabilityPanel
+                sourceImageUrl={mattingSourceUrl}
+                mediaType={sourceAsset?.kind === 'video' ? 'video' : 'image'}
+                onClose={() => { setMattingPanelOpen(false); setMattingSourceUrl(''); }}
+                onExtract={handleMattingExtract}
+                onTrack={sourceAsset?.kind === 'video' ? handleMattingTrack : undefined}
+              />
+            </Suspense>
+          ) : null}
+        </SheetContent>
+      </Sheet>
+
       {panelOpen ? (
         <div
           className="absolute left-full top-0 z-50 ml-4 w-[720px] overflow-hidden rounded-[28px] border border-white/10 bg-[#0e0f11] shadow-[0_24px_80px_rgba(0,0,0,0.42)]"
@@ -3565,7 +2651,8 @@ export function PostNode({ id, data, selected }: NodeProps) {
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                className="nodrag inline-flex items-center gap-1.5 rounded-xl border border-white/8 bg-[#111] px-2.5 py-1.5 text-xs text-[#d0d0d0] hover:bg-[#171717]"
+                className="nodrag inline-flex items-center gap-1.5 rounded-xl border border-white/8 bg-[#111] px-2.5 py-1.5 text-xs text-[#d0d0d0] hover:bg-[#171717] disabled:opacity-50"
+                disabled={isApplying}
                 onPointerDown={stopCanvasPointer}
                 onClick={() => handleResetEffect(activeEffect)}
                 data-testid={`post-reset-${activeEffect}-${id}`}
@@ -3656,10 +2743,12 @@ export function PostNode({ id, data, selected }: NodeProps) {
         onClose={() => setActivation(null)}
       />
     </div>
+    </ControlsDisabledContext.Provider>
   );
 }
 
-export default PostNode;
+export default memo(PostNode);
+
 
 
 

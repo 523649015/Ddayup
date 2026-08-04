@@ -72,6 +72,17 @@ self.onmessage = async (event: MessageEvent) => {
     }
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
+    const stack = e instanceof Error ? e.stack || message : message;
+    // 把完整堆栈 POST 到 dev 服务器 /api/diag，便于定位 registerBackend 等错误根因。
+    try {
+      fetch('/api/diag', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'worker-error', message, stack, msgType: data.type }),
+      }).catch(() => {});
+    } catch {
+      /* noop */
+    }
     if (data.type === 'translate') {
       post({ type: 'error', id: data.id, error: message });
     } else {
