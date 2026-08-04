@@ -3,10 +3,13 @@
   "name": "Ddayup网页素材采集扩展",
   "version": "0.1.3",
   "description": "Ddayup 网页素材采集扩展：扫描当前网页的图片 / 视频 / 音效 / 3D 模型资源，支持下载到本地、保存到自定义目录、导入 Ddayup 素材库 / 画布（Chrome / Edge 通用）",
+  "offline_enabled": true,
+  "privacy_policy_url": "https://523649015.github.io/Ddayup/privacy-policy.html",
+  "homepage_url": "https://523649015.github.io/Ddayup/",
   "icons": {
-    "16": "icons/icon.svg",
-    "48": "icons/icon.svg",
-    "128": "icons/icon.svg"
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
   },
   "permissions": [
     "activeTab",
@@ -20,6 +23,7 @@
     "declarativeNetRequestWithHostAccess",
     "cookies",
     "clipboardWrite",
+    "nativeMessaging",
     "tabs"
   ],
   "host_permissions": ["<all_urls>"],
@@ -32,9 +36,9 @@
   "action": {
     "default_title": "Ddayup网页素材采集扩展",
     "default_icon": {
-      "16": "icons/icon.svg",
-      "48": "icons/icon.svg",
-      "128": "icons/icon.svg"
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
     }
   },
   "side_panel": {

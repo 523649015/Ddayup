@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ddayup 网页素材采集扩展 · 隐私政策</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; line-height: 1.7; color: #1f2328; }
+    h1 { font-size: 22px; } h2 { font-size: 17px; margin-top: 28px; }
+    code { background: #f0f0f0; padding: 1px 5px; border-radius: 4px; }
+    .updated { color: #666; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>Ddayup 网页素材采集扩展 · 隐私政策</h1>
+  <p class="updated">最后更新：2026-08-04</p>
+
+  <h2>1. 我们收集什么</h2>
+  <p>本扩展<strong>不收集、不上传您的浏览历史或个人身份信息</strong>。扩展在本地扫描您主动打开的网页中公开可访问的图片、视频、音效、3D 模型资源链接，这些操作全部在您的浏览器本机完成。</p>
+
+  <h2>2. 数据如何处理</h2>
+  <ul>
+    <li>采集到的素材链接仅临时存放在浏览器本地存储（<code>chrome.storage</code>），用于在当前会话内展示与下载。</li>
+    <li>下载文件直接写入您指定的本地目录，不经过任何远程服务器。</li>
+    <li>原生主机（<code>ddayup-host</code>）仅在本机运行，用于调用本机已安装的 yt-dlp / ffmpeg 进行下载与转码，<strong>不与任何远程服务器通信</strong>。</li>
+  </ul>
+
+  <h2>3. 何时会与服务器通信</h2>
+  <p>仅当您主动使用以下功能时，扩展会连接您自建或授权的 Ddayup 后端（默认 <code>http://127.0.0.1:3000</code>）：</p>
+  <ul>
+    <li>「导入 Ddayup 素材库 / 画布」——将选中素材推送到后端（需您已部署后端）。</li>
+    <li>「账号登录 / 7 天试用 / 付费激活」——向后端校验授权状态。后端不可达时，扩展自动进入本地试用模式，核心采集功能不受影响。</li>
+  </ul>
+  <p>除上述目的外，扩展不会在后台静默上传任何数据。</p>
+
+  <h2>4. 必需权限说明</h2>
+  <ul>
+    <li><code>host_permissions &lt;all_urls&gt;</code>：用于在您访问的网页中读取素材资源链接与封面图；仅对您主动扫描的页面生效。</li>
+    <li><code>cookies</code>：仅用于读取抖音 / YouTube 等平台的会话 Cookie，以便本机原生主机下载受鉴权的媒体直链；Cookie 不会被上传。</li>
+    <li><code>downloads</code>：将素材保存到您选择的本地目录。</li>
+    <li><code>nativeMessaging</code>：与本机原生主机进程通信，调用 yt-dlp 下载。</li>
+    <li><code>sidePanel</code> / <code>activeTab</code> / <code>scripting</code> / <code>tabs</code>：提供侧边栏界面与页面扫描能力。</li>
+  </ul>
+
+  <h2>5. 您的权利</h2>
+  <p>您可随时在浏览器扩展管理页卸载本扩展，本地存储的素材缓存会随之清除。我们不在服务器端长期留存任何可用于识别个人的信息。</p>
+
+  <h2>6. 联系我们</h2>
+  <p>如有隐私疑问，请联系：privacy@ddayup.example（示例地址，请替换为真实联系方式）。</p>
+</body>
+</html>
