@@ -71,6 +71,7 @@ app/server/image/
 app/server/video/
 app/server/__pycache__/
 app/server/tmp-post-runtime-smoke*/
+app/test-results/
 
 # Local verification scripts (development-only)
 app/server/verify-*.mjs
