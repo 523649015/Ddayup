@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "api": "node server/hmdao-api.mjs",
+    "api": "node --watch server/hmdao-api.mjs",
     "serve:3000": "node server/ui-static-proxy.mjs --port 3000 --api http://127.0.0.1:8792",
     "dev:full": "node server/dev-full.mjs",
     "dev:full:real": "node server/dev-full.mjs --real-api",
@@ -17,19 +17,24 @@
     "verify:dcc-browser": "node server/verify-dcc-browser-flow.mjs",
     "verify:dcc-video-tagging": "node server/verify-dcc-video-tagging-flow.mjs",
     "verify:dcc-browser:keep-open": "node server/verify-dcc-browser-flow.mjs --visible --keep-open",
-    "verify:browser": "node server/verify-browser-flow.mjs",
-    "verify:browser:full": "node -e \"process.env.HMDAO_VERIFY_FULL_TOOL_CHAIN='1'; import('./server/verify-browser-flow.mjs').then((m)=>m.main())\"",
+    "verify:browser": "node scripts/verify-browser-flow.mjs",
+    "verify:browser:full": "node -e \"process.env.HMDAO_VERIFY_FULL_TOOL_CHAIN='1'; import('./scripts/verify-browser-flow.mjs').then((m)=>m.main())\"",
     "verify:post-browser": "node server/verify-post-browser-flow.mjs",
     "verify:tagging-contract": "node server/verify-tagging-contract-preview.mjs",
-    "verify:browser:visible": "node server/verify-browser-visible-flow.mjs",
+    "verify:browser:visible": "node scripts/verify-browser-visible-flow.mjs",
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc -b",
     "lint": "eslint .",
+    "mcp": "node server/mcp/index.mjs",
+    "test:mcp": "node ../scripts/test-mcp-memory.mjs",
+    "test:auth": "node ../scripts/verify-bcf-logic.mjs && node ../scripts/verify-gij-logic.mjs && node ../scripts/verify-lmn-logic.mjs",
+    "test:gate": "node ../scripts/run-decision-gate.mjs",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@ffmpeg/core": "^0.12.9",
@@ -63,6 +68,8 @@
     "@radix-ui/react-toggle": "^1.1.10",
     "@radix-ui/react-toggle-group": "^1.1.11",
     "@radix-ui/react-tooltip": "^1.2.8",
+    "@react-three/drei": "^10.7.7",
+    "@react-three/fiber": "^9.6.1",
     "@types/three": "^0.184.1",
     "@xenova/transformers": "^2.17.2",
     "@xyflow/react": "^12.11.0",
@@ -92,6 +99,7 @@
     "three": "^0.184.0",
     "uuid": "^14.0.0",
     "vaul": "^1.1.2",
+    "webm-muxer": "^5.1.4",
     "y-protocols": "^1.0.7",
     "yjs": "^13.6.31",
     "zod": "^4.3.5",
@@ -99,6 +107,8 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
+    "@playwright/test": "^1.49.1",
+    "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
@@ -106,6 +116,7 @@
     "@types/react": "^19.2.5",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.1",
+    "@vitest/runner": "3.2.7",
     "autoprefixer": "^10.4.23",
     "eslint": "^9.39.1",
     "eslint-plugin-react-hooks": "^7.0.1",
@@ -121,6 +132,9 @@
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.46.4",
     "vite": "^7.2.4",
-    "vitest": "^4.1.10"
+    "vitest": "3.2.7"
+  },
+  "overrides": {
+    "onnxruntime-web": "^1.27.0"
   }
 }

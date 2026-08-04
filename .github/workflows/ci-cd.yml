@@ -51,8 +51,8 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
-      - name: TypeScript 类型检查
-        run: npx tsc --noEmit
+      - name: TypeScript 类型检查（项目引用构建，零错误门禁）
+        run: npm run typecheck
 
       - name: ESLint 检查
         run: npm run lint
@@ -105,12 +105,7 @@ jobs:
       - name: 安装 Playwright 浏览器
         run: npx playwright install --with-deps chromium
 
-      - name: 启动开发服务器
-        run: npm run dev -- --host 0.0.0.0 &
-
-      - name: 等待服务器就绪
-        run: npx wait-on http://localhost:5173 --timeout 30000
-
+      # 由 playwright.config.ts 的 webServer 在端口 3000 拉起开发服务器（与发布 serve:3000 一致）
       - name: 运行 E2E 测试
         run: npx playwright test --reporter=html
 
@@ -122,11 +117,91 @@ jobs:
           path: app/playwright-report/
           retention-days: 7
 
+  # ===== Job 3.5: 后端架构回归验证（Node，无第三方依赖，纯内置模块）=====
+  # 守护架构重构：任何后续拆分若引入漏注/断链/未迁移分支，此门禁失败。
+  backend-integration:
+    name: 后端架构回归验证 (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 守卫 — 禁止 scripts/ 根目录散落 .log
+        run: |
+          FOUND=$(find scripts -maxdepth 1 -name '*.log' 2>/dev/null | wc -l)
+          if [ "$FOUND" -ne 0 ]; then
+            echo "ERROR: 发现 scripts/ 根目录散落日志文件，应移入 scripts/_archive/logs/";
+            find scripts -maxdepth 1 -name '*.log';
+            exit 1;
+          fi
+          echo "scripts/ 根目录无散落 .log ✅"
+
+      - name: 启动后端 (8792)
+        run: |
+          node app/server/hmdao-api.mjs > /tmp/hmdao-backend.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8792/api/health >/dev/null 2>&1; then
+              echo "backend ready on 8792"; break
+            fi
+            sleep 1
+          done
+
+      - name: 运行架构回归验证（硬门禁）
+        run: |
+          set +e
+          FAIL=0
+          node scripts/test-session-store.mjs        | tee /tmp/c0.log || true
+          node scripts/test-core-chains.mjs          | tee /tmp/c1.log || true
+          node scripts/probe-migrated-routes.mjs     | tee /tmp/c2.log || true
+          node scripts/test-byok-surface.mjs         | tee /tmp/c2b.log || true
+          node scripts/verify-route-migration.mjs    | tee /tmp/c3.log || true
+          node scripts/test-fullchain-integrity.mjs  | tee /tmp/c4.log || true
+          node scripts/audit-bare-globals.mjs        | tee /tmp/c5.log || true
+          node scripts/audit-deps-wiring.mjs         | tee /tmp/c6.log || true
+          grep -E "BROKEN:[[:space:]]*[1-9]" /tmp/c0.log && FAIL=1
+          grep -E "BROKEN:[[:space:]]*[1-9]" /tmp/c1.log && FAIL=1
+          grep -E "FAIL=[1-9]" /tmp/c2.log && FAIL=1
+          grep -E "BROKEN:[[:space:]]*[1-9]" /tmp/c2b.log && FAIL=1
+          grep -E "遗漏[[:space:]]*:[[:space:]]*[1-9]" /tmp/c3.log && FAIL=1
+          grep -E "BROKEN:[[:space:]]*[1-9]" /tmp/c4.log && FAIL=1
+          grep -E "candidates:[[:space:]]*[1-9]" /tmp/c5.log && FAIL=1
+          grep -E "缺失 deps:[[:space:]]*[1-9]" /tmp/c6.log && FAIL=1
+          echo "=== 后端架构硬门禁结果: $FAIL (0=通过) ==="
+          if [ "$FAIL" -ne 0 ]; then cat /tmp/hmdao-backend.log; fi
+          exit $FAIL
+
+      - name: 运行性能/深度检测（信息性，不阻断流水线）
+        if: always()
+        run: |
+          node scripts/deep-inspect-system.mjs || true
+          node scripts/bench-endpoints.mjs || true
+
+      # ===== 决策回归验证（纯 Node，无第三方依赖，串跑 scripts/verify-*-logic.mjs 全部）=====
+      # 守护各修复任务的「核心决策不回退」：invalid 语义(AL/AM/AN)、对账误删(AH)、store 可用性(AJ) 等。
+      # 用 glob 遍历，后续新增 verify-*-logic.mjs 自动纳入，避免硬编码清单遗漏。
+      - name: 决策回归验证 — 串跑 verify-*-logic.mjs（硬门禁）
+        run: |
+          set +e
+          FAIL=0
+          shopt -s nullglob
+          for f in scripts/verify-*-logic.mjs; do
+            echo "--- $f ---"
+            node "$f" | tee "/tmp/$(basename "$f" .mjs).log" || FAIL=1
+          done
+          shopt -u nullglob
+          echo "=== 决策回归硬门禁结果: $FAIL (0=通过) ==="
+          exit $FAIL
+
   # ===== Job 4: 构建 =====
   build:
     name: Vite 生产构建
     runs-on: ubuntu-latest
-    needs: [typecheck-and-lint, unit-tests]
+    needs: [typecheck-and-lint, unit-tests, backend-integration]
     defaults:
       run:
         working-directory: app
