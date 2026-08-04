@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
+import { extractFirstMatch } from '../../lib/str-utils.mjs';
 
 export const UNREAL_PLUGIN_NAME = 'HMDaoUnrealCapture';
 export const UNREAL_PLUGIN_FRIENDLY_NAME = 'HMDao Unreal Capture';
@@ -67,11 +68,6 @@ export async function probeTcp(port, host = '127.0.0.1', timeoutMs = 1200) {
   });
 }
 
-export function extractFirstMatch(text, regex) {
-  const match = String(text || '').match(regex);
-  return match?.[1] || '';
-}
-
 export function hasNonAsciiText(value) {
   return /[^\u0000-\u007f]/.test(String(value || ''));
 }
@@ -125,6 +121,50 @@ export async function runPowerShellInline(scriptText, options = {}) {
     child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
     child.on('error', (error) => finish({ ok: false, code: -1, stdout, stderr: `${stderr}\n${error.message}`.trim() }));
     child.on('close', (code) => finish({ ok: code === 0, code: Number(code || 0), stdout, stderr }));
+  });
+}
+
+/**
+ * 通用异步子进程执行器。
+ *
+ * 存在意义：替换散落在适配器里的 spawnSync —— 同步执行会阻塞整个 Node 事件循环，
+ * 一次 900ms 的外部工具调用会让同期所有 HTTP 请求一起卡住（延迟尖峰根因）。
+ * 返回结构刻意与 spawnSync 的消费方式对齐（ok/code/stdout/stderr/error/timedOut），
+ * 便于逐个改造调用点而不改动其后续逻辑。
+ */
+export async function runProcessAsync(executable, args = [], options = {}) {
+  const timeoutMs = Math.max(0, Number(options.timeoutMs || 0));
+  return await new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(executable, args, {
+        cwd: options.cwd || undefined,
+        windowsHide: options.windowsHide !== undefined ? Boolean(options.windowsHide) : true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      resolve({ ok: false, code: -1, stdout: '', stderr: '', error: String(error?.message || error), timedOut: false, timeoutMs });
+      return;
+    }
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({ timeoutMs, ...payload });
+    };
+    const timer = timeoutMs > 0
+      ? setTimeout(() => {
+        try { child.kill(); } catch { /* already gone */ }
+        finish({ ok: false, code: -1, stdout: stdout.trim(), stderr: `${stderr}\nTimed out after ${timeoutMs}ms`.trim(), error: '', timedOut: true });
+      }, timeoutMs)
+      : null;
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+    child.on('error', (error) => finish({ ok: false, code: -1, stdout: stdout.trim(), stderr: stderr.trim(), error: String(error?.message || error), timedOut: false }));
+    child.on('close', (code) => finish({ ok: code === 0, code: Number.isInteger(code) ? code : -1, stdout: stdout.trim(), stderr: stderr.trim(), error: '', timedOut: false }));
   });
 }
 

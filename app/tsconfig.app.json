@@ -35,6 +35,9 @@
     "src/nodes/lazyLoad.ts",
     "src/services/collaboration.ts",
     "src/services/gpuResourceTracker.ts",
-    "src/services/workflowEngine.ts"
+    "src/services/workflowEngine.ts",
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "src/**/__tests__/**"
   ]
 }

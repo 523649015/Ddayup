@@ -4,40 +4,185 @@
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import {
   promises as fs,
   createReadStream,
   createWriteStream,
   existsSync,
   mkdirSync,
-  readdirSync,
-  readFileSync,
-  statSync,
-  writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import {
+  buildPlatformInfo,
+  gmicManagedInstallSupport,
+  isForbiddenInstallTarget,
+  platformExecutableCandidates,
+  resolveYtDlpAssetNames,
+  selectPypiWheelPlatformRegex,
+} from './platform-utils.mjs';
 import { pipeline } from 'node:stream/promises';
 import Busboy from 'busboy';
-import { unzipSync } from 'fflate';
 import { createDccEnvironmentManager } from './dcc-plugin-manager.mjs';
 import { createUnrealPixelStreamingLegacyModule } from './dcc/unreal-pixel-streaming-legacy.mjs';
+import {
+  getMemory,
+  setMemory,
+  setAllMemory,
+  deleteMemory,
+  memoryContextString,
+} from './lib/agent-memory-store.mjs';
+
+// 火山方舟推理接入点管理已抽离为独立模块（缓存私有化 + 原子写 + 超时 + 自愈入口）。
+// 见 app/server/providers/ark.mjs：resolveArkModel / getArkEndpointInfo / getAllArkEndpoints /
+// syncArkEndpoints / invalidateArkEndpoint（自愈入口，运行期接线为后续步骤）/ rebuildSingleArkEndpoint。
+import {
+  resolveArkModel,
+  syncArkEndpoints,
+} from './providers/ark.mjs';
+// 统一原子写 JSON 持久化基础设施。
+// 纯认证工具函数（从主文件剥离，行为零变更）。
+import {
+  normalizeLocalEmail,
+  isValidLocalEmail,
+  hashPassword,
+  verifyPassword,
+  publicUser,
+} from './lib/auth-utils.mjs';
+// 媒体代理纯工具函数（从主文件剥离，行为零变更）。
+import {
+  inferMediaContentType,
+  mediaMimeTypeFromExtension,
+  looksLikeHtml,
+  sanitizeForwardHeaderValue,
+  getRemoteSignedUrlExpiry,
+  createMediaProxyErrorPayload,
+  normalizeHttpUrl,
+  readHeaderValue,
+} from './lib/media-utils.mjs';
+// 纯字符串/Shell 工具函数（从主文件剥离，行为零变更；services/* 经 deps 注入复用）。
+import {
+  extractFirstString,
+  uniqueStrings,
+  escapePowerShellSingleQuoted,
+  escapeXml,
+  extractJsonObjectFromText,
+} from './lib/str-utils.mjs';
+import {
+  buildSafeInlineContentDisposition,
+  sanitizeLocalAssetId,
+  sanitizeMultipartFieldName,
+  parseStringArrayField,
+  parseInlineDataUrl,
+  isManagedPublicRelayAssetUrl,
+  isTemporaryTunnelHost,
+  isApimartBaseUrl,
+} from './lib/parse-utils.mjs';
+import {
+  isPrivateOrLocalHostname,
+  extractManagedLocalRoutePath,
+  isPublicRemoteMediaUrl,
+  isLocalOnlyMediaReference,
+} from './lib/media-url-utils.mjs';
+// 目录归一化 + relay 模态推断（含从 byokService 下沉的纯函数，行为零变更）。
+import { inferMode } from './lib/catalog-utils.mjs';
+import { sha256 } from './lib/crypto-utils.mjs';
+import { imageExtensionFromMimeType } from './lib/media-utils.mjs';
+// WebSocket 帧编解码纯工具（从主文件剥离，行为零变更）。
+import {
+  wsAcceptKey,
+  encodeWsFrame,
+  createFrameParser,
+  sendWs,
+} from './lib/ws-frame-utils.mjs';
+// 纯对象/代理错误分类工具（从主文件剥离，行为零变更）。
+import {
+  compactObject,
+  classifyProxyError,
+  normalizeAspectRatio,
+  stripInternalGenerationFields,
+} from './lib/object-utils.mjs';
+import { extractApimartTaskId, normalizeApimartTaskPhase, apimartTaskStatusCandidates, apimartVideoSize, apimartVideoAspectRatio, rawAspectRatioFromResolution, apimartKlingMode, isApimartKlingVideoModelKind, isStrictImageSubjectSwapOperation, apimartImageSize, apimartImageResolution, assetCoverageRoles, apimartExpandedImageRoles } from './lib/apimart-payload-utils.mjs';
+import { buildApimartTaskResultPayload, apimartTaskStatusValue, extractApimartAsyncFailureMessage } from './lib/apimart-task-result.mjs';
+import { normalizeReferenceAssets, buildApimartImageRoleEntries, buildApimartOrderedImageUrls, buildApimartImagePromptContract, buildApimartVideoRoleEntries, buildApimartAudioUrls } from './lib/apimart-role-builders.mjs';
+import { apimartVideoModelKind, apimartImageModelKind, shouldRouteApimartVideoEditToHappyhorse } from './lib/apimart-model-kind.mjs';
+// 会话存储（sessions / accessSessions / createSession / deleteSessionsForUser），从主文件
+// 抽离。ES 模块 live binding：主文件与各路由组共享同一批 Map 实例，行为零变更。
+import {
+  sessions,
+  accessSessions,
+  createSession,
+  deleteSessionsForUser,
+} from './lib/session-store.mjs';
+// 路由注册表：替代 route() 中的顺序 if 链，路由组按 routes/ 目录逐步外移。
+import { createHttpRouter } from './core/http-router.mjs';
+import { registerHealthRoutes } from './routes/health.mjs';
+import { registerAuthRoutes } from './routes/auth.mjs';
+import { registerExtensionLicenseRoutes } from './routes/extension-license.mjs';
+import { registerByokRoutes } from './routes/byok.mjs';
+import { registerModelsRoutes } from './routes/models.mjs';
+import { registerAssetsRoutes } from './routes/assets.mjs';
+import { registerDccRoutes } from './routes/dcc.mjs';
+import { registerMediaRoutes } from './routes/media.mjs';
+import { registerCobuildRoutes } from './routes/cobuild.mjs';
+import { registerSearchRoutes } from './routes/search.mjs';
+import { registerLocalAiRoutes } from './routes/local-ai.mjs';
+import { registerAgentRoutes } from './routes/agent.mjs';
+import { createAssetLibraryService } from './services/assetLibrary.mjs';
 
 const PORT = Number(process.env.HMDAO_API_PORT || 8792);
-const APP_DIR = process.cwd();
-const REPO_ROOT = path.resolve(APP_DIR, '..');
-const DATA_DIR = path.resolve(APP_DIR, '.hmdao-data');
+// P1-10：基础路径常量收敛至 lib/server-paths.mjs 单点导出（值与原定义逐字节一致）。
+import { APP_DIR, REPO_ROOT, DATA_DIR } from './lib/server-paths.mjs';
+import {
+  IMAGE_OPERATION_DISPATCH,
+  buildDefaultOperationDispatchConfig,
+  normalizeOperationDispatchConfig,
+  buildVideoSourceConstraint,
+  isApimartRelayEndpoint,
+  normalizeIdentityController,
+  modelSupportsRequirement,
+  capabilityPenalty,
+  expandedReferenceRoles,
+  referenceRoleRoutingScore,
+  videoGenerationModeRoutingScore,
+} from './lib/operation-dispatch-utils.mjs';
 const LOCAL_VIDEO_EDIT_DIR = path.join(DATA_DIR, 'local-video-edits');
 const LOCAL_VIDEO_RESULT_DIR = path.join(DATA_DIR, 'local-video-results');
 const LOCAL_AUDIO_EDIT_DIR = path.join(DATA_DIR, 'local-audio-edits');
 const LOCAL_AUDIO_RESULT_DIR = path.join(DATA_DIR, 'local-audio-results');
 const LOCAL_IMAGE_ANALYSIS_DIR = path.join(DATA_DIR, 'local-image-analysis');
 const LOCAL_POST_EDIT_DIR = path.join(DATA_DIR, 'local-post-edits');
+const COMFYUI_TEMP_DIR = path.join(DATA_DIR, 'comfyui-tmp');
+const COMFYUI_TEMP_TTL_MS = Number(process.env.HMDAO_COMFYUI_TEMP_TTL_MS || 30 * 60 * 1000);
 const LOCAL_POST_RESULT_DIR = path.join(DATA_DIR, 'local-post-results');
 const LOCAL_VIDEO_PARSE_SCRIPT = path.resolve(APP_DIR, 'server', 'local_video_parse.py');
 const LOCAL_VIDEO_REMOVE_SUBTITLE_SCRIPT = path.resolve(APP_DIR, 'server', 'local_video_remove_subtitle.py');
+
+// P1：hf-proxy 磁盘缓存（NLLB 等大模型文件服务端落盘，浏览器重试/弱网可同源秒取）
+const HF_PROXY_CACHE_DIR = path.resolve(DATA_DIR, 'hf-proxy-cache');
+const hfProxyCacheLocks = new Set();
+function ensureHfProxyCacheDir() {
+  if (!existsSync(HF_PROXY_CACHE_DIR)) {
+    try { fs.mkdirSync(HF_PROXY_CACHE_DIR, { recursive: true }); } catch { /* noop */ }
+  }
+  return HF_PROXY_CACHE_DIR;
+}
+// 已知需预热的模型文件清单：浏览器「一键安装」前由后端异步拉取落盘，绕开美国 CDN 慢链路
+const HF_PROXY_PREWARM = {
+  'Xenova/nllb-200-distilled-600M': [
+    'config.json',
+    'tokenizer.json',
+    'tokenizer_config.json',
+    'special_tokens_map.json',
+    'vocab.json',
+    'merges.txt',
+    'encoder_model.onnx',
+    'decoder_model.onnx',
+    'decoder_with_past_model.onnx',
+  ],
+};
 const DEFAULT_ASSET_LIBRARY_STORAGE_DIR = process.env.HMDAO_ASSET_LIBRARY_DIR
   ? path.resolve(APP_DIR, process.env.HMDAO_ASSET_LIBRARY_DIR)
   : path.join(DATA_DIR, 'asset-library-files');
@@ -58,27 +203,29 @@ const OPERATION_DISPATCH_CONFIG_FILE = process.env.HMDAO_OPERATION_DISPATCH_CONF
   ? path.resolve(APP_DIR, process.env.HMDAO_OPERATION_DISPATCH_CONFIG)
   : path.resolve(APP_DIR, 'server', 'operation-dispatch.config.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const COBUILD_FILE = path.join(DATA_DIR, 'cobuild.json');
 const UNREAL_CONFIG_FILE = path.join(DATA_DIR, 'unreal-config.json');
-const sessions = new Map();
 const activatedProviders = new Map();
-let activatedProvidersHydrated = false;
+// [migrated to ./services/byokService.mjs] let activatedProvidersHydrated = false;
 const workflowRuns = new Map();
 const workflowSocketSubscriptions = new Map();
 const catalogSocketSubscriptions = new Map();
+const polyhavenCatalogCache = new Map();
 const ENABLE_UNREAL_PIXEL_STREAMING_LEGACY = process.env.HMDAO_ENABLE_UNREAL_PIXEL_STREAMING_LEGACY === '1';
 
 const providers = [
   { id: 'deepseek', name: 'DeepSeek', domestic: true, modes: ['llm'] },
   { id: 'siliconflow', name: '硅基流动', domestic: true, modes: ['llm', 'image', 'video'] },
   { id: 'zhipu', name: 'Zhipu AI', domestic: true, modes: ['llm', 'image', 'video'] },
-  { id: 'bailian', name: 'Bailian', domestic: true, modes: ['llm', 'image', 'video'] },
+  { id: 'bailian', name: 'Bailian', domestic: true, modes: ['llm', 'image', 'video', 'audio'] },
   { id: 'minimax', name: 'MiniMax', domestic: true, modes: ['llm', 'audio'] },
-  { id: 'volcengine', name: '火山方舟', domestic: true, modes: ['image', 'video', 'audio'] },
+  { id: 'volcengine', name: '火山方舟', domestic: true, modes: ['llm', 'image', 'video', 'audio'] },
   { id: 'kling', name: 'Kling AI', domestic: true, modes: ['image', 'video'] },
   { id: 'modelscope', name: 'ModelScope', domestic: true, modes: ['llm', 'image', 'video'] },
   { id: 'openai', name: 'OpenAI', domestic: false, modes: ['llm', 'image'] },
   { id: 'fal', name: 'fal.ai', domestic: false, modes: ['image', 'video'] },
   { id: 'replicate', name: 'Replicate', domestic: false, modes: ['image', 'video'] },
+  { id: 'comfyui', name: 'ComfyUI', domestic: true, modes: ['image', 'video', 'audio'] },
 ];
 
 const PROVIDER_BASE_URLS = {
@@ -95,804 +242,14 @@ const PROVIDER_BASE_URLS = {
   replicate: 'https://api.replicate.com/v1',
 };
 
-function createImageCapabilities(overrides = {}) {
-  return {
-    generationModes: ['textToImage', 'imageToImage', 'inpaint', 'outpaint'],
-    referenceRoles: ['style', 'subject', 'element', 'composition', 'lighting', 'omni'],
-    toolOperations: [
-      'panorama_720',
-      'multi_angle_view',
-      'pbr_relight',
-      'storyboard_grid',
-      'hd_toolbox_enhance',
-      'hd_upscale',
-      'hd_outpaint',
-      'hd_inpaint',
-      'hd_erase',
-      'hd_cutout',
-      'hd_crop',
-      'hd_restore',
-      'smart_grid_split',
-      'cinematic_camera_simulation',
-    ],
-    supportsMultiReference: false,
-    supportsOmniReference: false,
-    supportsSubjectLock: false,
-    supportsCompositionLock: false,
-    supportsLightingControl: false,
-    supportsConsistencyEnhancement: false,
-    supportsIdentityController: false,
-    supportsLocalEditing: false,
-    supportsRemoteEditing: true,
-    supportsStageValidation: true,
-    bestFor: [],
-    limitations: [],
-    ...overrides,
-  };
-}
+// ==================== 模型目录自动对账（已迁移至 ./services/catalogReconcile.mjs）====================
+// 对账服务依赖 BYOK 服务函数，接线位于 byok 服务块之后。
 
-function createVideoCapabilities(overrides = {}) {
-  return {
-    generationModes: [],
-    referenceRoles: [],
-    toolOperations: [
-      'ffmpeg_lossless_trim_wavesurfer',
-      'ffmpeg_pixel_crop_cropper',
-      'real_cugan_rife_codeformer_enhance',
-      'opencv_scenedetect_keyframe_parse',
-      'opencv_telea_subtitle_remove',
-      'demucs_v4_audio_split',
-    ],
-    supportsMultiReference: false,
-    supportsOmniReference: false,
-    supportsSubjectLock: false,
-    supportsCompositionLock: false,
-    supportsLightingControl: false,
-    supportsConsistencyEnhancement: false,
-    supportsCameraMotionLockEnhancement: false,
-    supportsIdentityController: false,
-    supportsTextToVideo: false,
-    supportsImageToVideo: false,
-    supportsFirstLastFrame: false,
-    supportsReferenceVideo: false,
-    supportsReferenceImage: false,
-    supportsVideoStyleTransfer: false,
-    supportsPrimaryVideoMotionLock: false,
-    supportsActionTransfer: false,
-    supportsLocalEditing: false,
-    supportsRemoteEditing: true,
-    supportsStageValidation: true,
-    bestFor: [],
-    limitations: [],
-    ...overrides,
-  };
-}
-
-const MODEL_CATALOG = [
-  {
-    id: 'deepseek-chat',
-    name: 'DeepSeek Chat',
-    provider: 'deepseek',
-    mode: 'llm',
-    nodeTypes: ['text', 'script', 'storyboard', 'aiapp'],
-    description: 'General text generation and reasoning.',
-    latency: '2s',
-    price: 0.02,
-    currency: 'CNY',
-    discountLabel: 'New user 9x',
-    discountPercent: 10,
-  },
-  {
-    id: 'gemini-31',
-    name: 'Gemini 3.1',
-    provider: 'openai',
-    mode: 'llm',
-    nodeTypes: ['text', 'script', 'storyboard', 'aiapp'],
-    description: 'OpenAI-compatible multimodal reasoning model routed through relay endpoints.',
-    latency: '3s',
-    price: 0.08,
-    currency: 'USD',
-    upstreamModel: 'gemini-3.1',
-  },
-  {
-    id: 'lib-image',
-    name: 'Qwen 图片',
-    provider: 'siliconflow',
-    mode: 'image',
-    nodeTypes: ['image'],
-    description: '硅基流动托管的 Qwen 原生图片生成',
-    latency: '12s',
-    price: 0.28,
-    currency: 'CNY',
-    discountLabel: 'Limited 85x',
-    discountPercent: 15,
-    upstreamModel: 'Qwen/Qwen-Image',
-    capabilities: createImageCapabilities({
-      supportsMultiReference: true,
-      supportsOmniReference: true,
-      supportsSubjectLock: true,
-      supportsLightingControl: true,
-      supportsConsistencyEnhancement: true,
-      supportsIdentityController: true,
-      bestFor: ['中文海报', '多参考图像生成', '参考主体锁定', '保构图换主体', '全能参数'],
-      limitations: ['严格构图锁死弱于专用编辑模型'],
-    }),
-  },
-  {
-    id: 'doubao-seedream-5-0-lite',
-    name: 'Seedream 5.0 Lite',
-    provider: 'volcengine',
-    mode: 'image',
-    nodeTypes: ['image'],
-    description: 'High quality product and scene images with stronger edit routing for multi-reference work.',
-    latency: '18s',
-    price: 0.36,
-    currency: 'CNY',
-    upstreamModel: 'doubao-seedream-5.0-lite',
-    capabilities: createImageCapabilities({
-      supportsMultiReference: true,
-      supportsOmniReference: true,
-      supportsSubjectLock: true,
-      supportsCompositionLock: true,
-      supportsLightingControl: true,
-      supportsConsistencyEnhancement: true,
-      toolOperations: ['multi_angle_view', 'pbr_relight', 'storyboard_grid', 'hd_toolbox_enhance', 'cinematic_camera_simulation'],
-      bestFor: ['商品图', '高质感场景', '打光强化', '构图细化', '保构图换主体', '全能参数'],
-    }),
-  },
-  {
-    id: 'doubao-seedream-5-0-pro',
-    name: 'Seedream 5.0 Pro',
-    provider: 'volcengine',
-    mode: 'image',
-    nodeTypes: ['image'],
-    description: '火山方舟 Seedream 5.0 旗舰图片模型，最高质感与最强语义理解，适合品牌 KV、广告大片与复杂多参考工作流。',
-    latency: '22s',
-    price: 0.6,
-    currency: 'CNY',
-    upstreamModel: 'doubao-seedream-5.0-pro',
-    capabilities: createImageCapabilities({
-      supportsMultiReference: true,
-      supportsOmniReference: true,
-      supportsSubjectLock: true,
-      supportsCompositionLock: true,
-      supportsLightingControl: true,
-      supportsConsistencyEnhancement: true,
-      supportsIdentityController: true,
-      toolOperations: ['multi_angle_view', 'pbr_relight', 'storyboard_grid', 'hd_toolbox_enhance', 'cinematic_camera_simulation'],
-      bestFor: ['品牌 KV', '广告大片', '高质感商品图', '复杂多参考', '保构图换主体', '全能参考'],
-    }),
-  },
-  {
-    id: 'doubao-seedance-2-0',
-    name: '豆包 Seedance 2.0',
-    provider: 'volcengine',
-    mode: 'video',
-    nodeTypes: ['video'],
-    description: '火山方舟 Seedance 2.0 视频生成模型，支持文生视频、图生视频与首尾帧控制，适合中文商业片、角色参考与镜头延展。',
-    latency: '60s',
-    price: 2.8,
-    currency: 'CNY',
-    upstreamModel: 'doubao-seedance-2.0',
-    capabilities: createVideoCapabilities({
-      generationModes: ['textToVideo', 'imageToVideo', 'firstLastFrame'],
-      referenceRoles: ['style', 'subject', 'composition', 'lighting', 'omni'],
-      supportsMultiReference: true,
-      supportsOmniReference: true,
-      supportsSubjectLock: true,
-      supportsCompositionLock: true,
-      supportsLightingControl: true,
-      supportsConsistencyEnhancement: true,
-      supportsIdentityController: true,
-      supportsTextToVideo: true,
-      supportsImageToVideo: true,
-      supportsFirstLastFrame: true,
-      supportsReferenceImage: true,
-      supportsReferenceVideo: false,
-      supportsVideoStyleTransfer: false,
-      supportsPrimaryVideoMotionLock: false,
-      supportsActionTransfer: false,
-      bestFor: ['中文商业片', '图生视频', '首尾帧控制', '角色参考', '镜头延展'],
-    }),
-  },
-  {
-    id: 'doubao-audio-1-0',
-    name: '豆包 音频生成 1.0',
-    provider: 'volcengine',
-    mode: 'audio',
-    nodeTypes: ['audio'],
-    description: '火山方舟 豆包音频生成 1.0，支持 TTS 语音合成、配音与 BGM 生成，适合中文有声内容、配音与短视频音轨。',
-    latency: '8s',
-    price: 0.12,
-    currency: 'CNY',
-    upstreamModel: 'doubao-audio-1.0',
-    capabilities: {
-      generationModes: ['textToAudio', 'voiceClone'],
-      supportsTextToAudio: true,
-      supportsVoiceClone: true,
-      supportsBgm: true,
-      bestFor: ['中文 TTS', '配音', '短视频音轨', '有声内容'],
-      limitations: ['不支持视频生成'],
-    },
-  },
-  {
-    id: 'gpt-image-2',
-    name: 'GPT Image 2',
-    provider: 'openai',
-    mode: 'image',
-    nodeTypes: ['image'],
-    description: 'OpenAI-compatible image generation and editing through relay endpoints.',
-    latency: '14s',
-    price: 0.45,
-    currency: 'USD',
-    upstreamModel: 'gpt-image-2',
-    capabilities: createImageCapabilities({
-      supportsMultiReference: true,
-      supportsOmniReference: true,
-      supportsSubjectLock: true,
-      supportsCompositionLock: true,
-      supportsLightingControl: true,
-      supportsConsistencyEnhancement: true,
-      supportsIdentityController: true,
-      bestFor: ['商品图', '局部改图', '保构图换主体', '多模态图片编辑', '全能参数'],
-    }),
-  },
-  {
-    id: 'grok-imagine-1.5-edit-apimart',
-    name: 'Grok Imagine 1.5 Edit',
-    provider: 'openai',
-    mode: 'image',
-    nodeTypes: ['image'],
-    description: 'Relay-edit image model optimized for instruction-heavy and multi-reference image editing.',
-    latency: '18s',
-    price: 0.52,
-    currency: 'USD',
-    upstreamModel: 'grok-imagine-1.5-edit-apimart',
-    capabilities: createImageCapabilities({
-      supportsMultiReference: true,
-      supportsOmniReference: true,
-      supportsSubjectLock: true,
-      supportsCompositionLock: true,
-      supportsLightingControl: true,
-      supportsConsistencyEnhancement: true,
-      supportsIdentityController: true,
-      bestFor: ['复杂编辑', '保构图换主体', '多参考改图', '全能参数'],
-    }),
-  },
-  {
-    id: 'gemini-3-pro-image-preview',
-    name: 'Gemini 3 Pro Image Preview',
-    provider: 'openai',
-    mode: 'image',
-    nodeTypes: ['image'],
-    description: 'OpenAI-compatible relay preview model for multimodal image understanding and draft editing.',
-    latency: '15s',
-    price: 0.32,
-    currency: 'USD',
-    upstreamModel: 'gemini-3-pro-image-preview',
-    capabilities: createImageCapabilities({
-      supportsMultiReference: true,
-      supportsOmniReference: true,
-      supportsSubjectLock: true,
-      supportsLightingControl: true,
-      supportsConsistencyEnhancement: true,
-      bestFor: ['多模态预览', '结构理解', '参考分析', '草案编辑'],
-      limitations: ['严格构图锁死弱于专用编辑模型'],
-    }),
-  },
-  {
-    id: 'midjourney-relax',
-    name: 'Midjourney Relax',
-    provider: 'openai',
-    mode: 'image',
-    nodeTypes: ['image'],
-    description: 'Relay-based Midjourney image generation candidate.',
-    latency: '20s',
-    price: 0.5,
-    currency: 'USD',
-    upstreamModel: 'midjourney-relax',
-    capabilities: createImageCapabilities({
-      bestFor: ['风格化创作', '概念图', '海报初稿'],
-      limitations: ['多参考主体锁定较弱'],
-    }),
-  },
-  {
-    id: 'nano-banana2',
-    name: 'Nano Banana 2',
-    provider: 'openai',
-    mode: 'image',
-    nodeTypes: ['image'],
-    description: 'Creative relay image model for lightweight visual ideation.',
-    latency: '12s',
-    price: 0.22,
-    currency: 'USD',
-    upstreamModel: 'nano-banana2',
-    capabilities: createImageCapabilities({
-      bestFor: ['创意草图', '轻量商品图', '风格探索'],
-    }),
-  },
-  {
-    id: 'flux-pro',
-    name: 'FLUX Pro',
-    provider: 'fal',
-    mode: 'image',
-    nodeTypes: ['image'],
-    description: 'Poster and photorealistic generation.',
-    latency: '20s',
-    price: 0.38,
-    currency: 'CNY',
-    discountLabel: 'Member 88x',
-    discountPercent: 12,
-    capabilities: createImageCapabilities({
-      supportsMultiReference: true,
-      supportsOmniReference: true,
-      supportsSubjectLock: true,
-      supportsCompositionLock: true,
-      supportsLightingControl: true,
-      supportsConsistencyEnhancement: true,
-      supportsIdentityController: true,
-      bestFor: ['海报', '写实图像', '角色一致性', '保构图换主体', '全能参数'],
-    }),
-  },
-  {
-    id: 'wanx-v1',
-    name: '通义万相',
-    provider: 'bailian',
-    mode: 'image',
-    nodeTypes: ['image'],
-    description: 'Chinese prompt image generation.',
-    latency: '15s',
-    price: 0.3,
-    currency: 'CNY',
-    capabilities: createImageCapabilities({
-      toolOperations: ['storyboard_grid', 'hd_toolbox_enhance', 'smart_grid_split'],
-      bestFor: ['中文文生图', '轻量图片生成'],
-      limitations: ['复杂多参考控制较弱', '严格保构图换主体能力有限'],
-    }),
-  },
-  {
-    id: 'qwen3.7-plus',
-    name: 'Qwen3.7-Plus',
-    provider: 'bailian',
-    mode: 'llm',
-    nodeTypes: ['text', 'script', 'storyboard', 'aiapp'],
-    description: '百炼最新旗舰多模态模型，支持图片/视频深度分析、提示词反推、光影构图风格解析，中文理解领先。',
-    latency: '3s',
-    price: 0.008,
-    currency: 'CNY',
-    upstreamModel: 'qwen3.7-plus',
-    discountLabel: '新用户免费',
-    discountPercent: 100,
-  },
-  {
-    id: 'wan22-t2v-a14b',
-    name: 'Wan 2.2 文生视频',
-    provider: 'siliconflow',
-    mode: 'video',
-    nodeTypes: ['video'],
-    description: '硅基流动 Wan2.2 文生视频模型，适合广告短片与镜头预演',
-    latency: '88s',
-    price: 0.29,
-    currency: 'USD',
-    upstreamModel: 'Wan-AI/Wan2.2-T2V-A14B',
-    capabilities: createVideoCapabilities({
-      generationModes: ['textToVideo'],
-      supportsTextToVideo: true,
-      bestFor: ['文生视频预览', '广告分镜预演'],
-      limitations: ['不支持主视频运镜锁定', '不支持身份控制器'],
-    }),
-  },
-  {
-    id: 'wan22-i2v-a14b',
-    name: 'Wan 2.2 图生视频',
-    provider: 'siliconflow',
-    mode: 'video',
-    nodeTypes: ['video'],
-    description: '硅基流动 Wan2.2 图生视频模型，适合首尾帧、参考图和风格延展',
-    latency: '95s',
-    price: 0.29,
-    currency: 'USD',
-    upstreamModel: 'Wan-AI/Wan2.2-I2V-A14B',
-    capabilities: createVideoCapabilities({
-      generationModes: ['imageToVideo', 'firstLastFrame'],
-      referenceRoles: ['style', 'subject', 'composition', 'lighting'],
-      supportsMultiReference: true,
-      supportsSubjectLock: true,
-      supportsCompositionLock: true,
-      supportsLightingControl: true,
-      supportsConsistencyEnhancement: true,
-      supportsImageToVideo: true,
-      supportsFirstLastFrame: true,
-      supportsReferenceImage: true,
-      bestFor: ['图生视频', '首尾帧过渡', '风格延展'],
-      limitations: ['不支持主视频运镜锁定', '不支持视频风格迁移'],
-    }),
-  },
-  {
-    id: 'bailian-wan22-t2v-plus',
-    name: '百炼 Wan 2.2 文生视频',
-    provider: 'bailian',
-    mode: 'video',
-    nodeTypes: ['video'],
-    description: '阿里云百炼 Wan 2.2 文生视频模型，余额不足时自动回退到硅基流动 Wan2.2',
-    latency: '90s',
-    price: 1.4,
-    currency: 'CNY',
-    upstreamModel: 'wan2.2-t2v-plus',
-    capabilities: createVideoCapabilities({
-      generationModes: ['textToVideo'],
-      supportsTextToVideo: true,
-      bestFor: ['文生视频预览', '中文商业片草稿'],
-      limitations: ['不支持主视频运镜锁定', '不支持身份控制器'],
-    }),
-  },
-  {
-    id: 'bailian-wan22-i2v-plus',
-    name: '百炼 Wan 2.2 图生视频',
-    provider: 'bailian',
-    mode: 'video',
-    nodeTypes: ['video'],
-    description: '阿里云百炼 Wan 2.2 图生视频模型，支持参考图/首帧驱动视频生成',
-    latency: '100s',
-    price: 1.8,
-    currency: 'CNY',
-    upstreamModel: 'wan2.2-i2v-plus',
-    capabilities: createVideoCapabilities({
-      generationModes: ['imageToVideo', 'firstLastFrame'],
-      referenceRoles: ['style', 'subject', 'composition', 'lighting'],
-      supportsMultiReference: true,
-      supportsSubjectLock: true,
-      supportsCompositionLock: true,
-      supportsLightingControl: true,
-      supportsConsistencyEnhancement: true,
-      supportsImageToVideo: true,
-      supportsFirstLastFrame: true,
-      supportsReferenceImage: true,
-      bestFor: ['中文图生视频', '首尾帧生成'],
-      limitations: ['不支持主视频运镜锁定', '不支持视频风格迁移'],
-    }),
-  },
-  {
-    id: 'seedance-v2',
-    name: 'Seedance V2',
-    provider: 'fal',
-    mode: 'video',
-    nodeTypes: ['video'],
-    description: 'Image-to-video and camera motion.',
-    latency: '55s',
-    price: 2.8,
-    currency: 'CNY',
-    upstreamModel: 'doubao-seedance-2.0',
-    capabilities: createVideoCapabilities({
-      // 实测验证：APIMart relay 的 doubao-seedance-2.0 不支持 video_urls（HTTP 400）
-      // 仅支持 imageToVideo / firstLastFrame (image_with_roles)
-      generationModes: ['imageToVideo', 'firstLastFrame'],
-      referenceRoles: ['style', 'subject', 'composition', 'lighting', 'omni'],
-      supportsMultiReference: true,
-      supportsOmniReference: true,
-      supportsSubjectLock: true,
-      supportsCompositionLock: true,
-      supportsLightingControl: true,
-      supportsConsistencyEnhancement: true,
-      supportsCameraMotionLockEnhancement: false,
-      supportsIdentityController: true,
-      supportsImageToVideo: true,
-      supportsFirstLastFrame: true,
-      supportsReferenceVideo: false,
-      supportsReferenceImage: true,
-      supportsVideoStyleTransfer: false,
-      supportsPrimaryVideoMotionLock: false,
-      supportsActionTransfer: false,
-      bestFor: ['图生视频', '首尾帧控制', '主体一致性', '角色参考'],
-    }),
-  },
-  {
-    id: 'happyhorse-11',
-    name: 'HappyHorse 1.1',
-    provider: 'bailian',
-    mode: 'video',
-    nodeTypes: ['video'],
-    description: 'Unified APIMart/Bailian video model that supports T2V, I2V, R2V, and edit style routing.',
-    latency: '70s',
-    price: 1.6,
-    currency: 'CNY',
-    upstreamModel: 'happyhorse-1.1',
-    capabilities: createVideoCapabilities({
-      generationModes: ['textToVideo', 'imageToVideo', 'referenceVideo', 'videoStyleTransfer'],
-      referenceRoles: ['subject', 'style', 'composition', 'motion', 'omni'],
-      supportsMultiReference: true,
-      supportsOmniReference: true,
-      supportsSubjectLock: true,
-      supportsCompositionLock: true,
-      supportsConsistencyEnhancement: true,
-      supportsCameraMotionLockEnhancement: true,
-      supportsTextToVideo: true,
-      supportsImageToVideo: true,
-      supportsReferenceVideo: true,
-      supportsReferenceImage: true,
-      supportsVideoStyleTransfer: true,
-      supportsPrimaryVideoMotionLock: true,
-      supportsActionTransfer: true,
-      bestFor: ['多模态视频参考', '动作迁移', '视频编辑', '首帧驱动', '全能参数'],
-    }),
-  },
-  {
-    id: 'kling-v3-omni',
-    name: 'Kling V3 Omni',
-    provider: 'kling',
-    mode: 'video',
-    nodeTypes: ['video'],
-    description: 'Primary-video-preserving multi-reference video editing with omni conditioning.',
-    latency: '60s',
-    price: 3,
-    currency: 'CNY',
-    upstreamModel: 'kling-v3-omni',
-    discountLabel: 'Limited 9x',
-    discountPercent: 10,
-    capabilities: createVideoCapabilities({
-      generationModes: ['textToVideo', 'imageToVideo', 'firstLastFrame', 'referenceVideo', 'videoStyleTransfer'],
-      referenceRoles: ['style', 'subject', 'composition', 'lighting', 'motion', 'rhythm', 'omni'],
-      supportsMultiReference: true,
-      supportsOmniReference: true,
-      supportsSubjectLock: true,
-      supportsCompositionLock: true,
-      supportsLightingControl: true,
-      supportsConsistencyEnhancement: true,
-      supportsCameraMotionLockEnhancement: true,
-      supportsIdentityController: true,
-      supportsTextToVideo: true,
-      supportsImageToVideo: true,
-      supportsFirstLastFrame: true,
-      supportsReferenceVideo: true,
-      supportsReferenceImage: true,
-      supportsVideoStyleTransfer: true,
-      supportsPrimaryVideoMotionLock: true,
-      supportsActionTransfer: true,
-      bestFor: ['主体锁定', '主视频运镜保持', '动作迁移', '多参考换角', '全能参数'],
-    }),
-  },
-  {
-    id: 'kling-o3',
-    name: 'Kling O3',
-    provider: 'kling',
-    mode: 'video',
-    nodeTypes: ['video'],
-    description: 'Realistic motion and first-last frame video.',
-    latency: '60s',
-    price: 3,
-    currency: 'CNY',
-    upstreamModel: 'kling-v3',
-    discountLabel: 'Limited 9x',
-    discountPercent: 10,
-    capabilities: createVideoCapabilities({
-      generationModes: ['textToVideo', 'imageToVideo', 'firstLastFrame', 'referenceVideo', 'videoStyleTransfer'],
-      referenceRoles: ['style', 'subject', 'composition', 'lighting', 'motion', 'rhythm', 'omni'],
-      supportsMultiReference: true,
-      supportsOmniReference: true,
-      supportsSubjectLock: true,
-      supportsCompositionLock: true,
-      supportsLightingControl: true,
-      supportsConsistencyEnhancement: true,
-      supportsCameraMotionLockEnhancement: true,
-      supportsIdentityController: true,
-      supportsTextToVideo: true,
-      supportsImageToVideo: true,
-      supportsFirstLastFrame: true,
-      supportsReferenceVideo: true,
-      supportsReferenceImage: true,
-      supportsVideoStyleTransfer: true,
-      supportsPrimaryVideoMotionLock: true,
-      supportsActionTransfer: true,
-      bestFor: ['主体锁定', '主视频运镜保持', '动作迁移', '高要求参考视频编辑', '全能参数'],
-    }),
-  },
-];
-const IMAGE_OPERATION_DISPATCH = {
-  panorama_720: {
-    label: '720 panorama generation',
-    latestTechnique: 'Single-image spherical panorama using geometry-aware scene extension and seam-constrained diffusion outpainting.',
-    candidates: ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'lib-image'],
-  },
-  multi_angle_view: {
-    label: 'consistent multi-angle generation',
-    latestTechnique: 'Geometry-consistent multi-view diffusion with identity locking, camera-conditioned view synthesis, and reference feature anchoring.',
-    candidates: ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'lib-image'],
-  },
-  pbr_relight: {
-    label: 'PBR relighting',
-    latestTechnique: 'Relightable representation with intrinsic decomposition, normal-aware shading reconstruction, and material-preserving highlight transfer.',
-    candidates: ['doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'flux-pro', 'gpt-image-2', 'lib-image'],
-  },
-  storyboard_grid: {
-    label: 'cinematic storyboard batching',
-    latestTechnique: 'Reference-consistent storyboard generation with shot-language prompting and panel-level composition control.',
-    candidates: ['doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'flux-pro', 'gpt-image-2', 'lib-image', 'wanx-v1'],
-  },
-  hd_toolbox_enhance: {
-    label: 'HD toolbox enhance',
-    latestTechnique: 'Hybrid super-resolution and restoration using detail hallucination control with face-preserving refinement.',
-    candidates: ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'lib-image'],
-  },
-  hd_upscale: {
-    label: 'HD upscale',
-    latestTechnique: 'Super-resolution with face-aware detail preservation and texture-consistent sharpening.',
-    candidates: ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'lib-image'],
-  },
-  hd_outpaint: {
-    label: 'HD outpaint',
-    latestTechnique: 'Composition-aware outpainting with boundary extrapolation and perspective continuity control.',
-    candidates: ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'lib-image'],
-  },
-  hd_inpaint: {
-    label: 'HD inpaint',
-    latestTechnique: 'Localized inpainting with context-aware fill and subject boundary recovery.',
-    candidates: ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'lib-image'],
-  },
-  hd_erase: {
-    label: 'HD erase',
-    latestTechnique: 'Object removal with semantic masking and background completion.',
-    candidates: ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'lib-image'],
-  },
-  hd_cutout: {
-    label: 'HD cutout',
-    latestTechnique: 'Foreground extraction with matting refinement and edge fidelity recovery.',
-    candidates: ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'lib-image'],
-  },
-  hd_crop: {
-    label: 'HD crop',
-    latestTechnique: 'Cropping and reframing with composition-preserving subject alignment.',
-    candidates: ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'lib-image'],
-  },
-  hd_restore: {
-    label: 'HD restore',
-    latestTechnique: 'Restoration-first enhancement with denoise, deblur, and artifact suppression.',
-    candidates: ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'lib-image'],
-  },
-  smart_grid_split: {
-    label: 'subject-aware grid split',
-    latestTechnique: 'Subject-aware composition analysis with face-safe cut line planning and export-ready tile layout.',
-    candidates: ['lib-image', 'gpt-image-2', 'flux-pro', 'wanx-v1'],
-  },
-  cinematic_camera_simulation: {
-    label: 'cinematic camera simulation',
-    latestTechnique: 'Lens-character post-simulation with depth-aware bokeh, optical aberration shaping, and filmic color-science LUT mapping.',
-    candidates: ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'lib-image'],
-  },
-  preserveCompositionReplaceSubject: {
-    label: 'preserve composition replace subject',
-    latestTechnique: 'Reference-conditioned image editing that locks composition, framing, and perspective while replacing only the hero subject using stronger identity and layout control.',
-    candidates: ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'grok-imagine-1.5-edit-apimart', 'lib-image'],
-  },
-};
+// ==================== 模型目录数据（已迁移至 ./services/modelCatalogData.mjs） ====================
+import { MODEL_CATALOG, QWEN3_TTS_VOICES } from './services/modelCatalogData.mjs';
 
 let operationDispatchConfigCache = null;
 let operationDispatchConfigCacheMtime = 0;
-
-function buildDefaultOperationDispatchConfig() {
-  return {
-    version: 1,
-    global: {
-      weights: {
-        activation: 1200,
-        preferredModel: 260,
-        preferredProvider: 140,
-        regionMatch: 90,
-        regionMismatch: -80,
-        cost: -22,
-        latency: -9,
-        disabled: -100000,
-        referenceRole: 180,
-        generationMode: 260,
-      },
-      referenceRouting: {
-        image: {
-          style: { preferredProviders: ['fal', 'openai', 'volcengine', 'siliconflow'], preferredModels: ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'Qwen/Qwen-Image'] },
-          subject: { preferredProviders: ['fal', 'openai', 'volcengine', 'siliconflow'], preferredModels: ['flux-pro', 'gpt-image-2', 'grok-imagine-1.5-edit-apimart', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'Qwen/Qwen-Image'] },
-          element: { preferredProviders: ['volcengine', 'openai', 'fal', 'siliconflow'], preferredModels: ['doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'gpt-image-2', 'flux-pro', 'Qwen/Qwen-Image'] },
-          composition: { preferredProviders: ['fal', 'openai', 'volcengine', 'siliconflow'], preferredModels: ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'Qwen/Qwen-Image'] },
-          lighting: { preferredProviders: ['volcengine', 'fal', 'openai', 'siliconflow'], preferredModels: ['doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'flux-pro', 'gpt-image-2', 'Qwen/Qwen-Image'] },
-        },
-        video: {
-          style: { preferredProviders: ['kling', 'bailian', 'fal', 'siliconflow'], preferredModels: ['kling-v3-omni', 'seedance-v2', 'kling-o3', 'happyhorse-11', 'wan2.2-i2v-plus', 'Wan-AI/Wan2.2-I2V-A14B'] },
-          subject: { preferredProviders: ['kling', 'bailian', 'fal', 'siliconflow'], preferredModels: ['kling-v3-omni', 'seedance-v2', 'kling-o3', 'happyhorse-11', 'wan2.2-i2v-plus', 'Wan-AI/Wan2.2-I2V-A14B'] },
-          composition: { preferredProviders: ['kling', 'bailian', 'fal', 'siliconflow'], preferredModels: ['kling-v3-omni', 'seedance-v2', 'kling-o3', 'happyhorse-11', 'wan2.2-i2v-plus', 'Wan-AI/Wan2.2-I2V-A14B'] },
-          lighting: { preferredProviders: ['kling', 'bailian', 'fal', 'siliconflow'], preferredModels: ['kling-v3-omni', 'seedance-v2', 'kling-o3', 'happyhorse-11', 'wan2.2-i2v-plus', 'Wan-AI/Wan2.2-I2V-A14B'] },
-          motion: { preferredProviders: ['kling', 'bailian', 'fal', 'siliconflow'], preferredModels: ['kling-v3-omni', 'seedance-v2', 'kling-o3', 'happyhorse-11', 'wan2.2-i2v-plus', 'Wan-AI/Wan2.2-I2V-A14B'] },
-          rhythm: { preferredProviders: ['kling', 'bailian', 'fal', 'siliconflow'], preferredModels: ['kling-v3-omni', 'seedance-v2', 'kling-o3', 'happyhorse-11', 'wan2.2-i2v-plus', 'Wan-AI/Wan2.2-I2V-A14B'] },
-        },
-        videoGenerationModes: {
-          textToVideo: { preferredProviders: ['siliconflow', 'bailian', 'kling', 'fal'], preferredModels: ['Wan-AI/Wan2.2-T2V-A14B', 'wan2.2-t2v-plus', 'kling-o3'] },
-          imageToVideo: { preferredProviders: ['kling', 'bailian', 'fal', 'siliconflow'], preferredModels: ['kling-o3', 'happyhorse-11', 'seedance-v2', 'wan2.2-i2v-plus', 'Wan-AI/Wan2.2-I2V-A14B'] },
-          firstLastFrame: { preferredProviders: ['kling', 'bailian', 'fal', 'siliconflow'], preferredModels: ['kling-o3', 'happyhorse-11', 'seedance-v2', 'wan2.2-i2v-plus', 'Wan-AI/Wan2.2-I2V-A14B'] },
-          referenceVideo: { preferredProviders: ['kling', 'bailian', 'fal', 'siliconflow'], preferredModels: ['kling-v3-omni', 'seedance-v2', 'kling-o3', 'happyhorse-11', 'wan2.2-i2v-plus', 'Wan-AI/Wan2.2-I2V-A14B'] },
-          videoStyleTransfer: { preferredProviders: ['kling', 'bailian', 'fal', 'replicate'], preferredModels: ['kling-v3-omni', 'seedance-v2', 'kling-o3', 'happyhorse-11'] },
-        },
-      },
-      regionPreference: {
-        CN: {
-          preferredProviders: ['siliconflow', 'volcengine', 'bailian', 'kling'],
-          secondaryProviders: ['openai', 'fal', 'replicate'],
-        },
-        US: {
-          preferredProviders: ['openai', 'fal', 'replicate'],
-          secondaryProviders: ['siliconflow', 'volcengine', 'bailian', 'kling'],
-        },
-        OTHER: {
-          preferredProviders: ['openai', 'fal', 'replicate', 'siliconflow'],
-          secondaryProviders: ['volcengine', 'bailian', 'kling'],
-        },
-      },
-      disabledModels: [],
-    },
-    operations: Object.fromEntries(
-      Object.entries(IMAGE_OPERATION_DISPATCH).map(([operation, strategy]) => [
-        operation,
-        {
-          ...strategy,
-          candidates: [...(strategy.candidates || [])],
-          preferredProviders: [],
-          disabledModels: [],
-        },
-      ]),
-    ),
-  };
-}
-
-function normalizeOperationDispatchConfig(input) {
-  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
-  const defaults = buildDefaultOperationDispatchConfig();
-  const sourceGlobal = source.global && typeof source.global === 'object' && !Array.isArray(source.global) ? source.global : {};
-  const sourceOperations = source.operations && typeof source.operations === 'object' && !Array.isArray(source.operations) ? source.operations : {};
-
-  const operations = { ...defaults.operations };
-
-  for (const [operation, strategy] of Object.entries(sourceOperations)) {
-    const normalizedStrategy = strategy && typeof strategy === 'object' && !Array.isArray(strategy) ? strategy : {};
-    const baseStrategy = defaults.operations[operation] || {
-      label: operation,
-      latestTechnique: '',
-      candidates: [],
-      preferredProviders: [],
-      disabledModels: [],
-    };
-
-    operations[operation] = {
-      ...baseStrategy,
-      ...normalizedStrategy,
-      candidates: Array.isArray(normalizedStrategy.candidates)
-        ? normalizedStrategy.candidates.filter(Boolean)
-        : [...(baseStrategy.candidates || [])],
-      preferredProviders: Array.isArray(normalizedStrategy.preferredProviders)
-        ? normalizedStrategy.preferredProviders.filter(Boolean)
-        : [...(baseStrategy.preferredProviders || [])],
-      disabledModels: Array.isArray(normalizedStrategy.disabledModels)
-        ? normalizedStrategy.disabledModels.filter(Boolean)
-        : [...(baseStrategy.disabledModels || [])],
-    };
-  }
-
-  return {
-    version: Number(source.version || defaults.version) || defaults.version,
-    global: {
-      weights: {
-        ...defaults.global.weights,
-        ...(sourceGlobal.weights && typeof sourceGlobal.weights === 'object' && !Array.isArray(sourceGlobal.weights) ? sourceGlobal.weights : {}),
-      },
-      referenceRouting: {
-        ...defaults.global.referenceRouting,
-        ...(sourceGlobal.referenceRouting && typeof sourceGlobal.referenceRouting === 'object' && !Array.isArray(sourceGlobal.referenceRouting) ? sourceGlobal.referenceRouting : {}),
-      },
-      regionPreference: {
-        ...defaults.global.regionPreference,
-        ...(sourceGlobal.regionPreference && typeof sourceGlobal.regionPreference === 'object' && !Array.isArray(sourceGlobal.regionPreference) ? sourceGlobal.regionPreference : {}),
-      },
-      disabledModels: Array.isArray(sourceGlobal.disabledModels)
-        ? sourceGlobal.disabledModels.filter(Boolean)
-        : [...defaults.global.disabledModels],
-    },
-    operations,
-  };
-}
 
 async function loadOperationDispatchConfig({ force = false } = {}) {
   let stat = null;
@@ -934,684 +291,46 @@ async function saveOperationDispatchConfig(config) {
   return normalized;
 }
 
-function sanitizeAssetFileBaseName(value = 'asset') {
-  return String(value || 'asset')
-    .replace(/\.[^.]+$/, '')
-    .trim()
-    .replace(/[<>:"/\\|?*\x00-\x1f]+/g, '-')
-    .replace(/\s+/g, ' ')
-    .replace(/-+/g, '-')
-    .slice(0, 80)
-    .trim() || 'asset';
-}
-
-function inferAssetTypeFromMime(mimeType = '', fallback = 'image') {
-  const normalized = String(mimeType || '').toLowerCase();
-  if (normalized.startsWith('video/')) return 'video';
-  if (normalized.startsWith('audio/')) return 'audio';
-  if (normalized.startsWith('text/') || normalized.includes('json') || normalized.includes('csv') || normalized.includes('pdf')) return 'text';
-  if (normalized.startsWith('image/')) return 'image';
-  return fallback;
-}
-
-function inferAssetTypeFromPath(filePath = '', fallback = 'image') {
-  const mimeType = mediaMimeTypeFromExtension(filePath, '');
-  return inferAssetTypeFromMime(mimeType, fallback);
-}
-
-const ASSET_IMPORT_CATEGORY_RULES = [
-  { keywords: ['landscape', 'mountain', 'forest', 'ocean', 'nature', '风景', '自然', '风光', '山水'], category: '风景' },
-  { keywords: ['portrait', 'person', 'model', 'people', '人像', '人物', '模特'], category: '人物' },
-  { keywords: ['city', 'building', 'architecture', 'interior', '城市', '建筑', '室内'], category: '建筑' },
-  { keywords: ['night', 'nightscape', 'neon', '夜景', '霓虹'], category: '夜景' },
-  { keywords: ['car', 'vehicle', 'auto', 'automobile', '汽车', '车辆'], category: '汽车' },
-  { keywords: ['product', 'commerce', 'electric', 'watch', 'phone', '产品', '电商', '静物'], category: '产品' },
-  { keywords: ['tech', 'technology', 'digital', '芯片', '科技'], category: '科技' },
-  { keywords: ['fashion', 'beauty', 'clothes', '时尚', '美妆'], category: '时尚' },
-  { keywords: ['food', 'drink', 'cafe', 'coffee', '美食', '饮品'], category: '美食' },
-  { keywords: ['audio', 'bgm', 'voice', 'music', '音频', '音乐', '旁白'], category: '音频' },
-  { keywords: ['video', 'film', 'cinema', '镜头', '视频'], category: '视频' },
-];
-
-function inferSupportedImportAssetType(filePath = '', mimeType = '') {
-  const type = inferAssetTypeFromMime(mimeType, inferAssetTypeFromPath(filePath, ''));
-  return ['image', 'video', 'audio', 'text'].includes(String(type || '')) ? type : null;
-}
-
-function normalizeAssetImportToken(value = '') {
-  return String(value || '')
-    .replace(/\.[^.]+$/, '')
-    .replace(/[_-]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function classifyAssetImportText(text = '') {
-  const normalized = String(text || '').toLowerCase();
-  return uniqueStrings(
-    ASSET_IMPORT_CATEGORY_RULES
-      .filter((rule) => rule.keywords.some((keyword) => normalized.includes(String(keyword).toLowerCase())))
-      .map((rule) => rule.category),
-  ).slice(0, 6);
-}
-
-function inferAssetImportFolderSegments(relativePath = '') {
-  return uniqueStrings(
-    String(relativePath || '')
-      .split(/[\\/]+/)
-      .slice(0, -1)
-      .map((segment) => normalizeAssetImportToken(segment))
-      .filter((segment) => segment.length >= 2),
-  ).slice(-4);
-}
-
-function inferAssetImportHints(filePath = '', type = 'image', rootPath = '') {
-  const relativePath = rootPath ? path.relative(rootPath, filePath) : path.basename(filePath);
-  const folderSegments = inferAssetImportFolderSegments(relativePath);
-  const semanticCategories = classifyAssetImportText([path.basename(filePath), relativePath].join(' '));
-  const smartCategories = uniqueStrings([
-    ...semanticCategories,
-    ...folderSegments.slice(0, 2),
-  ]).slice(0, 6);
-  const nameParts = sanitizeAssetFileBaseName(path.basename(filePath))
-    .split(/[\s_.-]+/)
-    .map((part) => String(part || '').trim())
-    .filter((part) => part.length >= 2)
-    .slice(0, 3);
-  const typeLabel = type === 'video' ? '视频' : type === 'audio' ? '音频' : type === 'text' ? '文档' : '图片';
-  const tags = uniqueStrings([
-    ...folderSegments,
-    ...smartCategories,
-    ...nameParts,
-    typeLabel,
-  ]).slice(0, 8);
-  return {
-    relativePath,
-    smartCategories,
-    tags,
-  };
-}
-
-function buildAssetLibraryContentUrl(assetId) {
-  return `/api/assets/content/${encodeURIComponent(String(assetId || ''))}`;
-}
-
-function normalizeAssetLibraryItem(source = {}) {
-  const assetId = String(source.id || source.backendAssetId || crypto.randomUUID());
-  const type = ['image', 'video', 'audio', 'text'].includes(String(source.type || ''))
-    ? String(source.type)
-    : inferAssetTypeFromPath(String(source.filePath || ''), 'image');
-  const createdAt = Number(source.createdAt || Date.now());
-  const updatedAt = Number(source.updatedAt || createdAt || Date.now());
-  const tags = Array.isArray(source.tags) ? source.tags.map((item) => String(item || '').trim()).filter(Boolean) : [];
-  const smartCategories = Array.isArray(source.smartCategories) ? source.smartCategories.map((item) => String(item || '').trim()).filter(Boolean) : [];
-  const filePath = path.resolve(String(source.filePath || ''));
-  const contentUrl = buildAssetLibraryContentUrl(assetId);
-  const storageLabel = String(source.storageLabel || '').trim().toLowerCase() === 'reference'
-    ? 'reference'
-    : 'disk';
-  return {
-    id: assetId,
-    backendAssetId: assetId,
-    name: String(source.name || `${assetId}`),
-    type,
-    url: contentUrl,
-    thumbnail: type === 'audio' ? '' : String(source.thumbnail || contentUrl),
-    folderId: String(source.folderId || 'root'),
-    size: Math.max(0, Number(source.size || 0)),
-    width: Number(source.width || 0) || undefined,
-    height: Number(source.height || 0) || undefined,
-    duration: Number(source.duration || 0) || undefined,
-    tags,
-    smartCategories,
-    prompt: typeof source.prompt === 'string' ? source.prompt : undefined,
-    sourceUrl: String(source.sourceUrl || ''),
-    filePath,
-    persisted: true,
-    storageLabel,
-    duplicateOf: typeof source.duplicateOf === 'string' ? String(source.duplicateOf).trim() : undefined,
-    contentHash: typeof source.contentHash === 'string' ? String(source.contentHash).trim() : undefined,
-    source: ['upload', 'web', 'crawl', 'generate'].includes(String(source.source || '')) ? String(source.source) : 'upload',
-    createdAt,
-    updatedAt,
-  };
-}
-
-function normalizeAssetDuplicateValue(value = '') {
-  const normalized = String(value || '').trim().replace(/\//g, '\\');
-  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
-}
-
-function buildAssetDuplicateFingerprint({
-  type = 'image',
-  filePath = '',
-  sourceUrl = '',
-  name = '',
-  size = 0,
-  width = 0,
-  height = 0,
-  duration = 0,
-  storageLabel = '',
-  source = '',
-  contentHash = '',
-}) {
-  const normalizedContentHash = String(contentHash || '').trim();
-  if (normalizedContentHash) {
-    return `content:${type}:${normalizedContentHash}`;
-  }
-  const normalizedStorageLabel = String(storageLabel || '').trim().toLowerCase();
-  const normalizedFilePath = normalizeAssetDuplicateValue(filePath);
-  const normalizedSourceUrl = normalizeAssetDuplicateValue(sourceUrl);
-  const normalizedSource = String(source || '').trim().toLowerCase();
-  if (normalizedStorageLabel === 'reference' && normalizedFilePath) {
-    return `reference:${type}:${normalizedFilePath}`;
-  }
-  if (
-    normalizedSourceUrl
-    && ['crawl', 'web', 'generate'].includes(normalizedSource)
-  ) {
-    return `source:${type}:${normalizedSourceUrl}:${Math.max(0, Number(size || 0))}`;
-  }
-  return [
-    'content',
-    type,
-    normalizeAssetDuplicateValue(name),
-    Math.max(0, Number(size || 0)),
-    Math.max(0, Number(width || 0)),
-    Math.max(0, Number(height || 0)),
-    Math.max(0, Number(duration || 0)),
-  ].join(':');
-}
-
-function findDuplicateAssetLibraryItem(items = [], candidate = {}) {
-  const fingerprint = buildAssetDuplicateFingerprint(candidate);
-  if (!fingerprint) return null;
-  return items.find((item) => buildAssetDuplicateFingerprint(item) === fingerprint) || null;
-}
-
-function mergeUniqueStringList(...lists) {
-  return Array.from(
-    new Set(
-      lists
-        .flatMap((list) => Array.isArray(list) ? list : [])
-        .map((item) => String(item || '').trim())
-        .filter(Boolean),
-    ),
-  );
-}
-
-function mergeDuplicateAssetCandidate(existingItem, candidate = {}) {
-  const updatedAt = Date.now();
-  return normalizeAssetLibraryItem({
-    ...existingItem,
-    folderId: String(candidate.folderId || existingItem.folderId || 'root').trim() || 'root',
-    width: Number(existingItem.width || 0) || Number(candidate.width || 0) || undefined,
-    height: Number(existingItem.height || 0) || Number(candidate.height || 0) || undefined,
-    duration: Number(existingItem.duration || 0) || Number(candidate.duration || 0) || undefined,
-    prompt: typeof existingItem.prompt === 'string' && existingItem.prompt.trim()
-      ? existingItem.prompt
-      : (typeof candidate.prompt === 'string' ? candidate.prompt.trim() : undefined),
-    sourceUrl: String(existingItem.sourceUrl || candidate.sourceUrl || '').trim(),
-    tags: mergeUniqueStringList(existingItem.tags, candidate.tags),
-    smartCategories: mergeUniqueStringList(existingItem.smartCategories, candidate.smartCategories),
-    updatedAt,
-  });
-}
-
-async function readAssetLibrarySettings() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  try {
-    const raw = await fs.readFile(ASSET_LIBRARY_SETTINGS_FILE, 'utf8');
-    const normalized = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
-    const parsed = JSON.parse(normalized);
-    const storagePath = String(parsed?.storagePath || '').trim();
-    return {
-      storagePath: storagePath ? path.resolve(storagePath) : DEFAULT_ASSET_LIBRARY_STORAGE_DIR,
-    };
-  } catch {
-    return {
-      storagePath: DEFAULT_ASSET_LIBRARY_STORAGE_DIR,
-    };
-  }
-}
-
-async function writeAssetLibrarySettings(storagePath) {
-  const resolvedPath = path.resolve(String(storagePath || DEFAULT_ASSET_LIBRARY_STORAGE_DIR));
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.mkdir(resolvedPath, { recursive: true });
-  await fs.writeFile(ASSET_LIBRARY_SETTINGS_FILE, JSON.stringify({
-    storagePath: resolvedPath,
-    updatedAt: Date.now(),
-  }, null, 2), 'utf8');
-  return {
-    storagePath: resolvedPath,
-  };
-}
-
-async function pickLocalDirectory(initialPath = '', autoSelectPath = '') {
-  if (process.platform !== 'win32') {
-    throw new Error('Native directory picker is currently only available on Windows.');
-  }
-  const automationPath = String(autoSelectPath || '').trim();
-  if (automationPath) {
-    return {
-      canceled: false,
-      path: path.resolve(automationPath),
-    };
-  }
-  const preferredPath = String(initialPath || '').trim();
-  const inlineAutomationMatch = preferredPath.match(/^__HMDAO_AUTO_PICK__:(.+)$/);
-  if (inlineAutomationMatch?.[1]) {
-    return {
-      canceled: false,
-      path: path.resolve(String(inlineAutomationMatch[1]).trim()),
-    };
-  }
-  const script = [
-    '$ErrorActionPreference = "Stop"',
-    '$utf8NoBom = New-Object System.Text.UTF8Encoding($false)',
-    '[Console]::InputEncoding = $utf8NoBom',
-    '[Console]::OutputEncoding = $utf8NoBom',
-    '$OutputEncoding = $utf8NoBom',
-    'Add-Type -AssemblyName System.Windows.Forms',
-    '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog',
-    '$dialog.Description = "选择资产库存储目录',
-    '$dialog.ShowNewFolderButton = $true',
-    `$initialPath = '${escapePowerShellSingleQuoted(preferredPath)}'`,
-    'if ($initialPath -and (Test-Path -LiteralPath $initialPath -PathType Container)) {',
-    '  $resolved = (Resolve-Path -LiteralPath $initialPath | Select-Object -First 1).Path',
-    '  if ($resolved) { $dialog.SelectedPath = $resolved }',
-    '}',
-    '$result = $dialog.ShowDialog()',
-    '$payload = if ($result -eq [System.Windows.Forms.DialogResult]::OK -and $dialog.SelectedPath) {',
-    '  @{ success = $true; canceled = $false; path = $dialog.SelectedPath }',
-    '} else {',
-    '  @{ success = $true; canceled = $true; path = "" }',
-    '}',
-    '$dialog.Dispose()',
-    '$payload | ConvertTo-Json -Compress',
-  ].join('; ');
-
-  const { stdout } = await runCommand('powershell', ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', script]);
-  const parsed = JSON.parse(String(stdout || '{}').trim() || '{}');
-  return {
-    canceled: Boolean(parsed?.canceled),
-    path: parsed?.path ? path.resolve(String(parsed.path)) : '',
-  };
-}
-
-async function readAssetLibraryCatalog() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  try {
-    const raw = await fs.readFile(ASSET_LIBRARY_CATALOG_FILE, 'utf8');
-    const normalized = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
-    const parsed = JSON.parse(normalized);
-    const items = Array.isArray(parsed?.items) ? parsed.items : [];
-    return items.map((item) => normalizeAssetLibraryItem(item));
-  } catch {
-    return [];
-  }
-}
-
-async function writeAssetLibraryCatalog(items) {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(ASSET_LIBRARY_CATALOG_FILE, JSON.stringify({
-    version: 1,
-    updatedAt: Date.now(),
-    items,
-  }, null, 2), 'utf8');
-  return items;
-}
-
-async function upsertAssetLibraryItem(item) {
-  const nextItem = normalizeAssetLibraryItem(item);
-  const items = await readAssetLibraryCatalog();
-  const nextItems = [...items.filter((entry) => entry.id !== nextItem.id), nextItem]
-    .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0));
-  await writeAssetLibraryCatalog(nextItems);
-  return nextItem;
-}
-
-// 资产回收站：删除时把物理文件移入 trash 目录（而非直接销毁），
-// 供撤销时通过 /api/assets/restore 找回，实现「云端文件找回」。
-const ASSET_LIBRARY_TRASH_DIR = path.join(DATA_DIR, 'asset-trash');
-// 去重结果持久化缓存文件：服务端去重分组在此落盘，供去重看板常驻视图读取。
-const ASSET_LIBRARY_DUPLICATES_FILE = path.join(DATA_DIR, 'asset-duplicates.json');
-
-// 将去重分组写入缓存文件（覆盖式）。分组结构：{ canonicalId, type, name, contentHash, duplicateIds }。
-async function writeAssetLibraryDuplicates(groups = []) {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(
-    ASSET_LIBRARY_DUPLICATES_FILE,
-    JSON.stringify({ version: 1, updatedAt: Date.now(), groups: Array.isArray(groups) ? groups : [] }, null, 2),
-    'utf8',
-  );
-}
-
-async function readAssetLibraryDuplicates() {
-  try {
-    const text = await fs.readFile(ASSET_LIBRARY_DUPLICATES_FILE, 'utf8');
-    const parsed = JSON.parse(text);
-    return Array.isArray(parsed?.groups) ? parsed.groups : [];
-  } catch {
-    return [];
-  }
-}
-
-// 探测素材媒体是否可被解码：文件缺失/损坏返回对应状态，正常返回可转码标记。
-function resolveFfprobePath() {
-  const base = String(process.env.HMDAO_FFMPEG_PATH || 'ffmpeg').trim() || 'ffmpeg';
-  if (base.endsWith('ffmpeg')) return `${base.slice(0, -'ffmpeg'.length)}ffprobe`;
-  return 'ffprobe';
-}
-
-async function probeAssetMedia(filePath) {
-  const source = String(filePath || '');
-  if (!source) return { ok: false, state: 'missing' };
-  try {
-    await fs.access(source, fs.constants.F_OK);
-  } catch {
-    return { ok: false, state: 'missing' };
-  }
-  const ffprobe = resolveFfprobePath();
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (value) => {
-      if (!settled) {
-        settled = true;
-        resolve(value);
-      }
-    };
-    const child = spawn(ffprobe, [
-      '-v', 'error',
-      '-show_entries', 'stream=codec_type,codec_name',
-      '-of', 'json',
-      source,
-    ]);
-    child.stderr.on('data', () => {});
-    child.on('error', () => finish({ ok: false, state: 'corrupted', detail: 'probe-spawn-failed' }));
-    child.on('close', (code) => {
-      if (code !== 0) return finish({ ok: false, state: 'corrupted', detail: `ffprobe-exit-${code}` });
-      finish({ ok: true, state: 'ok', canTranscode: true });
-    });
-    const timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch { /* ignore */ }
-      finish({ ok: false, state: 'corrupted', detail: 'probe-timeout' });
-    }, 20000);
-    if (timer.unref) timer.unref();
-  });
-}
-
-// 修复（转码）：把不可在浏览器直接预览、但可被解码的素材转成标准格式
-// （视频→H.264/AAC 的 mp4，图片→png），原地替换文件并更新目录元数据。
-async function repairAssetLibraryItem(item) {
-  const filePath = String(item.filePath || '');
-  if (!filePath) throw new Error('asset-has-no-file');
-  const type = String(item.type || '');
-  const dir = path.dirname(filePath);
-  const ext = type === 'video' ? 'mp4' : 'png';
-  const outPath = path.join(dir, `${item.backendAssetId || item.id}-repaired.${ext}`);
-  const ffmpegPath = String(process.env.HMDAO_FFMPEG_PATH || 'ffmpeg').trim() || 'ffmpeg';
-  const args = type === 'video'
-    ? ['-y', '-i', filePath, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-c:a', 'aac', '-movflags', '+faststart', outPath]
-    : ['-y', '-i', filePath, outPath];
-  await new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (error) => {
-      if (!settled) {
-        settled = true;
-        if (error) reject(error);
-        else resolve();
-      }
-    };
-    const child = spawn(ffmpegPath, args);
-    child.stderr.on('data', () => {});
-    child.on('error', () => finish(new Error('ffmpeg-spawn-failed')));
-    child.on('close', (code) => finish(code === 0 ? null : new Error(`ffmpeg-exit-${code}`)));
-    const timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch { /* ignore */ }
-      finish(new Error('ffmpeg-timeout'));
-    }, 120000);
-    if (timer.unref) timer.unref();
-  });
-  const probe = await probeAssetMedia(outPath);
-  if (!probe.ok) throw new Error('repaired-file-invalid');
-  // 仅在转码产物验证通过后，用新文件覆盖原文件（先 copy 成功再替换，避免原文件丢失）
-  try {
-    await fs.rename(outPath, filePath);
-  } catch {
-    await fs.copyFile(outPath, filePath);
-    await fs.rm(outPath, { force: true }).catch(() => {});
-  }
-  const stat = await fs.stat(filePath).catch(() => null);
-  const size = stat ? stat.size : Number(item.size || 0);
-  const contentHash = await computeAssetContentHash(filePath, {
-    type,
-    duration: Number(item.duration || 0) || 0,
-  });
-  return { filePath, size, contentHash };
-}
-
-async function moveFileToTrash(filePath, assetId) {
-  const source = String(filePath || '');
-  if (!source) return;
-  const base = path.basename(source);
-  const trashDir = path.join(ASSET_LIBRARY_TRASH_DIR, String(assetId || ''));
-  await fs.mkdir(trashDir, { recursive: true });
-  const target = path.join(trashDir, base);
-  try {
-    await fs.rename(source, target);
-  } catch {
-    // 跨盘/占用时回退 copy + unlink
-    await fs.copyFile(source, target).catch(() => {});
-    await fs.rm(source, { force: true }).catch(() => {});
-  }
-}
-
-async function deleteAssetLibraryItems(assetIds = []) {
-  const ids = new Set(assetIds.map((item) => String(item || '').trim()).filter(Boolean));
-  if (!ids.size) return [];
-  const items = await readAssetLibraryCatalog();
-  const deletedItems = items.filter((item) => ids.has(String(item.id || '')));
-  await fs.mkdir(ASSET_LIBRARY_TRASH_DIR, { recursive: true }).catch(() => {});
-  await Promise.all(
-    deletedItems.map(async (item) => {
-      // 引用型素材未复制原文件，删除时不动物理文件
-      if (String(item.storageLabel || '').trim().toLowerCase() === 'reference') {
-        return;
-      }
-      const filePath = String(item.filePath || '');
-      if (!filePath) return;
-      try {
-        await moveFileToTrash(filePath, String(item.id || ''));
-      } catch {
-        // 软删除失败时回退硬删除，保证删除语义不被破坏
-        await fs.rm(filePath, { force: true }).catch(() => {});
-      }
-    }),
-  );
-  const nextItems = items.filter((item) => !ids.has(String(item.id || '')));
-  await writeAssetLibraryCatalog(nextItems);
-  return deletedItems.map((item) => String(item.id || ''));
-}
-
-// 撤销找回：把回收站里的文件移回原路径，并将目录项写回 catalog。
-async function restoreAssetLibraryItems(inputItems = []) {
-  const list = Array.isArray(inputItems) ? inputItems : [];
-  if (!list.length) return [];
-  const catalog = await readAssetLibraryCatalog();
-  const byId = new Map(catalog.map((item) => [String(item.id || ''), item]));
-  const restored = [];
-  for (const raw of list) {
-    const id = String(raw?.id || '').trim();
-    if (!id) continue;
-    const label = String(raw?.storageLabel || '').trim().toLowerCase();
-    const filePath = String(raw?.filePath || '');
-    if (label !== 'reference' && filePath) {
-      const base = path.basename(filePath);
-      const trashPath = path.join(ASSET_LIBRARY_TRASH_DIR, id, base);
-      try {
-        await fs.access(trashPath);
-        await fs.mkdir(path.dirname(filePath), { recursive: true });
-        try {
-          await fs.rename(trashPath, filePath);
-        } catch {
-          await fs.copyFile(trashPath, filePath).catch(() => {});
-          await fs.rm(trashPath, { force: true }).catch(() => {});
-        }
-        await fs.rm(path.join(ASSET_LIBRARY_TRASH_DIR, id), { recursive: true, force: true }).catch(() => {});
-      } catch {
-        // 回收站中无对应文件（可能已被清理），仅恢复目录项
-      }
-    }
-    try {
-      byId.set(id, normalizeAssetLibraryItem(raw));
-      restored.push(id);
-    } catch {
-      // 跳过无法规范化的条目
-    }
-  }
-  const nextItems = Array.from(byId.values()).sort(
-    (left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0),
-  );
-  await writeAssetLibraryCatalog(nextItems);
-  return restored;
-}
-
-async function findAssetLibraryItem(assetId) {
-  const items = await readAssetLibraryCatalog();
-  return items.find((item) => String(item.id || '') === String(assetId || '')) || null;
-}
-
-async function collectLocalAssetImportFiles(directoryPath) {
-  const entries = await fs.readdir(directoryPath, { withFileTypes: true });
-  const results = [];
-  for (const entry of entries) {
-    const fullPath = path.join(directoryPath, entry.name);
-    if (entry.isDirectory()) {
-      results.push(...await collectLocalAssetImportFiles(fullPath));
-      continue;
-    }
-    if (entry.isFile()) {
-      results.push(fullPath);
-    }
-  }
-  return results;
-}
-
-async function probeAssetImportMeta(filePath, type) {
-  try {
-    if (type === 'video') return await probeVideoFile(filePath);
-    if (type === 'image') return await probeImageFile(filePath);
-    if (type === 'audio') {
-      const audioMeta = await inspectAudioFile(filePath);
-      return {
-        width: 0,
-        height: 0,
-        duration: Number(audioMeta.duration || 0) || 0,
-      };
-    }
-  } catch {
-    // Ignore probe failures and fall back to a metadata-light import.
-  }
-  return {
-    width: 0,
-    height: 0,
-    duration: 0,
-  };
-}
-
-async function processAssetLibraryImportDirectory(options = {}) {
-  const folderId = String(options.folderId || 'root').trim() || 'root';
-  const initialPath = String(options.initialPath || '').trim();
-  const autoSelectPath = String(options.autoSelectPath || '').trim();
-  const settings = await readAssetLibrarySettings();
-  const picked = await pickLocalDirectory(initialPath || settings.storagePath || DEFAULT_ASSET_LIBRARY_STORAGE_DIR, autoSelectPath);
-  if (picked.canceled || !picked.path) {
-    return {
-      canceled: true,
-      path: '',
-      items: [],
-      report: {
-        importedCount: 0,
-        failedCount: 0,
-        skippedCount: 0,
-        duplicateCount: 0,
-        folderImport: true,
-        imageCount: 0,
-        videoCount: 0,
-        audioCount: 0,
-        textCount: 0,
-        autoTaggedCount: 0,
-        autoClassifiedCount: 0,
-      },
-    };
-  }
-
-  const importFiles = await collectLocalAssetImportFiles(picked.path);
-  const items = [];
-  const report = {
-    importedCount: 0,
-    failedCount: 0,
-    skippedCount: 0,
-    duplicateCount: 0,
-    folderImport: true,
-    imageCount: 0,
-    videoCount: 0,
-    audioCount: 0,
-    textCount: 0,
-    autoTaggedCount: 0,
-    autoClassifiedCount: 0,
-  };
-
-  for (const filePath of importFiles) {
-    const type = inferSupportedImportAssetType(filePath, mediaMimeTypeFromExtension(filePath, ''));
-    if (!type) {
-      report.skippedCount += 1;
-      continue;
-    }
-    try {
-      const hints = inferAssetImportHints(filePath, type, picked.path);
-      const meta = await probeAssetImportMeta(filePath, type);
-      const result = await processAssetLibraryImportRequest({
-        name: path.basename(filePath),
-        originalName: path.basename(filePath),
-        folderId,
-        type,
-        tags: hints.tags,
-        smartCategories: hints.smartCategories,
-        sourceUrl: hints.relativePath || path.basename(filePath),
-        inputPath: filePath,
-        inputMimeType: mediaMimeTypeFromExtension(filePath, 'application/octet-stream'),
-        width: Number(meta.width || 0) || 0,
-        height: Number(meta.height || 0) || 0,
-        duration: Number(meta.duration || 0) || 0,
-        referenceSourceFile: true,
-      });
-      items.push(result.item);
-      if (result.duplicate) {
-        report.duplicateCount += 1;
-      } else {
-        report.importedCount += 1;
-      }
-      report.autoTaggedCount += hints.tags.length > 0 ? 1 : 0;
-      report.autoClassifiedCount += hints.smartCategories.length > 0 ? 1 : 0;
-      if (type === 'image') report.imageCount += 1;
-      if (type === 'video') report.videoCount += 1;
-      if (type === 'audio') report.audioCount += 1;
-      if (type === 'text') report.textCount += 1;
-    } catch {
-      report.failedCount += 1;
-    }
-  }
-
-  return {
-    canceled: false,
-    path: picked.path,
-    items,
-    report,
-  };
-}
+// 资产库服务已外移至 app/server/services/assetLibrary.mjs（工厂注入 deps）。
+const assetLibraryService = createAssetLibraryService({
+  runCommand,
+  computeAssetContentHash,
+  probeVideoFile,
+  probeImageFile,
+  probeAudioFile,
+  mediaMimeTypeFromExtension,
+  processAssetLibraryImportRequest,
+  DATA_DIR,
+  ASSET_LIBRARY_CATALOG_FILE,
+  DEFAULT_ASSET_LIBRARY_STORAGE_DIR,
+  uniqueStrings,
+  escapePowerShellSingleQuoted,
+});
+const {
+  sanitizeAssetFileBaseName,
+  inferAssetTypeFromMime,
+  inferAssetTypeFromPath,
+  buildAssetLibraryContentUrl,
+  normalizeAssetDuplicateValue,
+  buildAssetDuplicateFingerprint,
+  findDuplicateAssetLibraryItem,
+  mergeDuplicateAssetCandidate,
+  readAssetLibrarySettings,
+  writeAssetLibrarySettings,
+  pickLocalDirectory,
+  readAssetLibraryCatalog,
+  writeAssetLibraryCatalog,
+  upsertAssetLibraryItem,
+  writeAssetLibraryDuplicates,
+  readAssetLibraryDuplicates,
+  probeAssetMedia,
+  repairAssetLibraryItem,
+  deleteAssetLibraryItems,
+  pruneMissingAssetLibraryItems,
+  restoreAssetLibraryItems,
+  findAssetLibraryItem,
+  processAssetLibraryImportDirectory,
+} = assetLibraryService;
 
 const DCC_ENGINES = {
   blender: { id: 'blender', label: 'Blender', port: 8766, pluginName: 'HMDao Blender Capture Plugin' },
@@ -1783,10 +502,6 @@ function engineConfig(engine) {
   return DCC_ENGINES[engine === 'unreal' ? 'unreal' : 'blender'];
 }
 
-function escapeXml(value) {
-  return String(value || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]));
-}
-
 function dccFrameDataUrl({ engine, cameraName, width, height, frameIndex, recording }) {
   const config = engineConfig(engine);
   const hue = engine === 'unreal' ? '#2563eb' : '#0f766e';
@@ -1809,109 +524,6 @@ function dccFrameDataUrl({ engine, cameraName, width, height, frameIndex, record
     <text x="${Math.round(width * 0.11)}" y="${Math.round(height * 0.62)}" fill="#e5e7eb" font-family="Arial, sans-serif" font-size="${Math.max(14, Math.round(width / 58))}">DCC bridge mock frame. Connect the real plugin to capture live camera output.</text>
   </svg>`;
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
-}
-
-function wsAcceptKey(key) {
-  return crypto.createHash('sha1')
-    .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-    .digest('base64');
-}
-
-function encodeWsFrame(payload, { masked = false, opcode = 1 } = {}) {
-  const data = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload));
-  const header = [];
-  header.push(0x80 | opcode);
-  if (data.length < 126) {
-    header.push((masked ? 0x80 : 0) | data.length);
-  } else if (data.length < 65536) {
-    header.push((masked ? 0x80 : 0) | 126, (data.length >> 8) & 255, data.length & 255);
-  } else {
-    header.push((masked ? 0x80 : 0) | 127, 0, 0, 0, 0, (data.length / 2 ** 24) & 255, (data.length / 2 ** 16) & 255, (data.length / 2 ** 8) & 255, data.length & 255);
-  }
-  if (!masked) return Buffer.concat([Buffer.from(header), data]);
-  const mask = crypto.randomBytes(4);
-  const out = Buffer.alloc(data.length);
-  for (let i = 0; i < data.length; i++) out[i] = data[i] ^ mask[i % 4];
-  return Buffer.concat([Buffer.from(header), mask, out]);
-}
-
-function createFrameParser(onMessage, onClose, onPing) {
-  let buffer = Buffer.alloc(0);
-  let fragmentedOpcode = 0;
-  let fragmentedChunks = [];
-
-  const emitMessage = (opcode, payload) => {
-    if (opcode === 0x1 || opcode === 0x2) onMessage(payload.toString('utf8'));
-  };
-
-  return (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    while (buffer.length >= 2) {
-      const first = buffer[0];
-      const second = buffer[1];
-      const fin = Boolean(first & 0x80);
-      const opcode = first & 0x0f;
-      const masked = Boolean(second & 0x80);
-      let length = second & 0x7f;
-      let offset = 2;
-      if (length === 126) {
-        if (buffer.length < 4) return;
-        length = buffer.readUInt16BE(2);
-        offset = 4;
-      } else if (length === 127) {
-        if (buffer.length < 10) return;
-        const high = buffer.readUInt32BE(2);
-        const low = buffer.readUInt32BE(6);
-        length = high * 2 ** 32 + low;
-        offset = 10;
-      }
-      const maskOffset = offset;
-      if (masked) offset += 4;
-      if (buffer.length < offset + length) return;
-      let payload = buffer.subarray(offset, offset + length);
-      if (masked) {
-        const mask = buffer.subarray(maskOffset, maskOffset + 4);
-        const unmasked = Buffer.allocUnsafe(payload.length);
-        for (let index = 0; index < payload.length; index += 1) {
-          unmasked[index] = payload[index] ^ mask[index % 4];
-        }
-        payload = unmasked;
-      }
-      buffer = buffer.subarray(offset + length);
-      if (opcode === 0x8) {
-        onClose?.();
-        return;
-      }
-      if (opcode === 0x9) {
-        onPing?.(payload);
-        continue;
-      }
-      if (opcode === 0xA) continue;
-
-      if (opcode === 0x0) {
-        if (!fragmentedOpcode) continue;
-        fragmentedChunks.push(payload);
-        if (fin) {
-          emitMessage(fragmentedOpcode, Buffer.concat(fragmentedChunks));
-          fragmentedOpcode = 0;
-          fragmentedChunks = [];
-        }
-        continue;
-      }
-
-      if (!fin) {
-        fragmentedOpcode = opcode;
-        fragmentedChunks = [payload];
-        continue;
-      }
-
-      emitMessage(opcode, payload);
-    }
-  };
-}
-
-function sendWs(socket, payload) {
-  if (!socket.destroyed) socket.write(encodeWsFrame(JSON.stringify(payload)));
 }
 
 function nextWorkflowId() {
@@ -1937,111 +549,10 @@ function probeTcp(port, timeoutMs = 350) {
   });
 }
 
-function normalizeHttpUrl(value, fallback) {
-  const raw = String(value || '').trim() || fallback;
-  const normalized = raw.replace(/\/$/, '');
-  if (normalized === 'http://127.0.0.1' || normalized === 'http://localhost') return fallback;
-  if (normalized === 'http://127.0.0.1:1025' || normalized === 'http://localhost:1025') return fallback;
-  return normalized;
-}
-
-function inferMediaContentType(targetUrl, upstreamType = '', kind = '') {
-  const normalizedType = String(upstreamType || '').split(';')[0].trim().toLowerCase();
-  if (normalizedType && normalizedType !== 'application/octet-stream') {
-    return upstreamType;
-  }
-
-  const pathname = (() => {
-    try {
-      return new URL(targetUrl).pathname.toLowerCase();
-    } catch {
-      return String(targetUrl || '').toLowerCase();
-    }
-  })();
-
-  if (pathname.endsWith('.png')) return 'image/png';
-  if (pathname.endsWith('.jpg') || pathname.endsWith('.jpeg')) return 'image/jpeg';
-  if (pathname.endsWith('.webp')) return 'image/webp';
-  if (pathname.endsWith('.gif')) return 'image/gif';
-  if (pathname.endsWith('.bmp')) return 'image/bmp';
-  if (pathname.endsWith('.svg')) return 'image/svg+xml';
-  if (pathname.endsWith('.avif')) return 'image/avif';
-  if (pathname.endsWith('.heic')) return 'image/heic';
-  if (pathname.endsWith('.heif')) return 'image/heif';
-  if (pathname.endsWith('.tif') || pathname.endsWith('.tiff')) return 'image/tiff';
-  if (pathname.endsWith('.hdr')) return 'image/vnd.radiance';
-  if (pathname.endsWith('.exr')) return 'image/x-exr';
-  if (pathname.endsWith('.dng')) return 'image/x-adobe-dng';
-  if (pathname.endsWith('.jxl')) return 'image/jxl';
-  if (pathname.endsWith('.mp4')) return 'video/mp4';
-  if (pathname.endsWith('.webm')) return 'video/webm';
-  if (pathname.endsWith('.mov')) return 'video/quicktime';
-  if (pathname.endsWith('.m4v')) return 'video/x-m4v';
-  if (pathname.endsWith('.mkv')) return 'video/x-matroska';
-  if (pathname.endsWith('.avi')) return 'video/x-msvideo';
-  if (pathname.endsWith('.mp3')) return 'audio/mpeg';
-  if (pathname.endsWith('.wav')) return 'audio/wav';
-  if (pathname.endsWith('.m4a')) return 'audio/mp4';
-  if (pathname.endsWith('.aac')) return 'audio/aac';
-
-  if (kind === 'image') return 'image/png';
-  if (kind === 'video') return 'video/mp4';
-  if (kind === 'audio') return 'audio/mpeg';
-  return upstreamType || 'application/octet-stream';
-}
-
-function readHeaderValue(headers, name) {
-  if (!headers) return '';
-  if (typeof headers.get === 'function') {
-    return String(headers.get(name) || '').trim();
-  }
-  const lowered = String(name || '').toLowerCase();
-  return String(extractFirstString(headers[lowered] ?? headers[name]) || '').trim();
-}
-
-function sanitizeForwardHeaderValue(value) {
-  return String(value || '').replace(/[\r\n]+/g, ' ').trim();
-}
-
-function parseAwsSignedAt(value) {
-  const raw = String(value || '').trim();
-  const match = raw.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
-  if (!match) return 0;
-  const [, year, month, day, hour, minute, second] = match;
-  return Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second));
-}
-
-function getRemoteSignedUrlExpiry(targetUrl) {
-  try {
-    const parsed = new URL(targetUrl);
-    const host = parsed.hostname.toLowerCase();
-    const signedAt = parseAwsSignedAt(parsed.searchParams.get('X-Amz-Date'));
-    const expiresInSeconds = Number(parsed.searchParams.get('X-Amz-Expires'));
-    if (!signedAt || !Number.isFinite(expiresInSeconds) || expiresInSeconds <= 0) return null;
-    const expiresAt = signedAt + expiresInSeconds * 1000;
-    return {
-      host,
-      provider: host.includes('siliconflow.cn') ? 'siliconflow' : '',
-      signedAt,
-      expiresAt,
-      expired: Date.now() > expiresAt,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function createMediaProxyErrorPayload(status, category, provider, message) {
-  return {
-    success: false,
-    error: {
-      status,
-      category,
-      provider,
-      message,
-    },
-  };
-}
+// 媒体代理纯工具函数已抽离至 lib/media-utils.mjs（inferMediaContentType / looksLikeHtml /
+// sanitizeForwardHeaderValue / parseAwsSignedAt / getRemoteSignedUrlExpiry /
+// createMediaProxyErrorPayload / normalizeHttpUrl / readHeaderValue），经顶部 import 复用，行为零变更。
+// 以下依赖主文件运行时状态（send / extractFirstString）的函数仍保留在此。
 
 function sendMediaProxyError(res, status, category, provider, message) {
   return send(
@@ -2115,61 +626,94 @@ function detectRemoteMediaUpstreamIssue(targetUrl, upstream) {
     };
   }
 
+  if (looksLikeHtml(upstream.body, contentType)) {
+    return {
+      status: 422,
+      category: 'remote-asset-not-media',
+      provider: signedUrl?.provider || '',
+      message:
+        '上游返回的是网页(HTML)而不是音频/视频文件。通常是源站启用了防盗链、需要登录，或服务端请求未携带正确的来源页 Referer/登录态。请在浏览器中直接打开该素材地址确认，或改用带正确来源页的地址后再导入。',
+    };
+  }
+
   return null;
 }
 
-async function requestRemoteBinaryAsset(targetUrl, {
-  method = 'GET',
-  headers = {},
-  timeoutMs = 45000,
-} = {}) {
-  const normalizedMethod = String(method || 'GET').toUpperCase();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs);
-  try {
-    const upstream = await fetch(targetUrl, {
-      method: normalizedMethod,
-      headers,
-      redirect: 'follow',
-      signal: controller.signal,
-    });
-    const body = normalizedMethod === 'HEAD'
-      ? Buffer.alloc(0)
-      : Buffer.from(await upstream.arrayBuffer());
-    return {
-      status: upstream.status,
-      headers: upstream.headers,
-      body,
-      transport: 'fetch',
-    };
-  } catch (fetchError) {
-    const fallback = await nativeHttpRequest(targetUrl, {
-      method: normalizedMethod,
-      timeoutMs,
-      headers,
-      responseType: 'buffer',
-    });
-    if (!fallback.ok && !fallback.status) {
-      throw fetchError instanceof Error ? fetchError : new Error(String(fetchError));
-    }
-    return {
-      status: Number(fallback.status || 0),
-      headers: fallback.headers || {},
-      body: normalizedMethod === 'HEAD' ? Buffer.alloc(0) : Buffer.from(fallback.bodyBuffer || Buffer.alloc(0)),
-      transport: 'native-http',
-    };
-  } finally {
-    clearTimeout(timeout);
+// P1-11：以下 5 个函数已抽取至 lib/http-fetch-utils.mjs。
+import {
+  downloadRemoteMediaBuffer,
+  extensionFromMimeType,
+  nativeHttpRequest,
+  requestRemoteBinaryAsset,
+} from './lib/http-fetch-utils.mjs';
+
+// ———— yt-dlp 辅助函数 ————
+const YT_DLP_PATHS = [
+  'C:\\Users\\123\\yt-dlp.exe',
+  '/usr/local/bin/yt-dlp',
+  '/usr/bin/yt-dlp',
+  'yt-dlp',
+];
+function resolveYtDlpPath() {
+  // 优先使用「模型下载面板」一键安装的托管运行时（用户可在任意机器下载安装）。
+  const managed = detectManagedLocalPostYtDlpPath();
+  if (managed) {
+    try { require('fs').accessSync(managed, require('fs').constants.X_OK); return managed; } catch (_) {}
   }
+  for (const p of YT_DLP_PATHS) {
+    try { require('fs').accessSync(p, require('fs').constants.X_OK); return p; } catch (_) {}
+  }
+  return YT_DLP_PATHS[0]; // fallback
+}
+function execFileAsync(cmd, args, opts) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, opts || {}, (err, stdout, stderr) => {
+      if (err) reject(err);
+      else resolve({ stdout, stderr });
+    });
+  });
 }
 
-async function proxyRemoteMediaAsset(req, res, mediaUrl, kind = '') {
+async function proxyRemoteMediaAsset(req, res, mediaUrl, kind = '', referer = '', origin = '') {
   const targetUrl = String(mediaUrl || '').trim();
   const isHttpTarget = /^https?:\/\//i.test(targetUrl);
   const isFileUrlTarget = /^file:\/\//i.test(targetUrl);
   const isWindowsPathTarget = /^[a-zA-Z]:[\\/]/.test(targetUrl) || targetUrl.startsWith('\\\\');
   if (!isHttpTarget && !isFileUrlTarget && !isWindowsPathTarget) {
     return send(res, 400, { success: false, error: { message: 'Media proxy requires an absolute http(s) URL or local file path.' } });
+  }
+
+  // 同源本地预览资源（如 http://127.0.0.1:3000/assets/...）：直接读取对应静态文件返回，
+  // 不再经 media-proxy「自请求」本机 URL。否则文件缺失时 static 服务兜底返回
+  // index.html（HTML），被 detectRemoteMediaUpstreamIssue 误判为 422（Unprocessable Entity）。
+  if (isHttpTarget) {
+    const webPort = String(process.env.HMDAO_APP_PORT || '3000');
+    let parsed;
+    try {
+      parsed = new URL(targetUrl);
+    } catch {
+      parsed = null;
+    }
+    if (
+      parsed
+      && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '::1')
+      && parsed.port === webPort
+      && parsed.pathname.startsWith('/assets/')
+    ) {
+      const webDistDir = path.resolve(APP_DIR, 'dist');
+      const filePath = path.normalize(path.join(webDistDir, parsed.pathname));
+      if (filePath.startsWith(webDistDir)) {
+        try {
+          await sendLocalFileStream(req, res, filePath, {
+            mimeType: mediaMimeTypeFromExtension(filePath, inferMediaContentType(filePath, '', kind)),
+            contentDisposition: buildSafeInlineContentDisposition(filePath),
+          });
+          return;
+        } catch {
+          return send(res, 404, { success: false, error: { message: 'local-asset-not-found' } });
+        }
+      }
+    }
   }
 
   if (isFileUrlTarget || isWindowsPathTarget) {
@@ -2218,6 +762,13 @@ async function proxyRemoteMediaAsset(req, res, mediaUrl, kind = '') {
   if (req.headers.range) {
     upstreamHeaders.Range = req.headers.range;
   }
+  // 转发来源页 Referer/Origin，以绕过仅依赖 Referer 的防盗链（源站常只对带正确
+  // Referer 的请求返回真实媒体，否则返回登录/播放器 HTML 页面）。
+  if (referer) {
+    upstreamHeaders.Referer = sanitizeForwardHeaderValue(referer);
+    if (!origin) upstreamHeaders.Origin = sanitizeForwardHeaderValue(referer);
+  }
+  if (origin) upstreamHeaders.Origin = sanitizeForwardHeaderValue(origin);
 
   try {
     const upstream = await requestRemoteBinaryAsset(targetUrl, {
@@ -2277,6 +828,67 @@ async function proxyRemoteMediaAsset(req, res, mediaUrl, kind = '') {
  * 转发：https://hf-mirror.com/{model}/resolve/{revision}/{path...}
  * 采用流式转发，避免把 600MB 模型整体缓冲进内存。
  */
+// P1b：后台把模型文件预热到服务端磁盘缓存（绕开美国 CDN 慢链路）。
+// 浏览器「一键安装」时前端会 POST /api/hf-proxy/prefetch/{model}，触发后服务端慢慢从镜像拉取落盘，
+// 浏览器随后的真实 GET 即可从同源磁盘命中，首装与重试耗时大幅缩短。
+async function prewarmHfModel(modelKey) {
+  const files = HF_PROXY_PREWARM[modelKey];
+  if (!files || !files.length) return;
+  const cacheDir = ensureHfProxyCacheDir();
+  const hosts = ['https://hf-mirror.com', 'https://huggingface.co'];
+  const hfToken = process.env.HF_TOKEN;
+  for (const file of files) {
+    const suffix = `${modelKey}/resolve/main/${file}`;
+    const cacheKey = crypto.createHash('sha1').update(suffix).digest('hex');
+    const cacheFile = path.join(cacheDir, cacheKey);
+    const cacheTmp = `${cacheFile}.part`;
+    if (existsSync(cacheFile) || hfProxyCacheLocks.has(cacheKey)) continue;
+    hfProxyCacheLocks.add(cacheKey);
+    let ws = null;
+    try { ws = createWriteStream(cacheTmp); } catch { hfProxyCacheLocks.delete(cacheKey); continue; }
+    let ok = false;
+    for (const host of hosts) {
+      const target = `${host}/${suffix}`;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(new Error('hf-proxy-timeout')), 30 * 60 * 1000);
+      try {
+        const upstream = await fetch(target, {
+          method: 'GET',
+          headers: {
+            'User-Agent': 'HMDao-HFProxy/1.0',
+            'Accept-Encoding': 'identity',
+            ...(hfToken ? { Authorization: `Bearer ${hfToken}` } : {}),
+          },
+          redirect: 'follow',
+          signal: controller.signal,
+        });
+        if (!upstream.ok || upstream.status === 404) { try { upstream.body?.cancel?.(); } catch { /* noop */ } continue; }
+        const reader = upstream.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value && value.length) {
+            if (!ws.write(Buffer.from(value))) await new Promise((r) => ws.once('drain', r));
+          }
+        }
+        ok = true;
+        break;
+      } catch {
+        try { upstream?.body?.cancel?.(); } catch { /* noop */ }
+        continue;
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    try { await new Promise((r) => ws.end(r)); } catch { /* noop */ }
+    hfProxyCacheLocks.delete(cacheKey);
+    try {
+      if (ok) await fs.rename(cacheTmp, cacheFile);
+      else await fs.unlink(cacheTmp);
+    } catch { /* noop */ }
+  }
+}
+
 async function proxyHuggingFace(req, res, url) {
   const prefix = '/api/hf-proxy/';
   const suffix = String(url.pathname || '').startsWith(prefix)
@@ -2286,10 +898,47 @@ async function proxyHuggingFace(req, res, url) {
     return send(res, 400, { success: false, error: { message: 'invalid-hf-proxy-path' } });
   }
 
+  // P1b：POST /api/hf-proxy/prefetch/{model} → 后台预热模型文件到服务端磁盘缓存（非阻塞）
+  if (req.method === 'POST' && suffix.startsWith('prefetch/')) {
+    const modelKey = suffix.slice('prefetch/'.length);
+    prewarmHfModel(modelKey).catch((e) => console.error('[hf-proxy] prefetch 失败', modelKey, e?.message));
+    return send(res, 202, { success: true, message: 'prefetch-started', model: modelKey });
+  }
+
   const origin = res._hmdaoOrigin || '';
   const corsHeaders = origin
     ? { 'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Credentials': 'true' }
     : { 'Access-Control-Allow-Origin': '*' };
+
+  // ---- P1：服务端磁盘缓存命中 ----
+  // 命中则直接从磁盘返回（同源、带正确 Content-Length），浏览器重试/弱网下秒取，
+  // 同时规避「浏览器 IndexedDB 缓存损坏(offset out of bounds)」后仍需穿越美国 CDN 的问题。
+  const isRangeRequest = Boolean(req.headers.range);
+  const hfCacheKey = crypto.createHash('sha1').update(suffix).digest('hex');
+  const hfCacheDir = ensureHfProxyCacheDir();
+  const hfCacheFile = path.join(hfCacheDir, hfCacheKey);
+  const hfCacheTmp = `${hfCacheFile}.part`;
+  if (!isRangeRequest && existsSync(hfCacheFile)) {
+    try {
+      const st = await fs.stat(hfCacheFile);
+      if (st.size > 0) {
+        const diskHdrs = {
+          ...corsHeaders,
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(st.size),
+          'Accept-Ranges': 'bytes',
+          'Cache-Control': 'public, max-age=86400',
+          'Access-Control-Expose-Headers': 'Accept-Ranges, Content-Length, Content-Type',
+        };
+        res.writeHead(200, diskHdrs);
+        if (req.method === 'HEAD') { res.end(); return; }
+        createReadStream(hfCacheFile).pipe(res);
+        return;
+      }
+    } catch {
+      /* 落盘读取失败，回退到上游拉取 */
+    }
+  }
 
   const upstreamHeaders = {
     Accept: req.headers.accept || '*/*',
@@ -2298,6 +947,12 @@ async function proxyHuggingFace(req, res, url) {
     // 与真实明文 body 不一致，导致浏览器按压缩长度截断模型文件 → offset is out of bounds。
     'Accept-Encoding': 'identity',
   };
+  // 受限（gated）模型（如 briaai/RMBG-2.0）需要鉴权才能下载：若服务端配置了 HF_TOKEN，
+  // 则携带 Bearer 令牌转发，使「需登录/接受许可」的模型也能经由本代理下载。
+  const hfToken = process.env.HF_TOKEN;
+  if (hfToken) {
+    upstreamHeaders['Authorization'] = `Bearer ${hfToken}`;
+  }
   if (req.headers.range) upstreamHeaders.Range = req.headers.range;
 
   // 镜像源优先（Node 可直连），huggingface.co 兜底
@@ -2363,18 +1018,44 @@ async function proxyHuggingFace(req, res, url) {
         return;
       }
 
+      // 全量 GET 成功时，把字节同时落到服务端磁盘缓存（供后续重试/弱网秒取）。
+      // 已在缓存中或正被并发写入的文件跳过，避免多请求写入同一临时文件损坏。
+      const shouldCache =
+        !isRangeRequest && !existsSync(hfCacheFile) && !hfProxyCacheLocks.has(hfCacheKey);
+      let cacheWs = null;
+      if (shouldCache) {
+        hfProxyCacheLocks.add(hfCacheKey);
+        try { cacheWs = createWriteStream(hfCacheTmp); } catch { cacheWs = null; }
+      }
+
       const reader = upstream.body.getReader();
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value && value.length) {
-          if (!res.write(Buffer.from(value))) {
-            await new Promise((resolve) => res.once('drain', resolve));
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value && value.length) {
+            if (!res.write(Buffer.from(value))) {
+              await new Promise((resolve) => res.once('drain', resolve));
+            }
+            if (cacheWs) {
+              if (!cacheWs.write(Buffer.from(value))) {
+                await new Promise((resolve) => cacheWs.once('drain', resolve));
+              }
+            }
           }
         }
+        await new Promise((resolve) => res.end(resolve));
+        if (cacheWs) {
+          await new Promise((resolve) => cacheWs.end(resolve));
+          try { await fs.rename(hfCacheTmp, hfCacheFile); } catch { try { await fs.unlink(hfCacheTmp); } catch {} }
+        }
+        return;
+      } catch (streamErr) {
+        try { await fs.unlink(hfCacheTmp); } catch {}
+        throw streamErr;
+      } finally {
+        if (cacheWs) hfProxyCacheLocks.delete(hfCacheKey);
       }
-      res.end();
-      return;
     } catch (error) {
       lastError = error;
       continue;
@@ -2394,6 +1075,185 @@ async function proxyHuggingFace(req, res, url) {
     });
   }
   // 已写出响应头，优雅关闭
+  try { res.end(); } catch { /* noop */ }
+}
+
+/**
+ * 路由：GET/HEAD /api/local-model/{id}  与  POST /api/local-model/prefetch/{id}
+ *
+ * 背景：HuggingFace 新版 Xet 存储会把大文件二进制 302 重定向到美国 AWS S3 CDN
+ * （cas-bridge.xethub.hf.co），即便走 hf-mirror 也只代理「文件在哪」的元数据，真实字节
+ * 仍来自美国，导致国内浏览器拉取 BiRefNet 等大模型极慢、进度条几乎不动、且每次重试都从
+ * 美国重下。
+ *
+ * 方案：后端把模型一次性拉到本机磁盘缓存（tmp/model-cache/{id}.onnx），之后浏览器从
+ * 127.0.0.1 本地秒下。首次请求（尚未缓存）时边从上游拉取边写入磁盘（tee）并透传
+ * Content-Length，使进度条可正常推进；后续请求直接本地读盘，极快。
+ * POST prefetch 触发后台预拉取（非阻塞），便于先让服务端慢速拉完、浏览器再来秒取。
+ */
+const LOCAL_MODEL_SOURCES = {
+  // 2026-07-20 状态：BiRefNet 的 int8 量化在本机无法产出可用模型，故该引擎暂时禁用，抠像走 @imgly 兜底。
+  // 根因（已验证）：
+  //  - 静态量化 quantize_static(QDQ/QOperator) 在本机 ORT 1.27 下对该 927MB 模型确定性卡死
+  //    （~1000s CPU 后进程挂起，反复验证），无法生成小体积 int8 模型；
+  //  - 动态量化会产出 1GB 坏模型（原 fp32 权重未移除 + 叠加 int8 路径，且无 DequantizeLinear 桥接），
+  //    浏览器加载时需分配整文件大小(1GB)的连续 wasm 缓冲 → 失败；
+  //  - HuggingFace 的 onnx-community/BiRefNet-ONNX 只提供 fp32/fp16，无现成 int8 可下载。
+  // 因此指向一个不存在的路径，使后端干净返回模型缺失 → 前端直接回退 @imgly/background-removal
+  // （isnet_quint8，小巧、浏览器原生支持，已验证可用）。磁盘上的 birefnet_uint8.onnx / model.onnx
+  // 保留不删，待在更强机器上量化出真正的小 int8 后可改回此处启用。
+  'birefnet-matting': 'f:/Work/HMDAODAO/app/tmp/model-cache/birefnet_uint8.onnx.DISABLED',
+};
+const MODEL_CACHE_DIR = path.join(process.cwd(), 'tmp', 'model-cache');
+let modelCacheReady = false;
+function ensureModelCacheDir() {
+  if (modelCacheReady) return;
+  try { mkdirSync(MODEL_CACHE_DIR, { recursive: true }); } catch { /* noop */ }
+  modelCacheReady = true;
+}
+// 本地已量化文件源（绝对路径 / file://），识别后直接服务，不再去上游拉取。
+function isLocalModelSource(src) {
+  if (typeof src !== 'string' || !src) return false;
+  if (src.startsWith('file://')) return true;
+  // Windows 绝对路径如 f:\... 或 f:/...
+  return /^[a-zA-Z]:[\\/]/.test(src);
+}
+function localModelPathFromSource(src) {
+  return path.resolve(src.startsWith('file://') ? src.slice('file://'.length) : src);
+}
+// 缓存文件名按模型源区分：本地源直接用源文件本身；URL 源用 basename（避免 fp16/fp32 串味）。
+function localModelFileFor(id) {
+  const src = LOCAL_MODEL_SOURCES[id];
+  if (src && isLocalModelSource(src)) return localModelPathFromSource(src);
+  const base = src ? src.split('/').pop() || `${id}.onnx` : `${id}.onnx`;
+  return path.join(MODEL_CACHE_DIR, base);
+}
+const modelPrefetching = new Set();
+
+async function streamUpstreamToDisk(id, localPath, tmpPath) {
+  const src = LOCAL_MODEL_SOURCES[id];
+  if (!src) throw new Error('unknown-local-model:' + id);
+  if (isLocalModelSource(src)) throw new Error('local-source-should-not-stream:' + id);
+  const upstreams = [src, src.replace('hf-mirror.com', 'huggingface.co')];
+  let lastErr;
+  for (const u of upstreams) {
+    try {
+      const upstream = await fetch(u, {
+        redirect: 'follow',
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Encoding': 'identity' },
+      });
+      if (!upstream.ok || !upstream.body) { lastErr = new Error('upstream ' + upstream.status); continue; }
+      const ws = createWriteStream(tmpPath);
+      const reader = upstream.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.length) {
+          if (!ws.write(Buffer.from(value))) await new Promise((r) => ws.once('drain', r));
+        }
+      }
+      await new Promise((r) => ws.end(r));
+      await fs.rename(tmpPath, localPath);
+      console.info(`[local-model] 已缓存 ${id} -> ${localPath}`);
+      return;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('download-failed');
+}
+
+async function downloadModelToDisk(id) {
+  if (modelPrefetching.has(id)) return;
+  modelPrefetching.add(id);
+  try {
+    ensureModelCacheDir();
+    const localPath = localModelFileFor(id);
+    // 本地已量化文件（绝对路径源）直接存在，无需下载；缺失则报错避免误走上游。
+    if (isLocalModelSource(LOCAL_MODEL_SOURCES[id])) {
+      if (existsSync(localPath)) return;
+      throw new Error('local-model-missing:' + id + ' @ ' + localPath);
+    }
+    if (existsSync(localPath)) return;
+    await streamUpstreamToDisk(id, localPath, localPath + '.part');
+  } finally {
+    modelPrefetching.delete(id);
+  }
+}
+
+async function serveLocalModel(req, res, url) {
+  const prefix = '/api/local-model/';
+  const rest = String(url.pathname || '').slice(prefix.length);
+
+  // 后台预拉取：触发即返回 202，由服务端慢慢从美国拉到本地磁盘
+  if (req.method === 'POST' && rest.startsWith('prefetch/')) {
+    const id = rest.slice('prefetch/'.length);
+    if (!LOCAL_MODEL_SOURCES[id]) return send(res, 404, { success: false, error: 'unknown-model' });
+    downloadModelToDisk(id).catch((e) => console.error('[local-model] prefetch 失败', id, e?.message));
+    return send(res, 202, { success: true, message: 'prefetch-started', id });
+  }
+
+  const id = rest;
+  if (!LOCAL_MODEL_SOURCES[id]) return send(res, 404, { success: false, error: 'unknown-model' });
+  ensureModelCacheDir();
+  const localPath = localModelFileFor(id);
+
+  // 已缓存：本地读盘，极快，带 Content-Length 让进度条正常
+  if (existsSync(localPath)) {
+    try {
+      const stat = await fs.stat(localPath);
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(stat.size),
+        'Content-Disposition': `inline; filename="${id}.onnx"`,
+        'Accept-Ranges': 'bytes',
+        'Access-Control-Allow-Origin': '*',
+      });
+      if (req.method === 'HEAD') { res.end(); return; }
+      createReadStream(localPath).pipe(res);
+      return;
+    } catch { /* 落到上游 */ }
+  }
+
+  // 未缓存：从上游拉取并 tee 到磁盘（首次较慢，之后走本地）
+  const src = LOCAL_MODEL_SOURCES[id];
+  const upstreams = [src, src.replace('hf-mirror.com', 'huggingface.co')];
+  let lastErr;
+  for (const u of upstreams) {
+    try {
+      const upstream = await fetch(u, {
+        redirect: 'follow',
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Encoding': 'identity' },
+      });
+      if (!upstream.ok) { lastErr = new Error('upstream ' + upstream.status); continue; }
+      const passHeaders = {};
+      for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified']) {
+        const v = upstream.headers.get(h);
+        if (v) passHeaders[h] = v;
+      }
+      passHeaders['Access-Control-Allow-Origin'] = '*';
+      passHeaders['Content-Disposition'] = `inline; filename="${id}.onnx"`;
+      res.writeHead(upstream.status, passHeaders);
+      if (req.method === 'HEAD' || !upstream.body) { res.end(); return; }
+      const tmpPath = localPath + '.dl';
+      const ws = createWriteStream(tmpPath);
+      const reader = upstream.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.length) {
+          if (!res.write(Buffer.from(value))) await new Promise((r) => res.once('drain', r));
+          if (!ws.write(Buffer.from(value))) await new Promise((r) => ws.once('drain', r));
+        }
+      }
+      ws.end();
+      await new Promise((r) => ws.once('finish', r));
+      try { await fs.rename(tmpPath, localPath); } catch { /* 可能已被 prefetch 写入，忽略 */ }
+      res.end();
+      return;
+    } catch (e) { lastErr = e; }
+  }
+  if (!res.headersSent) {
+    return send(res, 502, { success: false, error: 'local-model-failed: ' + (lastErr instanceof Error ? lastErr.message : 'all-upstreams-failed') });
+  }
   try { res.end(); } catch { /* noop */ }
 }
 
@@ -2459,264 +1319,18 @@ async function serveTransformersModule(req, res, url) {
   }
 }
 
-async function downloadRemoteMediaBuffer(targetUrl) {
-  const upstream = await requestRemoteBinaryAsset(targetUrl, {
-    method: 'GET',
-    headers: {
-      Accept: '*/*',
-      'User-Agent': 'HMDao-LocalVideoEdit/1.0',
-    },
-    timeoutMs: 45000,
-  });
-  if (!(upstream.status >= 200 && upstream.status < 300)) {
-    throw new Error(`remote-media-fetch-failed:${upstream.status}`);
-  }
-  const mimeType = readHeaderValue(upstream.headers, 'content-type');
-  const bytes = upstream.body;
-  return {
-    bytes,
-    mimeType,
-  };
-}
-
-async function probeAnalyzeImageFile(filePath) {
-  const { stdout } = await runCommand('ffprobe', [
-    '-v',
-    'error',
-    '-select_streams',
-    'v:0',
-    '-show_entries',
-    'stream=width,height',
-    '-of',
-    'json',
-    filePath,
-  ]);
-  const parsed = JSON.parse(stdout || '{}');
-  return {
-    width: Math.max(0, Number(parsed?.streams?.[0]?.width || 0)),
-    height: Math.max(0, Number(parsed?.streams?.[0]?.height || 0)),
-  };
-}
-
-function uniqueStrings(values) {
-  return Array.from(new Set((Array.isArray(values) ? values : [])
-    .map((item) => String(item || '').trim())
-    .filter(Boolean)));
-}
-
-function classifyAssetKeyword(text, map, fallback) {
-  const lowered = String(text || '').toLowerCase();
-  for (const [label, tokens] of map) {
-    if (tokens.some((token) => lowered.includes(token))) {
-      return label;
-    }
-  }
-  return fallback;
-}
-
-function inferImageAnalysisFallback(payload) {
-  const width = Math.max(0, Number(payload?.width || 0));
-  const height = Math.max(0, Number(payload?.height || 0));
-  const orientation = width > 0 && height > 0
-    ? width > height
-      ? 'landscape'
-      : width < height
-        ? 'portrait'
-        : 'square'
-    : 'unlabeled';
-  const text = [
-    String(payload?.name || ''),
-    String(payload?.sourceUrl || ''),
-    ...parseStringArrayField(payload?.tags),
-    ...parseStringArrayField(payload?.smartCategories),
-  ].join(' ').toLowerCase();
-
-  const subject = classifyAssetKeyword(text, [
-    ['人物主体', ['portrait', 'person', 'people', 'face', 'woman', 'man', '人物', '人像', '模特']],
-    ['产品主体', ['product', 'watch', 'phone', 'laptop', 'bag', 'product-shot', '产品', '静物']],
-    ['建筑场景', ['building', 'architecture', 'city', 'interior', '建筑', '城市', '室内']],
-    ['自然风景', ['landscape', 'mountain', 'forest', 'ocean', 'nature', '风景', '风光', '山水', '自然']],
-    ['车辆主体', ['car', 'vehicle', 'auto', '汽车', '车辆']],
-  ], '主体待确认');
-
-  const scene = classifyAssetKeyword(text, [
-    ['户外真实场景', ['outdoor', 'street', 'travel', 'mountain', 'forest', '风光', '山水', '自然', '户外']],
-    ['室内棚拍场景', ['studio', 'indoor', 'interior', 'room', '棚拍', '室内']],
-    ['商业产品展示场景', ['product', 'commerce', 'ecommerce', '广告', '海报', '展示']],
-    ['城市叙事场景', ['city', 'urban', 'building', 'street', '城市', '街道']],
-  ], '场景信息有限');
-
-  const style = classifyAssetKeyword(text, [
-    ['电影感写实', ['cinematic', 'film', 'moody', '电影', '叙事']],
-    ['商业广告风', ['poster', 'ad', 'campaign', 'commercial', '广告', '海报']],
-    ['极简产品风', ['minimal', 'clean', 'product', '极简', '产品']],
-    ['写实摄影风', ['photo', 'photography', 'realistic', '写实', '摄影']],
-    ['插画概念风', ['illustration', 'concept', 'art', '插画', '概念']],
-  ], '写实参考风格');
-
-  const lighting = classifyAssetKeyword(text, [
-    ['柔和自然光', ['soft light', 'window', 'daylight', 'natural light', '柔光', '自然光']],
-    ['高反差戏剧光', ['dramatic', 'hard light', 'contrast', 'rim', '戏剧', '高反差']],
-    ['棚拍商业布光', ['studio', 'beauty light', 'commercial light', '棚拍', '商业布光']],
-    ['氛围霓虹光', ['neon', 'cyberpunk', 'night', '霓虹', '夜景']],
-  ], '光影信息有限');
-
-  const composition = `${orientation}${width > 0 && height > 0 ? `，分辨率为${width} × ${height}` : ''}`;
-  const camera = classifyAssetKeyword(text, [
-    ['中近景镜头', ['close', 'portrait', 'mid-shot', '特写', '近景', '人像']],
-    ['广角环境镜头', ['wide', 'landscape', 'environment', '全景', '广角', '风景']],
-    ['产品特写镜头', ['macro', 'detail', 'product', '特写', '细节', '产品']],
-  ], '镜头语言待补充');
-  const mood = classifyAssetKeyword(text, [
-    ['高级商业风', ['luxury', 'premium', 'commercial', '高级', '商业']],
-    ['安静自然风', ['nature', 'soft', 'daylight', '安静', '自然']],
-    ['戏剧张力感', ['dramatic', 'contrast', 'night', '张力', '戏剧']],
-  ], '氛围信息有限');
-
-  const keywords = uniqueStrings([
-    subject,
-    scene,
-    style,
-    lighting,
-    camera,
-    mood,
-    ...parseStringArrayField(payload?.tags),
-    ...parseStringArrayField(payload?.smartCategories),
-  ]).slice(0, 12);
-
-  return {
-    engine: 'local-heuristic-fallback',
-    summary: subject + ', ' + scene + ', ' + style + ', ' + lighting + ', ' + camera + '.',
-    subject,
-    scene,
-    style,
-    lighting,
-    composition,
-    camera,
-    mood,
-    keywords,
-    promptZh: 'Keep ' + subject + ' in a ' + composition + ' layout, place it in ' + scene + ', render it with ' + style + ', ' + lighting + ', ' + camera + ', and a ' + mood + ' mood.',
-    promptEn: 'Keep the original ' + orientation + ' framing, emphasize ' + subject + ', place it in ' + scene + ', render it in a ' + style + ' look with ' + lighting + ', use ' + camera + ', and preserve a ' + mood + ' mood with clean details for poster-ready image generation.',
-    warnings: [
-      '当前未接入本地多模态模型，结果由本地启发式链路生成',
-      '如需更强解析，建议优先配置 CLIP Interrogator、Florence-2 或 Qwen 视觉的 wrapper',
-    ],
-    runtime: {
-      wrapperConfigured: Boolean(String(process.env.HMDAO_IMAGE_ANALYSIS_COMMAND || '').trim()),
-      wrapperCommand: String(process.env.HMDAO_IMAGE_ANALYSIS_COMMAND || '').trim() ? 'custom' : '',
-      recommendedModels: ['CLIP Interrogator', 'Florence-2', 'Qwen Vision'],
-    },
-    metadata: {
-      width,
-      height,
-      orientation,
-      sourceKind: payload?.inputPath ? 'upload' : /^https?:\/\//i.test(String(payload?.sourceUrl || '')) ? 'remote-url' : 'unknown',
-    },
-    analyzedAt: Date.now(),
-  };
-}
-
-function normalizeImageAnalysisResult(raw, fallback) {
-  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
-  return {
-    ...fallback,
-    engine: String(source.engine || fallback.engine),
-    summary: String(source.summary || fallback.summary),
-    subject: String(source.subject || fallback.subject),
-    scene: String(source.scene || fallback.scene),
-    style: String(source.style || fallback.style),
-    lighting: String(source.lighting || fallback.lighting),
-    composition: String(source.composition || fallback.composition),
-    camera: String(source.camera || fallback.camera),
-    mood: String(source.mood || fallback.mood),
-    keywords: uniqueStrings(Array.isArray(source.keywords) ? source.keywords : fallback.keywords).slice(0, 16),
-    promptZh: String(source.promptZh || source.prompt_zh || fallback.promptZh),
-    promptEn: String(source.promptEn || source.prompt_en || fallback.promptEn),
-    palette: uniqueStrings(Array.isArray(source.palette) ? source.palette : fallback.palette || []).slice(0, 8),
-    warnings: uniqueStrings(Array.isArray(source.warnings) ? source.warnings : fallback.warnings || []).slice(0, 8),
-    runtime: {
-      ...(fallback.runtime || {}),
-      ...(source.runtime && typeof source.runtime === 'object' && !Array.isArray(source.runtime) ? source.runtime : {}),
-    },
-    metadata: {
-      ...(fallback.metadata || {}),
-      ...(source.metadata && typeof source.metadata === 'object' && !Array.isArray(source.metadata) ? source.metadata : {}),
-    },
-    analyzedAt: Date.now(),
-  };
-}
-
-function getConfiguredImageAnalysisCommands() {
-  const genericCommand = String(process.env.HMDAO_IMAGE_ANALYSIS_COMMAND || '').trim();
-  return {
-    genericCommand,
-    clipInterrogator: resolveLocalImageWrapperCommand({
-      envCommand: 'HMDAO_CLIP_INTERROGATOR_COMMAND',
-      envPath: 'HMDAO_CLIP_INTERROGATOR_PATH',
-    }).commandLine || genericCommand,
-    florence2: resolveLocalImageWrapperCommand({
-      envCommand: 'HMDAO_FLORENCE2_COMMAND',
-      envPath: 'HMDAO_FLORENCE2_PATH',
-      wrapperKey: 'florence2',
-    }).commandLine || genericCommand,
-    qwen35vl: resolveLocalImageWrapperCommand({
-      envCommand: 'HMDAO_QWEN35_VL_COMMAND',
-      envPath: 'HMDAO_QWEN35_VL_PATH',
-      wrapperKey: 'qwen35-vl',
-    }).commandLine,
-    qwen25vl: resolveLocalImageWrapperCommand({
-      envCommand: 'HMDAO_QWEN25_VL_COMMAND',
-      envPath: 'HMDAO_QWEN25_VL_PATH',
-    }).commandLine,
-    customApi: resolveLocalImageWrapperCommand({
-      envCommand: 'HMDAO_IMAGE_ANALYSIS_API_COMMAND',
-      envPath: 'HMDAO_IMAGE_ANALYSIS_API_PATH',
-    }).commandLine,
-  };
-}
-
-function buildDirectImageAnalysisCommandFromPath(runtimePath = '') {
-  const normalized = String(runtimePath || '').trim();
-  if (!normalized) return '';
-  const resolvedPath = path.resolve(normalized);
-  const shellSafePath = resolvedPath.replace(/\\/g, '/');
-  const ext = path.extname(resolvedPath).toLowerCase();
-  if (ext === '.py') return 'py -3 "' + shellSafePath + '" --payload {{payloadPath}}';
-  if (ext === '.ps1') return 'powershell -NoProfile -ExecutionPolicy Bypass -File "' + shellSafePath + '" --payload {{payloadPath}}';
-  if (ext === '.js' || ext === '.mjs' || ext === '.cjs') return 'node "' + shellSafePath + '" --payload {{payloadPath}}';
-  return '"' + shellSafePath + '" --payload {{payloadPath}}';
-}
-
-function resolveLocalImageWrapperCommand({ envCommand = '', envPath = '', wrapperKey = '' } = {}) {
-  let commandLine = envCommand ? String(process.env[envCommand] || '').trim() : '';
-  const detectedPath = envPath ? String(process.env[envPath] || '').trim() : '';
-  const wrapperScript = wrapperKey ? LOCAL_IMAGE_ANALYSIS_BACKEND_WRAPPERS[wrapperKey] : '';
-  if (!commandLine && detectedPath && wrapperScript) {
-    const relativeWrapperScript = path.relative(APP_DIR, wrapperScript).replace(/\\/g, '/');
-    commandLine = 'node ./' + relativeWrapperScript;
-  }
-  if (!commandLine && detectedPath && !wrapperScript) {
-    commandLine = buildDirectImageAnalysisCommandFromPath(detectedPath);
-  }
-  return {
-    commandLine,
-    detectedPath,
-  };
-}
-
-function getConfiguredImageAnalysisRuntimes() {
-  const commands = getConfiguredImageAnalysisCommands();
-  const preferredQwenCommand = String(commands.qwen35vl || commands.qwen25vl || commands.genericCommand || '').trim();
-  const configured = [
-    { id: 'clip-interrogator', commandLine: commands.clipInterrogator || commands.genericCommand, priority: 10 },
-    { id: 'florence2', commandLine: commands.florence2 || commands.genericCommand, priority: 20 },
-    { id: 'qwen35-vl', commandLine: preferredQwenCommand, priority: 30 },
-    { id: 'custom-api', commandLine: commands.customApi, priority: 40 },
-  ]
-    .filter((item) => String(item.commandLine || '').trim())
-    .sort((left, right) => left.priority - right.priority);
-  return configured.filter((item, index, list) => list.findIndex((entry) => entry.id === item.id) === index);
-}
+// P1-11：以下 15 个函数已抽取至 lib/image-analysis-utils.mjs。
+import {
+  buildImageAnalysisRemotePrompt,
+  buildImageDataUrl,
+  getConfiguredImageAnalysisCommands,
+  getConfiguredImageAnalysisRuntimes,
+  inferImageAnalysisFallback,
+  mergeImageAnalysisResults,
+  modelLabelForRuntime,
+  normalizeImageAnalysisResult,
+  probeAnalyzeImageFile,
+} from './lib/image-analysis-utils.mjs';
 
 function resolveImageAnalysisRuntime(requestedEngine = 'auto', preferred = null) {
   const requested = String(requestedEngine || 'auto').trim().toLowerCase() || 'auto';
@@ -2753,26 +1367,38 @@ function resolveImageAnalysisRuntime(requestedEngine = 'auto', preferred = null)
   const fusionChain = configuredRuntimes
     .filter((item) => ['clip-interrogator', 'qwen35-vl', 'florence2', 'custom-api'].includes(item.id))
     .map((item) => item.id);
-  const autoPreferred = fusionChain.length >= 2
+  const freeVision = nextFreeLlm('vision');
+  const autoPreferred = freeVision
     ? {
-        envCommand: '__HMDAO_PROMPT_FUSION__',
-        resolved: 'prompt-fusion',
-        chain: fusionChain,
-        mode: 'fusion',
+        resolved: 'custom-api',
+        commandLine: '',
+        chain: ['custom-api'],
+        mode: 'remote',
+        remoteProvider: String(freeVision.provider || '').trim(),
+        remoteModel: String(freeVision.model || '').trim(),
+        remoteEndpoint: String(freeVision.endpoint || '').trim(),
+        remoteApiKey: String(freeVision.apiKey || '').trim(),
       }
-    : configuredRuntimes[0]
+    : (fusionChain.length >= 2
       ? {
-          envCommand: configuredRuntimes[0].commandLine,
-          resolved: configuredRuntimes[0].id,
-          chain: [configuredRuntimes[0].id],
-          mode: 'single',
+          envCommand: '__HMDAO_PROMPT_FUSION__',
+          resolved: 'prompt-fusion',
+          chain: fusionChain,
+          mode: 'fusion',
         }
-      : {
-          envCommand: '',
-          resolved: 'local-heuristic',
-          chain: [],
-          mode: 'fallback',
-        };
+      : configuredRuntimes[0]
+        ? {
+            envCommand: configuredRuntimes[0].commandLine,
+            resolved: configuredRuntimes[0].id,
+            chain: [configuredRuntimes[0].id],
+            mode: 'single',
+          }
+        : {
+            envCommand: '',
+            resolved: 'local-heuristic',
+            chain: [],
+            mode: 'fallback',
+          });
   const engineConfig = {
     auto: autoPreferred,
     'local-heuristic': {
@@ -2809,6 +1435,12 @@ function resolveImageAnalysisRuntime(requestedEngine = 'auto', preferred = null)
       envCommand: preferredQwenCommand,
       resolved: preferredQwenResolved,
       chain: preferredQwenCommand ? [preferredQwenResolved] : [],
+      mode: preferredQwenCommand ? 'single' : 'fallback',
+    },
+    'qwen37-vl': {
+      envCommand: preferredQwenCommand,
+      resolved: preferredQwenCommand ? 'qwen37-vl' : 'local-heuristic',
+      chain: preferredQwenCommand ? ['qwen37-vl'] : [],
       mode: preferredQwenCommand ? 'single' : 'fallback',
     },
     'custom-api': {
@@ -2881,57 +1513,65 @@ function pickActivatedCloudImageAnalysisRuntime(preferred = null) {
   };
 }
 
-function buildImageAnalysisRemotePrompt(payload = {}) {
-  const tags = parseStringArrayField(payload?.tags).slice(0, 12);
-  const smartCategories = parseStringArrayField(payload?.smartCategories).slice(0, 12);
-  const sizeHint = [
-    Number(payload?.width || 0) > 0 ? 'width ' + Number(payload.width) + ' px' : '',
-    Number(payload?.height || 0) > 0 ? 'height ' + Number(payload.height) + ' px' : '',
-  ].filter(Boolean).join(' x ');
-  return [
-    'Analyze this image into structured prompt fields for image or video generation, and return JSON only.',
-    'Required JSON fields: engine, summary, subject, scene, style, lighting, composition, camera, mood, keywords, promptZh, promptEn, palette.',
-    'keywords and palette must be string arrays.',
-    'promptZh should be a concise generation prompt focused on subject consistency, style, lighting, composition, and camera language.',
-    'promptEn should be the English version suitable for image and video generation models.',
-    tags.length ? 'Known tags: ' + tags.join(', ') + '.' : '',
-    smartCategories.length ? 'Known categories: ' + smartCategories.join(', ') + '.' : '',
-    sizeHint ? 'Size reference: ' + sizeHint + '.' : '',
-  ].filter(Boolean).join('\n');
+// ===== 免费额度 LLM 轮换（智能机器人聊天 + 图片/视频反推提示词共用"平台免费模型"）=====
+// 聊天与图片分析都走"平台里免费额度的模型"，并在多个免费模型之间轮换，避免单模型限流/额度耗尽。
+// TokenHub 内置免费文本/视觉模型池（走 HMDAO_AI_KEY，腾讯免费额度通道）。
+const TOKENHUB_FREE_CHAT_MODELS = [
+  'hy3', 'glm-5.2', 'qwen3.5-plus', 'deepseek-v4-flash',
+  'minimax-m3', 'kimi-k2.7-code', 'qwen3.5-flash', 'hunyuan-t1-vision',
+];
+// 平台免费额度（腾讯 TokenHub）当前无可用视觉模型（hunyuan-t1-vision 不存在、glm-5.2 不收图），
+// 故视觉候选池为空，图片分析 auto 走本地 Florence-2 看图 + 在线免费文本 LLM 结构化中文。
+const TOKENHUB_FREE_VISION_MODELS = [];
+
+const freeLlmRotation = { chat: 0, vision: 0, signature: '' };
+
+function collectFreeLlmCandidates(kind = 'chat') {
+  const candidates = [];
+  const tokenhubKey = String(process.env.HMDAO_AI_KEY || 'sk-dAViKE9mAm0RqXdfc8nFYn4xAYyOlMjp0l0LcfnmgYdfUcni').trim();
+  const tokenhubUrl = String(process.env.HMDAO_AI_URL || 'https://tokenhub.tencentmaas.com/v1/chat/completions').trim();
+  if (tokenhubKey) {
+    // 平台免费额度通道（腾讯 TokenHub）优先：聊天/视觉均走免费模型池并轮换，
+    // 不混入用户自行添加的非平台第三方 provider（如 suanliai.top），保证"免费额度"语义干净。
+    const pool = kind === 'vision' ? TOKENHUB_FREE_VISION_MODELS : TOKENHUB_FREE_CHAT_MODELS;
+    for (const m of pool) {
+      candidates.push({ provider: 'tokenhub', model: m, endpoint: tokenhubUrl, apiKey: tokenhubKey });
+    }
+  } else {
+    // 无 TokenHub key 时回退到用户已激活的 LLM provider 记录（兼容旧行为）
+    const activationPool = listActivatedProviderRecords()
+      .filter((r) => String(r?.mode || '').trim().toLowerCase() === 'llm'
+        && String(r?.apiKey || '').trim()
+        && String(r?.model || '').trim())
+      .map((r) => ({
+        provider: String(r.provider || '').trim(),
+        model: String(r.model || '').trim(),
+        endpoint: String(r.endpoint || PROVIDER_BASE_URLS[r.provider] || '').trim().replace(/\/$/, ''),
+        apiKey: String(r.apiKey || '').trim(),
+      }));
+    candidates.push(...activationPool);
+  }
+  if (kind === 'vision') {
+    // 视觉模型严格白名单：仅保留人工确认的视觉模型，避免把纯 LLM（如 gemini-3-flash 经第三方）误当视觉
+    const VISION_ALLOW = /hunyuan[-\w.]*vision|glm-?4v|glm[-\w.]*v|glm[-\w.]*v[-\w.]*plus|qwen[-\w]*vl|qwen3[-\w]*vl|gpt-4[o1]|gpt-4\.1|gemini[-\w]*(pro|flash)|claude|llava|moondream|minicpm-v|phi-?3[-\w]*vision|internvl|deepseek-vl|doubao[-\w.]*vision|abab.*v|kimi[-\w]*vl|step[-\w]*vision|step-?1[\w.]*v|ernie[-\w.]*vl|cogvlm|cogagent/i;
+    return candidates.filter((c) => VISION_ALLOW.test(c.model));
+  }
+  return candidates;
 }
 
-function extractJsonObjectFromText(value = '') {
-  const text = String(value || '').trim();
-  if (!text) return null;
-  const stripped = text.startsWith('```json') ? text.slice(7) : (text.startsWith('```') ? text.slice(3) : text);
-  const normalizedStripped = stripped.endsWith('```') ? stripped.slice(0, -3).trim() : stripped.trim();
-  const directCandidates = [
-    text,
-    normalizedStripped,
-  ];
-  for (const candidate of directCandidates) {
-    if (!candidate) continue;
-    try {
-      return JSON.parse(candidate);
-    } catch {
-      // try next
-    }
+// 在免费额度模型池间 round-robin；候选集合变化（用户改了 provider/key）时重置索引，避免越界。
+function nextFreeLlm(kind = 'chat') {
+  const pool = collectFreeLlmCandidates(kind);
+  if (pool.length === 0) return null;
+  const signature = kind + ':' + pool.map((c) => `${c.provider}/${c.model}`).join(',');
+  if (freeLlmRotation.signature !== signature) {
+    freeLlmRotation.chat = 0;
+    freeLlmRotation.vision = 0;
+    freeLlmRotation.signature = signature;
   }
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start >= 0 && end > start) {
-    try {
-      return JSON.parse(text.slice(start, end + 1));
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-async function buildImageDataUrl(inputPath = '', mimeType = 'image/jpeg') {
-  const bytes = await fs.readFile(inputPath);
-  return `data:${String(mimeType || 'image/jpeg').trim() || 'image/jpeg'};base64,${bytes.toString('base64')}`;
+  const idx = freeLlmRotation[kind] % pool.length;
+  freeLlmRotation[kind] = (idx + 1) % pool.length;
+  return { ...pool[idx] };
 }
 
 async function runRemoteImageAnalysis(runtime, normalizedPayload, fallback) {
@@ -2961,6 +1601,10 @@ async function runRemoteImageAnalysis(runtime, normalizedPayload, fallback) {
     };
   }
 
+  const userPrompt = buildImageAnalysisRemotePrompt(normalizedPayload);
+  const isVideoContext = /video[-_]?shot/i.test(String(normalizedPayload?.name || '').trim())
+    || userPrompt.includes('Video context hints');
+
   const requestBody = {
     model,
     temperature: 0.2,
@@ -2969,12 +1613,14 @@ async function runRemoteImageAnalysis(runtime, normalizedPayload, fallback) {
     messages: [
       {
         role: 'system',
-        content: 'You are a multimodal creative director. Return only valid JSON.',
+        content: isVideoContext
+          ? 'You are a video analysis expert. Analyze video keyframes with attention to subject continuity, camera language, lighting evolution, and scene progression. Return only valid JSON.'
+          : 'You are a multimodal creative director. Return only valid JSON.',
       },
       {
         role: 'user',
         content: [
-          { type: 'text', text: buildImageAnalysisRemotePrompt(normalizedPayload) },
+          { type: 'text', text: userPrompt },
           { type: 'image_url', image_url: { url: imageUrl } },
         ],
       },
@@ -3054,6 +1700,7 @@ async function runRemoteImageAnalysis(runtime, normalizedPayload, fallback) {
         provider: String(runtime?.remoteProvider || '').trim(),
         model,
         endpoint,
+        modelLabel: modelLabelForRuntime({ mode: 'remote', resolvedEngine: 'custom-api', provider: String(runtime?.remoteProvider || '').trim(), model }),
       },
       metadata: {
         ...(fallback?.metadata || {}),
@@ -3062,6 +1709,7 @@ async function runRemoteImageAnalysis(runtime, normalizedPayload, fallback) {
         provider: String(runtime?.remoteProvider || '').trim(),
         model,
         endpoint,
+        modelLabel: modelLabelForRuntime({ mode: 'remote', resolvedEngine: 'custom-api', provider: String(runtime?.remoteProvider || '').trim(), model }),
       },
     });
   } catch (error) {
@@ -3081,124 +1729,6 @@ async function runRemoteImageAnalysis(runtime, normalizedPayload, fallback) {
   }
 }
 
-function isMeaningfulImageAnalysisText(value = '') {
-  const normalized = String(value || '').trim();
-  if (!normalized) return false;
-  const lowered = normalized.toLowerCase();
-  const placeholders = [
-    'main subject',
-    'scene context',
-    'visual style',
-    'lighting mood',
-    'composition layout',
-    'camera language',
-    'overall atmosphere',
-    '主体待确认',
-    '场景信息有限',
-    '写实参考风格',
-    '光影信息有限',
-    '镜头语言待补充',
-    '氛围信息有限',
-  ];
-  return !placeholders.includes(lowered) && !placeholders.includes(normalized);
-}
-
-function pickPreferredImageAnalysisField(...values) {
-  for (const value of values) {
-    if (isMeaningfulImageAnalysisText(value)) return String(value).trim();
-  }
-  for (const value of values) {
-    const normalized = String(value || '').trim();
-    if (normalized) return normalized;
-  }
-  return '';
-}
-
-function buildMergedImagePromptZh(fields = {}, fallback = {}) {
-  const subject = pickPreferredImageAnalysisField(fields.subject, fallback.subject, '主体');
-  const scene = pickPreferredImageAnalysisField(fields.scene, fallback.scene, '场景');
-  const style = pickPreferredImageAnalysisField(fields.style, fallback.style, '风格');
-  const lighting = pickPreferredImageAnalysisField(fields.lighting, fallback.lighting, '光影');
-  const composition = pickPreferredImageAnalysisField(fields.composition, fallback.composition, '原始构图');
-  const camera = pickPreferredImageAnalysisField(fields.camera, fallback.camera, '镜头语言');
-  const mood = pickPreferredImageAnalysisField(fields.mood, fallback.mood, '整体氛围');
-  return 'Preserve ' + composition + ', keep the subject placement centered on ' + subject + ', place it in ' + scene + ', render it with ' + style + ', shape the scene with ' + lighting + ', emphasize ' + camera + ', and maintain a ' + mood + ' atmosphere with stronger detail.';
-}
-
-function buildMergedImagePromptEn(fields = {}, fallback = {}) {
-  const subject = pickPreferredImageAnalysisField(fields.subject, fallback.subject, 'main subject');
-  const scene = pickPreferredImageAnalysisField(fields.scene, fallback.scene, 'scene');
-  const style = pickPreferredImageAnalysisField(fields.style, fallback.style, 'visual style');
-  const lighting = pickPreferredImageAnalysisField(fields.lighting, fallback.lighting, 'lighting');
-  const composition = pickPreferredImageAnalysisField(fields.composition, fallback.composition, 'original composition');
-  const camera = pickPreferredImageAnalysisField(fields.camera, fallback.camera, 'camera language');
-  const mood = pickPreferredImageAnalysisField(fields.mood, fallback.mood, 'overall mood');
-  return `Preserve the ${composition}, keep the subject placement and framing locked, center the image around ${subject}, place it in ${scene}, render it with ${style}, shape the scene with ${lighting}, emphasize ${camera}, and maintain a ${mood} atmosphere with stronger texture, material, and color detail.`;
-}
-
-function mergeImageAnalysisResults(fallback, results = [], runtime = null) {
-  const validResults = results.filter((item) => item && typeof item === 'object');
-  if (!validResults.length) return fallback;
-  const preferredOrder = ['qwen35-vl', 'qwen2.5-omni', 'qwen25-vl', 'qwen2.5-vl', 'florence2', 'clip-interrogator'];
-  const sorted = [...validResults].sort((left, right) => {
-    const leftEngine = String(left?.metadata?.resolvedEngine || left?.engine || '').toLowerCase();
-    const rightEngine = String(right?.metadata?.resolvedEngine || right?.engine || '').toLowerCase();
-    const leftIndex = preferredOrder.findIndex((item) => leftEngine.includes(item));
-    const rightIndex = preferredOrder.findIndex((item) => rightEngine.includes(item));
-    return (leftIndex === -1 ? 99 : leftIndex) - (rightIndex === -1 ? 99 : rightIndex);
-  });
-  const detailFirst = sorted[0] || fallback;
-  const styleFirst = sorted.find((item) => String(item?.engine || '').toLowerCase().includes('clip-interrogator')) || detailFirst;
-  const merged = {
-    ...fallback,
-    engine: runtime?.resolved === 'prompt-fusion'
-      ? `prompt-fusion:${(runtime?.chain || []).join('+') || 'local'}`
-      : String(detailFirst.engine || fallback.engine),
-    summary: pickPreferredImageAnalysisField(detailFirst.summary, styleFirst.summary, fallback.summary),
-    subject: pickPreferredImageAnalysisField(detailFirst.subject, styleFirst.subject, fallback.subject),
-    scene: pickPreferredImageAnalysisField(detailFirst.scene, styleFirst.scene, fallback.scene),
-    style: pickPreferredImageAnalysisField(styleFirst.style, detailFirst.style, fallback.style),
-    lighting: pickPreferredImageAnalysisField(styleFirst.lighting, detailFirst.lighting, fallback.lighting),
-    composition: pickPreferredImageAnalysisField(detailFirst.composition, styleFirst.composition, fallback.composition),
-    camera: pickPreferredImageAnalysisField(detailFirst.camera, styleFirst.camera, fallback.camera),
-    mood: pickPreferredImageAnalysisField(styleFirst.mood, detailFirst.mood, fallback.mood),
-    keywords: uniqueStrings([
-      ...(Array.isArray(detailFirst.keywords) ? detailFirst.keywords : []),
-      ...(Array.isArray(styleFirst.keywords) ? styleFirst.keywords : []),
-      ...(Array.isArray(fallback.keywords) ? fallback.keywords : []),
-    ]).slice(0, 20),
-    palette: uniqueStrings([
-      ...(Array.isArray(styleFirst.palette) ? styleFirst.palette : []),
-      ...(Array.isArray(detailFirst.palette) ? detailFirst.palette : []),
-      ...(Array.isArray(fallback.palette) ? fallback.palette : []),
-    ]).slice(0, 8),
-    warnings: uniqueStrings([
-      ...(Array.isArray(fallback.warnings) ? fallback.warnings : []),
-      ...validResults.flatMap((item) => Array.isArray(item?.warnings) ? item.warnings : []),
-    ]).slice(0, 12),
-    runtime: {
-      ...(fallback.runtime || {}),
-      wrapperConfigured: true,
-      wrapperCommand: runtime?.resolved || 'prompt-fusion',
-      requestedEngine: runtime?.requested || fallback?.runtime?.requestedEngine || 'auto',
-      resolvedEngine: runtime?.resolved || 'prompt-fusion',
-      fusionEngines: Array.isArray(runtime?.chain) ? runtime.chain : [],
-      recommendedModels: ['CLIP Interrogator', 'Florence-2', 'Qwen Vision'],
-    },
-    metadata: {
-      ...(fallback.metadata || {}),
-      fusionEngines: Array.isArray(runtime?.chain) ? runtime.chain : [],
-    },
-  };
-  merged.promptZh = buildMergedImagePromptZh(merged, fallback);
-  merged.promptEn = pickPreferredImageAnalysisField(
-    validResults.find((item) => isMeaningfulImageAnalysisText(item?.promptEn))?.promptEn,
-    buildMergedImagePromptEn(merged, fallback),
-    fallback.promptEn,
-  );
-  return merged;
-}
-
 async function runSingleImageAnalysisEngine(runtime, normalizedPayload, fallback, cleanupPaths = []) {
   if (!runtime?.commandLine) {
     return fallback;
@@ -3208,14 +1738,34 @@ async function runSingleImageAnalysisEngine(runtime, normalizedPayload, fallback
     `${String(normalizedPayload?.requestId || crypto.randomUUID())}-${String(runtime.resolved || 'analysis')}-payload.json`,
   );
   cleanupPaths.push(wrapperPayloadPath);
-  const wrapperResult = await runJsonWrapperCommand(runtime.commandLine, normalizedPayload, {
-    cwd: APP_DIR,
-    payloadPath: wrapperPayloadPath,
-    env: {
-      HMDAO_IMAGE_ANALYSIS_INPUT: String(normalizedPayload?.inputPath || ''),
-      HMDAO_IMAGE_ANALYSIS_ENGINE: String(runtime.resolved || ''),
-    },
-  });
+  let wrapperResult;
+  try {
+    wrapperResult = await runJsonWrapperCommand(runtime.commandLine, normalizedPayload, {
+      cwd: APP_DIR,
+      payloadPath: wrapperPayloadPath,
+      env: {
+        HMDAO_IMAGE_ANALYSIS_INPUT: String(normalizedPayload?.inputPath || ''),
+        HMDAO_IMAGE_ANALYSIS_ENGINE: String(runtime.resolved || ''),
+      },
+    });
+  } catch (engineErr) {
+    // R2：视觉引擎崩溃（如 Florence-2 调用失败）时，不把整条请求变成 success:false，
+    // 而是带 warning 回退到启发式分析，前端据此可见「分析失败但已用基础分析兜底」。
+    const msg = String((engineErr && engineErr.message) || engineErr);
+    console.warn(`[runSingleImageAnalysisEngine] 引擎 ${runtime.resolved} 调用失败，回退启发式：`, msg);
+    const failed = { ...fallback };
+    failed.warning = `视觉引擎(${runtime.resolved})调用失败，已回退到基础分析：${msg}`;
+    failed.runtime = {
+      ...(failed.runtime || {}),
+      requestedEngine: runtime.requested,
+      resolvedEngine: runtime.resolved,
+      wrapperConfigured: true,
+      wrapperCommand: runtime.commandLine ? runtime.resolved : '',
+      engineError: msg,
+    };
+    failed.metadata = { ...(failed.metadata || {}), requestedEngine: runtime.requested, resolvedEngine: runtime.resolved };
+    return failed;
+  }
   return normalizeImageAnalysisResult(wrapperResult.parsed, {
     ...fallback,
     metadata: {
@@ -3300,6 +1850,26 @@ async function processLocalImageAnalyzeRequest(payload) {
       await fs.writeFile(inputPath, remote.bytes);
     }
 
+    // P0.1 修复：支持前端发来的相对路径（/api/assets/content/<id>）或显式 itemId，
+    // 从本地资产库解析出真实文件路径取字节。否则相对路径不匹配远程正则 → 无字节 → 空壳分析。
+    if (!inputPath) {
+      const assetId = String(payload?.itemId || '').trim()
+        || (sourceUrl.startsWith('/api/assets/content/')
+          ? sanitizeLocalAssetId(sourceUrl.slice('/api/assets/content/'.length).split(/[?#]/, 1)[0])
+          : '');
+      if (assetId) {
+        const catalog = await readAssetLibraryCatalog().catch(() => []);
+        const assetItem = Array.isArray(catalog)
+          ? catalog.find((it) => String(it.id) === assetId)
+          : null;
+        if (assetItem && assetItem.filePath && (await fileExists(assetItem.filePath))) {
+          inputPath = assetItem.filePath;
+          if (assetItem.mimeType) inputMimeType = assetItem.mimeType;
+          else if (assetItem.type && assetItem.type.startsWith('image/')) inputMimeType = assetItem.type;
+        }
+      }
+    }
+
     if (inputPath && (!width || !height)) {
       const probed = await probeAnalyzeImageFile(inputPath).catch(() => ({ width: 0, height: 0 }));
       width = width || probed.width;
@@ -3335,6 +1905,13 @@ async function processLocalImageAnalyzeRequest(payload) {
       provider: String(runtime.remoteProvider || '').trim(),
       model: String(runtime.remoteModel || '').trim(),
       endpoint: String(runtime.remoteEndpoint || '').trim(),
+      modelLabel: modelLabelForRuntime({
+        mode: runtime.mode,
+        resolvedEngine: runtime.resolved,
+        provider: runtime.remoteProvider,
+        model: runtime.remoteModel,
+        fusionEngines: runtime.fusionEngines,
+      }),
     };
     fallback.metadata = {
       ...(fallback.metadata || {}),
@@ -3353,9 +1930,62 @@ async function processLocalImageAnalyzeRequest(payload) {
       return await runFusedImageAnalysis(runtime, normalizedPayload, fallback, cleanupPaths);
     }
 
-    return await runSingleImageAnalysisEngine(runtime, normalizedPayload, fallback, cleanupPaths);
+    const localResult = await runSingleImageAnalysisEngine(runtime, normalizedPayload, fallback, cleanupPaths);
+    return await refineLocalAnalysisWithFreeLlm(localResult, fallback);
   } finally {
     await Promise.all(cleanupPaths.map((filePath) => fs.rm(filePath, { force: true }).catch(() => {})));
+  }
+}
+
+// 本地 Florence-2 看图（免费）+ 在线免费文本 LLM 结构化中文（免费额度，轮换）：
+// 把 Florence-2 的英文详细描述翻译/拆解为中文细粒度字段（颜色/细节/动作/表情等），补全本地模型短板。
+async function refineLocalAnalysisWithFreeLlm(result, fallback) {
+  const rawCaption = String(result?.rawCaption || result?.metadata?.segments?.join(' ') || '').trim();
+  const engineStr = `${result?.engine || ''} ${fallback?.runtime?.wrapperCommand || ''} ${fallback?.runtime?.resolvedEngine || ''}`;
+  const isLocalFlorence = /florence/i.test(engineStr);
+  if (!rawCaption || !isLocalFlorence) return result;
+  const candidate = nextFreeLlm('chat');
+  if (!candidate) return result;
+  const apiKey = String(candidate.apiKey || process.env.HMDAO_AI_KEY || '').trim();
+  const apiUrl = String(candidate.endpoint || process.env.HMDAO_AI_URL || 'https://tokenhub.tencentmaas.com/v1/chat/completions').trim();
+  const model = String(candidate.model || process.env.HMDAO_AI_MODEL || 'hy3').trim();
+  const prompt = `下面是一段英文图片描述（来自 Florence-2 视觉模型）。请翻译成中文，并拆解为结构化字段，只返回 JSON，不要额外解释：\n{ "subject":"中文主体描述", "subjectColors":"具体颜色如酒红色丝绒", "subjectDetails":"材质/纹理/服饰/细节", "action":"动作或姿态，无则写静态", "expression":"表情，无人物脸部写none", "scene":"场景", "style":"风格", "lighting":"光影", "camera":"镜头/运镜", "mood":"情绪", "promptZh":"可复现的中文生成提示词(可附推荐模型与比例)", "promptEn":"英文生成提示词" }\n英文描述：${rawCaption}`;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 60000);
+    const r = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: prompt }], temperature: 0.3, max_tokens: 1200 }),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!r.ok) return result;
+    const data = await r.json().catch(() => ({}));
+    const text = data?.choices?.[0]?.message?.content || '';
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return result;
+    const parsed = JSON.parse(jsonMatch[0]);
+    const fill = (v) => (typeof v === 'string' && v.trim() && !/^(none|无|待|未|需在线|static)/i.test(v.trim())) ? v.trim() : null;
+    const merged = { ...result };
+    const map = {
+      subject: 'subject', subjectColors: 'subjectColors', subjectDetails: 'subjectDetails',
+      action: 'action', expression: 'expression', scene: 'scene', style: 'style',
+      lighting: 'lighting', camera: 'camera', mood: 'mood', promptZh: 'promptZh', promptEn: 'promptEn',
+    };
+    for (const [src, dst] of Object.entries(map)) {
+      const v = fill(parsed[src]);
+      if (v) merged[dst] = v;
+    }
+    if (parsed.summary) merged.summary = String(parsed.summary).trim();
+    merged.runtime = {
+      ...(merged.runtime || {}),
+      refinedByLlm: model,
+      modelLabel: `本地 Florence-2 看图 + 在线免费 LLM（${model}）结构化`,
+    };
+    return merged;
+  } catch {
+    return result;
   }
 }
 
@@ -3397,68 +2027,6 @@ async function getUnrealControlConfig() {
     configured: Boolean(controlObjectPath),
     source: process.env.HMDAO_UNREAL_CONTROL_OBJECT_PATH ? 'env' : stored.controlObjectPath ? 'file' : 'unset',
   };
-}
-
-function requestModuleFor(protocol) {
-  return protocol === 'https:' ? https : http;
-}
-
-function nativeHttpRequest(url, { method = 'GET', timeoutMs = 2500, headers = {}, responseType = 'text' } = {}) {
-  return new Promise((resolve) => {
-    let parsed;
-    try {
-      parsed = new URL(url);
-    } catch {
-      resolve({ ok: false, status: 0, error: 'invalid-url' });
-      return;
-    }
-
-    const requestLib = requestModuleFor(parsed.protocol);
-    const port = parsed.port ? Number(parsed.port) : parsed.protocol === 'https:' ? 443 : 80;
-    const req = requestLib.request(
-      {
-        protocol: parsed.protocol,
-        hostname: parsed.hostname,
-        port,
-        path: `${parsed.pathname || '/'}${parsed.search || ''}`,
-        method,
-        headers,
-      },
-      (res) => {
-        const chunks = [];
-        res.on('data', (chunk) => chunks.push(chunk));
-        res.on('end', () => {
-          const body = Buffer.concat(chunks);
-          if (responseType === 'buffer') {
-            resolve({
-              ok: res.statusCode >= 200 && res.statusCode < 500,
-              status: res.statusCode || 0,
-              bodyBuffer: body,
-              headers: res.headers,
-            });
-            return;
-          }
-          if (responseType === 'json') {
-            try {
-              const data = JSON.parse(body.toString('utf8'));
-              resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode || 0, data, headers: res.headers });
-            } catch {
-              resolve({ ok: false, status: res.statusCode || 0, error: 'invalid-json', data: null, headers: res.headers });
-            }
-            return;
-          }
-          resolve({ ok: res.statusCode >= 200 && res.statusCode < 500, status: res.statusCode || 0, body: body.toString('utf8'), headers: res.headers });
-        });
-      },
-    );
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error('timeout'));
-    });
-    req.on('error', (error) => {
-      resolve({ ok: false, status: 0, error: error instanceof Error ? error.message : String(error), code: error?.code || '' });
-    });
-    req.end();
-  });
 }
 
 const UNREAL_PIXEL_STREAMING_LEGACY = createUnrealPixelStreamingLegacyModule({
@@ -4432,53 +3000,6 @@ function sendRaw(res, status, body, headers = {}) {
   res.end(body);
 }
 
-function mediaMimeTypeFromExtension(filePath, fallback = 'application/octet-stream') {
-  const ext = path.extname(String(filePath || '')).toLowerCase();
-  if (ext === '.png') return 'image/png';
-  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
-  if (ext === '.webp') return 'image/webp';
-  if (ext === '.gif') return 'image/gif';
-  if (ext === '.bmp') return 'image/bmp';
-  if (ext === '.svg') return 'image/svg+xml';
-  if (ext === '.avif') return 'image/avif';
-  if (ext === '.heic') return 'image/heic';
-  if (ext === '.heif') return 'image/heif';
-  if (ext === '.tif' || ext === '.tiff') return 'image/tiff';
-  if (ext === '.hdr') return 'image/vnd.radiance';
-  if (ext === '.exr') return 'image/x-exr';
-  if (ext === '.dng') return 'image/x-adobe-dng';
-  if (ext === '.jxl') return 'image/jxl';
-  if (ext === '.webm') return 'video/webm';
-  if (ext === '.mp4') return 'video/mp4';
-  if (ext === '.mov') return 'video/quicktime';
-  if (ext === '.m4v') return 'video/x-m4v';
-  if (ext === '.mkv') return 'video/x-matroska';
-  if (ext === '.avi') return 'video/x-msvideo';
-  if (ext === '.wav') return 'audio/wav';
-  if (ext === '.mp3') return 'audio/mpeg';
-  if (ext === '.ogg') return 'audio/ogg';
-  if (ext === '.flac') return 'audio/flac';
-  if (ext === '.m4a') return 'audio/mp4';
-  if (ext === '.aac') return 'audio/aac';
-  if (ext === '.json') return 'application/json; charset=utf-8';
-  if (ext === '.csv') return 'text/csv; charset=utf-8';
-  return fallback;
-}
-
-function buildSafeInlineContentDisposition(filename = '') {
-  const rawName = path.basename(String(filename || '').trim()) || 'file';
-  const asciiName = rawName
-    .normalize('NFKD')
-    .replace(/[^\x20-\x7E]+/g, '_')
-    .replace(/["\\;]/g, '_')
-    .replace(/\s+/g, ' ')
-    .trim() || 'file';
-  const encodedName = encodeURIComponent(rawName)
-    .replace(/['()]/g, escape)
-    .replace(/\*/g, '%2A');
-  return `inline; filename="${asciiName}"; filename*=UTF-8''${encodedName}`;
-}
-
 async function sendLocalFileStream(req, res, filePath, options = {}) {
   const stat = await fs.stat(filePath);
   const total = Number(stat.size || 0);
@@ -4560,14 +3081,6 @@ async function sendLocalFileStream(req, res, filePath, options = {}) {
   createReadStream(filePath, { start, end }).pipe(res);
 }
 
-function sanitizeLocalAssetId(value) {
-  const assetId = String(value || '').trim();
-  if (!assetId || assetId.includes('..') || assetId.includes('/') || assetId.includes('\\')) {
-    return '';
-  }
-  return assetId;
-}
-
 async function persistLocalPostResultFile(sourcePath, requestId, mediaKind) {
   await fs.mkdir(LOCAL_POST_RESULT_DIR, { recursive: true });
   const extension = mediaKind === 'video' ? 'webm' : 'png';
@@ -4624,15 +3137,6 @@ async function readJson(req) {
   if (chunks.length === 0) return {};
   const text = Buffer.concat(chunks).toString('utf8');
   return text ? JSON.parse(text) : {};
-}
-
-function sanitizeMultipartFieldName(value = 'field') {
-  return String(value || 'field')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/gi, '-')
-    .replace(/-{2,}/g, '-')
-    .replace(/^-|-$/g, '') || 'field';
 }
 
 async function readLocalPostMultipart(req) {
@@ -4737,35 +3241,6 @@ async function readLocalPostMultipart(req) {
     await Promise.all(createdPaths.map((filePath) => fs.rm(filePath, { force: true }).catch(() => {})));
     throw error;
   }
-}
-
-function imageExtensionFromMimeType(mimeType = 'image/jpeg') {
-  const normalized = String(mimeType || '').toLowerCase();
-  if (normalized.includes('png')) return 'png';
-  if (normalized.includes('webp')) return 'webp';
-  if (normalized.includes('gif')) return 'gif';
-  if (normalized.includes('bmp')) return 'bmp';
-  if (normalized.includes('svg')) return 'svg';
-  if (normalized.includes('jpeg') || normalized.includes('jpg')) return 'jpg';
-  return 'jpg';
-}
-
-function parseStringArrayField(value) {
-  if (Array.isArray(value)) {
-    return value.map((item) => String(item || '').trim()).filter(Boolean);
-  }
-  if (typeof value !== 'string') return [];
-  const trimmed = value.trim();
-  if (!trimmed) return [];
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (Array.isArray(parsed)) {
-      return parsed.map((item) => String(item || '').trim()).filter(Boolean);
-    }
-  } catch {
-    // ignore json parse failure
-  }
-  return trimmed.split(',').map((item) => item.trim()).filter(Boolean);
 }
 
 async function readLocalImageAnalyzeMultipart(req) {
@@ -4954,12 +3429,23 @@ async function processAssetLibraryImportRequest(body = {}) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), Number(process.env.HMDAO_ASSET_IMPORT_TIMEOUT_MS || 120000));
     try {
+      const skAuth = (process.env.HMDAO_SKETCHFAB_API_KEY || process.env.VITE_SKETCHFAB_API_KEY || '');
+      const fetchHeaders = {
+        Accept: '*/*',
+        'User-Agent': 'DDUp Asset Import',
+      };
+      // 转发来源页 Referer 以绕过防盗链；源站常只对带正确 Referer 的请求返回真实媒体。
+      const importReferer = String(body.pageUrl || body.referer || sourceUrl || '').trim();
+      if (importReferer) {
+        fetchHeaders.Referer = importReferer;
+        fetchHeaders.Origin = importReferer;
+      }
+      if (skAuth && /sketchfab\.com\/v3\/models\/.+\/download/.test(sourceUrl)) {
+        fetchHeaders.Authorization = `Bearer ${skAuth}`;
+      }
       const response = await fetch(sourceUrl, {
         signal: controller.signal,
-        headers: {
-          Accept: '*/*',
-          'User-Agent': 'DDUp Asset Import',
-        },
+        headers: fetchHeaders,
       });
       if (!response.ok) {
         throw new Error(`asset-import-fetch-failed:${response.status}`);
@@ -4969,6 +3455,12 @@ async function processAssetLibraryImportRequest(body = {}) {
       tempPath = path.join(ASSET_LIBRARY_TEMP_DIR, `${assetId}-remote.${ext}`);
       await fs.mkdir(ASSET_LIBRARY_TEMP_DIR, { recursive: true });
       const buffer = Buffer.from(await response.arrayBuffer());
+      // 源站可能返回登录/播放器/防盗链 HTML 页面（HTTP 200）而非真实媒体。
+      // 若显式要求的是音视频/图片，却拿到 HTML，应直接报错，避免存成无用素材。
+      const expectedMedia = ['audio', 'video', 'image'].includes(explicitType);
+      if (expectedMedia && looksLikeHtml(buffer, sourceMimeType)) {
+        throw new Error('asset-import-not-media:上游返回的是网页(HTML)而非音频/视频/图片文件，通常因源站防盗链或需登录。请改用带正确来源页(Referer)的地址，或在浏览器中直接获取真实文件后本地导入。');
+      }
       await fs.writeFile(tempPath, buffer);
     } finally {
       clearTimeout(timeoutId);
@@ -4979,7 +3471,7 @@ async function processAssetLibraryImportRequest(body = {}) {
     throw new Error('asset-import-source-missing');
   }
 
-  const type = ['image', 'video', 'audio', 'text'].includes(explicitType)
+  const type = ['image', 'video', 'audio', 'text', 'model'].includes(explicitType)
     ? explicitType
     : inferAssetTypeFromMime(sourceMimeType, inferAssetTypeFromPath(tempPath, 'image'));
   const rawName = String(body.name || body.originalName || sourceUrl || path.basename(tempPath)).trim();
@@ -5083,66 +3575,6 @@ async function processAssetLibraryImportRequest(body = {}) {
   };
 }
 
-function extensionFromMimeType(mimeType = 'video/mp4') {
-  const normalized = String(mimeType || '').toLowerCase();
-  if (normalized.includes('.cube') || normalized.includes('cube')) return 'cube';
-  if (normalized.includes('.3dl') || normalized.includes('3dl')) return '3dl';
-  if (normalized.includes('plain')) return 'txt';
-  if (normalized.includes('png')) return 'png';
-  if (normalized.includes('jpeg') || normalized.includes('jpg')) return 'jpg';
-  if (normalized.includes('webp')) return 'webp';
-  if (normalized.includes('gif')) return 'gif';
-  if (normalized.includes('bmp')) return 'bmp';
-  if (normalized.includes('svg')) return 'svg';
-  if (normalized.includes('avif')) return 'avif';
-  if (normalized.includes('heic')) return 'heic';
-  if (normalized.includes('heif')) return 'heif';
-  if (normalized.includes('tiff') || normalized.includes('tif')) return 'tiff';
-  if (normalized.includes('radiance') || normalized.includes('hdr')) return 'hdr';
-  if (normalized.includes('exr')) return 'exr';
-  if (normalized.includes('adobe-dng') || normalized.includes('dng')) return 'dng';
-  if (normalized.includes('jxl')) return 'jxl';
-  if (normalized.includes('webm')) return 'webm';
-  if (normalized.includes('quicktime')) return 'mov';
-  if (normalized.includes('x-m4v') || normalized.includes('m4v')) return 'm4v';
-  if (normalized.includes('x-matroska') || normalized.includes('mkv')) return 'mkv';
-  if (normalized.includes('avi')) return 'avi';
-  if (normalized.includes('mpeg')) return 'mp3';
-  if (normalized.includes('wav')) return 'wav';
-  if (normalized.includes('flac')) return 'flac';
-  if (normalized.includes('audio/mp4') || normalized.includes('m4a')) return 'm4a';
-  if (normalized.includes('aac')) return 'aac';
-  return 'mp4';
-}
-
-async function runCommand(command, args) {
-  return await new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk;
-    });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      if (code === 0) {
-        resolve({ stdout, stderr });
-        return;
-      }
-      const detail = stderr.trim().split(/\r?\n/).slice(-8).join(' | ');
-      reject(new Error(`${command} exited ${code}: ${detail || 'unknown-error'}`));
-    });
-  });
-}
-
 function powershellSingleQuote(value) {
   return "'" + String(value || '').replace(/'/g, "''") + "'";
 }
@@ -5227,15 +3659,6 @@ async function executePowerShellRelayRequest({
   }
 }
 
-function isApimartBaseUrl(baseUrl = '') {
-  try {
-    const url = new URL(String(baseUrl || '').trim());
-    return /(^|\.)(apimart\.ai|suanliai\.top|comfly\.org)$/i.test(url.hostname);
-  } catch {
-    return false;
-  }
-}
-
 function isApimartAsyncGenerationRequest(baseUrl = '', endpoint = '', mode = '', payload = {}, provider = '') {
   if (!isApimartBaseUrl(baseUrl)) return false;
   if (mode !== 'image' && mode !== 'video') return false;
@@ -5244,46 +3667,7 @@ function isApimartAsyncGenerationRequest(baseUrl = '', endpoint = '', mode = '',
   if (mode !== 'video') return false;
   if (!/\/video\/?$/i.test(normalizedEndpoint)) return false;
   const requestedModel = extractFirstString(payload?.model) || String(provider || '').trim();
-  return Boolean(apimartVideoModelKind(requestedModel));
-}
-
-function extractApimartTaskId(payload = {}) {
-  return (
-    extractFirstString(payload?.task_id)
-    || extractFirstString(payload?.task?.id)
-    || extractFirstString(payload?.task?.task_id)
-    || extractFirstString(payload?.data?.[0]?.task_id)
-    || extractFirstString(payload?.data?.[0]?.id)
-    || extractFirstString(payload?.result?.task_id)
-    || ''
-  );
-}
-
-function normalizeApimartTaskPhase(value = '') {
-  const status = String(value || '').trim().toLowerCase();
-  if (!status) return 'pending';
-  if (['submitted', 'queued', 'pending', 'created', 'running', 'processing', 'generating', 'in_progress'].includes(status)) {
-    return 'pending';
-  }
-  if (['success', 'succeed', 'succeeded', 'completed', 'done', 'finished'].includes(status)) {
-    return 'success';
-  }
-  if (['failed', 'failure', 'error', 'cancelled', 'canceled', 'expired'].includes(status)) {
-    return 'failed';
-  }
-  return 'pending';
-}
-
-function apimartTaskStatusCandidates(baseUrl = '', endpoint = '', taskId = '') {
-  const normalizedTaskId = String(taskId || '').trim();
-  if (!normalizedTaskId) return [];
-  const normalizedBaseUrl = String(baseUrl || '').trim().replace(/\/$/, '');
-  const normalizedEndpoint = String(endpoint || '').trim().replace(/\/$/, '');
-  const candidates = [
-    `${normalizedBaseUrl}/tasks/${normalizedTaskId}`,
-    `${normalizedBaseUrl}${normalizedEndpoint}/${normalizedTaskId}`,
-  ];
-  return candidates.filter((value, index, array) => value && array.indexOf(value) === index);
+  return Boolean(apimartVideoModelKind(requestedModel, catalogLookup));
 }
 
 async function sleepWithSignal(ms, signal) {
@@ -5478,16 +3862,6 @@ async function probeRelayConnectivity(baseUrl = '', timeoutMs = 8000) {
   return lastFailure;
 }
 
-function parseInlineDataUrl(value = '') {
-  const source = String(value || '').trim();
-  const match = /^data:([^;,]+)?(?:;charset=[^;,]+)?;base64,([a-z0-9+/=\s]+)$/i.exec(source);
-  if (!match) return null;
-  return {
-    mimeType: String(match[1] || 'application/octet-stream').trim().toLowerCase(),
-    buffer: Buffer.from(match[2].replace(/\s+/g, ''), 'base64'),
-  };
-}
-
 async function executePowerShellRelayMultipartUpload({
   url,
   headers = {},
@@ -5548,46 +3922,6 @@ async function executePowerShellRelayMultipartUpload({
   } finally {
     await fs.rm(headersPath, { force: true }).catch(() => {});
   }
-}
-
-function extractManagedLocalRoutePath(value = '') {
-  const raw = String(value || '').trim();
-  if (!raw) return '';
-  if (raw.startsWith('/api/')) return raw;
-  try {
-    const url = new URL(raw);
-    if (!isPrivateOrLocalHostname(url.hostname) && !isManagedPublicRelayAssetUrl(raw)) return '';
-    return `${url.pathname}${url.search}`;
-  } catch {
-    return '';
-  }
-}
-
-function isManagedPublicRelayAssetUrl(value = '') {
-  const raw = String(value || '').trim();
-  if (!raw) return false;
-  try {
-    const url = new URL(raw);
-    return (
-      url.pathname.startsWith('/api/assets/content/')
-      || url.pathname.startsWith('/api/media-proxy')
-      || url.pathname.startsWith('/api/local-video/result/')
-      || url.pathname.startsWith('/api/local-post/result/')
-    );
-  } catch {
-    return false;
-  }
-}
-
-function isTemporaryTunnelHost(hostname = '') {
-  const normalized = String(hostname || '').trim().toLowerCase();
-  return (
-    normalized.endsWith('.loca.lt')
-    || normalized.endsWith('.localtunnel.me')
-    || normalized.endsWith('.lhr.life')
-    || normalized.endsWith('.localhost.run')
-    || normalized.endsWith('.trycloudflare.com')
-  );
 }
 
 async function resolveManagedLocalMediaFile(value = '', kind = '') {
@@ -6002,138 +4336,6 @@ async function materializeApimartVideoConditioningPayload(payload = {}, timeoutM
   return next;
 }
 
-function apimartVideoSize(payload = {}) {
-  const quality = String(payload.quality || '').trim().toLowerCase();
-  if (/^\d+p$/.test(quality)) return quality;
-
-  const resolution = String(payload.resolution || '').trim().toLowerCase();
-  if (/^\d+p$/.test(resolution)) return resolution;
-
-  const width = Number(payload.width);
-  const height = Number(payload.height);
-  if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
-    const key = `${Math.round(width)}x${Math.round(height)}`;
-    const known = {
-      '854x480': '480p',
-      '960x720': '720p',
-      '1024x1024': '720p',
-      '1280x720': '720p',
-      '1440x1080': '1080p',
-      '1920x1080': '1080p',
-    };
-    return known[key] || key;
-  }
-
-  const aspectRatio = normalizeAspectRatio(payload.aspect_ratio || payload.aspectRatio || '16:9', '16:9');
-  const fallback = {
-    '16:9': '720p',
-    '9:16': '720p',
-    '1:1': '720p',
-    '4:3': '720p',
-    '3:4': '720p',
-  };
-  return fallback[aspectRatio] || '720p';
-}
-
-function apimartVideoAspectRatio(payload = {}) {
-  return normalizeAspectRatio(
-    payload.aspect_ratio || payload.aspectRatio || payload.size || rawAspectRatioFromResolution(payload.width, payload.height) || '16:9',
-    '16:9',
-  );
-}
-
-function rawAspectRatioFromResolution(width, height) {
-  const normalizedWidth = Number(width);
-  const normalizedHeight = Number(height);
-  if (!Number.isFinite(normalizedWidth) || !Number.isFinite(normalizedHeight) || normalizedWidth <= 0 || normalizedHeight <= 0) {
-    return '';
-  }
-  if (Math.abs((normalizedWidth / normalizedHeight) - (16 / 9)) < 0.04) return '16:9';
-  if (Math.abs((normalizedWidth / normalizedHeight) - (9 / 16)) < 0.04) return '9:16';
-  if (Math.abs((normalizedWidth / normalizedHeight) - 1) < 0.04) return '1:1';
-  if (Math.abs((normalizedWidth / normalizedHeight) - (4 / 3)) < 0.04) return '4:3';
-  if (Math.abs((normalizedWidth / normalizedHeight) - (3 / 4)) < 0.04) return '3:4';
-  return '';
-}
-
-function apimartKlingMode(payload = {}) {
-  const explicitMode = String(payload.mode || '').trim().toLowerCase();
-  if (['std', 'pro', '4k'].includes(explicitMode)) return explicitMode;
-  const quality = String(payload.quality || payload.resolution || '').trim().toLowerCase();
-  if (quality === '4k' || quality === '2160p') return '4k';
-  if (quality === '1080p') return 'pro';
-  return 'std';
-}
-
-function apimartVideoModelKind(model = '') {
-  const normalized = normalizeCatalogIdentifier(model);
-  if (!normalized) return '';
-  const catalogItem = catalogModelByIdentifier(model);
-  const candidates = [
-    catalogItem?.id,
-    catalogItem?.upstreamModel,
-    relayAliasCatalogId(model),
-    model,
-  ]
-    .map((value) => normalizeCatalogIdentifier(value))
-    .filter(Boolean);
-  if (candidates.some((value) => value === 'seedance-v2' || value.includes('seedance'))) return 'seedance-v2';
-  if (candidates.some((value) => value.includes('happyhorse'))) return 'happyhorse';
-  if (candidates.some((value) => value.includes('kling-v3-omni'))) return 'kling-v3-omni';
-  if (candidates.some((value) => value.includes('kling-v3-motion-control'))) return 'kling-v3-motion-control';
-  if (candidates.some((value) => value.includes('kling-video-o1'))) return 'kling-video-o1';
-  if (candidates.some((value) => value === 'kling-o3')) return 'kling-o3';
-  if (candidates.some((value) => value.includes('kling-v3'))) return 'kling-v3';
-  if (candidates.some((value) => value.includes('kling'))) return 'kling';
-  return '';
-}
-
-function isApimartKlingVideoModelKind(modelKind = '') {
-  return /^kling(?:-|$)/.test(String(modelKind || '').trim().toLowerCase());
-}
-
-function shouldRouteApimartVideoEditToHappyhorse(rawPayload = {}, normalizedPayload = {}) {
-  const fallbackEnabled = ['1', 'true', 'yes'].includes(String(process.env.HMDAO_ENABLE_HAPPYHORSE_VIDEO_EDIT_FALLBACK || '').trim().toLowerCase());
-  if (!fallbackEnabled) return false;
-  const model = extractFirstString(normalizedPayload?.model) || extractFirstString(rawPayload?.model);
-  if (!isApimartKlingVideoModelKind(apimartVideoModelKind(model))) return false;
-  const sourceMediaType = String(rawPayload?.source_media_type || normalizedPayload?.source_media_type || '').trim().toLowerCase();
-  if (sourceMediaType !== 'video') return false;
-  const imageRoleEntries = buildApimartImageRoleEntries(rawPayload || {}, normalizedPayload || {});
-  return imageRoleEntries.length > 0;
-}
-
-function isPrivateOrLocalHostname(hostname = '') {
-  const normalized = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
-  if (!normalized) return true;
-  if (
-    normalized === 'localhost'
-    || normalized === '0.0.0.0'
-    || normalized === '::1'
-    || normalized.endsWith('.local')
-    || normalized.endsWith('.lan')
-    || normalized.endsWith('.internal')
-  ) {
-    return true;
-  }
-  const ipVersion = net.isIP(normalized);
-  if (ipVersion === 4) {
-    if (normalized.startsWith('10.')) return true;
-    if (normalized.startsWith('127.')) return true;
-    if (normalized.startsWith('192.168.')) return true;
-    if (normalized.startsWith('169.254.')) return true;
-    if (/^172\.(1[6-9]|2\d|3[01])\./.test(normalized)) return true;
-    return false;
-  }
-  if (ipVersion === 6) {
-    if (normalized === '::1') return true;
-    if (normalized.startsWith('fc') || normalized.startsWith('fd')) return true;
-    if (normalized.startsWith('fe80:')) return true;
-    return false;
-  }
-  return false;
-}
-
 function resolvePublicMediaBaseUrl(value = '') {
   const raw = String(value || '').trim();
   if (!raw) return '';
@@ -6153,19 +4355,6 @@ function resolvePublicMediaBaseUrl(value = '') {
 const PUBLIC_MEDIA_BASE_URL = resolvePublicMediaBaseUrl(
   process.env.HMDAO_PUBLIC_BASE_URL || process.env.HMDAO_REAL_PUBLIC_BASE_URL || '',
 );
-
-function isPublicRemoteMediaUrl(value = '') {
-  const raw = String(value || '').trim();
-  if (!raw) return false;
-  if (/^(data:|blob:|file:|hmdao-local:\/\/)/i.test(raw)) return false;
-  try {
-    const url = new URL(raw);
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-    return !isPrivateOrLocalHostname(url.hostname);
-  } catch {
-    return false;
-  }
-}
 
 function materializePublicRelayMediaUrl(value = '') {
   const raw = String(value || '').trim();
@@ -6258,6 +4447,84 @@ function materializePublicRelayPayload(payload = {}) {
   return next;
 }
 
+// P0.4：云端 provider（fal/replicate/siliconflow 等）无法访问本地 /api/assets/content/<id>
+// 相对路径或 localhost URL。派发前把这类"仅本地可达"的媒体引用转换为：
+//   1) 公网 tunnel URL（配置了 PUBLIC_MEDIA_BASE_URL 时，零拷贝）；
+//   2) 否则内联为 data: URL（读本地字节 base64，带大小上限防 OOM）。
+const CLOUD_INLINE_IMAGE_MAX_BYTES = 24 * 1024 * 1024;
+const CLOUD_INLINE_VIDEO_MAX_BYTES = 48 * 1024 * 1024;
+
+async function inlineLocalMediaReferenceForCloud(value = '', kind = 'image') {
+  const source = String(value || '').trim();
+  if (!source || !isLocalOnlyMediaReference(source)) return source;
+
+  if (PUBLIC_MEDIA_BASE_URL) {
+    const publicUrl = materializePublicRelayMediaUrl(source);
+    if (publicUrl && publicUrl !== source && /^https?:\/\//i.test(publicUrl)) {
+      try {
+        if (!isPrivateOrLocalHostname(new URL(publicUrl).hostname)) return publicUrl;
+      } catch {
+        // fall through to inline path
+      }
+    }
+  }
+
+  let materialized = null;
+  try {
+    materialized = await materializeMediaSourceToLocalFile(source, kind);
+    if (!materialized?.filePath || !(await fileExists(materialized.filePath))) return source;
+    const stat = await fs.stat(materialized.filePath);
+    const maxBytes = kind === 'video' ? CLOUD_INLINE_VIDEO_MAX_BYTES : CLOUD_INLINE_IMAGE_MAX_BYTES;
+    if (!stat.isFile() || stat.size <= 0 || stat.size > maxBytes) return source;
+    const bytes = await fs.readFile(materialized.filePath);
+    const mimeType = materialized.mimeType || (kind === 'video' ? 'video/mp4' : 'image/png');
+    return `data:${mimeType};base64,${bytes.toString('base64')}`;
+  } catch {
+    return source;
+  } finally {
+    for (const cleanupPath of materialized?.cleanupPaths || []) {
+      await fs.unlink(cleanupPath).catch(() => {});
+    }
+  }
+}
+
+const CLOUD_CONDITIONING_FIELD_KINDS = {
+  source_url: '',
+  image_url: 'image',
+  image: 'image',
+  first_frame_url: 'image',
+  last_frame_url: 'image',
+  first_frame_image_url: 'image',
+  last_frame_image_url: 'image',
+  first_frame_image: 'image',
+  last_frame_image: 'image',
+  reference_image_url: 'image',
+  reference_image: 'image',
+  reference_video_url: 'video',
+  reference_video: 'video',
+};
+
+async function inlineCloudConditioningMedia(payload = {}, mode = 'image') {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
+  const next = { ...payload };
+  const defaultKind = String(mode || '').toLowerCase() === 'video' ? 'video' : 'image';
+
+  for (const [field, fieldKind] of Object.entries(CLOUD_CONDITIONING_FIELD_KINDS)) {
+    if (typeof next[field] !== 'string' || !next[field].trim()) continue;
+    next[field] = await inlineLocalMediaReferenceForCloud(next[field], fieldKind || defaultKind);
+  }
+  for (const [field, kind] of [['image_urls', 'image'], ['video_urls', 'video']]) {
+    if (!Array.isArray(next[field])) continue;
+    next[field] = await Promise.all(next[field].map((item) => (
+      typeof item === 'string' ? inlineLocalMediaReferenceForCloud(item, kind) : Promise.resolve(item)
+    )));
+  }
+  if (next.input && typeof next.input === 'object' && !Array.isArray(next.input)) {
+    next.input = await inlineCloudConditioningMedia(next.input, mode);
+  }
+  return next;
+}
+
 function canMaterializeApimartStableVideoSource(value = '') {
   const source = String(value || '').trim();
   if (!source) return false;
@@ -6282,10 +4549,10 @@ function buildApimartAsyncRequestConstraint({
 }) {
   if (String(mode || '').trim().toLowerCase() !== 'video') return null;
   const requestedModel = extractFirstString(payload?.model) || extractFirstString(rawPayload?.model) || provider;
-  const model = shouldRouteApimartVideoEditToHappyhorse(rawPayload || {}, payload || {})
+  const model = shouldRouteApimartVideoEditToHappyhorse(rawPayload || {}, payload || {}, catalogLookup)
     ? 'happyhorse-1.0'
     : requestedModel;
-  const modelKind = apimartVideoModelKind(model || provider);
+  const modelKind = apimartVideoModelKind(model || provider, catalogLookup);
   if (!isApimartKlingVideoModelKind(modelKind)) return null;
 
   const sourceMediaType = String(rawPayload?.source_media_type || payload?.source_media_type || '').trim().toLowerCase();
@@ -6339,256 +4606,6 @@ function buildApimartAsyncRequestConstraint({
   };
 }
 
-function apimartImageModelKind(model = '') {
-  const normalized = normalizeCatalogIdentifier(model);
-  if (!normalized) return '';
-  const catalogItem = catalogModelByIdentifier(model);
-  const catalogId = normalizeCatalogIdentifier(catalogItem?.id || relayAliasCatalogId(model) || model);
-  if (catalogId === 'qwen-image-2-0' || normalized.includes('qwen-image')) return 'qwen-image';
-  if (catalogId === 'gpt-image-2' || normalized.includes('gpt-image-2')) return 'gpt-image-2';
-  return 'generic-image';
-}
-
-function isStrictImageSubjectSwapOperation(operation = '') {
-  return String(operation || '').trim() === 'preserveCompositionReplaceSubject';
-}
-
-function apimartImageSize(payload = {}) {
-  const explicitSize = extractFirstString(payload.size);
-  if (explicitSize) return explicitSize;
-
-  const aspectRatio = normalizeAspectRatio(
-    payload.aspect_ratio || payload.aspectRatio || rawAspectRatioFromResolution(payload.width, payload.height) || '1:1',
-    '1:1',
-  );
-  const supported = new Set(['1:1', '4:3', '3:4', '16:9', '9:16', '3:2', '2:3']);
-  return supported.has(aspectRatio) ? aspectRatio : '1:1';
-}
-
-function apimartImageResolution(payload = {}, modelKind = '') {
-  const explicitResolution = String(payload.resolution || '').trim().toLowerCase();
-  if (explicitResolution === '1k' || explicitResolution === '2k' || explicitResolution === '4k') {
-    if (modelKind === 'qwen-image' && explicitResolution === '4k') return '2K';
-    return modelKind === 'qwen-image' ? explicitResolution.toUpperCase() : explicitResolution;
-  }
-
-  const quality = String(payload.quality || '').trim().toLowerCase();
-  if (quality === '2k' || quality === 'hd' || quality === '1080p' || quality === '1440p') {
-    return modelKind === 'qwen-image' ? '2K' : '2k';
-  }
-  if (quality === '4k' || quality === '2160p') {
-    return modelKind === 'qwen-image' ? '2K' : '4k';
-  }
-
-  const width = Number(payload.width);
-  const height = Number(payload.height);
-  const maxEdge = Math.max(
-    Number.isFinite(width) ? width : 0,
-    Number.isFinite(height) ? height : 0,
-  );
-  if (maxEdge >= 2300) return modelKind === 'qwen-image' ? '2K' : '4k';
-  if (maxEdge >= 1400) return modelKind === 'qwen-image' ? '2K' : '2k';
-  return modelKind === 'qwen-image' ? '1K' : '1k';
-}
-
-function assetCoverageRoles(asset = {}, options = {}) {
-  const explicitCoverage = Array.isArray(asset?.coverageRoles)
-    ? asset.coverageRoles
-    : Array.isArray(asset?.coverage_roles)
-      ? asset.coverage_roles
-      : [];
-  const normalizedExplicitCoverage = Array.from(new Set(
-    explicitCoverage
-      .map((entry) => String(entry || '').trim().toLowerCase())
-      .filter(Boolean),
-  ));
-  if (normalizedExplicitCoverage.length > 0) return normalizedExplicitCoverage;
-
-  const normalizedRole = String(asset?.role || '').trim().toLowerCase();
-  if (!normalizedRole) return ['reference'];
-  if (normalizedRole === 'primary') return ['composition'];
-  if (normalizedRole !== 'omni') return [normalizedRole];
-  if (String(asset?.type || '').trim().toLowerCase() === 'video') return ['motion', 'rhythm', 'style'];
-  if (isStrictImageSubjectSwapOperation(options?.imageStrategyOperation)) return ['style', 'lighting'];
-  return ['subject', 'style', 'composition', 'lighting'];
-}
-
-function apimartExpandedImageRoles(asset = {}, options = {}) {
-  return assetCoverageRoles(asset, options);
-}
-
-function buildApimartImageRoleEntries(rawPayload = {}, normalizedPayload = {}) {
-  const entries = [];
-  const seen = new Set();
-  const push = (url, role, weight = 0, source = '') => {
-    const normalizedUrl = extractFirstString(url);
-    const normalizedRole = String(role || '').trim().toLowerCase();
-    if (!normalizedUrl || !normalizedRole) return;
-    const key = `${normalizedRole}::${normalizedUrl}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    entries.push(compactObject({
-      url: normalizedUrl,
-      image_url: normalizedUrl,
-      role: normalizedRole,
-      weight: Number.isFinite(Number(weight)) && Number(weight) > 0 ? Math.max(0.05, Math.min(1, Number(weight) > 1 ? Number(weight) / 100 : Number(weight))) : undefined,
-      source,
-    }));
-  };
-
-  const sourceMediaType = String(rawPayload.source_media_type || normalizedPayload.source_media_type || '').trim().toLowerCase();
-  const imageStrategyOperation = String(
-    rawPayload?.conditioning_strategy?.operation
-    || normalizedPayload?.conditioning_strategy?.operation
-    || '',
-  ).trim();
-  const primaryAssets = normalizeReferenceAssets(rawPayload.primary_assets);
-  const referenceAssets = normalizeReferenceAssets(rawPayload.reference_assets);
-
-  if (sourceMediaType !== 'video') {
-    const primarySourceUrl = extractFirstString(normalizedPayload.first_frame_url)
-      || extractFirstString(normalizedPayload.source_url);
-    if (primarySourceUrl) {
-      push(primarySourceUrl, 'composition', 1, 'primary-source');
-      push(primarySourceUrl, 'first_frame', 1, 'primary-source');
-    }
-  }
-
-  const lastFrameUrl = extractFirstString(normalizedPayload.last_frame_url);
-  if (lastFrameUrl) push(lastFrameUrl, 'last_frame', 1, 'last-frame');
-
-  for (const asset of primaryAssets) {
-    if (asset.type !== 'image') continue;
-    for (const role of apimartExpandedImageRoles(asset, { imageStrategyOperation })) {
-      push(asset.url, role === 'primary' ? 'composition' : role, asset.weight, 'primary-asset');
-    }
-  }
-
-  for (const asset of referenceAssets) {
-    if (asset.type !== 'image') continue;
-    for (const role of apimartExpandedImageRoles(asset, { imageStrategyOperation })) {
-      push(asset.url, role, asset.weight, 'reference-asset');
-    }
-  }
-
-  const fallbackReferenceImageUrl = extractFirstString(normalizedPayload.reference_image_url);
-  if (fallbackReferenceImageUrl) {
-    push(fallbackReferenceImageUrl, 'subject', Number(rawPayload.reference_weight || 0.7), 'reference-image-url');
-  }
-
-  return entries;
-}
-
-function buildApimartOrderedImageUrls(imageRoleEntries = []) {
-  const priority = new Map([
-    ['composition', 0],
-    ['first_frame', 1],
-    ['subject', 2],
-    ['style', 3],
-    ['lighting', 4],
-    ['reference', 5],
-    ['last_frame', 6],
-  ]);
-  return imageRoleEntries
-    .map((item, index) => ({
-      url: extractFirstString(item?.url),
-      order: priority.get(String(item?.role || '').trim().toLowerCase()) ?? 99,
-      index,
-    }))
-    .filter((item) => item.url)
-    .sort((left, right) => left.order - right.order || left.index - right.index)
-    .reduce((accumulator, item) => {
-      if (!accumulator.includes(item.url)) accumulator.push(item.url);
-      return accumulator;
-    }, [])
-    .slice(0, 16);
-}
-
-function buildApimartImagePromptContract(prompt = '', imageRoleEntries = [], strategyOperation = '') {
-  const basePrompt = String(prompt || '').trim();
-  if (!imageRoleEntries.length) return basePrompt;
-
-  const hasComposition = imageRoleEntries.some((item) => item.role === 'composition' || item.role === 'first_frame');
-  const hasSubject = imageRoleEntries.some((item) => item.role === 'subject');
-  const hasStyle = imageRoleEntries.some((item) => item.role === 'style' || item.role === 'lighting');
-  const lines = [basePrompt];
-
-  lines.push('');
-  lines.push('[HMDAO upstream image_urls role contract]');
-  if (hasComposition) {
-    lines.push('- image_urls[0] is the locked composition anchor. Preserve its camera angle, framing, crop, perspective, subject scale, depth and scene layout.');
-  }
-  if (hasSubject) {
-    lines.push('- The next subject reference image is the only authority for the replacement hero product or object. Replace only the original hero subject with that reference.');
-    lines.push('- This is an object or product replacement task, not portrait or character generation. Do not introduce people or human faces unless the prompt explicitly asks for them.');
-    lines.push('- Do not modernize, redesign, or substitute the requested subject with a different generation, class, era, or product family than the explicit subject reference.');
-  }
-  if (hasStyle) {
-    lines.push('- Remaining reference images refine only style palette, lighting mood, material finish and atmosphere. They must not override the locked composition or the explicit subject replacement.');
-    lines.push('- If any style, lighting, or background reference contains another vehicle, product, animal, or person, ignore that foreground identity completely. Use only its atmosphere, palette, reflections, and environment lighting.');
-    lines.push('- If any non-subject reference conflicts with the explicit subject reference, discard the non-subject foreground identity and keep only atmosphere-level cues.');
-  }
-  if (isStrictImageSubjectSwapOperation(strategyOperation)) {
-    lines.push('- Keep the original composition from image_urls[0], replace only the main subject, and preserve the rest of the scene structure.');
-  }
-  return lines.join('\n');
-}
-
-function buildApimartVideoRoleEntries(rawPayload = {}, normalizedPayload = {}) {
-  const entries = [];
-  const seen = new Set();
-  const push = (url, role, source = '') => {
-    const normalizedUrl = extractFirstString(url);
-    const normalizedRole = String(role || '').trim().toLowerCase();
-    if (!normalizedUrl || !normalizedRole) return;
-    const key = `${normalizedRole}::${normalizedUrl}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    entries.push({ url: normalizedUrl, role: normalizedRole, source });
-  };
-
-  const sourceMediaType = String(rawPayload.source_media_type || normalizedPayload.source_media_type || '').trim().toLowerCase();
-  const primaryAssets = normalizeReferenceAssets(rawPayload.primary_assets);
-  const referenceAssets = normalizeReferenceAssets(rawPayload.reference_assets);
-  if (sourceMediaType === 'video') {
-    const sourceUrl = extractFirstString(normalizedPayload.source_url);
-    if (sourceUrl) push(sourceUrl, 'composition', 'primary-source-video');
-  }
-
-  for (const asset of primaryAssets) {
-    if (asset.type !== 'video') continue;
-    push(asset.url, asset.role === 'primary' ? 'composition' : asset.role, 'primary-asset-video');
-  }
-
-  for (const asset of referenceAssets) {
-    if (asset.type !== 'video') continue;
-    const roles = String(asset.role || '').trim().toLowerCase() === 'omni'
-      ? ['motion', 'rhythm', 'style']
-      : [asset.role];
-    for (const role of roles) {
-      push(asset.url, role, 'reference-asset-video');
-    }
-  }
-
-  const fallbackReferenceVideoUrl = extractFirstString(normalizedPayload.reference_video_url);
-  if (fallbackReferenceVideoUrl) push(fallbackReferenceVideoUrl, 'motion', 'reference-video-url');
-
-  return entries;
-}
-
-function buildApimartAudioUrls(rawPayload = {}) {
-  const values = [
-    extractFirstString(rawPayload.linked_audio_url),
-    ...(Array.isArray(rawPayload.reference_assets)
-      ? rawPayload.reference_assets
-        .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
-        .filter((item) => String(item.type || '').trim().toLowerCase() === 'audio')
-        .map((item) => extractFirstString(item.url))
-      : []),
-  ].filter(Boolean);
-  return uniqueStrings(values);
-}
-
 function normalizeApimartAsyncGenerationPayload({
   provider,
   mode,
@@ -6601,7 +4618,7 @@ function normalizeApimartAsyncGenerationPayload({
     const imageRoleEntries = buildApimartImageRoleEntries(rawPayload, payload);
     const orderedImageUrls = buildApimartOrderedImageUrls(imageRoleEntries);
     const model = extractFirstString(payload.model) || extractFirstString(rawPayload.model);
-    const modelKind = apimartImageModelKind(model || provider);
+    const modelKind = apimartImageModelKind(model || provider, catalogLookup);
     const prompt = buildApimartImagePromptContract(
       extractFirstString(payload.prompt) || extractFirstString(rawPayload.prompt),
       imageRoleEntries,
@@ -6639,9 +4656,9 @@ function normalizeApimartAsyncGenerationPayload({
   const audioUrls = buildApimartAudioUrls(rawPayload);
   const sourceMediaType = String(rawPayload.source_media_type || payload.source_media_type || '').trim().toLowerCase();
   const requestedModel = extractFirstString(payload.model) || extractFirstString(rawPayload.model);
-  const useHappyhorseVideoEditRoute = shouldRouteApimartVideoEditToHappyhorse(rawPayload, payload);
+  const useHappyhorseVideoEditRoute = shouldRouteApimartVideoEditToHappyhorse(rawPayload, payload, catalogLookup);
   const model = useHappyhorseVideoEditRoute ? 'happyhorse-1.0' : requestedModel;
-  const modelKind = apimartVideoModelKind(model || provider);
+  const modelKind = apimartVideoModelKind(model || provider, catalogLookup);
   const normalizedModel = normalizeCatalogIdentifier(model || '');
   const firstFrameImage = extractFirstString(payload.first_frame_url)
     || imageRoleEntries.find((item) => item.role === 'first_frame')?.url
@@ -6816,100 +4833,6 @@ function normalizeApimartAsyncGenerationPayload({
     reference_image: subjectReferenceImage || undefined,
     reference_video: referenceVideo || undefined,
   });
-}
-
-function buildApimartTaskResultPayload(taskPayload = {}, submitPayload = null) {
-  const task = taskPayload?.task && typeof taskPayload.task === 'object' ? taskPayload.task : {};
-  const taskData = taskPayload?.data && typeof taskPayload.data === 'object' && !Array.isArray(taskPayload.data) ? taskPayload.data : {};
-  const result = task?.result && typeof task.result === 'object' ? task.result : {};
-  const response = task?.response && typeof task.response === 'object' ? task.response : {};
-  const taskDataResult = taskData?.result && typeof taskData.result === 'object' ? taskData.result : {};
-  const taskDataImages = Array.isArray(taskDataResult?.images)
-    ? taskDataResult.images.flatMap((item) => {
-      const urls = Array.isArray(item?.url) ? item.url : [item?.url];
-      return urls
-        .map((value) => extractFirstString(value))
-        .filter(Boolean)
-        .map((url) => ({ url }));
-    })
-    : [];
-  const taskDataVideos = Array.isArray(taskDataResult?.videos)
-    ? taskDataResult.videos.flatMap((item) => {
-      const urls = Array.isArray(item?.url) ? item.url : [item?.url];
-      return urls
-        .map((value) => extractFirstString(value))
-        .filter(Boolean)
-        .map((url) => ({ url }));
-    })
-    : [];
-  const mergedData = Array.isArray(result?.data)
-    ? result.data
-    : Array.isArray(response?.data)
-      ? response.data
-      : taskDataImages.length > 0
-        ? taskDataImages
-        : taskDataVideos.length > 0
-          ? taskDataVideos
-          : Array.isArray(taskPayload?.data)
-            ? taskPayload.data
-            : undefined;
-  const mergedVideoResults = Array.isArray(result?.results?.videos)
-    ? result.results.videos
-    : Array.isArray(response?.results?.videos)
-      ? response.results.videos
-      : taskDataVideos.length > 0
-        ? taskDataVideos
-        : undefined;
-  const mergedOutput = Array.isArray(result?.output)
-    ? result.output
-    : Array.isArray(response?.output)
-      ? response.output
-      : undefined;
-  return compactObject({
-    ...(submitPayload && typeof submitPayload === 'object' ? { submit: submitPayload } : {}),
-    task_id: extractApimartTaskId(taskPayload) || extractApimartTaskId(submitPayload || {}),
-    status: task?.status || taskData?.status || taskPayload?.status,
-    ...response,
-    ...result,
-    ...taskDataResult,
-    data: mergedData,
-    output: mergedOutput,
-    results: mergedVideoResults ? { videos: mergedVideoResults } : undefined,
-  });
-}
-
-function apimartTaskStatusValue(taskPayload = {}) {
-  return (
-    taskPayload?.task?.status
-    || taskPayload?.data?.status
-    || taskPayload?.status
-    || taskPayload?.data?.[0]?.status
-    || taskPayload?.result?.status
-    || taskPayload?.response?.status
-    || ''
-  );
-}
-
-function extractApimartAsyncFailureMessage(taskPayload = {}, fallback = 'Generation failed upstream.') {
-  const parts = [
-    extractFirstString(taskPayload?.task?.error?.message),
-    extractFirstString(taskPayload?.task?.error_message),
-    extractFirstString(taskPayload?.task?.reason),
-    extractFirstString(taskPayload?.task?.message),
-    extractFirstString(taskPayload?.error?.message),
-    extractFirstString(taskPayload?.error_message),
-    extractFirstString(taskPayload?.reason),
-    extractFirstString(taskPayload?.message),
-    extractFirstString(taskPayload?.data?.message),
-    extractFirstString(taskPayload?.data?.reason),
-    extractFirstString(taskPayload?.result?.message),
-    extractFirstString(taskPayload?.response?.message),
-  ].filter(Boolean);
-  if (parts.length > 0) return parts[0];
-  const status = String(apimartTaskStatusValue(taskPayload) || '').trim();
-  const taskId = extractApimartTaskId(taskPayload);
-  const detail = [status ? `status=${status}` : '', taskId ? `task_id=${taskId}` : ''].filter(Boolean).join(', ');
-  return detail ? `${fallback} (${detail})` : fallback;
 }
 
 async function executeApimartAsyncGenerationRequest({
@@ -7204,228 +5127,22 @@ async function runJsonWrapperCommand(commandLine, payload, {
   };
 }
 
-async function runLocalPython(commandArgs, { scriptPath, args = [], cwd = APP_DIR, timeoutMs = 0 } = {}) {
-  const executable = commandArgs[0];
-  const prefixArgs = commandArgs.slice(1);
-  const finalArgs = scriptPath ? [...prefixArgs, scriptPath, ...args] : [...prefixArgs, ...args];
-  return await new Promise((resolve, reject) => {
-    const child = spawn(executable, finalArgs, {
-      cwd,
-      env: {
-        ...process.env,
-        PYTHONUTF8: '1',
-        PYTHONIOENCODING: 'utf-8',
-      },
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const stdoutChunks = [];
-    const stderrChunks = [];
-    let timedOut = false;
-    const timeoutHandle = Number(timeoutMs) > 0
-      ? setTimeout(() => {
-          timedOut = true;
-          try {
-            child.kill();
-          } catch {
-            // noop
-          }
-        }, Number(timeoutMs))
-      : null;
-    child.stdout.on('data', (chunk) => {
-      stdoutChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    });
-    child.stderr.on('data', (chunk) => {
-      stderrChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
-      }
-      const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-      const stderr = Buffer.concat(stderrChunks).toString('utf8');
-      if (code === 0) {
-        resolve({ stdout, stderr });
-        return;
-      }
-      if (timedOut) {
-        reject(new Error(`${executable} timed out after ${Number(timeoutMs)}ms`));
-        return;
-      }
-      const detail = stderr.trim().split(/\r?\n/).slice(-10).join(' | ');
-      reject(new Error(`${executable} exited ${code}: ${detail || 'unknown-error'}`));
-    });
-  });
-}
-
-async function runPreferredLocalPython({ scriptPath, args = [], cwd = APP_DIR, timeoutMs = 0 } = {}) {
-  const candidates = [
-    ['py', '-3.13'],
-  ];
-  let lastError = null;
-  for (const candidate of candidates) {
-    try {
-      return await runLocalPython(candidate, { scriptPath, args, cwd, timeoutMs });
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError || new Error('preferred-local-python-unavailable');
-}
-
-async function runJsonPythonScript(scriptPath, args = []) {
-  const { stdout } = await runPreferredLocalPython({ scriptPath, args });
-  const text = String(stdout || '').trim();
-  if (!text) {
-    throw new Error(`python-script-empty-output:${path.basename(scriptPath)}`);
-  }
-  return JSON.parse(text);
-}
-
-async function probeVideoFile(filePath) {
-  const { stdout } = await runCommand('ffprobe', [
-    '-v',
-    'error',
-    '-select_streams',
-    'v:0',
-    '-show_entries',
-    'stream=width,height:format=duration',
-    '-of',
-    'json',
-    filePath,
-  ]);
-  const parsed = JSON.parse(stdout || '{}');
-  return {
-    width: Math.max(2, Number(parsed?.streams?.[0]?.width || 0)),
-    height: Math.max(2, Number(parsed?.streams?.[0]?.height || 0)),
-    duration: Math.max(0, Number(parsed?.format?.duration || 0)),
-  };
-}
-
-async function probeImageFile(filePath) {
-  const { stdout } = await runCommand('ffprobe', [
-    '-v',
-    'error',
-    '-select_streams',
-    'v:0',
-    '-show_entries',
-    'stream=width,height',
-    '-of',
-    'json',
-    filePath,
-  ]);
-  const parsed = JSON.parse(stdout || '{}');
-  return {
-    width: Math.max(2, Number(parsed?.streams?.[0]?.width || 0)),
-    height: Math.max(2, Number(parsed?.streams?.[0]?.height || 0)),
-    duration: 0,
-  };
-}
-
-async function probeMediaStreams(filePath) {
-  const { stdout } = await runCommand('ffprobe', [
-    '-v',
-    'error',
-    '-show_entries',
-    'stream=codec_type',
-    '-of',
-    'json',
-    filePath,
-  ]);
-  const parsed = JSON.parse(stdout || '{}');
-  const streams = Array.isArray(parsed?.streams) ? parsed.streams : [];
-  return {
-    hasVideo: streams.some((stream) => String(stream?.codec_type || '').toLowerCase() === 'video'),
-    hasAudio: streams.some((stream) => String(stream?.codec_type || '').toLowerCase() === 'audio'),
-  };
-}
-
-function normalizeClipSegments(segments, sourceDuration) {
-  return (Array.isArray(segments) ? segments : [])
-    .map((segment) => {
-      const startTime = Math.max(0, Math.min(Number(segment?.startTime || 0), Math.max(0, sourceDuration - 0.05)));
-      const endTime = Math.max(startTime + 0.05, Math.min(Number(segment?.endTime || sourceDuration), sourceDuration));
-      return {
-        startTime: Number(startTime.toFixed(3)),
-        endTime: Number(endTime.toFixed(3)),
-      };
-    })
-    .filter((segment) => segment.endTime > segment.startTime + 0.01)
-    .sort((left, right) => left.startTime - right.startTime);
-}
-
-function clampNumber(value, min, max, fallback) {
-  const next = Number(value);
-  if (!Number.isFinite(next)) return fallback;
-  return Math.max(min, Math.min(max, next));
-}
-
-function evenSize(value, fallback = 2) {
-  const rounded = Math.max(2, Math.round(Number(value) || fallback));
-  return rounded % 2 === 0 ? rounded : rounded - 1;
-}
-
-async function fileExists(filePath) {
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function buildWebmEncodeArgs(outputPath, { includeAudio = false } = {}) {
-  const args = [
-    '-c:v',
-    'libvpx',
-    '-deadline',
-    'good',
-    '-cpu-used',
-    '4',
-    '-crf',
-    '18',
-    '-b:v',
-    '0',
-    '-pix_fmt',
-    'yuv420p',
-  ];
-  if (includeAudio) {
-    args.push('-c:a', 'libopus', '-b:a', '128k');
-  } else {
-    args.push('-an');
-  }
-  args.push(outputPath);
-  return args;
-}
-
-function buildMp4EncodeArgs(outputPath, { includeAudio = true } = {}) {
-  const args = [
-    '-map',
-    '0:v:0',
-    '-map',
-    '0:a?',
-    '-vf',
-    'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-    '-c:v',
-    'libx264',
-    '-preset',
-    'veryfast',
-    '-crf',
-    '18',
-    '-pix_fmt',
-    'yuv420p',
-    '-movflags',
-    '+faststart',
-  ];
-  if (includeAudio) {
-    args.push('-c:a', 'aac', '-b:a', '128k');
-  } else {
-    args.push('-an');
-  }
-  args.push(outputPath);
-  return args;
-}
+// P1-11：以下 19 个函数已抽取至 lib/media-pipeline-utils.mjs。
+import {
+  audioExtensionFromMimeType,
+  buildHighQualityMp4Args,
+  buildWebmEncodeArgs,
+  evenSize,
+  fileExists,
+  floatSamplesToWavBuffer,
+  hashString,
+  normalizeClipSegments,
+  probeImageFile,
+  probeMediaStreams,
+  probeVideoFile,
+  runJsonPythonScript,
+  runPreferredLocalPython,
+} from './lib/media-pipeline-utils.mjs';
 
 let preferredMp4VideoEncoderPromise = null;
 
@@ -7440,101 +5157,6 @@ async function resolvePreferredMp4VideoEncoder() {
       .catch(() => 'mpeg4');
   }
   return preferredMp4VideoEncoderPromise;
-}
-
-function buildIntermediateVideoArgs(outputPath) {
-  return [
-    '-an',
-    '-c:v',
-    'libvpx',
-    '-deadline',
-    'good',
-    '-cpu-used',
-    '4',
-    '-crf',
-    '18',
-    '-b:v',
-    '0',
-    '-pix_fmt',
-    'yuv420p',
-    outputPath,
-  ];
-}
-
-function buildIntermediateImageArgs(outputPath) {
-  return [
-    '-frames:v',
-    '1',
-    '-c:v',
-    'png',
-    outputPath,
-  ];
-}
-
-function bloomBlendMode(value) {
-  if (value === 'add') return 'addition';
-  if (value === 'softlight') return 'softlight';
-  return 'screen';
-}
-
-function audioExtensionFromMimeType(mimeType = 'audio/mpeg') {
-  const normalized = String(mimeType || '').toLowerCase();
-  if (normalized.includes('wav')) return 'wav';
-  if (normalized.includes('ogg')) return 'ogg';
-  if (normalized.includes('flac')) return 'flac';
-  return 'mp3';
-}
-
-function escapePowerShellSingleQuoted(value) {
-  return String(value || '').replace(/'/g, "''");
-}
-
-function clampAudioSample(value) {
-  return Math.max(-1, Math.min(1, value));
-}
-
-function hashString(value = '') {
-  let hash = 2166136261;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return Math.abs(hash >>> 0);
-}
-
-function floatSamplesToWavBuffer(channels, sampleRate = 44100) {
-  const safeChannels = Array.isArray(channels) ? channels : [];
-  const channelCount = Math.max(1, safeChannels.length);
-  const frameCount = safeChannels[0]?.length || 0;
-  const blockAlign = channelCount * 2;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = frameCount * blockAlign;
-  const buffer = Buffer.alloc(44 + dataSize);
-
-  buffer.write('RIFF', 0);
-  buffer.writeUInt32LE(36 + dataSize, 4);
-  buffer.write('WAVE', 8);
-  buffer.write('fmt ', 12);
-  buffer.writeUInt32LE(16, 16);
-  buffer.writeUInt16LE(1, 20);
-  buffer.writeUInt16LE(channelCount, 22);
-  buffer.writeUInt32LE(sampleRate, 24);
-  buffer.writeUInt32LE(byteRate, 28);
-  buffer.writeUInt16LE(blockAlign, 32);
-  buffer.writeUInt16LE(16, 34);
-  buffer.write('data', 36);
-  buffer.writeUInt32LE(dataSize, 40);
-
-  let offset = 44;
-  for (let frame = 0; frame < frameCount; frame += 1) {
-    for (let channel = 0; channel < channelCount; channel += 1) {
-      const sample = clampAudioSample(Number(safeChannels[channel]?.[frame] || 0));
-      const pcm = sample < 0 ? Math.round(sample * 0x8000) : Math.round(sample * 0x7fff);
-      buffer.writeInt16LE(pcm, offset);
-      offset += 2;
-    }
-  }
-  return buffer;
 }
 
 const LOCAL_AUDIO_BACKEND_META = {
@@ -7562,116 +5184,15 @@ const LOCAL_AUDIO_BACKEND_WRAPPERS = {
   voxcpm: path.resolve(APP_DIR, 'server', 'local_voxcpm_wrapper.mjs'),
 };
 
-const LOCAL_IMAGE_ANALYSIS_BACKEND_WRAPPERS = {
-  florence2: path.resolve(APP_DIR, 'server', 'local_image_florence2_wrapper.mjs'),
-  'qwen35-vl': path.resolve(APP_DIR, 'server', 'local_image_qwen35_vl_wrapper.mjs'),
-};
-
-const LOCAL_POST_BACKEND_WRAPPERS = {
-  'fsr-preview': path.resolve(APP_DIR, 'server', 'local_post_fsr_wrapper.mjs'),
-  realbasicvsr: path.resolve(APP_DIR, 'server', 'local_post_realbasicvsr_wrapper.mjs'),
-  supir: path.resolve(APP_DIR, 'server', 'local_post_supir_wrapper.mjs'),
-  ocio: path.resolve(APP_DIR, 'server', 'local_post_ocio_wrapper.mjs'),
-  'ocio-managed': path.resolve(APP_DIR, 'server', 'local_post_ocio_managed_wrapper.mjs'),
-  oiio: path.resolve(APP_DIR, 'server', 'local_post_oiio_wrapper.mjs'),
-  gmic: path.resolve(APP_DIR, 'server', 'local_post_gmic_wrapper.mjs'),
-  depth: path.resolve(APP_DIR, 'server', 'local_post_depth_anything_wrapper.mjs'),
-};
-
-const LOCAL_POST_RUNTIME_GUIDES = {
-  ocio: {
-    runtimeName: 'OpenColorIO Runtime',
-    envPath: 'HMDAO_POST_OCIO_PATH',
-    envCommand: 'HMDAO_POST_OCIO_COMMAND',
-    docsUrl: 'https://opencolorio.org/',
-    downloadUrl: 'https://opencolorio.org/downloads.html',
-    installHint: '安装 OpenColorIO 后，把可执行脚本或运行时入口写入 HMDAO_POST_OCIO_PATH；如需自定义启动命令可改为 HMDAO_POST_OCIO_COMMAND',
-    successHint: '探测成功后，后期节点里的 OCIO Runtime 状态会切换为"外部 Wrapper 已配置"，生成结果会显示真实 OCIO 链路',
-    commonInstallPaths: [
-      'C:\\Program Files\\OpenColorIO\\bin\\ocioconvert.exe',
-      'C:\\Program Files\\OpenColorIO\\bin\\python.exe',
-    ],
-    supportsImage: true,
-    supportsVideo: true,
-  },
-  oiio: {
-    runtimeName: 'OpenImageIO oiiotool',
-    envPath: 'HMDAO_POST_OIIO_PATH',
-    envCommand: 'HMDAO_POST_OIIO_COMMAND',
-    docsUrl: 'https://openimageio.readthedocs.io/en/latest/oiiotool.html',
-    downloadUrl: 'https://github.com/OpenImageIO/oiio/releases',
-    installHint: '安装 oiiotool 后，将 oiiotool.exe 路径写入 HMDAO_POST_OIIO_PATH。若需要固定 OCIO Config，可额外设置 HMDAO_POST_OIIO_OCIO_CONFIG 的 OCIO',
-    successHint: '探测成功后，后期节点里的 OIIO 严格图片调色会显示"已可接管图片调色"，图片调色会优先走 OIIO + OpenColorIO',
-    commonInstallPaths: [
-      'C:\\Program Files\\OpenImageIO\\bin\\oiiotool.exe',
-      'C:\\Users\\<用户名>\\AppData\\Local\\Programs\\OpenImageIO\\bin\\oiiotool.exe',
-    ],
-    supportsImage: true,
-    supportsVideo: false,
-  },
-  gmic: {
-    runtimeName: 'G\'MIC CLI',
-    envPath: 'HMDAO_POST_GMIC_PATH',
-    envCommand: 'HMDAO_POST_GMIC_COMMAND',
-    docsUrl: 'https://gmic.eu/reference.shtml',
-    downloadUrl: 'https://gmic.eu/download.html',
-    installHint: '安装 G\'MIC CLI 后，优先将 gmic.exe 路径写入 HMDAO_POST_GMIC_PATH；如需自定义前置命令可改为 HMDAO_POST_GMIC_COMMAND',
-    successHint: '探测成功后，后期节点里的 G\'MIC Runtime 状态会切换到"图片真实处理已接入"，Bloom / Grain / 细节修复会优先走 G\'MIC',
-    commonInstallPaths: [
-      'C:\\Program Files\\G-MIC\\gmic.exe',
-      'C:\\Program Files\\GMIC\\gmic.exe',
-      'C:\\Users\\<用户名>\\AppData\\Local\\Programs\\GMIC\\gmic.exe',
-    ],
-    supportsImage: true,
-    supportsVideo: false,
-  },
-  'fsr-preview': {
-    runtimeName: 'FSR Preview Wrapper',
-    envPath: 'HMDAO_POST_FSR_PATH',
-    envCommand: 'HMDAO_POST_FSR_COMMAND',
-    docsUrl: 'https://gpuopen.com/fidelityfx-superresolution-1/',
-    downloadUrl: '',
-    installHint: '优先把可执行运行时入口写入 HMDAO_POST_FSR_PATH；如果已有自定义包装命令，可改写 HMDAO_POST_FSR_COMMAND',
-    successHint: '探测成功后，后期节点里的高清 Runtime 状态会显示对应 Wrapper 已配置，预览放大可优先走外部链路',
-    commonInstallPaths: [],
-    supportsImage: true,
-    supportsVideo: true,
-  },
-  realbasicvsr: {
-    runtimeName: 'RealBasicVSR Wrapper',
-    envPath: 'HMDAO_POST_REALBASICVSR_PATH',
-    envCommand: 'HMDAO_POST_REALBASICVSR_COMMAND',
-    docsUrl: 'https://github.com/ckkelvinchan/RealBasicVSR',
-    downloadUrl: '',
-    installHint: '将 RealBasicVSR 的运行入口写入 HMDAO_POST_REALBASICVSR_PATH，或通过 HMDAO_POST_REALBASICVSR_COMMAND 指向你自己的封装命令',
-    successHint: '探测成功后，视频高清增强会优先走 RealBasicVSR Wrapper，结果区会显示真实高清链路',
-    commonInstallPaths: [],
-    supportsImage: false,
-    supportsVideo: true,
-  },
-  supir: {
-    runtimeName: 'SUPIR Wrapper',
-    envPath: 'HMDAO_POST_SUPIR_PATH',
-    envCommand: 'HMDAO_POST_SUPIR_COMMAND',
-    docsUrl: 'https://github.com/Fanghua-Yu/SUPIR',
-    downloadUrl: '',
-    installHint: '将 SUPIR 运行入口写入 HMDAO_POST_SUPIR_PATH，或改用 HMDAO_POST_SUPIR_COMMAND 挂自定义启动命令',
-    successHint: '探测成功后，图片高清增强会优先走 SUPIR Wrapper，结果区会显示真实高清链路',
-    commonInstallPaths: [],
-    supportsImage: true,
-    supportsVideo: false,
-  },
-};
-
-const EXECUTABLE_DETECTION_CACHE = new Map();
-const LOCAL_POST_RELEASE_CACHE = new Map();
-const LOCAL_POST_RELEASE_TTL_MS = 1000 * 60 * 30;
-const LOCAL_POST_MANAGED_RUNTIME_DIR = path.join(DATA_DIR, 'local-post-runtimes');
-const LOCAL_POST_MANAGED_RUNTIME_DOWNLOAD_DIR = path.join(LOCAL_POST_MANAGED_RUNTIME_DIR, 'downloads');
-const LOCAL_POST_MANAGED_RUNTIME_MANIFEST_FILE = path.join(LOCAL_POST_MANAGED_RUNTIME_DIR, 'manifest.json');
-const LOCAL_POST_RUNTIME_INSTALL_JOBS = new Map();
-const LOCAL_POST_RUNTIME_INSTALL_JOBS_BY_KEY = new Map();
-const LOCAL_POST_RUNTIME_INSTALL_MAX_HISTORY = 18;
+// P1-10：local-post 运行时常量已收敛至 lib/local-post-constants.mjs（单点导出，ESM 单例共享 Map 实例）。
+import {
+  LOCAL_POST_BACKEND_WRAPPERS,
+  LOCAL_POST_RUNTIME_GUIDES,
+  LOCAL_POST_RELEASE_CACHE,
+  LOCAL_POST_RELEASE_TTL_MS,
+  LOCAL_POST_MANAGED_RUNTIME_DIR,
+  LOCAL_POST_RUNTIME_INSTALL_JOBS,
+} from './lib/local-post-constants.mjs';
 
 const LOCAL_POST_INSTALLABLE_RUNTIMES = {
   gmic: {
@@ -7689,8 +5210,19 @@ const LOCAL_POST_INSTALLABLE_RUNTIMES = {
     runtimeName: LOCAL_POST_RUNTIME_GUIDES.ocio.runtimeName,
     sourceLabel: 'PyPI / OpenColorIO',
   },
+  ytdlp: {
+    runtimeKey: 'ytdlp',
+    runtimeName: LOCAL_POST_RUNTIME_GUIDES.ytdlp.runtimeName,
+    sourceLabel: 'GitHub / yt-dlp',
+  },
+  florence2: {
+    runtimeKey: 'florence2',
+    runtimeName: LOCAL_POST_RUNTIME_GUIDES.florence2.runtimeName,
+    sourceLabel: 'Hugging Face / PyPI',
+  },
 };
 const LOCAL_POST_SELF_CHECK_TIMEOUT_MS = 12000;
+const LOCAL_POST_INSTALL_STEP_TIMEOUT_MS = 45 * 60 * 1000; // 安装步骤（建 venv / 装 torch / 下 2.3GB 权重）必须长超时，否则会被 12s 自检超时杀掉
 
 function normalizeLocalAudioBackend(value) {
   const requested = String(value || 'fallback-local').trim().toLowerCase();
@@ -8111,6 +5643,320 @@ async function processLocalAudioGenerateRequest(payload) {
   };
 }
 
+async function resolveAudioProviderApiKey(providerId) {
+  const records = listActivatedProviderRecords().filter((r) => String(r?.provider || '').trim() === String(providerId).trim());
+  const exactAudio = records.find((r) => String(r?.mode || '').trim() === 'audio');
+  if (exactAudio) return String(exactAudio.apiKey || '').trim();
+  // 优先使用原生密钥（无自定义 endpoint），避免中继 key 无法代理该服务（如百炼 TTS）
+  const native = records.find((r) => !r?.endpoint);
+  if (native) return String(native.apiKey || '').trim();
+  const any = records[0];
+  return any ? String(any.apiKey || '').trim() : '';
+}
+
+function catalogAudioModelById(modelId) {
+  return MODEL_CATALOG.find((m) => m.id === modelId) || null;
+}
+
+function mapVoicePresetToMinimax(voicePreset) {
+  const v = String(voicePreset || '').toLowerCase();
+  if (v.includes('female')) return 'female-yujie';
+  if (v.includes('male')) return 'male-qn-qingse';
+  return 'male-qn-qingse';
+}
+
+function buildMinimaxMusicPrompt(prompt, mode) {
+  const base = String(prompt || '').trim();
+  if (mode === 'sfx') return `纯音效：${base}。无人声、无歌词，仅环境音/拟音/音效铺底。`;
+  return base || '生成一段氛围舒缓、适合短视频使用的背景音乐。';
+}
+
+async function generateAudioViaMinimax({ mode, prompt, voicePreset, speechRate, apiKey, upstreamModel }) {
+  const base = 'https://api.minimaxi.com/v1';
+  const isMusic = mode === 'bgm' || mode === 'sfx';
+  if (isMusic) {
+    const model = upstreamModel && upstreamModel !== 'minimax-music-01' ? upstreamModel : 'music-01';
+    const submit = await fetch(`${base}/music_generation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, prompt: buildMinimaxMusicPrompt(prompt, mode) }),
+    });
+    const sj = await submit.json().catch(() => ({}));
+    const taskId = sj?.data?.task_id || sj?.task_id;
+    if (!taskId) throw new Error(`minimax-music-submit-failed:${submit.status} ${JSON.stringify(sj).slice(0, 300)}`);
+    let audioUrl = null;
+    for (let i = 0; i < 80; i += 1) {
+      await new Promise((r) => setTimeout(r, 3000));
+      const poll = await fetch(`${base}/get_music?task_id=${encodeURIComponent(taskId)}`, { headers: { Authorization: `Bearer ${apiKey}` } });
+      const pj = await poll.json().catch(() => ({}));
+      const status = pj?.data?.status || pj?.status;
+      if (status === 'SUCCESS' || status === 'success' || pj?.data?.audio || pj?.audio) {
+        audioUrl = pj?.data?.audio || pj?.audio || pj?.data?.stream_audio || pj?.data?.audio_file;
+        if (audioUrl) break;
+      }
+      if (status === 'FAILED' || status === 'failed') throw new Error(`minimax-music-failed:${JSON.stringify(pj).slice(0, 300)}`);
+    }
+    if (!audioUrl) throw new Error('minimax-music-timeout');
+    const bytes = await downloadRemoteMediaBuffer(audioUrl);
+    return { buffer: bytes.bytes, mimeType: bytes.mimeType || 'audio/mp3', ext: audioExtensionFromMimeType(bytes.mimeType) || 'mp3' };
+  }
+  const model = upstreamModel && upstreamModel !== 'minimax-speech-28' ? upstreamModel : 'speech-2.8-hd';
+  const tts = await fetch(`${base}/t2a_v2`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      text: prompt,
+      voice_setting: { voice_id: mapVoicePresetToMinimax(voicePreset), speed: clampNumber(Number(speechRate || 1), 0.5, 2, 1) },
+      audio_setting: { sample_rate: 32000, bitrate: 128000, format: 'mp3' },
+    }),
+  });
+  const tj = await tts.json().catch(() => ({}));
+  const audioB64 = tj?.data?.audio || tj?.audio;
+  if (!audioB64) {
+    const audioFile = tj?.data?.audio_file || tj?.audio_file;
+    if (audioFile) {
+      const bytes = await downloadRemoteMediaBuffer(audioFile);
+      return { buffer: bytes.bytes, mimeType: bytes.mimeType || 'audio/mp3', ext: audioExtensionFromMimeType(bytes.mimeType) || 'mp3' };
+    }
+    throw new Error(`minimax-tts-failed:${tts.status} ${JSON.stringify(tj).slice(0, 300)}`);
+  }
+  const buffer = Buffer.from(String(audioB64), 'base64');
+  return { buffer, mimeType: 'audio/mp3', ext: 'mp3' };
+}
+
+async function generateAudioViaVolcengine({ prompt, speechRate, apiKey, upstreamModel }) {
+  // 火山方舟生成类模型必须走推理接入点 ep-xxxx（裸模型名返回 InvalidEndpointOrModel.NotFound）。
+  // 统一入口为 /api/v3/chat/completions（其余 audio/* 路径探针实测均 404）。
+  const base = 'https://ark.cn-beijing.volces.com/api/v3';
+  const model = String(upstreamModel || 'doubao-audio-1.0').trim();
+  const submit = await fetch(`${base}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: 'user', content: String(prompt || '生成一段背景音乐') }],
+    }),
+  });
+  const sj = await submit.json().catch(() => ({}));
+  if (!submit.ok) {
+    throw new Error(`volcengine-audio-submit-failed:${submit.status} ${JSON.stringify(sj).slice(0, 400)}`);
+  }
+  const content = String(sj?.choices?.[0]?.message?.content || '');
+  // 情况1：同步返回 data URI base64 音频
+  const dataMatch = content.match(/data:audio\/[^;]+;base64,([A-Za-z0-9+/=]+)/);
+  if (dataMatch) {
+    const buffer = Buffer.from(dataMatch[1], 'base64');
+    const mime = (content.match(/data:(audio\/[^;]+)/) || [])[1] || 'audio/wav';
+    return { buffer, mimeType: mime, ext: audioExtensionFromMimeType(mime) || 'wav' };
+  }
+  // 情况2：同步返回音频 URL
+  const urlMatch = content.match(/https?:\/\/\S+\.(wav|mp3|ogg|m4a|flac)/i);
+  if (urlMatch) {
+    const bytes = await downloadRemoteMediaBuffer(urlMatch[0]);
+    return { buffer: bytes.bytes, mimeType: bytes.mimeType || 'audio/wav', ext: audioExtensionFromMimeType(bytes.mimeType) || 'wav' };
+  }
+  // 情况3：异步任务（返回 task_id），轮询结果
+  const taskId = sj?.id || sj?.task_id || sj?.data?.task_id;
+  if (taskId) {
+    let audioUrl = null;
+    for (let i = 0; i < 80; i += 1) {
+      await new Promise((r) => setTimeout(r, 3000));
+      const poll = await fetch(`${base}/tasks/${encodeURIComponent(taskId)}`, { headers: { Authorization: `Bearer ${apiKey}` } });
+      const pj = await poll.json().catch(() => ({}));
+      const url = pj?.url || pj?.data?.url || pj?.audio_url || pj?.choices?.[0]?.message?.content;
+      if (url && /^https?:\/\//.test(String(url))) { audioUrl = String(url); break; }
+      if (/failed/i.test(String(pj?.status || ''))) throw new Error(`volcengine-audio-failed:${JSON.stringify(pj).slice(0, 300)}`);
+    }
+    if (!audioUrl) throw new Error('volcengine-audio-timeout');
+    const bytes = await downloadRemoteMediaBuffer(audioUrl);
+    return { buffer: bytes.bytes, mimeType: bytes.mimeType || 'audio/wav', ext: audioExtensionFromMimeType(bytes.mimeType) || 'wav' };
+  }
+  throw new Error(`volcengine-audio-unexpected-response:${JSON.stringify(sj).slice(0, 400)}`);
+}
+
+const QWEN3_TTS_VOICE_VALUES = QWEN3_TTS_VOICES.map(v => v.value);
+
+async function generateAudioViaQwen3({ mode, prompt, voicePreset, instructions, speechRate = 1, apiKey, upstreamModel, workspaceId }) {
+  const wsId = String(workspaceId || process.env.DASHSCOPE_WORKSPACE_ID || '').trim();
+  const base = wsId
+    ? `https://${wsId}.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation`
+    : 'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation';
+  const model = String(upstreamModel || 'qwen3-tts-instruct-flash').trim();
+  const rawVoice = String(voicePreset || '').trim();
+  const voice = QWEN3_TTS_VOICE_VALUES.includes(rawVoice) ? rawVoice : 'Cherry';
+  const text = String(prompt || '生成一段语音').trim();
+  const input = { text, voice };
+  const ins = String(instructions || '').trim();
+  if (ins) {
+    input.instructions = ins;
+    input.optimize_instructions = true;
+  }
+  const submit = await fetch(base, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({ model, input }),
+  });
+  const sj = await submit.json().catch(() => ({}));
+  if (!submit.ok) throw new Error(`qwen3-tts-submit-failed:${submit.status} ${JSON.stringify(sj).slice(0, 400)}`);
+  const audio = sj?.output?.audio;
+  const audioUrl = audio?.url;
+  const audioData = audio?.data;
+  if (audioData) {
+    const match = String(audioData).match(/^data:audio\/([^;]+);base64,(.*)$/);
+    if (match) {
+      const buffer = Buffer.from(match[2], 'base64');
+      return { buffer, mimeType: `audio/${match[1]}`, ext: match[1] };
+    }
+    const buffer = Buffer.from(String(audioData), 'base64');
+    return { buffer, mimeType: 'audio/wav', ext: 'wav' };
+  }
+  if (audioUrl) {
+    const bytes = await downloadRemoteMediaBuffer(String(audioUrl));
+    return { buffer: bytes.bytes, mimeType: bytes.mimeType || 'audio/wav', ext: audioExtensionFromMimeType(bytes.mimeType) || 'wav' };
+  }
+  throw new Error(`qwen3-tts-unexpected-response:${JSON.stringify(sj).slice(0, 400)}`);
+}
+
+async function generateAudioViaQwen({ mode, prompt, voicePreset, speechRate, apiKey, upstreamModel, workspaceId }) {
+  // 阿里百炼 / DashScope 非实时语音合成（Qwen-Audio-3.0-TTS）
+  // TTS 服务需走工作空间主机；未配置 workspaceId 时回退到默认 dashscope 主机
+  const wsId = String(workspaceId || process.env.DASHSCOPE_WORKSPACE_ID || '').trim();
+  const base = wsId
+    ? `https://${wsId}.cn-beijing.maas.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer`
+    : 'https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer';
+  const model = String(upstreamModel || 'qwen-audio-3.0-tts-flash').trim();
+  // 旧版 Qwen-Audio-3.0-TTS：flash 音色 longanhuan_v3.6/longjielidou_v3.6/loongeva_v3.6/loongjohn；plus 音色 longanlingxin/longanlufeng
+  // voicePreset 可能是 'female'/'male' 语义标签或真实音色名，做兼容映射
+  const rawVoice = String(voicePreset || '').trim();
+  const FLASH_VOICES = ['longanhuan_v3.6', 'longjielidou_v3.6', 'loongeva_v3.6', 'loongjohn'];
+  const PLUS_VOICES = ['longanlingxin', 'longanlufeng'];
+  const FLAME_MAP = { female: 'longanhuan_v3.6', male: 'longjielidou_v3.6', f: 'longanhuan_v3.6', m: 'longjielidou_v3.6' };
+  const PLUS_MAP = { female: 'longanlingxin', male: 'longanlufeng', f: 'longanlingxin', m: 'longanlufeng' };
+  const map = String(model).includes('plus') ? PLUS_MAP : FLAME_MAP;
+  const valid = String(model).includes('plus') ? PLUS_VOICES : FLASH_VOICES;
+  let voice;
+  if (valid.includes(rawVoice)) voice = rawVoice;
+  else if (map[rawVoice.toLowerCase()]) voice = map[rawVoice.toLowerCase()];
+  else voice = valid[0];
+  const submit = await fetch(base, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      input: {
+        text: String(prompt || '生成一段语音').trim(),
+        voice,
+        format: 'wav',
+        sample_rate: 24000,
+      },
+    }),
+  });
+  const sj = await submit.json().catch(() => ({}));
+  if (!submit.ok) throw new Error(`qwen-audio-submit-failed:${submit.status} ${JSON.stringify(sj).slice(0, 400)}`);
+  const audio = sj?.output?.audio || sj?.audio;
+  const audioUrl = audio?.url;
+  const audioData = audio?.data;
+  if (audioData) {
+    const match = String(audioData).match(/^data:audio\/([^;]+);base64,(.*)$/);
+    if (match) {
+      const buffer = Buffer.from(match[2], 'base64');
+      return { buffer, mimeType: `audio/${match[1]}`, ext: match[1] };
+    }
+    const buffer = Buffer.from(String(audioData), 'base64');
+    return { buffer, mimeType: 'audio/wav', ext: 'wav' };
+  }
+  if (audioUrl) {
+    const bytes = await downloadRemoteMediaBuffer(String(audioUrl));
+    return { buffer: bytes.bytes, mimeType: bytes.mimeType || 'audio/wav', ext: audioExtensionFromMimeType(bytes.mimeType) || 'wav' };
+  }
+  throw new Error(`qwen-audio-unexpected-response:${JSON.stringify(sj).slice(0, 400)}`);
+}
+
+async function processRemoteAudioGenerateRequest(payload) {
+  const modelId = String(payload?.model || '').trim();
+  const catalogModel = catalogAudioModelById(modelId);
+  const provider = String(payload?.provider || catalogModel?.provider || '').trim();
+  const upstreamModel = String(payload?.upstreamModel || catalogModel?.upstreamModel || modelId).trim();
+  const mode = String(payload?.mode || catalogModel?.capabilities?.generationModes?.[0] || 'bgm').trim().toLowerCase();
+  if (!provider) throw new Error(`audio-model-unknown-provider:${modelId}`);
+  const apiKey = await resolveAudioProviderApiKey(provider);
+  if (!apiKey) throw new Error(`missing-provider-api-key:${provider}（请在 BYOK 中配置该服务商密钥）`);
+  let generated;
+  if (provider === 'minimax') {
+    generated = await generateAudioViaMinimax({
+      mode,
+      prompt: String(payload?.prompt || '').trim(),
+      duration: Number(payload?.duration || 0),
+      intensity: Number(payload?.intensity || 0.62),
+      voicePreset: String(payload?.voicePreset || ''),
+      speechRate: Number(payload?.speechRate || 1),
+      apiKey,
+      upstreamModel: resolveArkModel(modelId, upstreamModel),
+    });
+  } else if (provider === 'volcengine') {
+    generated = await generateAudioViaVolcengine({
+      mode,
+      prompt: String(payload?.prompt || '').trim(),
+      duration: Number(payload?.duration || 0),
+      intensity: Number(payload?.intensity || 0.62),
+      voicePreset: String(payload?.voicePreset || ''),
+      speechRate: Number(payload?.speechRate || 1),
+      apiKey,
+      upstreamModel,
+    });
+  } else if (provider === 'bailian') {
+    const bailianRec = getActivatedProviderRecord('bailian', 'audio') || getActivatedProviderRecord('bailian', '');
+    const wsId = bailianRec?.workspaceId || payload?.workspaceId || '';
+    if (String(upstreamModel || '').includes('qwen3-tts')) {
+      generated = await generateAudioViaQwen3({
+        mode,
+        prompt: String(payload?.prompt || '').trim(),
+        voicePreset: String(payload?.voicePreset || ''),
+        instructions: String(payload?.instructions || ''),
+        speechRate: Number(payload?.speechRate || 1),
+        apiKey,
+        upstreamModel,
+        workspaceId: wsId,
+      });
+    } else {
+      generated = await generateAudioViaQwen({
+        mode,
+        prompt: String(payload?.prompt || '').trim(),
+        voicePreset: String(payload?.voicePreset || ''),
+        speechRate: Number(payload?.speechRate || 1),
+        apiKey,
+        upstreamModel,
+        workspaceId: wsId,
+      });
+    }
+  } else {
+    throw new Error(`unsupported-audio-provider:${provider}`);
+  }
+  const requestId = crypto.randomUUID();
+  const persisted = await persistLocalBufferResult(LOCAL_AUDIO_RESULT_DIR, generated.buffer, requestId, generated.ext || 'wav');
+  const stat = await fs.stat(persisted.persistedPath).catch(() => ({ size: 0 }));
+  const probed = await probeAudioFile(persisted.persistedPath).catch(() => ({}));
+  return {
+    mode,
+    engine: modelId,
+    format: generated.ext || 'wav',
+    mimeType: generated.mimeType || 'audio/wav',
+    outputUrl: `/api/local-audio/result/${encodeURIComponent(persisted.assetId)}`,
+    outputAssetId: persisted.assetId,
+    size: Number(stat?.size || 0),
+    duration: Number(probed?.duration || payload?.duration || 0),
+    sampleRate: Number(probed?.sampleRate || 0),
+    channels: Number(probed?.channels || 0),
+    requestedBackend: modelId,
+    backend: modelId,
+    backendLabel: catalogModel?.name || modelId,
+    backendAvailable: true,
+    fallbackUsed: false,
+    fallbackReason: '',
+  };
+}
+
 async function probeAudioFile(filePath) {
   const { stdout } = await runCommand('ffprobe', [
     '-v',
@@ -8265,7 +6111,7 @@ async function runLocalParseAnalysis(inputPath, sampleFps, options = {}) {
 
 function shouldEnhanceVideoParseWithImageInterrogation(requestedSemanticEngine) {
   const requested = String(requestedSemanticEngine || 'auto').trim().toLowerCase();
-  if (['clip-interrogator', 'prompt-fusion', 'qwen25-vl', 'qwen35-vl', 'florence2'].includes(requested)) return true;
+  if (['clip-interrogator', 'prompt-fusion', 'qwen25-vl', 'qwen35-vl', 'florence2', 'custom-api'].includes(requested)) return true;
   if (requested === 'auto') {
     return resolveImageAnalysisRuntime('auto').mode !== 'fallback';
   }
@@ -8290,7 +6136,10 @@ async function enhanceVideoParseWithImageAnalysis(summary, options = {}) {
   const rows = Array.isArray(summary?.parseRows) ? summary.parseRows : [];
   if (!rows.length) return summary;
   const runtime = resolveImageAnalysisRuntime(String(options.semanticEngine || 'clip-interrogator'));
-  if (!runtime.commandLine) return summary;
+  // cloud remote 的 commandLine 为空但 mode 为 'remote'；本地 wrapper 有 commandLine
+  if (!runtime.commandLine && runtime.mode !== 'remote') return summary;
+  const isRemote = runtime.mode === 'remote';
+  const hasRemote = Boolean(runtime.remoteProvider && runtime.remoteModel && runtime.remoteEndpoint);
 
   const enhancedRows = [];
   for (let index = 0; index < rows.length; index += 1) {
@@ -8306,17 +6155,37 @@ async function enhanceVideoParseWithImageAnalysis(summary, options = {}) {
     try {
       await fs.mkdir(LOCAL_IMAGE_ANALYSIS_DIR, { recursive: true });
       await fs.writeFile(framePath, Buffer.from(base64, 'base64'));
-      const imageAnalysis = await processLocalImageAnalyzeRequest({
+
+      // 为视频分析构造更丰富的上下文：时间、运动、CV 推断
+      const videoContextTags = uniqueStrings([
+        ...(Array.isArray(row.visualKeywords) ? row.visualKeywords : []),
+        `shot-${index + 1}`,
+        row.cameraMovement ? `camera:${row.cameraMovement}` : '',
+        row.sceneType ? `shotSize:${row.sceneType}` : '',
+        row.cameraAngle ? `angle:${row.cameraAngle}` : '',
+        `duration:${Number(row.duration || 0).toFixed(2)}s`,
+        `time:${Number(row.startTime || 0).toFixed(2)}s-${Number(row.endTime || 0).toFixed(2)}s`,
+        row.motionStrength ? `motion:${row.motionStrength}` : '',
+      ].filter(Boolean));
+
+      const analysisPayload = {
         name: `video-shot-${index + 1}.${ext}`,
         inputPath: framePath,
         inputMimeType: mimeType,
         width: Number(row.keyframeWidth || summary.width || 0) || 0,
         height: Number(row.keyframeHeight || summary.height || 0) || 0,
         sourceUrl: '',
-        tags: Array.isArray(row.visualKeywords) ? row.visualKeywords : [],
+        tags: videoContextTags,
         smartCategories: [],
         engine: runtime.resolved,
-      });
+        // 传递云端路由信息以确保进入远程分析
+        ...(isRemote && hasRemote ? {
+          provider: runtime.remoteProvider,
+          model: runtime.remoteModel,
+        } : {}),
+      };
+
+      const imageAnalysis = await processLocalImageAnalyzeRequest(analysisPayload);
       enhancedRows.push({
         ...row,
         frameDescription: [
@@ -8347,7 +6216,9 @@ async function enhanceVideoParseWithImageAnalysis(summary, options = {}) {
     }
   }
 
-  const engineLabel = `keyframe-image-analysis:${runtime.resolved}`;
+  const engineLabel = isRemote
+    ? `keyframe-video-analysis:${String(runtime.remoteModel || runtime.resolved)}`
+    : `keyframe-image-analysis:${runtime.resolved}`;
   return {
     ...summary,
     parseRows: enhancedRows,
@@ -8460,650 +6331,74 @@ async function runDemucsAudioSplit({
   };
 }
 
-async function detectSceneCuts(filePath, threshold = 0.24, maxCount = 10) {
-  try {
-    const { stderr } = await runCommand('ffmpeg', [
-      '-hide_banner',
-      '-i',
-      filePath,
-      '-filter:v',
-      `select='gt(scene,${threshold})',showinfo`,
-      '-vsync',
-      'vfr',
-      '-f',
-      'null',
-      '-',
-    ]);
-    const matches = [...String(stderr || '').matchAll(/pts_time:([0-9.]+)/g)];
-    const values = matches
-      .map((match) => Number(match[1]))
-      .filter((value) => Number.isFinite(value) && value >= 0);
-    return [...new Set(values.map((value) => Number(value.toFixed(3))))].slice(0, maxCount);
-  } catch {
-    return [];
-  }
-}
+// ===== Florence-2 本地视觉分析运行时（托管安装）=====
+// 让后端在每次解析时都能从托管清单把已安装的 Florence-2 路径、venv python、模型目录
+// 注入 process.env，使「一键安装」在进程重启后依然生效，且 wrapper 走 venv python 而非系统 py。
 
-function buildParseSummary(sceneCuts, meta, sampleFps) {
-  const sceneCount = sceneCuts.length + 1;
-  const summaryParts = [
-    `分辨率${meta.width}x${meta.height}`,
-    `时长 ${meta.duration.toFixed(2)}s`,
-    `抽样 ${sampleFps}fps`,
-    sceneCuts.length > 0 ? 'Detected ' + sceneCuts.length + ' cut point(s)' : 'No obvious cut points detected',
-  ];
-  const breakpoints = [0, ...sceneCuts.filter((item) => item > 0 && item < meta.duration), meta.duration]
-    .sort((left, right) => left - right)
-    .filter((item, index, list) => index === 0 || Math.abs(item - list[index - 1]) > 0.02);
-  const shotSizePool = ['特写', '近景', '中景', '全景', '大全景'];
-  const anglePool = ['平视', '低机位', '俯视', '三分之二侧面', '肩后视角'];
-  const movementPool = ['固定镜头', '缓慢推近', '轻微横移', '环绕主体', '跟随推进'];
-  const focusPool = ['浅景深', '中景深', '深景深'];
-  const lightingPool = ['柔和主光 + 辅光补面', '高对比侧光塑造', '冷暖混合氛围光', '轮廓逆光强化主体', '均匀漫反射商业布光'];
-  const beatPool = ['建立主体与空间关系', '承接上一镜并推进动作', '强化情绪与视觉节奏', '突出关键信息与主体变化', '完成段落收束与记忆点'];
-  const soundPool = ['环境底噪 + 氛围音乐铺垫', '动作节奏+ 轻微环境音', '空间混响 + 情绪音乐推进', '镜头转场音效 + 主体 Foley', '收束音效 + 背景音乐尾音'];
-  const parseRows = [];
-  for (let index = 0; index < Math.max(1, breakpoints.length - 1); index += 1) {
-    const startTime = Number(breakpoints[index].toFixed(3));
-    const endTime = Number(Math.max(startTime + 0.08, breakpoints[index + 1] ?? meta.duration).toFixed(3));
-    const duration = Number(Math.max(0.08, endTime - startTime).toFixed(3));
-    const shotSize = shotSizePool[index % shotSizePool.length];
-    const cameraAngle = anglePool[index % anglePool.length];
-    const cameraMovement = movementPool[index % movementPool.length];
-    const focusDepth = focusPool[index % focusPool.length];
-    const lighting = lightingPool[index % lightingPool.length];
-    const narrativeBeat = beatPool[index % beatPool.length];
-    const soundDesign = soundPool[index % soundPool.length];
-    const keyframeTime = Number((startTime + duration * 0.5).toFixed(3));
-    const frameDescription = 'Shot ' + (index + 1) + ': keep the current subject and composition relationship stable while carrying the action and spatial perspective forward.';
-    const cameraPrompt = cameraMovement + ', ' + cameraAngle + ', ' + shotSize + ', keep the subject motion direction and original framing stable.';
-    const imagePrompt = 'Keep the original composition stable, ' + shotSize + ', ' + cameraAngle + ', ' + focusDepth + ', ' + lighting + ', with clear background depth.';
-    const keyframePrompt = 'Keyframe ' + (index + 1) + ': preserve pose and center of interest, strengthen ' + lighting + ' and ' + cameraMovement + ' cues for downstream generation.';
-    parseRows.push({
-      id: `shot-${index + 1}`,
-      shotNumber: index + 1,
-      startTime,
-      endTime,
-      duration,
-      frameDescription,
-      narrativeBeat,
-      sceneType: shotSize,
-      cameraAngle,
-      cameraMovement,
-      focusDepth,
-      lighting,
-      soundDesign,
-      cameraPrompt,
-      imagePrompt,
-      keyframePrompt,
-      keyframeTime,
-      visualKeywords: [shotSize, cameraAngle, cameraMovement, focusDepth, lighting],
-    });
+// R1：把可能「指向目录（历史安装误存 backend 目录）」的 runtimePath 归一化为真正的 .py 推理脚本，
+// 否则 buildRuntimeInvocation 会把目录当 Python 脚本跑 → PermissionError → 整条分析失败。
+
+// P1-4: 在类 Unix 平台补充 Homebrew/系统 bin 目录候选（防止服务进程未继承完整 PATH）
+
+// P3-1: 下载工具（支持断点续传）来自独立轻量模块，避免测试时拉起重型 server。
+import { downloadFileWithProgress } from './runtime-download.mjs';
+
+// P3-8: 完整性校验函数来自独立轻量模块（见 runtime-integrity.mjs），避免隐式依赖整个 server 模块。
+import { verifyDownloadIntegrity } from './runtime-integrity.mjs';
+// P3-4: 磁盘空间预检来自独立轻量模块（见 runtime-disk.mjs）。
+import { assertEnoughDiskSpace, getAvailableDiskBytes, getDiskTotalBytes } from './runtime-disk.mjs';
+// P3-9/P3-3: 回滚与旧版本清理逻辑来自独立轻量模块（见 runtime-rollback.mjs），避免测试时拉起整个 server。
+import {
+  buildManagedRuntimePaths,
+  pruneOldBakBackups,
+  configureRuntimeRollback,
+  listManagedLocalPostBackups,
+  rollbackManagedLocalPostRuntime,
+  cleanupManagedLocalPostRuntimeTemp,
+} from './runtime-rollback.mjs';
+
+/**
+ * 本地卸载托管运行时：删除安装目录（含自定义目录/中文路径）+ 下载缓存 + 清单条目 + 探测缓存。
+ * 仅删除「本面板安装」的目录：默认托管目录，或清单里记录过 rootDir 的自定义目录。
+ */
+async function uninstallManagedLocalPostRuntime(runtimeKey) {
+  const normalizedKey = String(runtimeKey || '').trim();
+  if (!LOCAL_POST_INSTALLABLE_RUNTIMES[normalizedKey]) {
+    throw new Error(`unsupported-runtime:${normalizedKey}`);
   }
+  const entry = getManagedRuntimeManifestEntry(normalizedKey);
+  const removedDirs = [];
+  const candidateRoots = new Set();
+  // 默认托管目录
+  candidateRoots.add(buildManagedRuntimePaths(normalizedKey).rootDir);
+  // 清单记录的自定义安装目录（仅当确为本面板安装记录时才允许删除）
+  const recordedRoot = String(entry?.rootDir || '').trim();
+  if (recordedRoot && path.isAbsolute(recordedRoot)) {
+    candidateRoots.add(path.resolve(recordedRoot));
+  }
+  for (const rootDir of candidateRoots) {
+    if (!rootDir || !existsSync(rootDir)) continue;
+    // 双保险：目录内应有 current/staging 子目录之一，避免误删无关目录
+    const looksManaged = existsSync(path.join(rootDir, 'current')) || existsSync(path.join(rootDir, 'staging'));
+    const isDefaultRoot = isPathInsideDir(LOCAL_POST_MANAGED_RUNTIME_DIR, rootDir);
+    if (!looksManaged && !isDefaultRoot) continue;
+    await fs.rm(rootDir, { recursive: true, force: true }).catch(() => {});
+    removedDirs.push(rootDir);
+  }
+  // 下载缓存
+  const downloadDir = buildManagedRuntimePaths(normalizedKey).downloadDir;
+  if (existsSync(downloadDir)) {
+    await fs.rm(downloadDir, { recursive: true, force: true }).catch(() => {});
+    removedDirs.push(downloadDir);
+  }
+  await removeManagedRuntimeManifestEntry(normalizedKey);
+  clearLocalPostRuntimeDetectionCache();
+  const doctorReport = await buildLocalPostDoctorReport({ forceRelease: true }).catch(() => null);
   return {
-    sceneCount,
-    sceneCuts,
-    sampleFps,
-    summary: summaryParts.join(' | '),
-    suggestedShots: parseRows.map((row) => ({
-      id: row.id,
-      time: row.keyframeTime,
-      label: `镜头 ${row.shotNumber}`,
-      shotSize: row.sceneType,
-      cameraPrompt: row.cameraPrompt,
-      imagePrompt: row.imagePrompt,
-      keyframePrompt: row.keyframePrompt,
-    })),
-    parseRows,
+    runtimeKey: normalizedKey,
+    removedDirs,
+    doctor: doctorReport?.runtimes?.[normalizedKey] || null,
   };
-}
-
-function postTempPath(baseDir, requestId, stepIndex, mediaKind) {
-  return path.join(baseDir, `${requestId}-step-${stepIndex}.${mediaKind === 'video' ? 'webm' : 'png'}`);
-}
-
-function escapeFfmpegFilterPath(filePath) {
-  return String(filePath || '')
-    .replace(/\\/g, '/')
-    .replace(/:/g, '\\:')
-    .replace(/'/g, "\\'");
-}
-
-function isSupportedLutFile(filePath) {
-  return /\.(cube|3dl)$/i.test(String(filePath || '').trim());
-}
-
-function isSupportedOcioConfigFile(filePath) {
-  return /\.(ocio|yaml|yml|json|cfg|txt)$/i.test(String(filePath || '').trim());
-}
-
-async function inspectOcioConfigFile(filePath) {
-  const normalizedPath = String(filePath || '').trim();
-  if (!normalizedPath) {
-    return {
-      structurallyValid: false,
-      executable: false,
-      profileVersion: '',
-      detectedSections: [],
-      formatLabel: 'OCIO Config',
-      message: '未提供可读的 OCIO Config 路径',
-    };
-  }
-  const ext = path.extname(normalizedPath).toLowerCase();
-  const formatLabel = ext === '.json'
-    ? 'JSON Config'
-    : ext === '.yaml' || ext === '.yml'
-      ? 'YAML Config'
-      : ext === '.cfg' || ext === '.txt'
-        ? '文本 Config'
-        : 'OCIO Config';
-  let text = '';
-  try {
-    text = await fs.readFile(normalizedPath, 'utf8');
-  } catch (error) {
-    return {
-      structurallyValid: false,
-      executable: false,
-      profileVersion: '',
-      detectedSections: [],
-      formatLabel,
-      message: `读取 OCIO Config 失败{error instanceof Error ? error.message : 'unknown-read-error'}`,
-    };
-  }
-  if (!text.trim()) {
-    return {
-      structurallyValid: false,
-      executable: false,
-      profileVersion: '',
-      detectedSections: [],
-      formatLabel,
-      message: '当前 OCIO Config 文件为空',
-    };
-  }
-
-  const sectionLabels = ['roles', 'displays', 'views', 'looks', 'colorspaces'];
-  let profileVersion = '';
-  let detectedSections = [];
-  if (ext === '.json') {
-    try {
-      const parsed = JSON.parse(text);
-      const readField = (value) => typeof value === 'string' || typeof value === 'number' ? String(value) : '';
-      profileVersion = readField(parsed?.ocio_profile_version ?? parsed?.ocioProfileVersion);
-      detectedSections = sectionLabels.filter((key) => {
-        const value = parsed?.[key];
-        if (Array.isArray(value)) return value.length > 0;
-        if (value && typeof value === 'object') return Object.keys(value).length > 0;
-        return false;
-      });
-    } catch (error) {
-      return {
-        structurallyValid: false,
-        executable: false,
-        profileVersion: '',
-        detectedSections: [],
-        formatLabel,
-        message: `JSON 结构解析失败{error instanceof Error ? error.message : 'json-parse-failed'}`,
-      };
-    }
-  } else {
-    const sectionRegex = {
-      roles: /^\s*roles\s*:/im,
-      displays: /^\s*displays\s*:/im,
-      views: /^\s*views\s*:/im,
-      looks: /^\s*looks\s*:/im,
-      colorspaces: /^\s*colorspaces\s*:/im,
-    };
-    const versionMatch = text.match(/^\s*ocio_profile_version\s*:\s*("?)([0-9A-Za-z._-]+)\1/im);
-    profileVersion = versionMatch?.[2] || '';
-    detectedSections = sectionLabels.filter((key) => sectionRegex[key].test(text));
-  }
-
-  const structurallyValid = Boolean(profileVersion) && detectedSections.includes('colorspaces');
-  const executable = structurallyValid && detectedSections.some((item) => item === 'roles' || item === 'displays' || item === 'views');
-  let message = 'Current OCIO config structure is complete and ready for execution.';
-  if (!structurallyValid) {
-    message = !profileVersion
-      ? 'ocio_profile_version was not detected.'
-      : 'colorspaces were not detected, so color-space mapping cannot be established.';
-  } else if (!executable) {
-    message = 'Base color spaces were detected, but one of roles / displays / views is still missing.';
-  }
-  return {
-    structurallyValid,
-    executable,
-    profileVersion,
-    detectedSections,
-    formatLabel,
-    message,
-  };
-}
-
-function isSupportedBokehFile(filePath) {
-  return /\.(png|webp)$/i.test(String(filePath || '').trim());
-}
-
-function hexToRgbUnit(value, fallback = { r: 0.5, g: 0.5, b: 0.5 }) {
-  const normalized = String(value || '').trim();
-  const match = /^#?([0-9a-f]{6})$/i.exec(normalized);
-  if (!match) return fallback;
-  const hex = match[1];
-  return {
-    r: parseInt(hex.slice(0, 2), 16) / 255,
-    g: parseInt(hex.slice(2, 4), 16) / 255,
-    b: parseInt(hex.slice(4, 6), 16) / 255,
-  };
-}
-
-function normalizeCurvePointList(points, fallbackPreset = 'linear', channel = 'master') {
-  if (!Array.isArray(points) || points.length < 2) {
-    return null;
-  }
-  const normalized = points
-    .map((point, index, list) => ({
-      x: clampNumber(Number(point?.x), 0, 1, index === 0 ? 0 : index === list.length - 1 ? 1 : 0.5),
-      y: clampNumber(Number(point?.y), 0, 1, index === 0 ? 0 : index === list.length - 1 ? 1 : 0.5),
-    }))
-    .sort((left, right) => left.x - right.x);
-  normalized[0] = { x: 0, y: 0 };
-  normalized[normalized.length - 1] = { x: 1, y: 1 };
-  for (let index = 1; index < normalized.length - 1; index += 1) {
-    const prev = normalized[index - 1];
-    const next = normalized[index + 1];
-    normalized[index].x = clampNumber(normalized[index].x, prev.x + 0.02, next.x - 0.02, normalized[index].x);
-  }
-  if (normalized.length < 2) {
-    return normalizeCurvePointList(null, fallbackPreset, channel);
-  }
-  return normalized;
-}
-
-function curvePointsToFfmpeg(points) {
-  return points.map((point) => `${point.x.toFixed(3)}/${point.y.toFixed(3)}`).join(' ');
-}
-
-function buildCurvePoints(preset, channel = 'master', points = null) {
-  const normalizedPoints = normalizeCurvePointList(points, preset, channel);
-  if (normalizedPoints) {
-    return curvePointsToFfmpeg(normalizedPoints);
-  }
-  const normalized = String(preset || 'linear').trim();
-  if (normalized === 'soft-contrast') return '0/0 0.20/0.14 0.76/0.88 1/1';
-  if (normalized === 'film-s') return '0/0 0.18/0.10 0.40/0.44 0.74/0.88 1/1';
-  if (normalized === 'lifted-matte') return '0/0.06 0.22/0.20 0.78/0.84 1/0.97';
-  if (normalized === 'film-warm') return channel === 'red' ? '0/0.01 0.45/0.48 0.82/0.90 1/1' : '0/0 1/1';
-  if (normalized === 'teal-shadows') return channel === 'blue' ? '0/0.07 0.30/0.34 1/1' : channel === 'red' ? '0/0 0.28/0.22 1/1' : '0/0 1/1';
-  if (normalized === 'crisp-highlights') return '0/0 0.60/0.62 0.86/0.92 1/1';
-  if (normalized === 'film-balance') return channel === 'green' ? '0/0 0.22/0.20 0.70/0.74 1/1' : '0/0 1/1';
-  if (normalized === 'lift-shadows') return '0/0.05 0.16/0.18 1/1';
-  if (normalized === 'cool-highlights') return channel === 'blue' ? '0/0 0.66/0.72 1/1' : '0/0 1/1';
-  return '0/0 1/1';
-}
-
-function buildColorWheelFilter(config = {}) {
-  const lift = hexToRgbUnit(config.liftColor, { r: 0.5, g: 0.5, b: 0.5 });
-  const gamma = hexToRgbUnit(config.gammaColor, { r: 0.5, g: 0.5, b: 0.5 });
-  const gain = hexToRgbUnit(config.gainColor, { r: 0.5, g: 0.5, b: 0.5 });
-  const liftPower = clampNumber(Math.abs(config.lift) * clampNumber(config.liftAmount, 0, 1, 0.18), 0, 1, 0);
-  const gammaPower = clampNumber(Math.abs(config.gamma - 1) * clampNumber(config.gammaAmount, 0, 1, 0.14), 0, 1, 0);
-  const gainPower = clampNumber(Math.abs(config.gain - 1) * clampNumber(config.gainAmount, 0, 1, 0.16), 0, 1, 0);
-  return `colorbalance=rs=${((lift.r - 0.5) * liftPower).toFixed(3)}:gs=${((lift.g - 0.5) * liftPower).toFixed(3)}:bs=${((lift.b - 0.5) * liftPower).toFixed(3)}:rm=${((gamma.r - 0.5) * gammaPower).toFixed(3)}:gm=${((gamma.g - 0.5) * gammaPower).toFixed(3)}:bm=${((gamma.b - 0.5) * gammaPower).toFixed(3)}:rh=${((gain.r - 0.5) * gainPower).toFixed(3)}:gh=${((gain.g - 0.5) * gainPower).toFixed(3)}:bh=${((gain.b - 0.5) * gainPower).toFixed(3)}`;
-}
-
-function buildCurveFilter(config = {}) {
-  return `curves=all='${buildCurvePoints(config.masterCurve, 'master', config.masterCurvePoints)}':r='${buildCurvePoints(config.redCurve, 'red', config.redCurvePoints)}':g='${buildCurvePoints(config.greenCurve, 'green', config.greenCurvePoints)}':b='${buildCurvePoints(config.blueCurve, 'blue', config.blueCurvePoints)}'`;
-}
-
-function buildOcioLikeFilter(config = {}) {
-  const inputSpace = String(config.colorSpaceIn || 'sRGB').trim();
-  const outputSpace = String(config.colorSpaceOut || 'Rec.709').trim();
-  const ocioConfig = String(config.ocioConfig || 'builtin').trim();
-  const ocioDisplay = String(config.ocioDisplay || 'rec709-monitor').trim();
-  const ocioStrength = clampNumber(config.ocioLookStrength, 0, 1, 0.72);
-  const filters = [];
-  if (ocioConfig === 'aces-1.3' || inputSpace !== 'sRGB' || outputSpace !== 'Rec.709' || ocioDisplay !== 'rec709-monitor') {
-    const ocioContrast = 1 + ocioStrength * 0.06;
-    const ocioOutMin = clampNumber(0.5 - ocioContrast * 0.5, 0, 0.05, 0);
-    const ocioOutMax = clampNumber(0.5 + ocioContrast * 0.5, 0.95, 1, 1);
-    filters.push(`colorlevels=romin=${ocioOutMin.toFixed(3)}:gomin=${ocioOutMin.toFixed(3)}:bomin=${ocioOutMin.toFixed(3)}:romax=${ocioOutMax.toFixed(3)}:gomax=${ocioOutMax.toFixed(3)}:bomax=${ocioOutMax.toFixed(3)}`);
-    filters.push(`hue=s=${(1 + ocioStrength * 0.04).toFixed(3)}`);
-    if (inputSpace === 'ACEScg' || ocioConfig === 'aces-1.3') {
-      filters.push(`curves=all='0/0 0.18/0.12 0.70/0.82 1/1'`);
-    }
-    if (outputSpace === 'DCI-P3' || ocioDisplay === 'p3-cinema') {
-      const p3Mid = clampNumber(0.5 + ocioStrength * 0.012, 0.48, 0.56, 0.5);
-      filters.push(`hue=s=${(1 + ocioStrength * 0.05).toFixed(3)}`);
-      filters.push(`curves=all='0/0 0.50/${p3Mid.toFixed(3)} 1/1'`);
-    } else if (ocioDisplay === 'web-srgb') {
-      const webGamma = 1 + ocioStrength * 0.03;
-      const webMid = clampNumber(Math.pow(0.5, 1 / webGamma), 0.46, 0.56, 0.5);
-      filters.push(`curves=all='0/0 0.50/${webMid.toFixed(3)} 1/1'`);
-    }
-  }
-  return filters;
-}
-
-function resolvePostUpscaleRoute(config = {}) {
-  const routePolicy = String(config.routePolicy || 'auto').trim();
-  const model = String(config.model || 'realesrgan-balanced').trim();
-  if (routePolicy !== 'auto') return routePolicy;
-  if (model === 'supir-detail') return 'supir';
-  if (model === 'fsr-fast') return 'fsr-preview';
-  if (model === 'realbasicvsr-video') return 'realbasicvsr';
-  return 'realbasicvsr';
-}
-
-function resolveLocalPostWrapperCommand({ envCommand = '', envPath = '', wrapperKey = '' } = {}) {
-  let commandLine = envCommand ? String(process.env[envCommand] || '').trim() : '';
-  const detectedPath = envPath ? String(process.env[envPath] || '').trim() : '';
-  const wrapperScript = wrapperKey ? LOCAL_POST_BACKEND_WRAPPERS[wrapperKey] : '';
-  if (!commandLine && detectedPath && wrapperScript) {
-    commandLine = `node "${wrapperScript}"`;
-  }
-  return {
-    commandLine,
-    detectedPath,
-  };
-}
-
-function detectExecutablePath(cacheKey, names = [], preferredPaths = []) {
-  if (EXECUTABLE_DETECTION_CACHE.has(cacheKey)) {
-    return EXECUTABLE_DETECTION_CACHE.get(cacheKey) || '';
-  }
-  const normalizedPreferred = preferredPaths
-    .map((item) => String(item || '').trim())
-    .filter(Boolean);
-  const preferredHit = normalizedPreferred.find((item) => existsSync(item));
-  if (preferredHit) {
-    EXECUTABLE_DETECTION_CACHE.set(cacheKey, preferredHit);
-    return preferredHit;
-  }
-
-  const lookupCommand = process.platform === 'win32' ? 'where' : 'which';
-  for (const name of names.map((item) => String(item || '').trim()).filter(Boolean)) {
-    const lookup = spawnSync(lookupCommand, [name], {
-      cwd: APP_DIR,
-      windowsHide: true,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    if (lookup.status === 0) {
-      const hit = String(lookup.stdout || '')
-        .split(/\r?\n/)
-        .map((item) => item.trim())
-        .find(Boolean);
-      if (hit) {
-        EXECUTABLE_DETECTION_CACHE.set(cacheKey, hit);
-        return hit;
-      }
-    }
-  }
-  EXECUTABLE_DETECTION_CACHE.set(cacheKey, '');
-  return '';
-}
-
-function buildManagedRuntimePaths(runtimeKey) {
-  const rootDir = path.join(LOCAL_POST_MANAGED_RUNTIME_DIR, runtimeKey);
-  const currentDir = path.join(rootDir, 'current');
-  const stagingDir = path.join(rootDir, 'staging');
-  return {
-    rootDir,
-    currentDir,
-    stagingDir,
-    downloadDir: path.join(LOCAL_POST_MANAGED_RUNTIME_DOWNLOAD_DIR, runtimeKey),
-  };
-}
-
-function isPathInsideDir(baseDir, targetPath) {
-  const relative = path.relative(path.resolve(baseDir), path.resolve(targetPath));
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
-}
-
-function readManagedRuntimeManifest() {
-  try {
-    if (!existsSync(LOCAL_POST_MANAGED_RUNTIME_MANIFEST_FILE)) return {};
-    const parsed = JSON.parse(readFileSync(LOCAL_POST_MANAGED_RUNTIME_MANIFEST_FILE, 'utf8'));
-    return parsed && typeof parsed === 'object' ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-function writeManagedRuntimeManifestSync(manifest) {
-  mkdirSync(LOCAL_POST_MANAGED_RUNTIME_DIR, { recursive: true });
-  writeFileSync(LOCAL_POST_MANAGED_RUNTIME_MANIFEST_FILE, JSON.stringify(manifest, null, 2), 'utf8');
-}
-
-function getManagedRuntimeManifestEntry(runtimeKey) {
-  const manifest = readManagedRuntimeManifest();
-  const entry = manifest?.[runtimeKey];
-  return entry && typeof entry === 'object' ? entry : null;
-}
-
-function readManagedRuntimeFile(runtimeKey, field) {
-  const entry = getManagedRuntimeManifestEntry(runtimeKey);
-  const value = String(entry?.[field] || '').trim();
-  if (!value) return '';
-  const resolved = path.resolve(value);
-  return existsSync(resolved) ? resolved : '';
-}
-
-function findFileRecursively(rootDir, fileName, maxDepth = 6) {
-  const normalizedRoot = path.resolve(rootDir);
-  if (!existsSync(normalizedRoot)) return '';
-  const queue = [{ dir: normalizedRoot, depth: 0 }];
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (!current) continue;
-    let entries = [];
-    try {
-      entries = readdirSync(current.dir, { withFileTypes: true });
-    } catch {
-      entries = [];
-    }
-    for (const entry of entries) {
-      const entryPath = path.join(current.dir, entry.name);
-      if (entry.isFile() && entry.name.toLowerCase() === fileName.toLowerCase()) {
-        return entryPath;
-      }
-      if (entry.isDirectory() && current.depth < maxDepth) {
-        queue.push({ dir: entryPath, depth: current.depth + 1 });
-      }
-    }
-  }
-  return '';
-}
-
-function detectManagedLocalPostGmicPath() {
-  return readManagedRuntimeFile('gmic', 'executablePath')
-    || findFileRecursively(buildManagedRuntimePaths('gmic').currentDir, 'gmic.exe');
-}
-
-function detectManagedLocalPostOiioPath() {
-  return readManagedRuntimeFile('oiio', 'executablePath')
-    || findFileRecursively(buildManagedRuntimePaths('oiio').currentDir, 'oiiotool.exe');
-}
-
-function detectManagedLocalPostOcioPath() {
-  return readManagedRuntimeFile('ocio', 'runtimePath')
-    || findFileRecursively(buildManagedRuntimePaths('ocio').currentDir, 'ocioconvert.exe');
-}
-
-function detectManagedLocalPostOcioConfigPath() {
-  return readManagedRuntimeFile('ocio', 'configPath');
-}
-
-function detectLocalPostOcioRuntimePath() {
-  const configuredPath = String(process.env.HMDAO_POST_OCIO_PATH || '').trim();
-  if (configuredPath) return configuredPath;
-  const candidates = [
-    detectManagedLocalPostOcioPath(),
-    process.platform === 'win32' ? path.join(process.env.ProgramFiles || 'C:\\Program Files', 'OpenColorIO', 'bin', 'ocioconvert.exe') : '',
-    process.platform === 'win32' ? path.join(process.env.LocalAppData || '', 'Programs', 'OpenColorIO', 'bin', 'ocioconvert.exe') : '',
-  ].filter(Boolean);
-  return detectExecutablePath('post:ocio', ['ocioconvert', 'ocioconvert.exe'], candidates);
-}
-
-function detectLocalPostGmicPath() {
-  const configuredPath = String(process.env.HMDAO_POST_GMIC_PATH || '').trim();
-  if (configuredPath) return configuredPath;
-  const candidates = [
-    detectManagedLocalPostGmicPath(),
-    process.platform === 'win32' ? path.join(process.env.ProgramFiles || 'C:\\Program Files', 'GMIC', 'gmic.exe') : '',
-    process.platform === 'win32' ? path.join(process.env.ProgramFiles || 'C:\\Program Files', 'G-MIC', 'gmic.exe') : '',
-    process.platform === 'win32' ? path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'GMIC', 'gmic.exe') : '',
-    process.platform === 'win32' ? path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'G-MIC', 'gmic.exe') : '',
-    process.platform === 'win32' ? path.join(process.env.LocalAppData || '', 'Programs', 'GMIC', 'gmic.exe') : '',
-  ].filter(Boolean);
-  return detectExecutablePath('post:gmic', ['gmic', 'gmic.exe'], candidates);
-}
-
-function detectLocalPostOiioPath() {
-  const configuredPath = String(process.env.HMDAO_POST_OIIO_PATH || '').trim();
-  if (configuredPath) return configuredPath;
-  const candidates = [
-    detectManagedLocalPostOiioPath(),
-    process.platform === 'win32' ? path.join(process.env.ProgramFiles || 'C:\\Program Files', 'OpenImageIO', 'bin', 'oiiotool.exe') : '',
-    process.platform === 'win32' ? path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'OpenImageIO', 'bin', 'oiiotool.exe') : '',
-    process.platform === 'win32' ? path.join(process.env.LocalAppData || '', 'Programs', 'OpenImageIO', 'bin', 'oiiotool.exe') : '',
-  ].filter(Boolean);
-  return detectExecutablePath('post:oiio', ['oiiotool', 'oiiotool.exe'], candidates);
-}
-
-function detectLocalPostOiioConfigPath() {
-  const configured = String(process.env.HMDAO_POST_OIIO_OCIO_CONFIG || process.env.HMDAO_POST_OCIO_CONFIG || process.env.OCIO || '').trim();
-  if (configured && existsSync(configured)) return configured;
-  return detectManagedLocalPostOcioConfigPath();
-}
-
-function clearLocalPostRuntimeDetectionCache() {
-  EXECUTABLE_DETECTION_CACHE.clear();
-}
-
-function trimRuntimeInstallJobs() {
-  const jobs = Array.from(LOCAL_POST_RUNTIME_INSTALL_JOBS.values())
-    .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0));
-  for (const job of jobs.slice(LOCAL_POST_RUNTIME_INSTALL_MAX_HISTORY)) {
-    LOCAL_POST_RUNTIME_INSTALL_JOBS.delete(job.id);
-    const linked = LOCAL_POST_RUNTIME_INSTALL_JOBS_BY_KEY.get(job.runtimeKey);
-    if (linked === job.id) {
-      LOCAL_POST_RUNTIME_INSTALL_JOBS_BY_KEY.delete(job.runtimeKey);
-    }
-  }
-}
-
-function toRuntimeInstallJobResponse(job) {
-  if (!job) return null;
-  return {
-    id: job.id,
-    runtimeKey: job.runtimeKey,
-    runtimeName: job.runtimeName,
-    requestedAction: job.requestedAction,
-    status: job.status,
-    stage: job.stage,
-    progress: job.progress,
-    message: job.message,
-    error: job.error,
-    targetVersion: job.targetVersion,
-    installedVersion: job.installedVersion,
-    sourceLabel: job.sourceLabel,
-    downloadUrl: job.downloadUrl,
-    releaseUrl: job.releaseUrl,
-    startedAt: job.startedAt,
-    updatedAt: job.updatedAt,
-    completedAt: job.completedAt,
-    verified: Boolean(job.verified),
-    doctor: job.doctor || null,
-  };
-}
-
-function updateRuntimeInstallJob(job, patch = {}) {
-  Object.assign(job, patch, { updatedAt: Date.now() });
-  LOCAL_POST_RUNTIME_INSTALL_JOBS.set(job.id, job);
-  LOCAL_POST_RUNTIME_INSTALL_JOBS_BY_KEY.set(job.runtimeKey, job.id);
-  trimRuntimeInstallJobs();
-  return job;
-}
-
-function getRuntimeInstallJob(jobId) {
-  return LOCAL_POST_RUNTIME_INSTALL_JOBS.get(jobId) || null;
-}
-
-function getLatestRuntimeInstallJob(runtimeKey) {
-  const jobId = LOCAL_POST_RUNTIME_INSTALL_JOBS_BY_KEY.get(runtimeKey);
-  return jobId ? getRuntimeInstallJob(jobId) : null;
-}
-
-async function downloadFileWithProgress(url, targetPath, onProgress, headers = {}) {
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'HMDAO Runtime Installer',
-      ...headers,
-    },
-  });
-  if (!response.ok || !response.body) {
-    throw new Error(`download-failed:${response.status}`);
-  }
-  await fs.mkdir(path.dirname(targetPath), { recursive: true });
-  const contentLength = Number(response.headers.get('content-length') || 0);
-  const fileHandle = await fs.open(targetPath, 'w');
-  let receivedBytes = 0;
-  try {
-    const reader = response.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      receivedBytes += value.byteLength;
-      await fileHandle.write(Buffer.from(value));
-      onProgress?.({
-        receivedBytes,
-        totalBytes: contentLength,
-        percent: contentLength > 0 ? Math.min(100, Math.round((receivedBytes / contentLength) * 100)) : 0,
-      });
-    }
-  } finally {
-    await fileHandle.close().catch(() => {});
-  }
-  return {
-    receivedBytes,
-    totalBytes: contentLength,
-  };
-}
-
-async function extractZipArchiveToDirectory(archivePath, targetDir) {
-  const resolvedTargetDir = path.resolve(targetDir);
-  await fs.mkdir(resolvedTargetDir, { recursive: true });
-  const archiveBuffer = await fs.readFile(archivePath);
-  const extracted = unzipSync(new Uint8Array(archiveBuffer));
-  for (const [entryName, entryBytes] of Object.entries(extracted)) {
-    const normalizedEntry = String(entryName || '').replace(/\\/g, '/');
-    if (!normalizedEntry || normalizedEntry.endsWith('/')) continue;
-    const safeSegments = normalizedEntry.split('/').filter(Boolean);
-    if (!safeSegments.length || safeSegments.some((segment) => segment === '.' || segment === '..')) continue;
-    const outputPath = path.resolve(resolvedTargetDir, ...safeSegments);
-    if (!isPathInsideDir(resolvedTargetDir, outputPath)) {
-      throw new Error(`archive-path-outside-target:${normalizedEntry}`);
-    }
-    await fs.mkdir(path.dirname(outputPath), { recursive: true });
-    await fs.writeFile(outputPath, Buffer.from(entryBytes));
-  }
-}
-
-async function replaceDirectoryContents(targetDir, stagingDir) {
-  const resolvedTargetDir = path.resolve(targetDir);
-  const resolvedStagingDir = path.resolve(stagingDir);
-  const rootDir = path.dirname(resolvedTargetDir);
-  if (!isPathInsideDir(rootDir, resolvedTargetDir) || !isPathInsideDir(rootDir, resolvedStagingDir)) {
-    throw new Error('managed-runtime-path-outside-root');
-  }
-  await fs.rm(resolvedTargetDir, { recursive: true, force: true }).catch(() => {});
-  await fs.rename(resolvedStagingDir, resolvedTargetDir);
-}
-
-async function persistManagedRuntimeManifestEntry(runtimeKey, nextEntry) {
-  const manifest = readManagedRuntimeManifest();
-  manifest[runtimeKey] = nextEntry;
-  writeManagedRuntimeManifestSync(manifest);
 }
 
 async function resolvePypiWheelAsset(packageName, preferredVersion = '') {
@@ -9136,9 +6431,12 @@ async function resolvePypiWheelAsset(packageName, preferredVersion = '') {
   if (!payload) {
     throw new Error(`pypi-metadata-failed:${packageName}:${lastError || 'unknown-error'}`);
   }
+  // P1-3: 按当前平台 + CPU 架构选择匹配的 wheel 平台标签
+  const info = buildPlatformInfo();
+  const platformTagRe = selectPypiWheelPlatformRegex(info);
   const files = Array.isArray(payload?.urls) ? payload.urls : [];
   const ranked = files
-    .filter((item) => item?.packagetype === 'bdist_wheel' && /win_amd64\.whl$/i.test(String(item.filename || '')))
+    .filter((item) => item?.packagetype === 'bdist_wheel' && platformTagRe.test(String(item.filename || '')))
     .sort((left, right) => {
       const leftName = String(left?.filename || '');
       const rightName = String(right?.filename || '');
@@ -9148,13 +6446,16 @@ async function resolvePypiWheelAsset(packageName, preferredVersion = '') {
     });
   const selected = ranked[0] || null;
   if (!selected?.url) {
-    throw new Error(`wheel-not-found:${packageName}`);
+    throw new Error(`wheel-not-found:${packageName}:${info.platform}-${info.arch}`);
   }
   return {
     version: String(payload?.info?.version || '').trim() || normalizedVersion,
     downloadUrl: String(selected.url || '').trim(),
     fileName: String(selected.filename || '').trim() || `${packageName}.whl`,
     releaseUrl: `https://pypi.org/project/${encodeURIComponent(packageName)}/${encodeURIComponent(String(payload?.info?.version || normalizedVersion || '').trim() || 'latest')}/`,
+    // P3-8: 携带 PyPI 提供的 sha256 / 文件体积，供下载后完整性校验
+    expectedSha256: String(selected?.digests?.sha256 || '').trim() || null,
+    expectedSize: Number(selected?.size) > 0 ? Number(selected.size) : null,
   };
 }
 
@@ -9180,6 +6481,54 @@ async function resolveLatestGmicInstallAsset() {
   };
 }
 
+// yt-dlp 是单一可执行文件（自带 Python），从 GitHub Releases 拉取最新版平台二进制。
+// 各平台资产名：Windows=yt-dlp.exe / macOS=yt-dlp_macos（universal2）/ Linux=yt-dlp_linux。
+// 若 GitHub API 被限流/不可达，回退到已知稳定的版本直链，保证一键安装仍可用。
+const YTDLP_FALLBACK_VERSION = '2026.07.04';
+async function resolveLatestYtDlpInstallAsset() {
+  const { assetName, fileName } = resolveYtDlpAssetNames();
+  const assetNameLower = assetName.toLowerCase();
+  try {
+    const response = await fetch('https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest', {
+      headers: {
+        'User-Agent': 'HMDAO Runtime Installer',
+        Accept: 'application/vnd.github+json',
+      },
+    });
+    if (response.ok) {
+      const payload = await response.json().catch(() => null);
+      if (payload && Array.isArray(payload.assets)) {
+        const asset = payload.assets.find((item) => String(item?.name || '').toLowerCase() === assetNameLower);
+        if (asset?.browser_download_url) {
+          return {
+            version: String(payload?.tag_name || '').trim() || firstSemverToken(String(payload?.tag_name || '')),
+            downloadUrl: String(asset.browser_download_url || '').trim(),
+            fileName,
+            // 类 Unix 下载的裸二进制需要 +x 权限
+            executableMode: !buildPlatformInfo().isWindows,
+            releaseUrl: String(payload?.html_url || 'https://github.com/yt-dlp/yt-dlp/releases/latest').trim(),
+            // P3-8: GitHub release 资产自带 sha256 digest 与 size，供下载后完整性校验
+            expectedSha256: String(asset?.digest || '').trim() || null,
+            expectedSize: Number(asset?.size) > 0 ? Number(asset.size) : null,
+          };
+        }
+      }
+    }
+  } catch (_) {
+    // 网络/解析异常时走下方兜底直链
+  }
+  return {
+    version: YTDLP_FALLBACK_VERSION,
+    downloadUrl: `https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_FALLBACK_VERSION}/${assetName}`,
+    fileName,
+    executableMode: !buildPlatformInfo().isWindows,
+    releaseUrl: `https://github.com/yt-dlp/yt-dlp/releases/tag/${YTDLP_FALLBACK_VERSION}`,
+    // P3-8: 兜底直链无来源校验和，完整性校验将自动跳过（仅做下载体积兜底）
+    expectedSha256: null,
+    expectedSize: null,
+  };
+}
+
 async function resolveLatestOcioConfigAsset() {
   const response = await fetch('https://api.github.com/repos/AcademySoftwareFoundation/OpenColorIO-Config-ACES/releases/latest', {
     headers: {
@@ -9201,11 +6550,38 @@ async function resolveLatestOcioConfigAsset() {
     downloadUrl: String(matched.browser_download_url || '').trim(),
     fileName: String(matched.name || '').trim() || 'cg-config.ocio',
     releaseUrl: String(payload?.html_url || '').trim(),
+    // P3-8: GitHub release 资产自带 sha256 digest 与 size，供下载后完整性校验
+    expectedSha256: String(matched?.digest || '').trim() || null,
+    expectedSize: Number(matched?.size) > 0 ? Number(matched.size) : null,
   };
 }
 
 async function resolveInstallableRuntimeAsset(runtimeKey) {
+  if (runtimeKey === 'florence2') {
+    // Florence-2 不是预编译二进制，而是 Python ML 运行时：一键安装会创建 venv、pip 安装
+    // PyTorch/Transformers 并下载 HF 模型权重。这里只返回「版本 + 预期体积」，供面板展示与磁盘校验。
+    const latest = await fetchLatestLocalPostRuntimeVersion('florence2');
+    const layout = buildManagedRuntimePaths('florence2');
+    const python = detectManagedLocalPostFlorence2Python() || 'python3';
+    return {
+      runtimeKey,
+      runtimeName: LOCAL_POST_RUNTIME_GUIDES.florence2.runtimeName,
+      sourceLabel: latest.sourceLabel || 'Hugging Face / PyPI',
+      archiveType: 'ml-model',
+      version: latest.latestVersion || latest.pinnedVersion,
+      downloadUrl: '',
+      expectedSize: 3 * 1024 * 1024 * 1024, // 权重 + Python 虚拟环境 + 依赖合计约 3GB
+      pythonPath: python,
+      backendDir: path.join(layout.rootDir, 'backend'),
+      modelDir: path.join(layout.rootDir, 'model'),
+    };
+  }
   if (runtimeKey === 'gmic') {
+    // P1-6: gmic.eu 官方只发布 Windows CLI zip；非 Windows 一键安装会装进 PE 二进制导致自检失败，直接给出可读指引
+    const gmicSupport = gmicManagedInstallSupport();
+    if (!gmicSupport.supported) {
+      throw new Error(`gmic-managed-install-unsupported:${process.platform}。${gmicSupport.hint}`);
+    }
     const asset = await resolveLatestGmicInstallAsset();
     return {
       runtimeKey,
@@ -9239,6 +6615,16 @@ async function resolveInstallableRuntimeAsset(runtimeKey) {
       configAsset,
     };
   }
+  if (runtimeKey === 'ytdlp') {
+    const asset = await resolveLatestYtDlpInstallAsset();
+    return {
+      runtimeKey,
+      runtimeName: LOCAL_POST_RUNTIME_GUIDES.ytdlp.runtimeName,
+      sourceLabel: LOCAL_POST_INSTALLABLE_RUNTIMES.ytdlp.sourceLabel,
+      archiveType: 'raw',
+      ...asset,
+    };
+  }
   throw new Error(`unsupported-runtime:${runtimeKey}`);
 }
 
@@ -9270,6 +6656,40 @@ async function verifyManagedRuntimeInstall(runtimeKey, details = {}) {
       configPath: String(details.configPath || '').trim(),
     };
   }
+  if (runtimeKey === 'ytdlp') {
+    const version = await detectInstalledRuntimeVersion(String(details.executablePath || ''), [{ args: ['--version'] }]);
+    return {
+      ok: Boolean(version?.ok),
+      installedVersion: String(version?.version || '').trim(),
+      probe: version,
+      configPath: '',
+    };
+  }
+  if (runtimeKey === 'florence2') {
+    const entry = getManagedRuntimeManifestEntry('florence2');
+    const runtimePath = entry?.runtimePath || String(details.executablePath || '');
+    const pythonPath = entry?.pythonPath || detectManagedLocalPostFlorence2Python();
+    const modelDir = entry?.hfHome || '';
+    let ok = Boolean(runtimePath) && existsSync(runtimePath);
+    let probe = null;
+    if (ok) {
+      try {
+        probe = await runViaShell(pythonPath || 'python3', [
+          '-c',
+          'import torch, transformers; print("ok")',
+        ], { cwd: path.dirname(runtimePath), timeoutMs: 60 * 1000 });
+        ok = probe.exitCode === 0;
+      } catch (_) {
+        ok = false;
+      }
+    }
+    return {
+      ok,
+      installedVersion: String(entry?.version || '').trim(),
+      probe,
+      configPath: modelDir,
+    };
+  }
   return {
     ok: false,
     installedVersion: '',
@@ -9278,12 +6698,164 @@ async function verifyManagedRuntimeInstall(runtimeKey, details = {}) {
   };
 }
 
+async function findSystemPython() {
+  for (const candidate of ['python3', 'python', 'py']) {
+    try {
+      const probe = candidate === 'py' ? ['-3', '--version'] : ['--version'];
+      const res = await runViaShell(candidate, probe, { cwd: process.cwd() });
+      if (res.exitCode === 0) return candidate;
+    } catch (_) {}
+  }
+  return '';
+}
+
+async function installFlorence2Runtime(runtimeKey, layout, asset, job, runtimeMeta) {
+  const rootDir = layout.rootDir;
+  const backendDir = asset.backendDir || path.join(rootDir, 'backend');
+  const modelDir = asset.modelDir || path.join(rootDir, 'model');
+  const venvDir = path.join(rootDir, 'venv');
+  await fs.mkdir(backendDir, { recursive: true });
+  await fs.mkdir(modelDir, { recursive: true });
+
+  // 1) 定位系统 Python
+  updateRuntimeInstallJob(job, { stage: 'resolve', progress: 12, message: '正在定位 Python 运行时' });
+  const pyCmd = await findSystemPython();
+  if (!pyCmd) {
+    throw new Error('未检测到 Python，请先安装 Python 3.10+ 并加入 PATH 后重试');
+  }
+
+  const isWin = buildPlatformInfo().isWindows;
+  const venvPython = path.join(venvDir, isWin ? 'Scripts/python.exe' : 'bin/python');
+  const venvPip = path.join(venvDir, isWin ? 'Scripts/pip.exe' : 'bin/pip');
+
+  // 2) 复用已存在的 venv（断点续传：上次中断若已装好 torch/transformers，跳过重复下载约 1GB）
+  const venvAlreadyReady = existsSync(venvPython)
+    && await runViaShell(venvPython, ['-c', 'import torch, transformers, einops, timm; print(1)'], { cwd: rootDir, timeoutMs: 120000 })
+      .then((r) => r.exitCode === 0).catch(() => false);
+
+  if (venvAlreadyReady) {
+    updateRuntimeInstallJob(job, { stage: 'prepare', progress: 50, message: '检测到已安装依赖，跳过重复下载（约 1GB）' });
+  } else {
+    updateRuntimeInstallJob(job, { stage: 'prepare', progress: 16, message: '正在创建 Python 虚拟环境' });
+    await runViaShell(pyCmd, ['-m', 'venv', venvDir], { cwd: rootDir, timeoutMs: LOCAL_POST_INSTALL_STEP_TIMEOUT_MS });
+
+    // 3) 安装 PyTorch(CPU) / Transformers / Pillow / huggingface_hub（固定已知良好版本，确保「最新稳定」）
+    //    国内网络用清华镜像，避免 PyPI / PyTorch 官方源超时或被墙。
+    const pipIndex = process.env.HMDAO_PIP_INDEX || 'https://pypi.tuna.tsinghua.edu.cn/simple';
+    // 注意：清华/中科大等 PyTorch 镜像未同步 cp313/cp314 的 torch 轮子，必须走官方 CPU 索引（国内可达）。
+    const torchIndex = process.env.HMDAO_TORCH_INDEX || 'https://download.pytorch.org/whl/cpu';
+    updateRuntimeInstallJob(job, { stage: 'dependencies', progress: 24, message: '正在安装 PyTorch / Transformers 依赖（约 1GB，请耐心等待）' });
+    await runViaShell(venvPip, ['install', '--upgrade', 'pip', '-i', pipIndex], { cwd: rootDir, timeoutMs: LOCAL_POST_INSTALL_STEP_TIMEOUT_MS });
+    await runViaShell(venvPip, [
+      'install',
+      'torch==2.9.0',
+      'torchvision==0.24.0',
+      '--index-url', torchIndex,
+    ], { cwd: rootDir, timeoutMs: LOCAL_POST_INSTALL_STEP_TIMEOUT_MS });
+    await runViaShell(venvPip, [
+      'install',
+      'transformers==4.51.3',
+      'Pillow==11.3.0',
+      'huggingface_hub==0.30.2',
+      'numpy==1.26.4',
+      // Florence-2 的 trust_remote_code 模型代码（modeling_florence2.py）运行时依赖 einops/timm，
+      // 缺少会在推理阶段报 ImportError，必须随安装一并装好。
+      'einops==0.8.2',
+      'timm==1.0.28',
+      '-i', pipIndex,
+    ], { cwd: rootDir, timeoutMs: LOCAL_POST_INSTALL_STEP_TIMEOUT_MS });
+  }
+
+  // 4) 放置 Florence-2 推理脚本（仓库内自带，无需下载）
+  updateRuntimeInstallJob(job, { stage: 'prepare', progress: 48, message: '正在部署 Florence-2 推理脚本' });
+  const repoBackend = path.join(APP_DIR, 'server');
+  for (const f of ['local_image_example_florence2.py', 'local_image_runtime_examples.py']) {
+    const src = path.join(repoBackend, f);
+    if (existsSync(src)) {
+      await fs.copyFile(src, path.join(backendDir, f));
+    }
+  }
+  const runtimePyPath = path.join(backendDir, 'local_image_example_florence2.py');
+
+  // 5) 预下载 Florence-2-large 权重到独立模型目录（HF_ENDPOINT 走国内镜像，避免 huggingface.co 被墙）
+  //    注意：huggingface_hub>=0.26 已移除 `python -m huggingface_hub snapshot_download` 与 --local-dir-use-symlinks，
+  //    改用 `huggingface-cli download`（venv 内的可执行脚本）。
+  updateRuntimeInstallJob(job, { stage: 'download', progress: 54, message: '正在下载 Florence-2-large 权重（约 2.3GB，国内走 hf-mirror 镜像）' });
+  const hfEndpoint = process.env.HMDAO_HF_ENDPOINT || 'https://hf-mirror.com';
+  const hfCli = path.join(venvDir, isWin ? 'Scripts/huggingface-cli.exe' : 'bin/huggingface-cli');
+  const dl = await runViaShell(hfCli, [
+    'download',
+    'microsoft/Florence-2-large',
+    '--local-dir', modelDir,
+  ], {
+    cwd: rootDir,
+    timeoutMs: LOCAL_POST_INSTALL_STEP_TIMEOUT_MS,
+    extraEnv: {
+      HF_ENDPOINT: hfEndpoint,
+      HF_HOME: modelDir,
+      HF_HUB_DISABLE_PROGRESS_BARS: '1',
+      HF_HUB_ENABLE_HF_TRANSFER: '0',
+    },
+  });
+  if (!dl.ok || dl.exitCode !== 0) {
+    throw new Error('Florence-2 权重下载失败：' + (dl.stderr || dl.stdout || 'unknown').toString().slice(0, 500));
+  }
+
+  // 6) 自检：venv 内能否 import transformers / torch
+  updateRuntimeInstallJob(job, { stage: 'integrity', progress: 86, message: '正在校验 Florence-2 运行环境' });
+  await verifyFlorence2Runtime(runtimePyPath, venvPython, modelDir);
+
+  // 7) 写入托管清单 + 当前进程环境变量，确保立即可用且重启后自动恢复
+  updateRuntimeInstallJob(job, { stage: 'finalize', progress: 94, message: '正在写入运行时配置' });
+  persistManagedRuntimeManifestEntry('florence2', {
+    runtimeKey: 'florence2',
+    runtimeName: runtimeMeta.runtimeName,
+    runtimePath: runtimePyPath,
+    pythonPath: venvPython,
+    hfHome: modelDir,
+    version: String(asset.version || '').trim(),
+    installedAt: new Date().toISOString(),
+  });
+  process.env.HMDAO_FLORENCE2_PATH = runtimePyPath;
+  process.env.HMDAO_FLORENCE2_PYTHON = venvPython;
+  process.env.HMDAO_FLORENCE2_HF_HOME = modelDir;
+  // 推理脚本用本地目录直接 from_pretrained，避免再去 Hugging Face 拉取（离线必中）
+  process.env.HMDAO_FLORENCE2_MODEL = modelDir;
+  applyManagedFlorence2Env();
+
+  updateRuntimeInstallJob(job, {
+    stage: 'done',
+    progress: 100,
+    status: 'done',
+    installedVersion: String(asset.version || '').trim(),
+    message: 'Florence-2 已安装完成，图片/视频分析将使用真实模型输出。',
+  });
+  return { installedVersion: String(asset.version || '').trim() };
+}
+
+async function verifyFlorence2Runtime(runtimePyPath, venvPython, modelDir) {
+  if (!existsSync(runtimePyPath)) {
+    throw new Error('Florence-2 推理脚本缺失，安装未完成');
+  }
+  const probe = await runViaShell(venvPython, [
+    '-c',
+    'import torch, transformers, huggingface_hub, einops, timm; import importlib.metadata as m; '
+    + 'print("OK", m.version("transformers"), m.version("torch"))',
+  ], { cwd: path.dirname(runtimePyPath), timeoutMs: 2 * 60 * 1000 }).catch((error) => ({ exitCode: 1, stderr: String(error) }));
+  if (probe.exitCode !== 0) {
+    throw new Error(`Florence-2 依赖校验失败: ${trimDiagnosticText(probe.stderr || '', 200)}`);
+  }
+  if (!existsSync(modelDir) || (await fs.readdir(modelDir)).length === 0) {
+    throw new Error('Florence-2 模型权重目录为空，下载可能未成功');
+  }
+}
+
 async function installManagedLocalPostRuntime(runtimeKey, job) {
   const runtimeMeta = LOCAL_POST_INSTALLABLE_RUNTIMES[runtimeKey];
   if (!runtimeMeta) {
     throw new Error(`unsupported-runtime:${runtimeKey}`);
   }
-  const layout = buildManagedRuntimePaths(runtimeKey);
+  const layout = buildManagedRuntimePaths(runtimeKey, job.targetDir);
   await fs.mkdir(layout.downloadDir, { recursive: true });
   await fs.mkdir(layout.rootDir, { recursive: true });
   await fs.rm(layout.stagingDir, { recursive: true, force: true }).catch(() => {});
@@ -9304,6 +6876,26 @@ async function installManagedLocalPostRuntime(runtimeKey, job) {
     downloadUrl: String(asset.downloadUrl || '').trim(),
   });
 
+  // P3-4: 下载前校验目标盘剩余空间，避免下载/解压中途因空间不足失败（半截文件难清理）。
+  const MB = 1024 * 1024;
+  const GB = 1024 * MB;
+  const archiveBytes = Number(asset.expectedSize) || 0;
+  const configBytes = Number(asset.configAsset?.expectedSize) || 0;
+  // 峰值占用 ≈ 下载包 + 解压展开(约 3x 体积) + 配置包；来源未知体积时给 2GB 安全下限，不盲填磁盘。
+  const requiredBytes = (archiveBytes > 0 || configBytes > 0)
+    ? Math.ceil((archiveBytes + configBytes) * 4) + 256 * MB
+    : 2 * GB;
+  const disk = await assertEnoughDiskSpace(layout.rootDir, requiredBytes, { label: runtimeMeta.runtimeName });
+  updateRuntimeInstallJob(job, {
+    freeSpaceBytes: disk.freeBytes,
+    requiredSpaceBytes: requiredBytes,
+  });
+
+  // Florence-2：不走「下载预编译包」路径，而是创建 Python 虚拟环境 + 安装依赖 + 下载模型权重
+  if (asset.archiveType === 'ml-model') {
+    return await installFlorence2Runtime(runtimeKey, layout, asset, job, runtimeMeta);
+  }
+
   const archivePath = path.join(layout.downloadDir, asset.fileName);
   updateRuntimeInstallJob(job, {
     stage: 'download',
@@ -9318,17 +6910,42 @@ async function installManagedLocalPostRuntime(runtimeKey, job) {
     });
   });
 
+  // P3-8: 下载完毕即做完整性校验（hash/size）。损坏/被截断的安装包在解压与版本切换前被拦截，避免装进半成品。
+  updateRuntimeInstallJob(job, {
+    stage: 'integrity',
+    progress: 52,
+    message: '正在校验安装包完整性',
+  });
+  await verifyDownloadIntegrity(archivePath, {
+    expectedSha256: asset.expectedSha256 || null,
+    expectedSize: asset.expectedSize || null,
+  });
+
   updateRuntimeInstallJob(job, {
     stage: 'extract',
     progress: 55,
-    message: '正在解压运行时',
+    message: asset.archiveType === 'raw' ? '正在准备运行时' : '正在解压运行时',
   });
-  await extractZipArchiveToDirectory(archivePath, layout.stagingDir);
+  if (asset.archiveType === 'raw') {
+    // 裸二进制：按平台落地文件名（Windows=yt-dlp.exe / 类 Unix=yt-dlp）
+    const targetExe = path.join(layout.stagingDir, asset.fileName || 'yt-dlp');
+    await fs.mkdir(layout.stagingDir, { recursive: true });
+    await fs.copyFile(archivePath, targetExe);
+  } else {
+    await extractZipArchiveToDirectory(archivePath, layout.stagingDir);
+  }
+
+  // P1-3: 类 Unix 平台为可执行文件补 +x 权限（下载的裸二进制 / 解压后丢失权限位）
+  const ensureUnixExecutable = async (execPath) => {
+    if (!execPath || buildPlatformInfo().isWindows) return;
+    try { await fs.chmod(execPath, 0o755); } catch { /* best-effort */ }
+  };
 
   let manifestEntry = null;
   if (runtimeKey === 'gmic') {
-    const executablePath = findFileRecursively(layout.stagingDir, 'gmic.exe');
+    const executablePath = findFileRecursively(layout.stagingDir, platformExecutableCandidates('gmic'));
     if (!executablePath) throw new Error('gmic-executable-missing-after-extract');
+    await ensureUnixExecutable(executablePath);
     manifestEntry = {
       runtimeKey,
       runtimeName: runtimeMeta.runtimeName,
@@ -9340,8 +6957,9 @@ async function installManagedLocalPostRuntime(runtimeKey, job) {
       downloadUrl: asset.downloadUrl,
     };
   } else if (runtimeKey === 'oiio') {
-    const executablePath = findFileRecursively(layout.stagingDir, 'oiiotool.exe');
+    const executablePath = findFileRecursively(layout.stagingDir, platformExecutableCandidates('oiiotool'));
     if (!executablePath) throw new Error('oiio-executable-missing-after-extract');
+    await ensureUnixExecutable(executablePath);
     manifestEntry = {
       runtimeKey,
       runtimeName: runtimeMeta.runtimeName,
@@ -9353,8 +6971,9 @@ async function installManagedLocalPostRuntime(runtimeKey, job) {
       downloadUrl: asset.downloadUrl,
     };
   } else if (runtimeKey === 'ocio') {
-    const runtimePath = findFileRecursively(layout.stagingDir, 'ocioconvert.exe');
+    const runtimePath = findFileRecursively(layout.stagingDir, platformExecutableCandidates('ocioconvert'));
     if (!runtimePath) throw new Error('ocio-executable-missing-after-extract');
+    await ensureUnixExecutable(runtimePath);
     const configDir = path.join(layout.rootDir, 'configs');
     const configAsset = asset.configAsset || null;
     if (!configAsset?.downloadUrl) throw new Error('ocio-config-download-missing');
@@ -9372,6 +6991,11 @@ async function installManagedLocalPostRuntime(runtimeKey, job) {
         message: percent > 0 ? `正在下载官方 ACES 配置 ${percent}%` : '正在下载官方 ACES 配置',
       });
     });
+    // P3-8: OCIO 配置包同样校验完整性（GitHub release 自带 sha256/size）
+    await verifyDownloadIntegrity(configPath, {
+      expectedSha256: configAsset.expectedSha256 || null,
+      expectedSize: configAsset.expectedSize || null,
+    });
     manifestEntry = {
       runtimeKey,
       runtimeName: runtimeMeta.runtimeName,
@@ -9386,6 +7010,25 @@ async function installManagedLocalPostRuntime(runtimeKey, job) {
       releaseUrl: asset.releaseUrl,
       downloadUrl: asset.downloadUrl,
     };
+  } else if (runtimeKey === 'ytdlp') {
+    const executablePath = findFileRecursively(layout.stagingDir, platformExecutableCandidates('yt-dlp'));
+    if (!executablePath) throw new Error('ytdlp-executable-missing-after-prepare');
+    await ensureUnixExecutable(executablePath);
+    manifestEntry = {
+      runtimeKey,
+      runtimeName: runtimeMeta.runtimeName,
+      sourceLabel: asset.sourceLabel,
+      version: asset.version,
+      executablePath: path.resolve(layout.currentDir, path.relative(layout.stagingDir, executablePath)),
+      installedAt: new Date().toISOString(),
+      releaseUrl: asset.releaseUrl,
+      downloadUrl: asset.downloadUrl,
+    };
+  }
+
+  // 记录安装根目录（含自定义目录，兼容中文路径）：更新/卸载时据此定位原位置
+  if (manifestEntry) {
+    manifestEntry.rootDir = layout.rootDir;
   }
 
   updateRuntimeInstallJob(job, {
@@ -9393,6 +7036,27 @@ async function installManagedLocalPostRuntime(runtimeKey, job) {
     progress: 86,
     message: '正在切换到新版本',
   });
+  // P3-9 支撑：把当前版本清单写入 staging，使其随 current 一并进入 .bak 备份，
+  // 回滚时即可据此精确恢复 manifest 条目（版本号、可执行路径、rootDir 等）。
+  if (manifestEntry) {
+    await fs.writeFile(
+      path.join(layout.stagingDir, '.hmdao-runtime-meta.json'),
+      JSON.stringify({
+        runtimeKey: manifestEntry.runtimeKey,
+        runtimeName: manifestEntry.runtimeName,
+        installedVersion: manifestEntry.version,
+        sourceLabel: manifestEntry.sourceLabel,
+        downloadUrl: manifestEntry.downloadUrl,
+        releaseUrl: manifestEntry.releaseUrl,
+        rootDir: manifestEntry.rootDir,
+        executablePath: manifestEntry.executablePath,
+        configPath: manifestEntry.configPath || '',
+        configVersion: manifestEntry.configVersion || '',
+        installedAt: manifestEntry.installedAt,
+      }, null, 2),
+    );
+  }
+
   await replaceDirectoryContents(layout.currentDir, layout.stagingDir);
   await persistManagedRuntimeManifestEntry(runtimeKey, manifestEntry);
   clearLocalPostRuntimeDetectionCache();
@@ -9419,13 +7083,48 @@ async function installManagedLocalPostRuntime(runtimeKey, job) {
   });
 }
 
-async function startRuntimeInstallJob(runtimeKey, { requestedAction = 'install' } = {}) {
+// P3-11：全局串行安装队列（来自独立轻量模块，便于单测）。
+import {
+  enqueueManagedRuntimeInstall,
+  isJobStillQueued,
+  configureRuntimeInstallQueue,
+} from './runtime-install-queue.mjs';
+
+async function startRuntimeInstallJob(runtimeKey, { requestedAction = 'install', targetDir = '' } = {}) {
   const normalizedKey = String(runtimeKey || '').trim();
   if (!LOCAL_POST_INSTALLABLE_RUNTIMES[normalizedKey]) {
     throw new Error(`unsupported-runtime:${normalizedKey}`);
   }
+  // 校验自定义安装目录：仅允许绝对路径，且禁止写入系统/源目录
+  let safeTargetDir = '';
+  if (targetDir && String(targetDir).trim()) {
+    const resolved = path.resolve(String(targetDir).trim());
+    if (!path.isAbsolute(resolved)) {
+      throw new Error('target-dir-must-be-absolute');
+    }
+    // P1-6: 按平台防护系统目录（Windows / macOS / Linux），并始终禁止写入应用自身目录
+    if (isForbiddenInstallTarget(resolved, buildPlatformInfo(), [path.resolve(APP_DIR)])) {
+      throw new Error('target-dir-not-allowed');
+    }
+    safeTargetDir = resolved;
+  }
+  // 更新时未显式传目录 → 复用上次安装的自定义目录（保持用户统一管理位置，含中文路径）
+  if (!safeTargetDir) {
+    const priorRootDir = String(getManagedRuntimeManifestEntry(normalizedKey)?.rootDir || '').trim();
+    if (priorRootDir && path.isAbsolute(priorRootDir)) {
+      safeTargetDir = path.resolve(priorRootDir);
+    }
+  }
   const existing = getLatestRuntimeInstallJob(normalizedKey);
-  if (existing && (existing.status === 'pending' || existing.status === 'running')) {
+  // 防止「卡在 pending 的旧任务」永久阻塞一键安装：超过 60s 未推进的旧任务视为失效，允许重触发。
+  const STALE_JOB_MS = 60 * 1000;
+  const isStaleJob = (job) => {
+    if (!job) return false;
+    if (job.status !== 'pending' && job.status !== 'running') return false;
+    const startedAt = Number(job.startedAt || job.updatedAt || 0);
+    return Date.now() - startedAt > STALE_JOB_MS;
+  };
+  if (existing && (existing.status === 'pending' || existing.status === 'running') && !isStaleJob(existing)) {
     return existing;
   }
   const runtimeMeta = LOCAL_POST_INSTALLABLE_RUNTIMES[normalizedKey];
@@ -9434,6 +7133,7 @@ async function startRuntimeInstallJob(runtimeKey, { requestedAction = 'install' 
     runtimeKey: normalizedKey,
     runtimeName: runtimeMeta.runtimeName,
     requestedAction,
+    targetDir: safeTargetDir,
     status: 'pending',
     stage: 'queued',
     progress: 0,
@@ -9451,7 +7151,11 @@ async function startRuntimeInstallJob(runtimeKey, { requestedAction = 'install' 
     completedAt: 0,
   };
   updateRuntimeInstallJob(job);
-  queueMicrotask(async () => {
+  let settled = false;
+  const runInstall = async () => {
+    if (settled) return;
+    settled = true;
+    job.started = true;
     try {
       await installManagedLocalPostRuntime(normalizedKey, job);
     } catch (error) {
@@ -9465,176 +7169,38 @@ async function startRuntimeInstallJob(runtimeKey, { requestedAction = 'install' 
       });
       await fs.rm(buildManagedRuntimePaths(normalizedKey).stagingDir, { recursive: true, force: true }).catch(() => {});
     }
-  });
+  };
+  // P3-11：入队串行启动。runInstall 内部已 try/catch，故不会向外抛，队列会安全地推进下一个任务。
+  enqueueManagedRuntimeInstall(runInstall, job);
+  // watchdog：仅当任务既未启动、也不在队列中（疑似队列丢失）时才判定失败，
+  // 避免排队等待中的任务被误杀（前一个安装可能耗时 >15s）。
+  setTimeout(() => {
+    if (job.status === 'pending' && !job.started && !isJobStillQueued(job)) {
+      updateRuntimeInstallJob(job, {
+        status: 'failed',
+        stage: 'failed',
+        progress: Math.max(1, Number(job.progress || 0)),
+        error: 'install-job-did-not-start',
+        message: '安装任务未能启动，请重试',
+        completedAt: Date.now(),
+      });
+    }
+  }, 15000).unref?.();
   return job;
 }
 
-function trimDiagnosticText(value, maxLength = 220) {
-  const normalized = String(value || '').replace(/\s+/g, ' ').trim();
-  if (!normalized) return '';
-  return normalized.length <= maxLength ? normalized : normalized.slice(0, maxLength - 1) + '...';
-}
+// P1-11：以下 7 个函数已抽取至 lib/runtime-version-utils.mjs。
+import {
+  compareVersionStrings,
+  detectInstalledRuntimeVersion,
+  detectOcioRuntimeInstallation,
+  firstSemverToken,
+  runLocalPostDiagnosticCommand,
+  trimDiagnosticText,
+} from './lib/runtime-version-utils.mjs';
 
-function firstSemverToken(value) {
-  const matched = String(value || '').match(/\bv?\d+(?:\.\d+){1,4}(?:[-+._][0-9A-Za-z.-]+)?\b/);
-  return matched ? matched[0].replace(/^v/i, '') : '';
-}
-
-function versionParts(value) {
-  return String(value || '')
-    .replace(/^v/i, '')
-    .split(/[^0-9A-Za-z]+/)
-    .filter(Boolean)
-    .map((part) => (/^\d+$/.test(part) ? Number(part) : part.toLowerCase()));
-}
-
-function compareVersionStrings(left, right) {
-  const leftParts = versionParts(left);
-  const rightParts = versionParts(right);
-  const maxLength = Math.max(leftParts.length, rightParts.length);
-  for (let index = 0; index < maxLength; index += 1) {
-    const a = leftParts[index];
-    const b = rightParts[index];
-    if (a === undefined && b === undefined) return 0;
-    if (a === undefined) return -1;
-    if (b === undefined) return 1;
-    if (typeof a === 'number' && typeof b === 'number') {
-      if (a > b) return 1;
-      if (a < b) return -1;
-      continue;
-    }
-    const nextA = String(a);
-    const nextB = String(b);
-    if (nextA > nextB) return 1;
-    if (nextA < nextB) return -1;
-  }
-  return 0;
-}
-
-async function runLocalPostDiagnosticCommand(command, args = [], {
-  cwd = APP_DIR,
-  extraEnv = {},
-  timeoutMs = LOCAL_POST_SELF_CHECK_TIMEOUT_MS,
-} = {}) {
-  return await new Promise((resolve) => {
-    const stdout = [];
-    const stderr = [];
-    let finished = false;
-    const startedAt = Date.now();
-    const child = spawn(command, args, {
-      cwd,
-      shell: false,
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        ...extraEnv,
-      },
-    });
-    const timer = setTimeout(() => {
-      if (finished) return;
-      finished = true;
-      child.kill('SIGTERM');
-      resolve({
-        ok: false,
-        timedOut: true,
-        exitCode: null,
-        stdout: trimDiagnosticText(Buffer.concat(stdout).toString('utf8'), 600),
-        stderr: trimDiagnosticText(Buffer.concat(stderr).toString('utf8'), 600),
-        elapsedMs: Date.now() - startedAt,
-      });
-    }, timeoutMs);
-
-    child.stdout.on('data', (chunk) => stdout.push(Buffer.from(chunk)));
-    child.stderr.on('data', (chunk) => stderr.push(Buffer.from(chunk)));
-    child.on('error', (error) => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      resolve({
-        ok: false,
-        timedOut: false,
-        exitCode: null,
-        stdout: trimDiagnosticText(Buffer.concat(stdout).toString('utf8'), 600),
-        stderr: trimDiagnosticText(error instanceof Error ? error.message : String(error), 600),
-        elapsedMs: Date.now() - startedAt,
-      });
-    });
-    child.on('close', (code) => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      resolve({
-        ok: code === 0,
-        timedOut: false,
-        exitCode: code,
-        stdout: trimDiagnosticText(Buffer.concat(stdout).toString('utf8'), 600),
-        stderr: trimDiagnosticText(Buffer.concat(stderr).toString('utf8'), 600),
-        elapsedMs: Date.now() - startedAt,
-      });
-    });
-  });
-}
-
-async function detectInstalledRuntimeVersion(runtimePath, attempts = []) {
-  for (const attempt of attempts) {
-    const probe = await runLocalPostDiagnosticCommand(runtimePath, attempt.args, {
-      cwd: path.dirname(runtimePath),
-      extraEnv: attempt.extraEnv || {},
-    });
-    const combined = `${probe.stdout}\n${probe.stderr}`.trim();
-    const version = firstSemverToken(combined);
-    if (probe.ok || version) {
-      return {
-        ok: probe.ok,
-        version,
-        probe,
-        commandArgs: attempt.args,
-      };
-    }
-  }
-  return {
-    ok: false,
-    version: '',
-    probe: {
-      ok: false,
-      timedOut: false,
-      exitCode: null,
-      stdout: '',
-      stderr: '',
-      elapsedMs: 0,
-    },
-    commandArgs: [],
-  };
-}
-
-async function detectOcioRuntimeInstallation(runtimePath) {
-  const normalizedPath = String(runtimePath || '').trim();
-  if (!normalizedPath) {
-    return {
-      ok: false,
-      version: '',
-      probe: null,
-      commandArgs: [],
-    };
-  }
-  const probe = await runLocalPostDiagnosticCommand(normalizedPath, ['--help'], {
-    cwd: path.dirname(normalizedPath),
-  });
-  const combinedOutput = `${String(probe?.stdout || '')}\n${String(probe?.stderr || '')}`;
-  const managedVersion = String(getManagedRuntimeManifestEntry('ocio')?.version || '').trim();
-  const version = managedVersion || firstSemverToken(combinedOutput);
-  const ok = /ocioconvert -- apply colorspace transform to an image/i.test(combinedOutput);
-  return {
-    ok,
-    version,
-    probe: {
-      ...probe,
-      ok,
-    },
-    commandArgs: ['--help'],
-  };
-}
+// 安装流程复用底层诊断执行器（签名一致：command, args, { cwd, extraEnv, timeoutMs }）。
+const runViaShell = runLocalPostDiagnosticCommand;
 
 const LOCAL_POST_LATEST_VERSION_SOURCES = {
   ocio: {
@@ -9652,6 +7218,17 @@ const LOCAL_POST_LATEST_VERSION_SOURCES = {
       /Latest stable version[^0-9]*([0-9]+(?:\.[0-9]+){1,4})/i,
       /G'MIC[^0-9]*([0-9]+(?:\\.[0-9]+){1,4})/i,
     ],
+  },
+  ytdlp: {
+    sourceLabel: 'GitHub Releases',
+    apiUrl: 'https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest',
+  },
+  florence2: {
+    // Florence-2 没有传统「发布版本号」，这里跟踪 Hugging Face 模型仓库的最新 commit，
+    // 同时固定 PyTorch / Transformers 的已知良好版本，确保「一键安装」拿到的是最新稳定组合。
+    sourceLabel: 'Hugging Face / PyPI',
+    apiUrl: 'https://huggingface.co/api/models/microsoft/Florence-2-large',
+    pinnedVersion: 'Florence-2-large · torch 2.9.0(CPU) · transformers 4.51.3 · Python 3.14 兼容',
   },
 };
 
@@ -9694,7 +7271,11 @@ async function fetchLatestLocalPostRuntimeVersion(key, { force = false } = {}) {
       }
       const payload = await response.json().catch(() => null);
       result.latestVersion = firstSemverToken(payload?.tag_name || payload?.name || '');
-      result.releaseUrl = String(payload?.html_url || '').trim();
+      result.releaseUrl = String(payload?.html_url || source.docsUrl || '').trim();
+      if (!result.latestVersion && source.pinnedVersion) {
+        // Florence-2 等无语义化版本号的特殊运行时：使用固定已知良好版本组合
+        result.latestVersion = String(source.pinnedVersion || '').trim();
+      }
       if (!result.latestVersion) {
         throw new Error('latest-version-not-found');
       }
@@ -9778,12 +7359,24 @@ async function buildLocalPostDoctorReport({ forceRelease = false } = {}) {
   const resolvedOiioBackend = resolveLocalPostOiioBackend({ ocioExecutionMode: 'auto' }, 'image', '');
   const resolvedGmicBackend = resolveLocalPostGmicBackend();
   const ocioConfigPath = String(resolvedOiioBackend.detectedConfigPath || detectLocalPostOiioConfigPath()).trim();
+  // ★ 复用 resolveYtDlpPath：它已包含「托管运行时目录 + 固定路径 + 系统 PATH」的完整回退，
+  // 因此用户自己在 PATH 里安装的 yt-dlp 也能被模型下载面板与扩展侧栏识别到（此前 doctor 报告
+  // 只用 detectManagedLocalPostYtDlpPath，只查托管目录，导致自装 yt-dlp 永远显示「未安装」）。
+  // resolveYtDlpPath 在都找不到时会兜底返回首个固定路径（可能不存在），此处做存在性校验避免误报。
+  let ytDlpDetectedPath = String(resolveYtDlpPath() || detectManagedLocalPostYtDlpPath() || '').trim();
+  if (ytDlpDetectedPath) {
+    try { require('fs').accessSync(ytDlpDetectedPath, require('fs').constants.X_OK); }
+    catch (_) { ytDlpDetectedPath = ''; }
+  }
+  const florence2DetectedPath = String(detectManagedLocalPostFlorence2Path() || '').trim();
+  const florence2Python = String(detectManagedLocalPostFlorence2Python() || '').trim();
+  const florence2Entry = getManagedRuntimeManifestEntry('florence2') || {};
 
   const gmicDetectedPath = String(resolvedGmicBackend.detectedPath || '').trim();
   const oiioDetectedPath = String(resolvedOiioBackend.detectedPath || '').trim();
   const ocioRuntimePath = String(detectLocalPostOcioRuntimePath() || resolvedOcioBackend.detectedPath || '').trim();
 
-  const [gmicVersion, oiioVersion, ocioVersion] = await Promise.all([
+  const [gmicVersion, oiioVersion, ocioVersion, ytDlpVersion, florence2Version] = await Promise.all([
     gmicDetectedPath
       ? detectInstalledRuntimeVersion(gmicDetectedPath, [{ args: ['version'] }, { args: ['--version'] }, { args: ['-version'] }])
       : Promise.resolve(null),
@@ -9792,6 +7385,14 @@ async function buildLocalPostDoctorReport({ forceRelease = false } = {}) {
       : Promise.resolve(null),
     ocioRuntimePath
       ? detectOcioRuntimeInstallation(ocioRuntimePath)
+      : Promise.resolve(null),
+    ytDlpDetectedPath
+      ? detectInstalledRuntimeVersion(ytDlpDetectedPath, [{ args: ['--version'] }])
+      : Promise.resolve(null),
+    florence2DetectedPath && florence2Python
+      ? runViaShell(florence2Python, ['-c', 'import torch, transformers; print("ok")'], { cwd: path.dirname(florence2DetectedPath) })
+          .then((r) => ({ ok: r.exitCode === 0, version: String(florence2Entry.version || '').trim() }))
+          .catch(() => ({ ok: false, version: '' }))
       : Promise.resolve(null),
   ]);
 
@@ -9805,10 +7406,12 @@ async function buildLocalPostDoctorReport({ forceRelease = false } = {}) {
     })
     : null;
 
-  const [gmicUpdate, oiioUpdate, ocioUpdate] = await Promise.all([
+  const [gmicUpdate, oiioUpdate, ocioUpdate, ytDlpUpdate, florence2Update] = await Promise.all([
     buildRuntimeUpdateStatus('gmic', gmicVersion?.version || '', { force: forceRelease }),
     buildRuntimeUpdateStatus('oiio', oiioVersion?.version || '', { force: forceRelease }),
     buildRuntimeUpdateStatus('ocio', ocioVersion?.version || '', { force: forceRelease }),
+    buildRuntimeUpdateStatus('ytdlp', ytDlpVersion?.version || '', { force: forceRelease }),
+    buildRuntimeUpdateStatus('florence2', florence2Version?.version || '', { force: forceRelease }),
   ]);
 
   return {
@@ -9935,114 +7538,60 @@ async function buildLocalPostDoctorReport({ forceRelease = false } = {}) {
           : ['先安装 OpenColorIO Runtime，再点"一键自检"'],
         update: ocioUpdate,
       },
+      ytdlp: {
+        runtimeKey: 'ytdlp',
+        runtimeName: LOCAL_POST_RUNTIME_GUIDES.ytdlp.runtimeName,
+        status: ytDlpDetectedPath
+          ? ytDlpVersion?.ok
+            ? 'ok'
+            : 'error'
+          : 'error',
+        summary: ytDlpDetectedPath
+          ? ytDlpVersion?.ok
+            ? 'yt-dlp.exe passed the --version self-check.'
+            : 'yt-dlp.exe was found, but self-check failed.'
+          : 'yt-dlp.exe was not detected.',
+        detectedPath: ytDlpDetectedPath,
+        executableVerified: Boolean(ytDlpVersion?.ok),
+        installedVersion: String(ytDlpVersion?.version || '').trim(),
+        checkedCommand: ytDlpVersion?.commandArgs || [],
+        stdout: ytDlpVersion?.probe?.stdout || '',
+        stderr: ytDlpVersion?.probe?.stderr || '',
+        elapsedMs: Number(ytDlpVersion?.probe?.elapsedMs || 0),
+        suggestions: ytDlpDetectedPath
+          ? ytDlpVersion?.ok
+            ? ['扩展采集 YouTube 直链已可用，如刚升级版本可点"刷新运行时"']
+            : ['确认 yt-dlp.exe 可在命令行直接执行', '如在受限网络，可手动下载后写入 HMDAO_YT_DLP_PATH']
+          : ['在「模型下载」面板的运行时卡片中点「一键安装 yt-dlp」', '或从 GitHub 手动下载 yt-dlp.exe 并放到本地运行时目录'],
+        update: ytDlpUpdate,
+      },
+      florence2: {
+        runtimeKey: 'florence2',
+        runtimeName: LOCAL_POST_RUNTIME_GUIDES.florence2.runtimeName,
+        status: florence2DetectedPath
+          ? florence2Version?.ok
+            ? 'ok'
+            : 'error'
+          : 'error',
+        summary: florence2DetectedPath
+          ? florence2Version?.ok
+            ? 'Florence-2 视觉分析运行时自检通过，图片/视频分析将输出真实模型理解。'
+            : 'Florence-2 推理脚本已找到，但 Python 依赖/模型校验失败。'
+          : '未检测到 Florence-2 运行时，图片/视频分析将使用弱占位描述（建议安装）。',
+        detectedPath: florence2DetectedPath,
+        executableVerified: Boolean(florence2Version?.ok),
+        installedVersion: String(florence2Version?.version || florence2Entry.version || '').trim(),
+        stdout: florence2Version?.stdout || '',
+        stderr: florence2Version?.stderr || '',
+        modelDir: String(florence2Entry.hfHome || '').trim(),
+        suggestions: florence2DetectedPath
+          ? florence2Version?.ok
+            ? ['可在资产库/智能生成的视觉分析中选择 Florence-2 作为引擎']
+            : ['确认虚拟环境依赖完整（torch/transformers）', '确认模型目录已下载 Florence-2-large 权重']
+          : ['在「模型下载」面板点「一键安装 Florence-2（本地免费）」', '需先安装 Python 3.10+ 并加入 PATH'],
+        update: florence2Update,
+      },
     },
-  };
-}
-
-function buildLocalPostBackendStatus(key, resolvedBackend, exampleRuntimePath = '') {
-  const guide = LOCAL_POST_RUNTIME_GUIDES[key] || {};
-  return {
-    configured: Boolean(resolvedBackend?.configured),
-    commandConfigured: Boolean(resolvedBackend?.commandLine),
-    detectedPath: String(resolvedBackend?.detectedPath || '').trim(),
-    wrapperScript: LOCAL_POST_BACKEND_WRAPPERS[key] || '',
-    exampleRuntimePath,
-    runtimeName: String(guide.runtimeName || '').trim(),
-    envPath: String(guide.envPath || '').trim(),
-    envCommand: String(guide.envCommand || '').trim(),
-    docsUrl: String(guide.docsUrl || '').trim(),
-    downloadUrl: String(guide.downloadUrl || '').trim(),
-    installHint: String(guide.installHint || '').trim(),
-    successHint: String(guide.successHint || '').trim(),
-    commonInstallPaths: Array.isArray(guide.commonInstallPaths) ? guide.commonInstallPaths.map((item) => String(item || '').trim()).filter(Boolean) : [],
-    supportsImage: guide.supportsImage !== false,
-    supportsVideo: Boolean(guide.supportsVideo),
-    detectedConfigPath: String(resolvedBackend?.detectedConfigPath || '').trim(),
-  };
-}
-
-function resolveLocalPostUpscaleBackend(config = {}, mediaKind = 'image') {
-  const resolvedRoute = resolvePostUpscaleRoute(config);
-  const executionMode = String(config.executionMode || 'auto').trim();
-  const commandMap = {
-    'fsr-preview': { envCommand: 'HMDAO_POST_FSR_COMMAND', envPath: 'HMDAO_POST_FSR_PATH', label: 'FSR' },
-    realbasicvsr: { envCommand: 'HMDAO_POST_REALBASICVSR_COMMAND', envPath: 'HMDAO_POST_REALBASICVSR_PATH', label: 'RealBasicVSR' },
-    supir: { envCommand: 'HMDAO_POST_SUPIR_COMMAND', envPath: 'HMDAO_POST_SUPIR_PATH', label: 'SUPIR' },
-  };
-  const routeMeta = commandMap[resolvedRoute] || null;
-  const { commandLine, detectedPath } = routeMeta
-    ? resolveLocalPostWrapperCommand({
-      envCommand: routeMeta.envCommand,
-      envPath: routeMeta.envPath,
-      wrapperKey: resolvedRoute,
-    })
-    : { commandLine: '', detectedPath: '' };
-  return {
-    resolvedRoute,
-    label: routeMeta?.label || resolvedRoute,
-    commandLine,
-    detectedPath,
-    wrapperAllowed: executionMode !== 'fallback-only',
-    fallbackAllowed: executionMode !== 'wrapper-only',
-    mediaKind,
-    configured: Boolean(commandLine),
-  };
-}
-
-function resolveLocalPostOcioBackend(config = {}) {
-  const executionMode = String(config.ocioExecutionMode || 'auto').trim();
-  const envCommand = String(process.env.HMDAO_POST_OCIO_COMMAND || '').trim();
-  const envPath = String(process.env.HMDAO_POST_OCIO_PATH || '').trim();
-  const managedRuntimePath = detectManagedLocalPostOcioPath();
-  const wrapperScript = LOCAL_POST_BACKEND_WRAPPERS.ocio;
-  const managedWrapperScript = LOCAL_POST_BACKEND_WRAPPERS['ocio-managed'];
-  const commandLine = envCommand
-    || (envPath && wrapperScript ? `node "${wrapperScript}"` : '')
-    || (managedRuntimePath && managedWrapperScript ? `node "${managedWrapperScript}"` : '');
-  const detectedPath = envPath || managedRuntimePath || '';
-  return {
-    label: 'OCIO',
-    commandLine,
-    detectedPath,
-    detectedConfigPath: detectLocalPostOiioConfigPath(),
-    managedRuntime: Boolean(!envCommand && !envPath && managedRuntimePath),
-    wrapperAllowed: executionMode !== 'fallback-only',
-    fallbackAllowed: executionMode !== 'wrapper-only',
-    configured: Boolean(commandLine),
-  };
-}
-
-function resolveLocalPostOiioBackend(config = {}, mediaKind = 'image', ocioConfigPath = '') {
-  const executionMode = String(config.ocioExecutionMode || 'auto').trim();
-  const commandLineFromEnv = String(process.env.HMDAO_POST_OIIO_COMMAND || '').trim();
-  const detectedPath = detectLocalPostOiioPath();
-  const detectedConfigPath = String(ocioConfigPath || detectLocalPostOiioConfigPath()).trim();
-  const commandLine = commandLineFromEnv || (detectedPath ? `node "${LOCAL_POST_BACKEND_WRAPPERS.oiio}"` : '');
-  return {
-    label: 'OIIO + OCIO',
-    commandLine,
-    detectedPath,
-    detectedConfigPath,
-    wrapperAllowed: mediaKind === 'image' && executionMode !== 'fallback-only',
-    fallbackAllowed: executionMode !== 'wrapper-only',
-    configured: Boolean(commandLine && detectedConfigPath),
-    runtimeConfigured: Boolean(commandLine),
-    mediaKind,
-  };
-}
-
-function resolveLocalPostGmicBackend() {
-  const commandLineFromEnv = String(process.env.HMDAO_POST_GMIC_COMMAND || '').trim();
-  const detectedPath = detectLocalPostGmicPath();
-  const wrapperScript = LOCAL_POST_BACKEND_WRAPPERS.gmic;
-  const commandLine = commandLineFromEnv || (detectedPath && wrapperScript ? `node "${wrapperScript}"` : '');
-  return {
-    label: 'G\'MIC',
-    commandLine,
-    detectedPath,
-    wrapperAllowed: true,
-    fallbackAllowed: true,
-    configured: Boolean(commandLine),
   };
 }
 
@@ -10196,226 +7745,17 @@ async function runConfiguredPostGmicBackend(resolvedBackend, payload) {
   };
 }
 
-function buildPostColorFilter(config = {}, lutPath = '') {
-  const exposure = clampNumber(config.exposure, -1, 1, 0);
-  const contrast = 1 + clampNumber(config.contrast, -0.8, 1.2, 0.08) * 0.6;
-  const saturation = clampNumber(config.saturation, 0, 2.5, 1);
-  const hue = clampNumber(config.hue, -180, 180, 0);
-  const vibrance = clampNumber(config.vibrance, -1, 1, 0.12);
-  const temperature = clampNumber(config.temperature, -1, 1, 0);
-  const tint = clampNumber(config.tint, -1, 1, 0);
-  const lift = clampNumber(config.lift, -1, 1, 0);
-  const gain = clampNumber(config.gain, 0.2, 2.6, 1);
-  const gamma = clampNumber(config.gamma, 0.2, 3, 1);
-  const secondaryHueCenter = clampNumber(config.secondaryHueCenter, 0, 360, 180);
-  const secondaryHueRange = clampNumber(config.secondaryHueRange, 5, 180, 60);
-  const secondarySaturationBias = clampNumber(config.secondarySaturationBias, -1, 1, 0);
-  const secondaryLumaBias = clampNumber(config.secondaryLumaBias, -1, 1, 0);
-  const offset = clampNumber(config.offset, -1, 1, 0);
-  const offsetColor = hexToRgbUnit(config.offsetColor, { r: 0.5, g: 0.5, b: 0.5 });
-  const offsetAmount = clampNumber(config.offsetAmount, 0, 1, 0.08);
-  const outMin = clampNumber(0.5 - contrast * 0.5 + exposure * 0.18 + lift * 0.08, 0, 0.45, 0);
-  const outMax = clampNumber(0.5 + contrast * 0.5 + exposure * 0.18, 0.55, 1, 1);
-  const midInput = 0.5;
-  const midOutput = clampNumber(Math.pow(midInput, 1 / gamma), 0.18, 0.82, 0.5);
-  const filters = [
-    `colorlevels=romin=${outMin.toFixed(3)}:gomin=${outMin.toFixed(3)}:bomin=${outMin.toFixed(3)}:romax=${outMax.toFixed(3)}:gomax=${outMax.toFixed(3)}:bomax=${outMax.toFixed(3)}`,
-    buildColorWheelFilter(config),
-    `colorbalance=rs=${(temperature * 0.12).toFixed(3)}:bs=${(-temperature * 0.12).toFixed(3)}:gm=${(-tint * 0.08).toFixed(3)}:bm=${(tint * 0.08).toFixed(3)}:rh=${((offsetColor.r - 0.5) * Math.abs(offset) * offsetAmount).toFixed(3)}:gh=${((offsetColor.g - 0.5) * Math.abs(offset) * offsetAmount).toFixed(3)}:bh=${((offsetColor.b - 0.5) * Math.abs(offset) * offsetAmount).toFixed(3)}`,
-    `hue=h=${hue.toFixed(2)}:s=${gain.toFixed(3)}`,
-    `vibrance=intensity=${vibrance.toFixed(3)}`,
-    `curves=all='0/0 ${midInput.toFixed(2)}/${midOutput.toFixed(2)} 1/1'`,
-    buildCurveFilter(config),
-  ];
-  const filmPrint = String(config.filmPrint || 'none').trim();
-  if (filmPrint === 'kodak-2383') {
-    filters.push('curves=all=\'0/0 0.45/0.42 1/1\'');
-  } else if (filmPrint === 'kodak-5219') {
-    filters.push('curves=all=\'0/0 0.48/0.44 1/1\'');
-  } else if (filmPrint === 'fuji-3513') {
-    filters.push('curves=all=\'0/0 0.52/0.56 1/1\'');
-  }
-  if (Math.abs(saturation - 1) > 0.01) {
-    filters.push(`hue=s=${saturation.toFixed(3)}`);
-  }
-  if (Math.abs(secondarySaturationBias) > 0.01 || Math.abs(secondaryLumaBias) > 0.01) {
-    const qualifierWeight = clampNumber(secondaryHueRange / 180, 0.1, 1, 0.33);
-    const secondaryMid = clampNumber(0.5 + secondaryLumaBias * qualifierWeight * 0.05, 0.42, 0.58, 0.5);
-    filters.push(`hue=s=${clampNumber(1 + secondarySaturationBias * qualifierWeight * 0.22, 0.6, 1.6, 1).toFixed(3)}`);
-    filters.push(`curves=all='0/0 0.50/${secondaryMid.toFixed(3)} 1/1'`);
-  }
-  const ocioView = String(config.ocioView || 'default').trim();
-  if (ocioView === 'filmic') {
-    filters.push(`curves=all='0/0 0.18/0.12 0.75/0.84 1/1'`);
-  } else if (ocioView === 'aces') {
-    filters.push('colorlevels=romin=0.000:gomin=0.000:bomin=0.000:romax=1.000:gomax=1.000:bomax=1.000');
-    filters.push('hue=s=1.030');
-    filters.push("curves=all='0/0 0.50/0.520 1/1'");
-  }
-  filters.push(...buildOcioLikeFilter(config));
-  if (lutPath && isSupportedLutFile(lutPath)) {
-    filters.push(`lut3d=file='${escapeFfmpegFilterPath(lutPath)}'`);
-  }
-  return filters.join(',');
-}
-
-function buildPostUpscaleFilter(config = {}, meta = { width: 0, height: 0 }, mediaKind = 'image') {
-  const scale = clampNumber(config.scale, 1, 8, 2);
-  const denoise = clampNumber(config.denoise, 0, 1, 0.18);
-  const sharpen = clampNumber(config.sharpen, 0, 1, 0.34);
-  const resolvedRoute = resolvePostUpscaleRoute(config);
-  const tileSize = clampNumber(config.tileSize, 256, 2048, 768);
-  const seamFix = Boolean(config.seamFix);
-  const temporalStability = clampNumber(config.temporalStability, 0, 1, 0.65);
-  const outWidth = evenSize((meta.width || 2) * scale, meta.width || 2);
-  const outHeight = evenSize((meta.height || 2) * scale, meta.height || 2);
-  const scaleFlags = resolvedRoute === 'fsr-preview' ? 'bicubic' : resolvedRoute === 'supir' ? 'spline' : 'lanczos';
-  const filters = [`scale=${outWidth}:${outHeight}:flags=${scaleFlags}`];
-  if (denoise > 0.01) {
-    // 当前本机 ffmpeg 构建不包含 hqdn3d，回退到稳定可用的 gblur 轻降噪
-    const sigmaBase = resolvedRoute === 'supir' ? 1.2 : resolvedRoute === 'fsr-preview' ? 0.8 : 1;
-    filters.push(`gblur=sigma=${clampNumber(denoise * 1.6 * sigmaBase, 0.05, 2.4, 0.24).toFixed(2)}`);
-  }
-  if (sharpen > 0.01) {
-    const sharpenBoost = resolvedRoute === 'supir' ? 2.8 : resolvedRoute === 'fsr-preview' ? 1.9 : 2.4;
-    filters.push(`unsharp=7:7:${(0.25 + sharpen * sharpenBoost).toFixed(2)}:7:7:0`);
-  }
-  if (seamFix && tileSize < 900) {
-    // Keep seam smoothing on a filter that exists in the stock ffmpeg builds we ship against.
-    filters.push('gblur=sigma=0.28:steps=1');
-  }
-  if (mediaKind === 'video' && temporalStability > 0.55) {
-    filters.push(`tmix=frames=2:weights='${(1 - temporalStability * 0.18).toFixed(2)} ${(temporalStability * 0.18).toFixed(2)}'`);
-  }
-  if (resolvedRoute === 'supir') {
-    filters.push('colorlevels=romin=0.000:gomin=0.000:bomin=0.000:romax=1.000:gomax=1.000:bomax=1.000');
-    filters.push('hue=s=1.030');
-    filters.push("curves=all='0/0 0.50/0.515 1/1'");
-  }
-  return filters.join(',');
-}
-
-function buildPostBloomFilterComplex(config = {}) {
-  const threshold = Math.round(clampNumber(config.threshold, 0.1, 1, 0.76) * 255);
-  const radius = clampNumber(config.radius, 1, 64, 16);
-  const intensity = clampNumber(config.intensity, 0, 1.4, 0.34);
-  const rgbShift = clampNumber(config.rgbSplit, 0, 0.2, 0.04);
-  const shift = Math.max(0, Math.round(rgbShift * 12));
-  return [
-    `[0:v]split=2[base][glow]`,
-    `[glow]lutyuv=y='if(gte(val,${threshold}),val,0)',gblur=sigma=${radius.toFixed(2)},rgbashift=rh=${shift}:rv=0:gh=0:gv=0:bh=${-shift}:bv=0,colorchannelmixer=aa=${clampNumber(intensity * 0.9, 0, 1, 0.3).toFixed(3)}[bloom]`,
-    `[base][bloom]blend=all_mode=${bloomBlendMode(String(config.blendMode || 'screen'))}:all_opacity=${clampNumber(intensity, 0, 1, 0.34).toFixed(3)}[vout]`,
-  ].join(';');
-}
-
-function buildPostDofFilterComplex(config = {}, meta = { width: 0, height: 0 }, depthMaskPath = '') {
-  const focusWidth = Math.max(8, Math.round((clampNumber(config.focusWidth, 4, 100, 48) / 100) * meta.width));
-  const focusHeight = Math.max(8, Math.round((clampNumber(config.focusHeight, 4, 100, 42) / 100) * meta.height));
-  const focusX = Math.max(0, Math.min(meta.width - focusWidth, Math.round((clampNumber(config.focusX, 0, 100, 50) / 100) * meta.width) - Math.round(focusWidth / 2)));
-  const focusY = Math.max(0, Math.min(meta.height - focusHeight, Math.round((clampNumber(config.focusY, 0, 100, 50) / 100) * meta.height) - Math.round(focusHeight / 2)));
-  const blurStrength = clampNumber(config.blurStrength, 0, 1.4, 0.4);
-  const depthBlend = clampNumber(config.depthBlend, 0, 1, 0.72);
-  const tiltShift = Boolean(config.tiltShift);
-  const transitionPreset = String(config.transitionPreset || 'soft').trim();
-  const transitionBoost = transitionPreset === 'hard' ? 0.82 : transitionPreset === 'cinematic' ? 1.28 : 1;
-  const effectiveFocusHeight = tiltShift ? Math.max(6, Math.round(focusHeight * 0.6)) : focusHeight;
-  const effectiveFocusY = tiltShift ? Math.max(0, Math.min(meta.height - effectiveFocusHeight, focusY + Math.round((focusHeight - effectiveFocusHeight) / 2))) : focusY;
-  const blurSigma = Math.max(0.8, blurStrength * (8 + depthBlend * 12) * transitionBoost);
-  if (depthMaskPath) {
-    return [
-      `[0:v]gblur=sigma=${blurSigma.toFixed(2)}[blurred]`,
-      `[1:v]format=gray,scale=${meta.width}:${meta.height}[mask]`,
-      `[blurred][0:v][mask]maskedmerge[vout]`,
-    ].join(';');
-  }
-  return [
-    `[0:v]gblur=sigma=${blurSigma.toFixed(2)}[blurred]`,
-    `[0:v]crop=${focusWidth}:${effectiveFocusHeight}:${focusX}:${effectiveFocusY}[sharp]`,
-    `[blurred][sharp]overlay=${focusX}:${effectiveFocusY}[vout]`,
-  ].join(';');
-}
-
-function buildPostGrainFilter(config = {}, mediaKind = 'image') {
-  const iso = clampNumber(config.iso, 100, 6400, 800);
-  const amount = clampNumber(config.amount, 0, 1, 0.24);
-  const size = clampNumber(config.size, 0.5, 4, 1.4);
-  const chroma = clampNumber(config.chroma, 0, 1, 0.18);
-  const shadowBoost = clampNumber(config.shadowBoost, 0, 1, 0.2);
-  const distribution = String(config.distribution || 'poisson').trim();
-  const flags = mediaKind === 'video' ? 't+u' : 'u';
-  const distributionBoost = distribution === 'lognormal' ? 0.92 : distribution === 'gaussian' ? 0.86 : 1;
-  const strength = Math.max(1, Math.round((iso / 200) * (amount * 14 + size * 3.5 + chroma * 4.2 + shadowBoost * 3.8) * distributionBoost));
-  return `noise=alls=${strength}:allf=${flags}`;
-}
-
-async function writePostAssetInput(baseDir, requestId, asset) {
-  const key = String(asset?.key || '').trim();
-  if (!key) return null;
-  const uploadedPath = String(asset?.uploadedPath || '').trim();
-  if (uploadedPath) return uploadedPath;
-  const sourceUrl = String(asset?.sourceUrl || '').trim();
-  const inputBase64 = String(asset?.inputBase64 || '').trim();
-  if (!sourceUrl && !inputBase64) return null;
-  const ext = extensionFromMimeType(
-    asset?.inputMimeType
-      || asset?.originalName
-      || (asset?.kind === 'video' ? 'video/mp4' : 'image/png'),
-  );
-  const filePath = path.join(baseDir, `${requestId}-${key}.${ext}`);
-  if (inputBase64) {
-    await fs.writeFile(filePath, Buffer.from(inputBase64, 'base64'));
-  } else {
-    const remote = await downloadRemoteMediaBuffer(sourceUrl);
-    await fs.writeFile(filePath, remote.bytes);
-  }
-  return filePath;
-}
-
-async function runPostStep({
-  mediaKind,
-  inputPath,
-  outputPath,
-  filter,
-  filterComplex,
-  extraInputs = [],
-  map = '[vout]',
-  stage = 'post-step',
-}) {
-  const args = ['-y', '-i', inputPath];
-  for (const extraInput of extraInputs) {
-    args.push('-i', extraInput);
-  }
-  if (filterComplex) {
-    args.push('-filter_complex', filterComplex, '-map', map);
-  } else if (filter) {
-    args.push('-vf', filter);
-  }
-  args.push(...(mediaKind === 'video' ? buildIntermediateVideoArgs(outputPath) : buildIntermediateImageArgs(outputPath)));
-  try {
-    await runCommand('ffmpeg', args);
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error || 'unknown-error');
-    throw new Error(`${stage} failed: ${detail}`);
-  }
-  if (!(await fileExists(outputPath))) {
-    throw new Error(`${stage} produced no output: ${outputPath}; ffmpegArgs=${args.join(' ')}`);
-  }
-}
-
-async function finalizePostVideo(processedPath, originalInputPath, outputPath) {
-  await runCommand('ffmpeg', [
-    '-y',
-    '-i',
-    processedPath,
-    '-i',
-    originalInputPath,
-    '-map',
-    '0:v:0',
-    '-map',
-    '1:a?',
-    ...buildWebmEncodeArgs(outputPath, { includeAudio: true }),
-  ]);
-}
+// P1-11：以下 8 个函数已抽取至 lib/post-filter-builders.mjs。
+import {
+  buildPostBloomFilterComplex,
+  buildPostColorFilter,
+  buildPostDofFilterComplex,
+  buildPostGrainFilter,
+  buildPostUpscaleFilter,
+  finalizePostVideo,
+  runPostStep,
+  writePostAssetInput,
+} from './lib/post-filter-builders.mjs';
 
 async function processLocalPostRequest(payload) {
   const mediaKind = payload?.mediaKind === 'video' ? 'video' : 'image';
@@ -10972,6 +8312,8 @@ async function processLocalVideoEditRequest(payload) {
   const outputPath = path.join(LOCAL_VIDEO_EDIT_DIR, `${requestId}-output.webm`);
   const mixedOutputPath = path.join(LOCAL_VIDEO_EDIT_DIR, `${requestId}-mixed.webm`);
   const tempVideoOutputPath = path.join(LOCAL_VIDEO_EDIT_DIR, `${requestId}-output.mp4`);
+  // 裁剪/剪辑产物用 MP4/H.264 高画质输出（而非 webm/VP9 有损重编码），避免发糊。
+  const cropClipPath = path.join(LOCAL_VIDEO_EDIT_DIR, `${requestId}-edit.mp4`);
   const audioOutputPath = path.join(LOCAL_VIDEO_EDIT_DIR, `${requestId}-audio.wav`);
   const vocalOutputPath = path.join(LOCAL_VIDEO_EDIT_DIR, `${requestId}-vocal.wav`);
   const accompanimentOutputPath = path.join(LOCAL_VIDEO_EDIT_DIR, `${requestId}-accompaniment.wav`);
@@ -10997,20 +8339,20 @@ async function processLocalVideoEditRequest(payload) {
 
     if (operation === 'crop') {
       const rect = payload?.rect || {};
-      const cropX = Math.max(0, Math.min(sourceMeta.width - 2, Math.round((Number(rect.x || 0) / 100) * sourceMeta.width)));
-      const cropY = Math.max(0, Math.min(sourceMeta.height - 2, Math.round((Number(rect.y || 0) / 100) * sourceMeta.height)));
-      const cropWidth = Math.max(2, Math.round((Number(rect.width || 100) / 100) * sourceMeta.width));
-      const cropHeight = Math.max(2, Math.round((Number(rect.height || 100) / 100) * sourceMeta.height));
-      const outputWidth = Math.max(2, Math.min(cropWidth, sourceMeta.width - cropX));
-      const outputHeight = Math.max(2, Math.min(cropHeight, sourceMeta.height - cropY));
+      // 偶数对齐：yuv420p 要求宽高为偶数，奇数尺寸会被 libvpx/libx264 悄悄缩放导致模糊。
+      const even = (value) => Math.max(2, Math.round(value / 2) * 2);
+      const cropWidth = even((Number(rect.width || 100) / 100) * sourceMeta.width);
+      const cropHeight = even((Number(rect.height || 100) / 100) * sourceMeta.height);
+      const cropX = Math.min(sourceMeta.width - cropWidth, even((Number(rect.x || 0) / 100) * sourceMeta.width));
+      const cropY = Math.min(sourceMeta.height - cropHeight, even((Number(rect.y || 0) / 100) * sourceMeta.height));
 
       await runCommand('ffmpeg', [
         '-y',
         '-i',
         inputPath,
         '-vf',
-        `crop=${outputWidth}:${outputHeight}:${cropX}:${cropY}`,
-        ...buildWebmEncodeArgs(outputPath, { includeAudio: true }),
+        `crop=${cropWidth}:${cropHeight}:${cropX}:${cropY}`,
+        ...buildHighQualityMp4Args(cropClipPath, { includeAudio: true }),
       ]);
     } else if (operation === 'clip') {
       const normalizedSegments = normalizeClipSegments(payload?.segments, sourceMeta.duration);
@@ -11018,18 +8360,34 @@ async function processLocalVideoEditRequest(payload) {
         throw new Error('local-video-clip-segments-empty');
       }
 
-      const args = normalizedSegments.length === 1
-        ? [
+      if (normalizedSegments.length === 1) {
+        // 单段剪辑 = 纯时间裁剪，优先用无损流拷贝(-c copy)，彻底不重编码、不模糊；
+        // 若源容器/编码不适配 mp4 导致拷贝失败，回退到高质量 H.264 重编码。
+        const start = String(normalizedSegments[0].startTime);
+        const duration = String(Number((normalizedSegments[0].endTime - normalizedSegments[0].startTime).toFixed(3)));
+        const copyArgs = [
           '-y',
-          '-i',
-          inputPath,
-          '-ss',
-          String(normalizedSegments[0].startTime),
-          '-t',
-          String(Number((normalizedSegments[0].endTime - normalizedSegments[0].startTime).toFixed(3))),
-          ...buildWebmEncodeArgs(outputPath, { includeAudio: true }),
-        ]
-        : [
+          '-ss', start,
+          '-i', inputPath,
+          '-t', duration,
+          '-c', 'copy',
+          '-avoid_negative_ts', 'make_zero',
+          cropClipPath,
+        ];
+        try {
+          await runCommand('ffmpeg', copyArgs);
+        } catch {
+          await runCommand('ffmpeg', [
+            '-y',
+            '-ss', start,
+            '-i', inputPath,
+            '-t', duration,
+            ...buildHighQualityMp4Args(cropClipPath, { includeAudio: true }),
+          ]);
+        }
+      } else {
+        // 多段拼接必须重编码，用高质量 H.264（视频；拼接后音频轨道按原逻辑丢弃，与旧实现一致）。
+        await runCommand('ffmpeg', [
           '-y',
           '-i',
           inputPath,
@@ -11042,9 +8400,15 @@ async function processLocalVideoEditRequest(payload) {
           ].join(';'),
           '-map',
           '[vout]',
-          ...buildWebmEncodeArgs(outputPath),
-        ];
-      await runCommand('ffmpeg', args);
+          '-c:v', 'libx264',
+          '-preset', 'slow',
+          '-crf', '16',
+          '-pix_fmt', 'yuv420p',
+          '-an',
+          '-movflags', '+faststart',
+          cropClipPath,
+        ]);
+      }
     } else if (operation === 'hd') {
       const scale = clampNumber(payload?.scale, 1, 4, 2);
       const detailStrength = clampNumber(payload?.detailStrength, 0, 1, 0.58);
@@ -11066,6 +8430,57 @@ async function processLocalVideoEditRequest(payload) {
         filterChain,
         ...buildWebmEncodeArgs(outputPath, { includeAudio: true }),
       ]);
+    } else if (operation === 'motionblur') {
+      // 真实运动模糊（电影感快门模拟）：
+      //   轻量档用 tblend=all_mode=average（相邻帧均值）得到 2 帧曝光的运动拖影；
+      //   强档先用 minterpolate 做运动补偿插帧把帧率提到 shutter×fps，再 tblend 均值 +
+      //   framestep 抽回原帧率，得到多帧曝光的运动模糊。minterpolate 失败时自动回退到 tblend。
+      const fps = clampNumber(payload?.fps ?? sourceMeta.fps ?? 24, 1, 120, 24);
+      const strengthNorm = clampNumber(payload?.strength ?? 0.5, 0, 1, 0.5);
+      const shutter = Math.max(2, Math.min(12, Math.round(2 + strengthNorm * 8)));
+      const simpleFilter = 'tblend=all_mode=average';
+      const strongFilter = `minterpolate=fps=${Math.round(fps * shutter)}:mi_mode=blend,tblend=all_mode=average,framestep=${shutter},fps=${fps}`;
+      let usedFilter = shutter >= 3 ? strongFilter : simpleFilter;
+      let processingEngine = 'ffmpeg-tblend';
+      try {
+        await runCommand('ffmpeg', [
+          '-y',
+          '-i',
+          inputPath,
+          '-vf',
+          usedFilter,
+          ...buildWebmEncodeArgs(outputPath, { includeAudio: true }),
+        ]);
+      } catch (motionErr) {
+        if (usedFilter !== simpleFilter) {
+          usedFilter = simpleFilter;
+          processingEngine = 'ffmpeg-tblend-fallback';
+          await runCommand('ffmpeg', [
+            '-y',
+            '-i',
+            inputPath,
+            '-vf',
+            usedFilter,
+            ...buildWebmEncodeArgs(outputPath, { includeAudio: true }),
+          ]);
+        } else {
+          throw motionErr;
+        }
+      }
+      const outputMeta = await probeVideoFile(outputPath);
+      const persistedVideo = await persistLocalResultFile(LOCAL_VIDEO_RESULT_DIR, outputPath, requestId, 'webm');
+      const videoStat = await fs.stat(persistedVideo.persistedPath);
+      return {
+        format: 'webm',
+        mimeType: 'video/webm',
+        outputAssetId: persistedVideo.assetId,
+        outputUrl: `/api/local-video/result/${encodeURIComponent(persistedVideo.assetId)}`,
+        size: Number(videoStat.size || 0),
+        width: outputMeta.width,
+        height: outputMeta.height,
+        duration: outputMeta.duration,
+        processingEngine,
+      };
     } else if (operation === 'removeSubtitle') {
       const feather = clampNumber(payload?.maskFeather, 0, 32, 8);
       const detectionMode = String(payload?.detectionMode || 'auto').trim();
@@ -11325,27 +8740,32 @@ async function processLocalVideoEditRequest(payload) {
     }
 
     if (linkedAudioPath && ['crop', 'clip', 'hd', 'removeSubtitle'].includes(operation)) {
+      // 裁剪/剪辑产物是 mp4，混音输入/输出都走 cropClipPath；其余仍走 webm 的 outputPath。
+      const mixVideoPath = (operation === 'crop' || operation === 'clip') ? cropClipPath : outputPath;
       processingEngine = await mixExternalAudioIntoVideo({
-        videoPath: outputPath,
+        videoPath: mixVideoPath,
         audioPath: linkedAudioPath,
         outputPath: mixedOutputPath,
         mixMode: linkedAudioMixMode || 'bgm-under',
         audioGain: linkedAudioGain,
         videoGain: linkedVideoGain,
       });
-      await fs.rename(mixedOutputPath, outputPath).catch(async () => {
-        await fs.copyFile(mixedOutputPath, outputPath);
+      await fs.rename(mixedOutputPath, mixVideoPath).catch(async () => {
+        await fs.copyFile(mixedOutputPath, mixVideoPath);
         await fs.rm(mixedOutputPath, { force: true }).catch(() => {});
       });
     }
 
-    const outputMeta = await probeVideoFile(outputPath);
-    const persistedVideo = await persistLocalResultFile(LOCAL_VIDEO_RESULT_DIR, outputPath, requestId, 'webm');
+    // 裁剪/剪辑产物为 mp4 高画质；其余操作沿用 webm。
+    const isMp4Edit = operation === 'crop' || operation === 'clip';
+    const resultPath = isMp4Edit ? cropClipPath : outputPath;
+    const outputMeta = await probeVideoFile(resultPath);
+    const persistedVideo = await persistLocalResultFile(LOCAL_VIDEO_RESULT_DIR, resultPath, requestId, isMp4Edit ? 'mp4' : 'webm');
     persistedResultPaths.push(persistedVideo.persistedPath);
     const videoStat = await fs.stat(persistedVideo.persistedPath);
     return {
-      format: 'webm',
-      mimeType: 'video/webm',
+      format: isMp4Edit ? 'mp4' : 'webm',
+      mimeType: isMp4Edit ? 'video/mp4' : 'video/webm',
       outputAssetId: persistedVideo.assetId,
       outputUrl: `/api/local-video/result/${encodeURIComponent(persistedVideo.assetId)}`,
       size: Number(videoStat.size || 0),
@@ -11358,6 +8778,9 @@ async function processLocalVideoEditRequest(payload) {
     await fs.rm(inputPath, { force: true }).catch(() => {});
     if (!persistedResultPaths.includes(outputPath)) {
       await fs.rm(outputPath, { force: true }).catch(() => {});
+    }
+    if (!persistedResultPaths.includes(cropClipPath)) {
+      await fs.rm(cropClipPath, { force: true }).catch(() => {});
     }
     await fs.rm(mixedOutputPath, { force: true }).catch(() => {});
     if (!persistedResultPaths.includes(audioOutputPath)) {
@@ -11391,42 +8814,11 @@ async function writeUsers(users) {
   await fs.writeFile(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
 }
 
-function normalizeLocalEmail(value) {
-  return String(value || '').trim().toLowerCase();
-}
-
-function isValidLocalEmail(value) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeLocalEmail(value));
-}
-
-function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
-  const hash = crypto.pbkdf2Sync(password, salt, 120000, 32, 'sha256').toString('hex');
-  return { salt, hash };
-}
-
-function verifyPassword(password, user) {
-  return hashPassword(password, user.salt).hash === user.passwordHash;
-}
-
-function deleteSessionsForUser(userId) {
-  for (const [refreshToken, session] of sessions.entries()) {
-    if (session?.userId === userId) {
-      sessions.delete(refreshToken);
-    }
-  }
-}
-
-function createSession(user) {
-  const accessToken = crypto.randomBytes(24).toString('hex');
-  const refreshToken = crypto.randomBytes(24).toString('hex');
-  const expiresAt = Date.now() + 2 * 60 * 60 * 1000;
-  sessions.set(refreshToken, { userId: user.id, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 });
-  return { access_token: accessToken, refresh_token: refreshToken, expires_at: expiresAt };
-}
-
-function publicUser(user) {
-  return { id: user.id, email: user.email, created_at: user.createdAt };
-}
+// 纯认证工具函数已抽离至 lib/auth-utils.mjs（normalizeLocalEmail / isValidLocalEmail /
+// hashPassword / verifyPassword / publicUser），经顶部 import 复用，行为零变更。
+// sessions / accessSessions / createSession / deleteSessionsForUser 已抽离至
+// ./lib/session-store.mjs（顶部 import 复用）。以下依赖其或 send 的函数仍保留在此，
+// 并经由 deps 注入到 auth / cobuild 等路由组。
 
 function sendAuthError(res, status, code, message, extra = {}) {
   return send(res, status, {
@@ -11439,1590 +8831,124 @@ function sendAuthError(res, status, code, message, extra = {}) {
   });
 }
 
-function maskKey(apiKey = '') {
-  if (apiKey.length <= 8) return '****';
-  return `${apiKey.slice(0, 4)}****${apiKey.slice(-4)}`;
-}
+// ---- 需求共建（打赏 + 反馈留言）数据与鉴权 ----
 
-function inferMode(endpoint = '') {
-  if (endpoint.includes('video')) return 'video';
-  if (endpoint.includes('image')) return 'image';
-  if (endpoint.includes('audio') || endpoint.includes('tts')) return 'audio';
-  return 'llm';
-}
-
-function inferNodeTypesFromMode(mode) {
-  if (mode === 'image') return ['image'];
-  if (mode === 'video') return ['video'];
-  if (mode === 'audio') return ['audio'];
-  return ['text', 'script', 'storyboard', 'aiapp'];
-}
-
-function normalizeCatalogIdentifier(value) {
-  return String(value || '').trim().toLowerCase();
-}
-
-function relayAliasCatalogId(identifier) {
-  const source = String(identifier || '').trim();
-  if (!source) return '';
-  const matched = RELAY_MODEL_MATCHERS.find((matcher) => matcher.aliases.some((pattern) => pattern.test(source)));
-  return String(matched?.catalogId || '').trim();
-}
-
-function modelMatchesActivation(record, item) {
-  if (!record || !item) return false;
-  if (record.mode && record.mode !== item.mode) return false;
-
-  const explicitModels = [
-    ...(Array.isArray(record.catalogModelIds) ? record.catalogModelIds : []),
-    ...(Array.isArray(record.availableModels)
-      ? record.availableModels.flatMap((entry) => [entry?.catalogModelId, entry?.upstreamModel, entry?.id])
-      : []),
-  ]
-    .map((value) => normalizeCatalogIdentifier(value))
-    .filter(Boolean);
-  if (explicitModels.length) {
-    const candidateIds = [item.id, item.upstreamModel, item.model, item.name]
-      .map((value) => normalizeCatalogIdentifier(value))
-      .filter(Boolean);
-    if (candidateIds.some((candidate) => explicitModels.includes(candidate))) return true;
-  }
-
-  const requestedModel = normalizeCatalogIdentifier(record.model);
-  if (!requestedModel) return true;
-
-  const aliasCatalogId = normalizeCatalogIdentifier(relayAliasCatalogId(record.model));
-  const candidateIds = [
-    item.id,
-    item.upstreamModel,
-    item.model,
-    item.name,
-    aliasCatalogId,
-  ]
-    .map((value) => normalizeCatalogIdentifier(value))
-    .filter(Boolean);
-  return candidateIds.includes(requestedModel);
-}
-
-function resolveActivatedRelayModel(record, requestedModel = '') {
-  const requested = String(requestedModel || '').trim();
-  if (!record || !requested) return requested;
-  const availableModels = Array.isArray(record.availableModels) ? record.availableModels : [];
-  const normalizedRequested = normalizeCatalogIdentifier(requested);
-  const normalizedRequestedAlias = normalizeCatalogIdentifier(relayAliasCatalogId(requested));
-  const matchScore = (entry = {}) => {
-    const upstreamModel = normalizeCatalogIdentifier(entry?.upstreamModel || '');
-    const rawId = normalizeCatalogIdentifier(entry?.id || '');
-    const rawName = normalizeCatalogIdentifier(entry?.name || '');
-    const catalogModelId = normalizeCatalogIdentifier(entry?.catalogModelId || '');
-    if (normalizedRequested && [upstreamModel, rawId, rawName].includes(normalizedRequested)) return 4;
-    if (normalizedRequestedAlias && [upstreamModel, rawId, rawName].includes(normalizedRequestedAlias)) return 3;
-    if (normalizedRequested && catalogModelId === normalizedRequested) return 2;
-    if (normalizedRequestedAlias && catalogModelId === normalizedRequestedAlias) return 1;
-    return 0;
-  };
-  const matched = availableModels
-    .map((entry) => ({ entry, score: matchScore(entry) }))
-    .filter((item) => item.score > 0)
-    .sort((left, right) => right.score - left.score)[0]?.entry || null;
-  if (matched) {
-    // suanliai.top 的 seedance 有多个分辨率变体。优先选 720p。
-    const matchedId = String(matched.upstreamModel || matched.id || '').trim();
-    if (/suanliai\.top/i.test(record.endpoint || '') && /seedance/i.test(matchedId)) {
-      const preferred = availableModels.find((m) => (m?.id || '').includes('-720p'));
-      if (preferred?.id) return String(preferred.id).trim();
-    }
-    return matchedId;
-  }
-  const requestedCatalogModel = catalogModelByIdentifier(requested);
-  if (
-    requestedCatalogModel
-    && (!record.provider || requestedCatalogModel.provider === record.provider)
-    && (!record.mode || requestedCatalogModel.mode === record.mode)
-  ) {
-    const upstream = String(requestedCatalogModel.upstreamModel || requestedCatalogModel.id || requested).trim();
-    // suanliai.top 的 seedance 有多个分辨率变体（720p/480p/1080p）。
-    // 如果用户指定了 resolution=720p，优先匹配对应分辨率的 relay 模型变体。
-    const availableModels = Array.isArray(record.availableModels) ? record.availableModels : [];
-    if (availableModels.length > 0 && /suanliai\.top/i.test(record.endpoint || '') && /seedance/i.test(upstream)) {
-      const preferredModelId = availableModels.find((m) => m?.id?.includes('-720p'))?.id;
-      if (preferredModelId) return preferredModelId;
-    }
-    return upstream;
-  }
-  return String(record.model || requested).trim();
-}
-
-function providerActivationKey(providerId, mode = '') {
-  return mode ? `${providerId}::${mode}` : providerId;
-}
-
-// 视觉/多模态模型识别：用于图片分析链路优先选择真正具备视觉理解能力的模型，
-// 避免把图像/视频生成模型（如 wanx / flux / gpt-image / seedance）误当作视觉分析模型调用。
-const VISION_MODEL_PATTERNS = [
-  /qwen[-\w]*vl/i,
-  /qwen2\.5-vl/i,
-  /qwen3[-\w]*vl/i,
-  /qwen[-]?omni/i,
-  /gpt-4[o1]/i,
-  /gpt-4\.1/i,
-  /gemini[-\w]*flash/i,
-  /gemini[-\w]*pro/i,
-  /claude/i,
-  /llava/i,
-  /moondream/i,
-  /minicpm-v/i,
-  /phi-?3[-\w]*vision/i,
-  /glm-?4v/i,
-  /deepseek-vl/i,
-  /doubao-vision/i,
-  /abab.*v/i,
-  /qwen3[-\w\.]*/i,         // qwen3.7-plus, qwen3.7-vl 等最新系列
-  /qwen[-\w]*plus/i,        // qwen-plus, qwen3.7-plus 等
-  /qwen[-\w]*max/i,         // qwen-max, qwen-vl-max 等
-];
-
-function isVisionModelId(modelId) {
-  const value = String(modelId || '').trim();
-  if (!value) return false;
-  // 显式排除纯图像/视频生成模型，避免误判为视觉分析模型
-  if (/(wanx|flux|wan2|stable-diffusion|sd3|sdxl|midjourney|\bdalle\b|gpt-image|seedance|kling|veo|runway|hunyuan-video|wan21|wan22|imagen|dall-e)/i.test(value)) return false;
-  return VISION_MODEL_PATTERNS.some((pattern) => pattern.test(value));
-}
-
-
-function hydrateActivatedProviderRecordsFromDisk(force = false) {
-  if (activatedProvidersHydrated && !force) return;
-  activatedProvidersHydrated = true;
+async function readCobuild() {
+  await fs.mkdir(DATA_DIR, { recursive: true });
   try {
-    if (!existsSync(ACTIVATED_PROVIDERS_FILE)) return;
-    const raw = readFileSync(ACTIVATED_PROVIDERS_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-    const records = Array.isArray(parsed) ? parsed : [];
-    activatedProviders.clear();
-    for (const record of records) {
-      if (!record || typeof record !== 'object') continue;
-      const provider = String(record.provider || '').trim();
-      const mode = String(record.mode || '').trim();
-      if (!provider) continue;
-      activatedProviders.set(providerActivationKey(provider, mode), {
-        ...record,
-        provider,
-        mode,
-      });
-    }
+    const raw = await fs.readFile(COBUILD_FILE, 'utf8');
+    const normalized = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+    const parsed = JSON.parse(normalized);
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
-    // ignore broken activation cache and rebuild from fresh runtime state
+    return [];
   }
 }
 
-function persistActivatedProviderRecordsToDisk() {
-  try {
-    mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(
-      ACTIVATED_PROVIDERS_FILE,
-      JSON.stringify(Array.from(activatedProviders.values()), null, 2),
-      'utf8',
-    );
-  } catch {
-    // best-effort persistence only
+async function writeCobuild(entries) {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  await fs.writeFile(COBUILD_FILE, JSON.stringify(entries, null, 2), 'utf8');
+}
+
+function maskEmailForDisplay(email = '') {
+  const value = String(email || '').trim();
+  const at = value.indexOf('@');
+  if (at <= 0) return value || '匿名用户';
+  const name = value.slice(0, at);
+  const domain = value.slice(at);
+  if (name.length <= 1) return `${name}***${domain}`;
+  if (name.length <= 3) return `${name[0]}***${domain}`;
+  return `${name.slice(0, 2)}***${name.slice(-1)}${domain}`;
+}
+
+// 从请求中解析当前登录用户（基于 access token）。
+// 前端在 Authorization: Bearer <token> 或在请求体携带 access_token。
+function getUserFromRequest(req, body = {}) {
+  const headerToken = req.headers['authorization'] || req.headers['Authorization'] || '';
+  const bearerMatch = String(headerToken).match(/^Bearer\s+(.+)$/i);
+  const accessToken = bearerMatch ? bearerMatch[1].trim() : (body.access_token || body.accessToken || '').toString().trim();
+  if (!accessToken) return null;
+  const entry = accessSessions.get(accessToken);
+  if (!entry) return null;
+  if (entry.expiresAt && Date.now() > entry.expiresAt) {
+    accessSessions.delete(accessToken);
+    return null;
   }
+  return entry.userId;
 }
 
-function listActivatedProviderRecords() {
-  hydrateActivatedProviderRecordsFromDisk();
-  const records = new Map();
-  for (const [key, value] of activatedProviders.entries()) {
-    if (!value?.provider) continue;
-    const recordKey = providerActivationKey(value.provider, value.mode || '');
-    if (!records.has(recordKey) || key === recordKey) {
-      records.set(recordKey, value);
-    }
-  }
-  return Array.from(records.values());
+async function getCobuildUserSafe(userId) {
+  const users = await readUsers();
+  return users.find((u) => u.id === userId) || null;
 }
 
-function publicActivatedProviderRecord(record) {
-  if (!record || typeof record !== 'object') return null;
-  return {
-    ...record,
-    apiKey: undefined,
-  };
-}
-
-function publicImageAnalysisRuntime(runtime) {
-  if (!runtime || typeof runtime !== 'object') return null;
-  return {
-    ...runtime,
-    apiKey: undefined,
-  };
-}
-
-function providerLabelFor(providerId) {
-  return providers.find((provider) => provider.id === providerId)?.name || providerId;
-}
-
-function buildFallbackRuntimeCandidate(record) {
-  if (!record || typeof record !== 'object') return null;
-  const catalogModel = catalogModelByIdentifier(String(record.model || '').trim());
-  const mode = String(record.mode || catalogModel?.mode || 'llm').trim().toLowerCase();
-  if (!['llm', 'image', 'video', 'audio'].includes(mode)) return null;
-  return {
-    id: String(catalogModel?.id || record.model || `${record.provider}-${mode}`).trim(),
-    provider: String(record.provider || '').trim(),
-    providerLabel: providerLabelFor(String(record.provider || '').trim()),
-    mode,
-    model: String(record.model || catalogModel?.upstreamModel || catalogModel?.id || '').trim(),
-    title: String(catalogModel?.name || record.model || 'Untitled model').trim(),
-    description: String(catalogModel?.description || '').trim() || null,
-    relaySource: String(record.relaySource || '').trim() || null,
-    price: Number.isFinite(Number(record.primaryPrice)) ? Number(record.primaryPrice) : (Number.isFinite(Number(catalogModel?.price)) ? Number(catalogModel.price) : null),
-    currency: String(record.primaryCurrency || catalogModel?.currency || '').trim() || null,
-    priceUnit: null,
-    pricingSummary: null,
-    recommendation: null,
-    recommendationScore: Number(record.relaySource ? 65 : 52),
-    activatedAt: Number(record.activatedAt || 0),
-    supportedOnCanvas: Boolean(catalogModel),
-  };
-}
-
-function flattenActivatedRuntimeCandidates() {
-  return listActivatedProviderRecords()
-    .flatMap((record) => {
-      const availableModels = Array.isArray(record?.availableModels) ? record.availableModels : [];
-      if (availableModels.length === 0) {
-        const fallback = buildFallbackRuntimeCandidate(record);
-        return fallback ? [fallback] : [];
-      }
-      return availableModels.map((entry) => {
-        const catalogModel = catalogModelByIdentifier(String(entry?.catalogModelId || entry?.upstreamModel || entry?.id || '').trim());
-        const mode = String(entry?.mode || record?.mode || catalogModel?.mode || '').trim().toLowerCase();
-        return {
-          id: String(entry?.id || catalogModel?.id || '').trim(),
-          provider: String(record?.provider || '').trim(),
-          providerLabel: providerLabelFor(String(record?.provider || '').trim()),
-          mode,
-          model: String(entry?.upstreamModel || catalogModel?.upstreamModel || entry?.id || '').trim(),
-          title: String(entry?.name || catalogModel?.name || entry?.upstreamModel || entry?.id || 'Untitled model').trim(),
-          description: String(catalogModel?.description || '').trim() || null,
-          relaySource: String(record?.relaySource || '').trim() || null,
-          price: Number.isFinite(Number(entry?.price)) ? Number(entry.price) : null,
-          currency: String(entry?.currency || '').trim() || null,
-          priceUnit: String(entry?.priceUnit || '').trim() || null,
-          pricingSummary: String(entry?.pricingSummary || '').trim() || null,
-          recommendation: String(entry?.recommendation || '').trim() || null,
-          recommendationScore: Number.isFinite(Number(entry?.recommendationScore)) ? Number(entry.recommendationScore) : 0,
-          activatedAt: Number(record?.activatedAt || 0),
-          supportedOnCanvas: Boolean(catalogModel),
-          catalogModelId: String(entry?.catalogModelId || catalogModel?.id || '').trim() || null,
-        };
-      });
-    })
-    .filter((item) => item && ['llm', 'image', 'video', 'audio'].includes(String(item.mode || '').trim()));
-}
-
-function sortRuntimeCandidates(candidates = [], preferredModels = []) {
-  const normalizedPreferred = new Set(preferredModels.map((value) => normalizeCatalogIdentifier(value)).filter(Boolean));
-  return candidates.slice().sort((left, right) => {
-    const leftPreferred = normalizedPreferred.has(normalizeCatalogIdentifier(left?.id))
-      || normalizedPreferred.has(normalizeCatalogIdentifier(left?.model))
-      || normalizedPreferred.has(normalizeCatalogIdentifier(left?.catalogModelId));
-    const rightPreferred = normalizedPreferred.has(normalizeCatalogIdentifier(right?.id))
-      || normalizedPreferred.has(normalizeCatalogIdentifier(right?.model))
-      || normalizedPreferred.has(normalizeCatalogIdentifier(right?.catalogModelId));
-    if (leftPreferred !== rightPreferred) return rightPreferred ? 1 : -1;
-    const recommendedDelta = Number(right?.recommendationScore || 0) - Number(left?.recommendationScore || 0);
-    if (recommendedDelta !== 0) return recommendedDelta;
-    const canvasDelta = Number(Boolean(right?.supportedOnCanvas)) - Number(Boolean(left?.supportedOnCanvas));
-    if (canvasDelta !== 0) return canvasDelta;
-    const relayDelta = Number(Boolean(right?.relaySource)) - Number(Boolean(left?.relaySource));
-    if (relayDelta !== 0) return relayDelta;
-    return Number(right?.activatedAt || 0) - Number(left?.activatedAt || 0);
-  });
-}
-
-function publicRuntimeRecommendationCandidate(candidate) {
-  if (!candidate) return null;
-  return {
-    id: String(candidate.id || '').trim(),
-    provider: String(candidate.provider || '').trim(),
-    providerLabel: String(candidate.providerLabel || '').trim() || providerLabelFor(String(candidate.provider || '').trim()),
-    mode: String(candidate.mode || 'llm').trim(),
-    model: String(candidate.model || '').trim(),
-    title: String(candidate.title || candidate.model || candidate.id || '').trim(),
-    description: String(candidate.description || '').trim() || null,
-    relaySource: String(candidate.relaySource || '').trim() || null,
-    price: Number.isFinite(Number(candidate.price)) ? Number(candidate.price) : null,
-    currency: String(candidate.currency || '').trim() || null,
-    priceUnit: String(candidate.priceUnit || '').trim() || null,
-    pricingSummary: String(candidate.pricingSummary || '').trim() || null,
-    recommendation: String(candidate.recommendation || '').trim() || null,
-    recommendationScore: Number.isFinite(Number(candidate.recommendationScore)) ? Number(candidate.recommendationScore) : null,
-  };
-}
-
-function buildRuntimeRecommendationSummary(key, candidate, options = {}) {
-  if (!candidate) return null;
-  const candidates = Array.isArray(options.candidates)
-    ? options.candidates.map((item) => publicRuntimeRecommendationCandidate(item)).filter(Boolean)
-    : [];
-  const primary = publicRuntimeRecommendationCandidate(candidate);
-  return {
-    key,
-    title: String(options.title || '').trim(),
-    summary: String(options.summary || candidate.recommendation || '').trim(),
-    provider: String(candidate.provider || '').trim(),
-    providerLabel: String(candidate.providerLabel || '').trim() || providerLabelFor(String(candidate.provider || '').trim()),
-    mode: String(candidate.mode || 'llm').trim(),
-    model: String(candidate.model || '').trim(),
-    relaySource: String(candidate.relaySource || '').trim() || null,
-    price: Number.isFinite(Number(candidate.price)) ? Number(candidate.price) : null,
-    currency: String(candidate.currency || '').trim() || null,
-    priceUnit: String(candidate.priceUnit || '').trim() || null,
-    pricingSummary: String(candidate.pricingSummary || '').trim() || null,
-    recommendation: String(candidate.recommendation || '').trim() || null,
-    tags: Array.isArray(options.tags) ? options.tags.map((item) => String(item || '').trim()).filter(Boolean) : [],
-    primary,
-    alternates: candidates.filter((item) => item.id !== primary?.id || item.model !== primary?.model).slice(0, 2),
-    candidates,
-    tasks: Array.isArray(options.tasks) ? options.tasks.filter(Boolean) : [],
-  };
-}
-
-function buildRuntimeTaskRecommendation(id, options = {}) {
-  const candidates = Array.isArray(options.candidates)
-    ? options.candidates.map((item) => publicRuntimeRecommendationCandidate(item)).filter(Boolean)
-    : [];
-  const primary = candidates[0] || null;
-  if (!primary) return null;
-  return {
-    id: String(id || '').trim(),
-    title: String(options.title || '').trim(),
-    summary: String(options.summary || primary.recommendation || '').trim(),
-    tags: Array.isArray(options.tags) ? options.tags.map((item) => String(item || '').trim()).filter(Boolean) : [],
-    primary,
-    alternates: candidates.slice(1, 3),
-    candidates,
-  };
-}
-
-function buildRuntimeRecommendations() {
-  const allCandidates = flattenActivatedRuntimeCandidates();
-  const imageCandidates = allCandidates.filter((item) => item.mode === 'image');
-  const videoCandidates = allCandidates.filter((item) => item.mode === 'video');
-  const audioCandidates = allCandidates.filter((item) => item.mode === 'audio');
-  const analysisCandidates = allCandidates.filter((item) => item.mode === 'llm' || item.mode === 'image');
-
-  const imageGenerationCandidates = sortRuntimeCandidates(imageCandidates, ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'grok-imagine-1.5-edit-apimart', 'Qwen/Qwen-Image', 'lib-image']);
-  const videoGenerationCandidates = sortRuntimeCandidates(videoCandidates, ['kling-o3', 'happyhorse-11', 'doubao-seedance-2-0', 'seedance-v2', 'wan22-i2v-a14b', 'wan22-t2v-a14b']);
-  const audioGenerationCandidates = sortRuntimeCandidates(audioCandidates, ['doubao-audio-1-0', 'suno_music']);
-
-  const imageAnalysisRuntime = publicImageAnalysisRuntime(pickActivatedCloudImageAnalysisRuntime());
-  const matchedAnalysisCandidate = imageAnalysisRuntime
-    ? sortRuntimeCandidates(
-      analysisCandidates.filter((item) => (
-        String(item.provider || '').trim() === String(imageAnalysisRuntime.provider || '').trim()
-        || normalizeCatalogIdentifier(item.model) === normalizeCatalogIdentifier(imageAnalysisRuntime.model)
-        || normalizeCatalogIdentifier(item.id) === normalizeCatalogIdentifier(imageAnalysisRuntime.model)
-      )),
-      [String(imageAnalysisRuntime.model || '')],
-    )[0] || null
-    : null;
-  const analysisFallbackCandidate = imageAnalysisRuntime
-    ? {
-        id: String(imageAnalysisRuntime.model || 'analysis-runtime').trim(),
-        provider: String(imageAnalysisRuntime.provider || '').trim(),
-        providerLabel: providerLabelFor(String(imageAnalysisRuntime.provider || '').trim()),
-        mode: String(imageAnalysisRuntime.mode || 'llm').trim(),
-        model: String(imageAnalysisRuntime.model || '').trim(),
-        title: String(imageAnalysisRuntime.model || 'Cloud runtime model').trim(),
-        description: null,
-        relaySource: null,
-        price: null,
-        currency: null,
-        priceUnit: null,
-        pricingSummary: null,
-        recommendation: '已激活的云端多模态运行时，可直接用于图片解析与视频语义理解',
-        recommendationScore: 88,
-        activatedAt: 0,
-        supportedOnCanvas: false,
-      }
-    : null;
-  const analysisPrimary = matchedAnalysisCandidate || analysisFallbackCandidate;
-  const analysisTopCandidates = sortRuntimeCandidates(
-    analysisCandidates,
-    [String(imageAnalysisRuntime?.model || ''), 'qwen35-vl', 'florence2', 'clip-interrogator'],
-  ).slice(0, 3);
-  const imageSubjectReplaceCandidates = sortRuntimeCandidates(
-    imageCandidates,
-    ['flux-pro', 'gpt-image-2', 'grok-imagine-1.5-edit-apimart', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'Qwen/Qwen-Image', 'lib-image'],
-  ).slice(0, 3);
-  const imageOmniCandidates = sortRuntimeCandidates(
-    imageCandidates,
-    ['flux-pro', 'gpt-image-2', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'Qwen/Qwen-Image', 'lib-image'],
-  ).slice(0, 3);
-  const imageMultiReferenceCandidates = sortRuntimeCandidates(
-    imageCandidates,
-    ['doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'flux-pro', 'gpt-image-2', 'Qwen/Qwen-Image', 'lib-image'],
-  ).slice(0, 3);
-  const imageStyleCandidates = sortRuntimeCandidates(
-    imageCandidates,
-    ['flux-pro', 'doubao-seedream-5-0-lite', 'doubao-seedream-5-0-pro', 'gpt-image-2', 'Qwen/Qwen-Image', 'lib-image'],
-  ).slice(0, 3);
-  const imagePromptInterrogationCandidates = sortRuntimeCandidates(
-    analysisCandidates,
-    [String(imageAnalysisRuntime?.model || ''), 'clip-interrogator', 'florence2', 'qwen35-vl'],
-  ).slice(0, 3);
-  const imageCompositionAnalysisCandidates = sortRuntimeCandidates(
-    analysisCandidates,
-    [String(imageAnalysisRuntime?.model || ''), 'qwen35-vl', 'florence2', 'clip-interrogator'],
-  ).slice(0, 3);
-  const videoSubjectReplaceCandidates = sortRuntimeCandidates(
-    videoCandidates,
-    ['kling-o3', 'happyhorse-11', 'seedance-v2', 'wan22-i2v-a14b', 'wan22-t2v-a14b'],
-  ).slice(0, 3);
-  const videoOmniKeepMotionCandidates = sortRuntimeCandidates(
-    videoCandidates,
-    ['kling-o3', 'happyhorse-11', 'seedance-v2', 'wan22-i2v-a14b', 'wan22-t2v-a14b'],
-  ).slice(0, 3);
-  const videoMotionStyleCandidates = sortRuntimeCandidates(
-    videoCandidates,
-    ['kling-o3', 'seedance-v2', 'happyhorse-11', 'wan22-i2v-a14b', 'wan22-t2v-a14b'],
-  ).slice(0, 3);
-  const videoImageToVideoCandidates = sortRuntimeCandidates(
-    videoCandidates,
-    ['kling-o3', 'happyhorse-11', 'seedance-v2', 'wan22-i2v-a14b', 'wan22-t2v-a14b'],
-  ).slice(0, 3);
-  const videoSemanticParseCandidates = sortRuntimeCandidates(
-    analysisCandidates,
-    [String(imageAnalysisRuntime?.model || ''), 'qwen35-vl', 'internvideo', 'video-llava'],
-  ).slice(0, 3);
-  const videoShotBreakdownCandidates = sortRuntimeCandidates(
-    analysisCandidates,
-    [String(imageAnalysisRuntime?.model || ''), 'qwen35-vl', 'video-llava', 'internvideo'],
-  ).slice(0, 3);
-  const audioBgmCandidates = sortRuntimeCandidates(audioCandidates, ['suno_music']).slice(0, 3);
-  const audioSfxCandidates = sortRuntimeCandidates(audioCandidates, ['suno_music']).slice(0, 3);
-  const audioVoiceCandidates = sortRuntimeCandidates(audioCandidates, ['suno_music']).slice(0, 3);
-
-  return {
-    imageGeneration: buildRuntimeRecommendationSummary('imageGeneration', imageGenerationCandidates[0], {
-      title: '图片节点首推模型',
-      summary: '优先用于主素材+ 参考素材的图片生成、编辑与保构图换主体',
-      tags: ['图片生成', '主素材', '参考素材'],
-      candidates: imageGenerationCandidates.slice(0, 3),
-      tasks: [
-        buildRuntimeTaskRecommendation('subjectReplaceKeepComposition', {
-          title: '保构图换主体',
-          summary: '保持主素材的机位、构图与画面布局，优先替换主体到参考素材目标',
-          tags: ['composition', 'subject', '主体替换', '保构图'],
-          candidates: imageSubjectReplaceCandidates,
-        }),
-        buildRuntimeTaskRecommendation('omniReference', {
-          title: '全能参考融合',
-          summary: '同时吸收主体、材质、风格与氛围信息，更适合多条件强约束出图',
-          tags: ['omni', '多模态', '强条件'],
-          candidates: imageOmniCandidates,
-        }),
-        buildRuntimeTaskRecommendation('multiReferenceBlend', {
-          title: '多参考融合',
-          summary: '多张参考图混合时优先保持主体和风格的平衡，减少参考互相打架',
-          tags: ['multi-reference', 'blend', '风格融合'],
-          candidates: imageMultiReferenceCandidates,
-        }),
-        buildRuntimeTaskRecommendation('styleReference', {
-          title: '风格参考增强',
-          summary: '更偏向风格、光影和质感迁移，适合单参考快速增强',
-          tags: ['style', 'lighting', 'texture'],
-          candidates: imageStyleCandidates,
-        }),
-      ],
-    }),
-    imageAnalysis: buildRuntimeRecommendationSummary('imageAnalysis', analysisPrimary, {
-      title: '图片解析首推模型',
-      summary: '优先用于图片解析、反推提示词、风格光影和主体构图理解',
-      tags: ['图片解析', '提示词反推'],
-      candidates: analysisTopCandidates,
-      tasks: [
-        buildRuntimeTaskRecommendation('promptInterrogation', {
-          title: '提示词反推',
-          summary: '优先提取主体、风格、镜头、光影和氛围词，适合写回图片与视频节点参数区',
-          tags: ['prompt', 'style', 'lighting'],
-          candidates: imagePromptInterrogationCandidates,
-        }),
-        buildRuntimeTaskRecommendation('subjectLightingComposition', {
-          title: '主体 / 光影 / 构图理解',
-          summary: '更适合拆解主素材构图、主体层级和画面光影，辅助保构图换主体',
-          tags: ['composition', 'subject', 'lighting'],
-          candidates: imageCompositionAnalysisCandidates,
-        }),
-      ],
-    }),
-    videoGeneration: buildRuntimeRecommendationSummary('videoGeneration', videoGenerationCandidates[0], {
-      title: '视频节点首推模型',
-      summary: '优先用于视频生成、多模态参考、全能参考和保运镜换主体',
-      tags: ['视频生成', '多模态参考'],
-      candidates: videoGenerationCandidates.slice(0, 3),
-      tasks: [
-        buildRuntimeTaskRecommendation('subjectReplaceKeepMotion', {
-          title: '保运镜换主体',
-          summary: '锁定主视频的运镜、节奏和镜头结构，优先替换为参考主体',
-          tags: ['motion', 'subject', 'video-edit'],
-          candidates: videoSubjectReplaceCandidates,
-        }),
-        buildRuntimeTaskRecommendation('omniReferenceKeepMotion', {
-          title: '主视频锁定+ 全能参数',
-          summary: '在保留主视频镜头调度的同时融合主体、风格和场景参考',
-          tags: ['motion', 'omni', 'all-in-one'],
-          candidates: videoOmniKeepMotionCandidates,
-        }),
-        buildRuntimeTaskRecommendation('motionStyleBlend', {
-          title: '运镜与风格融合',
-          summary: '强调视频运动轨迹与视觉风格的同步迁移，适合广告或 MV 类镜头',
-          tags: ['motion', 'style', 'blend'],
-          candidates: videoMotionStyleCandidates,
-        }),
-        buildRuntimeTaskRecommendation('subjectReferenceImageToVideo', {
-          title: '主体参考图生视频',
-          summary: '以主体参考图为核心驱动视频生成，兼顾动作连贯和造型一致',
-          tags: ['image-to-video', 'subject', 'consistency'],
-          candidates: videoImageToVideoCandidates,
-        }),
-        buildRuntimeTaskRecommendation('omniReferenceVideoGeneration', {
-          title: '全能参考视频生成',
-          summary: '适合从多张参考中统一生成视频结果，兼顾主体、风格和镜头意图',
-          tags: ['omni', 'video-generation', 'multi-reference'],
-          candidates: videoOmniKeepMotionCandidates,
-        }),
-        buildRuntimeTaskRecommendation('referenceDrivenVideoGeneration', {
-          title: '参考驱动视频生成',
-          summary: '当参考约束较弱时优先保证视频可生成性，再逐步叠加主体和风格控制',
-          tags: ['reference', 'fallback', 'robust'],
-          candidates: videoGenerationCandidates.slice(0, 3),
-        }),
-      ],
-    }),
-    videoAnalysis: buildRuntimeRecommendationSummary('videoAnalysis', analysisPrimary, {
-      title: '视频解析首推模型',
-      summary: '优先用于关键帧语义解析、镜头语言整理和视频提示词反推',
-      tags: ['视频解析', '语义理解'],
-      candidates: analysisTopCandidates,
-      tasks: [
-        buildRuntimeTaskRecommendation('semanticParse', {
-          title: '视频语义解析',
-          summary: '优先理解镜头内容、时序语义和场景变化，适合驱动全能参考与视频解析',
-          tags: ['semantic', 'timeline', 'scene'],
-          candidates: videoSemanticParseCandidates,
-        }),
-        buildRuntimeTaskRecommendation('promptInterrogation', {
-          title: '视频提示词反推',
-          summary: '适合从关键帧和时序摘要中整理出可写回节点的提示词、风格和运动描述',
-          tags: ['prompt', 'style', 'motion'],
-          candidates: videoSemanticParseCandidates,
-        }),
-        buildRuntimeTaskRecommendation('shotBreakdown', {
-          title: '分镜 / 运镜拆解',
-          summary: '更适合提取镜头节奏、运镜方向和镜头切换结构，辅助保运镜换主体',
-          tags: ['shot', 'camera', 'motion'],
-          candidates: videoShotBreakdownCandidates,
-        }),
-      ],
-    }),
-    audioGeneration: buildRuntimeRecommendationSummary('audioGeneration', audioGenerationCandidates[0], {
-      title: '音频节点首推模型',
-      summary: '优先用于后续远程 BGM、音效和旁白生成链路',
-      tags: ['音频生成'],
-      candidates: audioGenerationCandidates.slice(0, 3),
-      tasks: [
-        buildRuntimeTaskRecommendation('bgm', {
-          title: 'BGM 生成',
-          summary: '适合氛围配乐、节奏铺底和音乐片段草图生成',
-          tags: ['bgm', 'music'],
-          candidates: audioBgmCandidates,
-        }),
-        buildRuntimeTaskRecommendation('sfx', {
-          title: '音效生成',
-          summary: '适合短音效、环境声与事件音频生成',
-          tags: ['sfx', 'foley'],
-          candidates: audioSfxCandidates,
-        }),
-        buildRuntimeTaskRecommendation('voiceover', {
-          title: '旁白生成',
-          summary: '适合后续真人感旁白、口播和语气化语音链路',
-          tags: ['voice', 'narration'],
-          candidates: audioVoiceCandidates,
-        }),
-      ],
-    }),
-  };
-}
-
-function getActivatedProviderRecord(providerId, mode = '') {
-  hydrateActivatedProviderRecordsFromDisk();
-  if (mode) {
-    const exact = activatedProviders.get(providerActivationKey(providerId, mode));
-    if (exact) return exact;
-  }
-  const legacy = activatedProviders.get(providerId);
-  if (legacy && (!mode || legacy.mode === mode)) return legacy;
-  return listActivatedProviderRecords().find((record) => (
-    record.provider === providerId && (!mode || record.mode === mode)
-  )) || null;
-}
-
-function setActivatedProviderRecord(providerId, mode, record) {
-  hydrateActivatedProviderRecordsFromDisk();
-  activatedProviders.set(providerActivationKey(providerId, mode), {
-    ...record,
-    provider: providerId,
-    mode,
-  });
-  persistActivatedProviderRecordsToDisk();
-}
-
-function isRealApiProxyEnabled() {
-  if (process.env.HMDAO_REAL_API === '1') return true;
-  hydrateActivatedProviderRecordsFromDisk();
-  if (String(process.env.HMDAO_LITELLM_API_KEY || '').trim()) return true;
-  for (const record of activatedProviders.values()) {
-    if (String(record?.apiKey || '').trim()) return true;
-  }
-  return false;
-}
-
-function deleteActivatedProviderRecord(providerId, mode = '') {
-  hydrateActivatedProviderRecordsFromDisk();
-  if (mode) {
-    activatedProviders.delete(providerActivationKey(providerId, mode));
-    const legacy = activatedProviders.get(providerId);
-    if (legacy?.mode === mode) activatedProviders.delete(providerId);
-    persistActivatedProviderRecordsToDisk();
-    return;
-  }
-  for (const key of Array.from(activatedProviders.keys())) {
-    if (key === providerId || key.startsWith(`${providerId}::`)) {
-      activatedProviders.delete(key);
-    }
-  }
-  persistActivatedProviderRecordsToDisk();
-}
-
-function activatedProviderPayload(providerId, catalogItem = null) {
-  const record = getActivatedProviderRecord(providerId, catalogItem?.mode || '');
-  const providerActivated = Boolean(record);
-  const activationModelMatched = catalogItem ? modelMatchesActivation(record, catalogItem) : providerActivated;
-  const matchedAvailableModel = providerActivated && catalogItem && Array.isArray(record?.availableModels)
-    ? record.availableModels.find((entry) => modelMatchesActivation({
-      mode: record.mode,
-      model: entry?.upstreamModel || entry?.catalogModelId || entry?.id,
-      catalogModelIds: [entry?.catalogModelId, entry?.upstreamModel, entry?.id].filter(Boolean),
-    }, catalogItem))
-    : null;
-  return {
-    activated: providerActivated,
-    activationModelMatched,
-    activatedAt: providerActivated ? (record?.activatedAt || null) : null,
-    activationMode: providerActivated ? (record?.mode || null) : null,
-    activationModel: providerActivated ? (record?.model || null) : null,
-    maskedKey: providerActivated ? (record?.maskedKey || '') : '',
-    activationPrice: providerActivated ? (matchedAvailableModel?.price ?? record?.primaryPrice ?? null) : null,
-    activationCurrency: providerActivated ? (matchedAvailableModel?.currency || record?.primaryCurrency || null) : null,
-    activationRelaySource: providerActivated ? (record?.relaySource || null) : null,
-    activationAvailableModelCount: providerActivated ? (Array.isArray(record?.availableModels) ? record.availableModels.length : 0) : 0,
-  };
-}
-
-function isCatalogModelActivated(item) {
-  return activatedProviderPayload(item.provider, item).activated;
-}
-
-function modelCatalogPayload({ mode, nodeType } = {}) {
-  return MODEL_CATALOG
-    .filter((item) => {
-      const providerMeta = providers.find((provider) => provider.id === item.provider);
-      const providerSupportsMode = providerMeta ? providerMeta.modes.includes(item.mode) : true;
-      return providerSupportsMode && (!mode || item.mode === mode) && (!nodeType || item.nodeTypes.includes(nodeType));
-    })
-    .map((item) => {
-      const activationState = activatedProviderPayload(item.provider, item);
-      const hasActivationPrice = activationState.activationPrice !== null
-        && activationState.activationPrice !== undefined
-        && Number.isFinite(Number(activationState.activationPrice));
-      return {
-        ...item,
-        model: item.upstreamModel || item.id,
-        price: hasActivationPrice ? Number(activationState.activationPrice) : item.price,
-        currency: activationState.activationCurrency || item.currency,
-        ...activationState,
-        providerMeta: providers.find((provider) => provider.id === item.provider) || null,
-      };
-    });
-}
-
-function activatedModelIds() {
-  return new Set(
-    listActivatedProviderRecords()
-      .flatMap((item) => {
-        const matched = catalogModelByIdentifier(item?.model);
-        return [
-          item?.model,
-          ...(Array.isArray(item?.catalogModelIds) ? item.catalogModelIds : []),
-          ...(Array.isArray(item?.availableModels)
-            ? item.availableModels.flatMap((entry) => [entry?.catalogModelId, entry?.upstreamModel, entry?.id])
-            : []),
-          ...(matched ? [matched.id, matched.upstreamModel] : []),
-        ].filter(Boolean);
-      }),
-  );
-}
-
-function modelMatchesIdentifier(item, identifier) {
-  const normalizedIdentifier = normalizeCatalogIdentifier(identifier);
-  if (!normalizedIdentifier) return false;
-  const resolvedCatalogId = normalizeCatalogIdentifier(relayAliasCatalogId(identifier));
-  const candidateIds = [
-    item?.id,
-    item?.name,
-    item?.model,
-    item?.upstreamModel,
-  ]
-    .map((value) => normalizeCatalogIdentifier(value))
-    .filter(Boolean);
-  return candidateIds.includes(normalizedIdentifier) || (resolvedCatalogId ? candidateIds.includes(resolvedCatalogId) : false);
-}
-
-function defaultProviderModeModel(provider, mode, items = []) {
-  if (provider === 'siliconflow' && mode === 'video') {
-    return items.find((item) => modelMatchesIdentifier(item, 'Wan-AI/Wan2.2-T2V-A14B'))
-      || items.find((item) => modelMatchesIdentifier(item, 'Wan-AI/Wan2.2-I2V-A14B'))
-      || null;
-  }
-  if (provider === 'siliconflow' && mode === 'image') {
-    return items.find((item) => modelMatchesIdentifier(item, 'Qwen/Qwen-Image')) || null;
-  }
-  return null;
-}
-
-function normalizeRelayEndpointInput(endpoint = '') {
-  const raw = String(endpoint || '').trim();
-  if (!raw) return '';
-  let normalized = raw.replace(/\/models\/?$/i, '').replace(/\/$/, '');
-  try {
-    const url = new URL(normalized);
-    if (url.hostname === 'www.apimart.ai') {
-      url.hostname = 'api.apimart.ai';
-    }
-    if (/^\/(?:zh|en|cn|ja|ko|ru|fr|de|es|pt)(?:-[a-z]{2})?\/v1\/?$/i.test(url.pathname)) {
-      url.pathname = '/v1';
-    }
-    if (/(^|\.)apimart\.ai$/i.test(url.hostname) && url.hostname !== 'api.apimart.ai') {
-      url.hostname = 'api.apimart.ai';
-    }
-    if (/(^|\.)apimart\.ai$/i.test(url.hostname) && (!url.pathname || url.pathname === '/')) {
-      url.pathname = '/v1';
-    }
-    normalized = url.toString().replace(/\/$/, '');
-  } catch {
-    normalized = normalized.replace(/\/$/, '');
-  }
-  return normalized;
-}
-
-function relayBaseUrlCandidates(baseUrl = '') {
-  const candidates = [];
-  const push = (value) => {
-    const normalized = String(value || '').trim().replace(/\/$/, '');
-    if (normalized && !candidates.includes(normalized)) candidates.push(normalized);
-  };
-  push(baseUrl);
-  try {
-    const url = new URL(baseUrl);
-    if (/(^|\.)apimart\.ai$/i.test(url.hostname) && url.hostname !== 'api.apimart.ai') {
-      const apiUrl = new URL(url.toString());
-      apiUrl.hostname = 'api.apimart.ai';
-      if (!apiUrl.pathname || apiUrl.pathname === '/') apiUrl.pathname = '/v1';
-      push(apiUrl.toString());
-    }
-  } catch {
-    // ignore malformed URL here; validation happens at request time
-  }
-  return candidates;
-}
-
-function relayRequestUrlCandidates(baseUrl = '', requestUrl = '') {
-  const candidates = [];
-  const push = (value) => {
-    const normalized = String(value || '').trim();
-    if (normalized && !candidates.includes(normalized)) candidates.push(normalized);
-  };
-  push(requestUrl);
-  try {
-    const target = new URL(requestUrl);
-    for (const candidateBaseUrl of relayBaseUrlCandidates(baseUrl)) {
-      const candidateBase = new URL(candidateBaseUrl);
-      if (candidateBase.origin === target.origin) continue;
-      const next = new URL(target.toString());
-      next.protocol = candidateBase.protocol;
-      next.hostname = candidateBase.hostname;
-      next.port = candidateBase.port;
-      push(next.toString());
-    }
-  } catch {
-    // ignore malformed URL here; validation happens at request time
-  }
-  return candidates;
-}
-
-function relayModelsEndpointCandidates(baseUrl = '') {
-  const candidates = [];
-  const push = (value) => {
-    const normalized = String(value || '').trim().replace(/\/$/, '');
-    if (normalized && !candidates.includes(normalized)) candidates.push(normalized);
-  };
-  push(baseUrl);
-  try {
-    const url = new URL(baseUrl);
-    if (/^\/(?:zh|en|cn|ja|ko|ru|fr|de|es|pt)(?:-[a-z]{2})?\/v1$/i.test(url.pathname)) {
-      const stripped = new URL(url.toString());
-      stripped.pathname = '/v1';
-      push(stripped.toString());
-    }
-    if (/(^|\.)apimart\.ai$/i.test(url.hostname) && url.hostname !== 'api.apimart.ai') {
-      const apiUrl = new URL(url.toString());
-      apiUrl.hostname = 'api.apimart.ai';
-      if (!apiUrl.pathname || apiUrl.pathname === '/') apiUrl.pathname = '/v1';
-      push(apiUrl.toString());
-    }
-  } catch {
-    // ignore malformed URL here; validation happens at request time
-  }
-  return candidates.map((value) => `${value}/models`);
-}
-
-function relayEndpointHelpMessage(baseUrl = '') {
-  try {
-    const url = new URL(baseUrl);
-    if (/(^|\.)apimart\.ai$/i.test(url.hostname)) {
-      return '检测到你填写的 APIMart 地址。请优先使用 OpenAI 兼容根地址，例如 https://apimart.ai/v1 或 https://api.apimart.ai/v1，而不是官网语言页地址';
-    }
-  } catch {
-    // ignore
-  }
-  return '请确认填写的 OpenAI 兼容 Base URL，而不是官网介绍页或文档页面地址';
-}
-
-const RELAY_PRESET_META = {
-  comfly: {
-    id: 'comfly',
-    name: 'Comfly',
-  },
-  suanliai: {
-    id: 'suanliai',
-    name: 'Suanliai',
-  },
-  apimart: {
-    id: 'apimart',
-    name: 'APIMart',
-  },
-  'generic-openai-relay': {
-    id: 'generic-openai-relay',
-    name: 'OpenAI Relay',
-  },
-};
-
-const RELAY_CONNECTIVITY_CACHE = new Map();
-const RELAY_CONNECTIVITY_SUCCESS_TTL_MS = 5 * 60 * 1000;
-const RELAY_CONNECTIVITY_FAILURE_TTL_MS = 60 * 1000;
-
-const RELAY_MODEL_MATCHERS = [
-  {
-    catalogId: 'lib-image',
-    aliases: [/qwen[\/\-_ ]?qwen[\/\-_ ]?image/i, /qwen[\/\-_ ]?image(?:[\/\-_ ]?edit)?/i],
-    score: 100,
-    recommendation: '多参考主体控制、保构图换主体、文字与商品图表现稳定',
-  },
-  {
-    catalogId: 'gpt-image-2',
-    aliases: [/gpt[\/\-_ ]?image(?:[\/\-_ ]?(?:1|1\.0|1\.5|2))?/i, /gpt[\/\-_ ]?4o[\/\-_ ]?image/i],
-    score: 92,
-    recommendation: '适合作为通用图片生成与编辑候选，尤其适合保构图换主体与多参考改图',
-  },
-  {
-    aliases: [/image\s*2/i, /imagen\s*2/i],
-    score: 82,
-    recommendation: 'Google 图片家族，适合作为聚合平台里的高质量图片候选',
-    mode: 'image',
-    providerLabel: 'Google',
-    displayName: 'Imagen 2 / image2',
-  },
-  {
-    catalogId: 'flux-pro',
-    aliases: [/flux[\/\-_ ]?pro/i],
-    score: 90,
-    recommendation: '写实海报和高质感商业图更稳，适合作为图片备选',
-  },
-  {
-    catalogId: 'doubao-seedream-5-0-lite',
-    aliases: [/seedream[\/\-_ ]?4(?:\.0)?/i, /doubao[\/\-_ ]?seedream[\/\-_ ]?4(?:\.0)?/i, /seedream[\/\-_ ]?5(?:\.0)?(?:[\/\-_ ]?lite)?/i, /doubao[\/\-_ ]?seedream[\/\-_ ]?5(?:\.0)?(?:[\/\-_ ]?lite)?/i],
-    score: 88,
-    recommendation: '商品图、打光和高质感场景表现强',
-  },
-  {
-    catalogId: 'grok-imagine-1.5-edit-apimart',
-    aliases: [/grok[\/\-_ ]?imagine[\/\-_ ]?1\.5[\/\-_ ]?edit/i],
-    score: 90,
-    recommendation: '复杂编辑指令和多参考改图适配更好，可作为强编辑备选',
-  },
-  {
-    catalogId: 'gemini-3-pro-image-preview',
-    aliases: [/gemini[\/\-_ ]?3(?:\.0|\.1)?[\/\-_ ]?pro[\/\-_ ]?image[\/\-_ ]?preview/i],
-    score: 84,
-    recommendation: '适合多模态预览、参考分析和结构理解',
-  },
-  {
-    catalogId: 'kling-v3-omni',
-    aliases: [/kling[\/\-_ ]?v3[\/\-_ ]?omni/i],
-    score: 100,
-    recommendation: '主视频保运镜、多参考换角和全能参考视频编辑优先推荐',
-  },
-  {
-    catalogId: 'kling-o3',
-    aliases: [/kling[\/\-_ ]?(?:o3|v3|video)/i],
-    score: 100,
-    recommendation: '全能参考、主体一致性和多模态视频编辑优先推荐',
-  },
-  {
-    catalogId: 'seedance-v2',
-    aliases: [/seedance[\/\-_ ]?(?:2(?:\.0)?|v2)/i],
-    score: 96,
-    recommendation: '参考图/参考视频参考音频混合输入能力强，适合多模态视频链路',
-  },
-  {
-    catalogId: 'wan22-i2v-a14b',
-    aliases: [/wan[^a-z0-9]*2(?:\.|_)?2[^a-z0-9]*(?:i2v|image[^a-z0-9]*to[^a-z0-9]*video)/i],
-    score: 84,
-    recommendation: '图生视频与首尾帧控制能力稳定，适合轻量预演',
-  },
-  {
-    catalogId: 'wan22-t2v-a14b',
-    aliases: [/wan[^a-z0-9]*2(?:\.|_)?2[^a-z0-9]*(?:t2v|text[^a-z0-9]*to[^a-z0-9]*video)/i],
-    score: 80,
-    recommendation: '文生视频预览成本更低，适合先做草案',
-  },
-  {
-    catalogId: 'deepseek-chat',
-    aliases: [/deepseek[\/\-_ ]?chat/i, /deepseek[\/\-_ ]?v?3/i, /deepseek[\/\-_ ]?r1/i],
-    score: 86,
-    recommendation: '用于文案、调度和 agent 辅助较稳',
-  },
-  {
-    aliases: [/grok[\/\-_ ]?1(?:\.5)?[\/\-_ ]?video/i, /grok[\/\-_ ]?video/i],
-    score: 83,
-    recommendation: '更适合作为平台侧的视频多模态候选，后续可扩成强语义视频理解与生成路由',
-    mode: 'video',
-    providerLabel: 'xAI',
-    displayName: 'Grok 1.5 Video',
-  },
-  {
-    aliases: [/veo[\/\-_ ]?3(?:\.1)?/i, /veo3(?:\.1)?/i],
-    score: 92,
-    recommendation: '高质量视频生成家族，适合列为 Comfly 平台级主流视频候选',
-    mode: 'video',
-    providerLabel: 'Google',
-    displayName: 'Veo 3.1',
-  },
-  {
-    aliases: [/\bomni\b/i],
-    score: 89,
-    recommendation: '适合作为全能参考多模态理解类入口展示，便于后续接强条件控制链路',
-    mode: 'llm',
-    providerLabel: 'Multimodal',
-    displayName: 'Omni',
-  },
-  {
-    aliases: [/nano[\/\-_ ]?banana[\/\-_ ]?pro/i],
-    score: 78,
-    recommendation: '更适合作为轻量创意图片候选，当前可先展示为平台可用模型',
-    mode: 'image',
-    providerLabel: 'Creative',
-    displayName: 'Nano Banana Pro',
-  },
-  {
-    catalogId: 'nano-banana2',
-    aliases: [/nano[\/\-_ ]?banana[\/\-_ ]?2/i, /nano[\/\-_ ]?banana[\/\-_ ]?v?2/i],
-    score: 80,
-    recommendation: '轻量创意图片与参考图改写候选，适合聚合平台侧快速出图',
-  },
-  {
-    catalogId: 'gemini-31',
-    aliases: [/gemini[\/\-_ ]?3(?:\.1)?/i, /gemini[\/\-_ ]?3[\/\-_ ]?pro/i, /gemini[\/\-_ ]?3[\/\-_ ]?flash/i],
-    score: 88,
-    recommendation: '适合作为多模态理解与 agent 路由候选，后续可扩到更深的视频/图像分析工作流',
-  },
-  {
-    catalogId: 'midjourney-relax',
-    aliases: [/mj[\/\-_ ]?relax/i, /midjourney[\/\-_ ]?relax/i, /\bmidjourney\b/i],
-    score: 80,
-    recommendation: '适合作为平台级图片创作候选展示，后续可补更精细的风格与计费提示',
-    displayName: 'MJ Relax',
-  },
-  {
-    catalogId: 'happyhorse-11',
-    aliases: [/happyhorse(?:[\/\-_ ]?1(?:\.0|\.1)?)?/i],
-    score: 94,
-    recommendation: '统一视频入口，适合文本、首帧、参考图与视频编辑混合链路',
-  },
-  {
-    aliases: [/suno[\/\-_ ]?music/i, /\bsuno\b/i],
-    score: 87,
-    recommendation: '适合作为音频/BGM 平台模型展示，后续可继续打通到音频节点',
-    mode: 'audio',
-    providerLabel: 'Suno',
-    displayName: 'Suno Music',
-  },
-  {
-    aliases: [/\brunway\b/i],
-    score: 90,
-    recommendation: 'Runway 视频家族适合作为平台级视频候选，后续可扩成强编辑路线',
-    mode: 'video',
-    providerLabel: 'Runway',
-    displayName: 'Runway',
-  },
-];
-
-function firstFiniteNumber(values = []) {
-  for (const value of values) {
-    const num = Number(value);
-    if (Number.isFinite(num)) return num;
-  }
-  return null;
-}
-
-function fallbackRelayModelsRequestViaPowerShell(url, apiKey, timeoutMs = 15000) {
-  return new Promise((resolve, reject) => {
-    const seconds = Math.max(5, Math.ceil(Number(timeoutMs || 15000) / 1000));
-    const script = `
-$ProgressPreference = 'SilentlyContinue'
-$uri = '${escapePowerShellSingleQuoted(url)}'
-$headers = @{
-  Accept = 'application/json'
-  Authorization = 'Bearer ${escapePowerShellSingleQuoted(String(apiKey || '').trim())}'
-}
-try {
-  $resp = Invoke-WebRequest -Uri $uri -Method GET -Headers $headers -TimeoutSec ${seconds} -ErrorAction Stop
-  [Console]::Out.Write([int]$resp.StatusCode)
-  [Console]::Out.Write([Environment]::NewLine)
-  [Console]::Out.Write(($resp.Headers['Content-Type'] -join ','))
-  [Console]::Out.Write([Environment]::NewLine)
-  [Console]::Out.Write([string]$resp.Content)
-} catch {
-  $resp = $_.Exception.Response
-  if ($resp) {
-    $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
-    $content = $reader.ReadToEnd()
-    [Console]::Out.Write([int]$resp.StatusCode)
-    [Console]::Out.Write([Environment]::NewLine)
-    [Console]::Out.Write(($resp.Headers['Content-Type'] -join ','))
-    [Console]::Out.Write([Environment]::NewLine)
-    [Console]::Out.Write([string]$content)
-    exit 0
-  }
-  throw
-}
-`.trim();
-
-    const child = spawn('powershell', ['-NoProfile', '-Command', script], {
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => { stdout += String(chunk || ''); });
-    child.stderr.on('data', (chunk) => { stderr += String(chunk || ''); });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      if (code !== 0 && !stdout.trim()) {
-        reject(new Error(stderr.trim() || `PowerShell request failed with code ${code}.`));
-        return;
-      }
-      const [statusLine = '', contentTypeLine = '', ...bodyLines] = stdout.split(/\r?\n/);
-      resolve({
-        status: Number(statusLine) || 500,
-        ok: Number(statusLine) >= 200 && Number(statusLine) < 300,
-        contentType: String(contentTypeLine || '').trim().toLowerCase(),
-        text: bodyLines.join('\n'),
-      });
-    });
-  });
-}
-
-async function requestRelayModelsEndpoint(url, apiKey, signal, timeoutMs = 15000) {
-  const headers = {
-    Accept: 'application/json',
-    Authorization: `Bearer ${String(apiKey).trim()}`,
-  };
-  const requestUrls = relayRequestUrlCandidates(url.replace(/\/models\/?$/i, ''), url);
-  let lastError = null;
-  for (const requestUrl of requestUrls) {
-    try {
-      const response = await fetch(requestUrl, {
-        method: 'GET',
-        headers,
-        signal,
-      });
-      return {
-        status: response.status,
-        ok: response.ok,
-        contentType: String(response.headers.get('content-type') || '').toLowerCase(),
-        text: await response.text(),
-      };
-    } catch (error) {
-      lastError = error;
-      const code = error?.cause?.code || error?.code || '';
-      if (!(process.platform === 'win32' && ['UND_ERR_CONNECT_TIMEOUT', 'ETIMEDOUT', 'ENETUNREACH', 'ECONNRESET', 'ECONNREFUSED'].includes(String(code)))) {
-        throw error;
-      }
-    }
-  }
-  if (process.platform === 'win32') {
-    for (const requestUrl of requestUrls) {
-      const fallback = await fallbackRelayModelsRequestViaPowerShell(requestUrl, apiKey, timeoutMs);
-      if (fallback.ok || fallback.status > 0 || String(fallback.text || '').trim()) {
-        return fallback;
-      }
-    }
-  }
-  throw lastError || new Error('relay-model-request-failed');
-}
-
-function parseRelayPricing(item = {}) {
-  const pricing = item?.pricing && typeof item.pricing === 'object' && !Array.isArray(item.pricing)
-    ? item.pricing
-    : null;
-  const directPrice = firstFiniteNumber([
-    item?.price,
-    item?.unit_price,
-    item?.cost,
-    item?.pricing,
-  ]);
-  const pricingPrice = pricing
-    ? firstFiniteNumber([
-      pricing.price,
-      pricing.unit_price,
-      pricing.image,
-      pricing.video,
-      pricing.input,
-      pricing.output,
-      pricing.per_call,
-      pricing.per_second,
-      pricing.per_image,
-    ])
-    : null;
-  const price = directPrice ?? pricingPrice;
-  const currency = extractFirstString([
-    item?.currency,
-    pricing?.currency,
-    pricing?.unit,
-  ]) || null;
-  const pricingUnit = extractFirstString([
-    pricing?.price_unit,
-    pricing?.billing_unit,
-    pricing?.unit_label,
-    item?.price_unit,
-    item?.billing_unit,
-  ]) || null;
-  const pricingSummary = pricing
-    ? Object.entries(pricing)
-      .filter(([, value]) => value !== null && value !== undefined && value !== '')
-      .slice(0, 5)
-      .map(([key, value]) => `${key}:${value}`)
-      .join(' | ')
-    : '';
-  return {
-    price,
-    currency,
-    pricingUnit,
-    pricingSummary: pricingSummary || null,
-  };
-}
-
-function guessRelayModelMode(modelId = '', modelName = '') {
-  const source = `${modelId} ${modelName}`.toLowerCase();
-  if (/\b(tts|speech|voice|audio|music|sound)\b/.test(source)) return 'audio';
-  if (/\b(video|i2v|t2v|ti2v|reference-to-video|img2video|image-to-video)\b/.test(source)) return 'video';
-  if (/\b(image|edit|flux|seedream|wanx|qwen-image|poster|photo)\b/.test(source)) return 'image';
-  return 'llm';
-}
-
-function matchRelayCatalogModel(modelId = '', modelName = '') {
-  const source = `${modelId} ${modelName}`.trim();
-  for (const matcher of RELAY_MODEL_MATCHERS) {
-    if (matcher.aliases.some((pattern) => pattern.test(source))) {
-      const catalogModel = matcher.catalogId ? catalogModelByIdentifier(matcher.catalogId) : null;
-      return {
-        catalogModel,
-        recommendationScore: matcher.score,
-        recommendation: matcher.recommendation,
-        mode: matcher.mode || catalogModel?.mode || null,
-        providerLabel: matcher.providerLabel || '',
-        displayName: matcher.displayName || '',
-      };
-    }
-  }
-
-  const normalizedSource = normalizeCatalogIdentifier(source);
-  const exactCatalogModel = MODEL_CATALOG.find((item) => (
-    [item.id, item.name, item.upstreamModel]
-      .map((value) => normalizeCatalogIdentifier(value))
-      .filter(Boolean)
-      .includes(normalizedSource)
-  ));
-
-  return exactCatalogModel
-    ? {
-        catalogModel: exactCatalogModel,
-        recommendationScore: 72,
-        recommendation: '已匹配到当前画布模型目录，可直接同步到节点菜单',
-        mode: exactCatalogModel.mode,
-        providerLabel: '',
-        displayName: '',
-      }
-    : null;
-}
-
-function normalizeRelayDiscoveredModel(item = {}) {
-  const modelId = extractFirstString([item?.id, item?.model, item?.name]);
-  if (!modelId) return null;
-  const modelName = extractFirstString([item?.name, item?.display_name, item?.label, modelId]);
-  const matched = matchRelayCatalogModel(modelId, modelName);
-  const catalogModel = matched?.catalogModel || null;
-  const pricing = parseRelayPricing(item);
-  const mode = matched?.mode || catalogModel?.mode || guessRelayModelMode(modelId, modelName);
-  const providerMeta = catalogModel ? providers.find((provider) => provider.id === catalogModel.provider) : null;
-  return {
-    id: modelId,
-    name: matched?.displayName || modelName,
-    mode,
-    provider: catalogModel?.provider || '',
-    providerLabel: matched?.providerLabel || providerMeta?.name || extractFirstString([item?.owned_by, item?.provider, item?.organization]) || '',
-    catalogModelId: catalogModel?.id || null,
-    upstreamModel: modelId,
-    supportedOnCanvas: Boolean(catalogModel),
-    recommended: Boolean(matched),
-    recommendationScore: matched?.recommendationScore || 0,
-    recommendation: matched?.recommendation || '',
-    description: catalogModel?.description || extractFirstString(item?.description) || '',
-    price: pricing.price ?? (Number.isFinite(Number(catalogModel?.price)) ? Number(catalogModel.price) : null),
-    currency: pricing.currency || catalogModel?.currency || null,
-    priceUnit: pricing.pricingUnit || null,
-    pricingSummary: pricing.pricingSummary || null,
-  };
-}
-
-function summarizeRelayRecommendations(models = []) {
-  return ['image', 'video', 'llm', 'audio'].reduce((acc, mode) => {
-    acc[mode] = models
-      .filter((item) => item.mode === mode && item.recommended)
-      .sort((left, right) => (
-        Number(right.recommendationScore || 0) - Number(left.recommendationScore || 0)
-      ))
-      .slice(0, mode === 'video' ? 3 : 2);
-    return acc;
-  }, {});
-}
-
-async function fetchRelayModelIndex({ endpoint = '', apiKey = '', relayPresetId = 'generic-openai-relay' } = {}) {
-  const baseUrl = normalizeRelayEndpointInput(endpoint);
-  if (!baseUrl) {
-    return {
-      success: false,
-      status: 400,
-      endpoint: '',
-      message: '中转站 Base URL 不能为空',
-      models: [],
-      recommended: summarizeRelayRecommendations([]),
-    };
-  }
-  if (!apiKey || String(apiKey).trim().length < 8) {
-    return {
-      success: false,
-      status: 400,
-      endpoint: baseUrl,
-      message: 'API Key 至少需 8 位',
-      models: [],
-      recommended: summarizeRelayRecommendations([]),
-    };
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
-  try {
-    const modelEndpoints = relayModelsEndpointCandidates(baseUrl);
-    let lastFailure = null;
-
-    for (const candidate of modelEndpoints) {
-      const response = await requestRelayModelsEndpoint(candidate, apiKey, controller.signal, 15000);
-      const text = response.text;
-      let payload = null;
-      try {
-        payload = text ? JSON.parse(text) : null;
-      } catch {
-        payload = null;
-      }
-      const contentType = String(response.contentType || '').toLowerCase();
-
-      if (!response.ok) {
-        const message = extractFirstString([payload?.error?.message, payload?.message])
-          || 'Relay model list request failed (HTTP ' + response.status + ').';
-        lastFailure = {
-          status: response.status,
-          endpoint: candidate.replace(/\/models$/i, ''),
-          contentType,
-          payload,
-          message,
-          text,
-        };
-        const shouldRetryCandidate = (
-          [404, 405].includes(response.status)
-          || contentType.includes('text/html')
-          || /^<!doctype html>/i.test(String(text || '').trim())
-        );
-        if (shouldRetryCandidate) {
-          continue;
-        }
-        return {
-          success: false,
-          status: response.status,
-          endpoint: candidate.replace(/\/models$/i, ''),
-          message,
-          models: [],
-          recommended: summarizeRelayRecommendations([]),
-        };
-      }
-
-      const rawModels = Array.isArray(payload?.data)
-        ? payload.data
-        : Array.isArray(payload?.models)
-          ? payload.models
-          : [];
-      const normalizedModels = rawModels
-        .map((entry) => normalizeRelayDiscoveredModel(entry))
-        .filter(Boolean)
-        .sort((left, right) => {
-          const recommendedDelta = Number(right.recommendationScore || 0) - Number(left.recommendationScore || 0);
-          if (recommendedDelta !== 0) return recommendedDelta;
-          return String(left.name || '').localeCompare(String(right.name || ''));
-        });
-      const recommended = summarizeRelayRecommendations(normalizedModels);
-      const relayPreset = RELAY_PRESET_META[relayPresetId] || RELAY_PRESET_META['generic-openai-relay'];
-      return {
-        success: true,
-        status: response.status,
-        endpoint: candidate.replace(/\/models$/i, ''),
-        relayPresetId: relayPreset.id,
-        relayName: relayPreset.name,
-        message: normalizedModels.length
-          ? 'Discovered ' + normalizedModels.length + ' model(s) and filtered mainstream multimodal recommendations.'
-          : '模型列表已返回，但暂未匹配到当前画布可直接使用的模型',
-        models: normalizedModels,
-        recommended,
-      };
-    }
-
-    return {
-      success: false,
-      status: lastFailure?.status || 400,
-      endpoint: lastFailure?.endpoint || baseUrl,
-      message: lastFailure?.message
-        ? `${lastFailure.message} ${relayEndpointHelpMessage(baseUrl)}`
-        : relayEndpointHelpMessage(baseUrl),
-      models: [],
-      recommended: summarizeRelayRecommendations([]),
-    };
-  } catch (error) {
-    return {
-      success: false,
-      status: 500,
-      endpoint: baseUrl,
-      message: error?.name === 'AbortError'
-        ? 'Relay model list request timed out. Please try again later.'
-        : (error instanceof Error ? error.message : String(error)),
-      models: [],
-      recommended: summarizeRelayRecommendations([]),
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function buildRelayActivationRecords(discoveredModels = []) {
-  const groups = new Map();
-  for (const item of discoveredModels) {
-    if (!item?.supportedOnCanvas || !item.provider || !item.mode) continue;
-    const key = providerActivationKey(item.provider, item.mode);
-    if (!groups.has(key)) {
-      groups.set(key, {
-        provider: item.provider,
-        mode: item.mode,
-        items: [],
-      });
-    }
-    groups.get(key).items.push(item);
-  }
-
-  return Array.from(groups.values()).map((group) => {
-    const items = group.items
-      .slice()
-      .sort((left, right) => Number(right.recommendationScore || 0) - Number(left.recommendationScore || 0));
-    const primary = items[0];
-    const availableModels = items.map((item) => ({
-      id: item.id,
-      name: item.name,
-      mode: item.mode,
-      catalogModelId: item.catalogModelId,
-      upstreamModel: item.upstreamModel,
-      price: item.price,
-      currency: item.currency,
-      priceUnit: item.priceUnit || null,
-      pricingSummary: item.pricingSummary || null,
-      recommended: item.recommended,
-      recommendationScore: item.recommendationScore,
-      recommendation: item.recommendation,
-    }));
-    return {
-      provider: group.provider,
-      mode: group.mode,
-      model: primary?.upstreamModel || primary?.id || '',
-      catalogModelIds: Array.from(new Set(
-        availableModels
-          .flatMap((item) => [item.catalogModelId, item.upstreamModel, item.id])
-          .filter(Boolean),
-      )),
-      availableModels,
-      primaryModelName: primary?.name || '',
-      primaryPrice: primary?.price ?? null,
-      primaryCurrency: primary?.currency || null,
-    };
-  });
-}
-
-async function validateByokProvider({ provider, apiKey, model, mode = 'llm', endpoint = '' }) {
-  const baseUrl = normalizeRelayEndpointInput(endpoint || PROVIDER_BASE_URLS[provider] || '');
-  const isRelayEndpoint = Boolean(String(endpoint || '').trim());
-  if (!baseUrl) {
-    return {
-      success: true,
-      validated: false,
-      model: model || '',
-      message: '已保存 API Key，但当前平台尚未接入远程校验',
-    };
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
-  try {
-    const response = await requestRelayModelsEndpoint(`${baseUrl}/models`, apiKey, controller.signal, 15000);
-    const text = response.text;
-    let payload = null;
-    try {
-      payload = text ? JSON.parse(text) : null;
-    } catch {
-      payload = null;
-    }
-
-    const contentType = String(response.contentType || '').toLowerCase();
-
-    if (!response.ok) {
-      if (isRelayEndpoint && ![401, 403].includes(response.status)) {
-        return {
-          success: true,
-          validated: false,
-          model: model || '',
-          message: '中转站未返回标准 /models 列表，已按中转站模式保存，首次真实请求时再确认可用性',
-        };
-      }
-      const message = extractFirstString(payload?.error?.message)
-        || extractFirstString(payload?.message)
-        || ('远程校验失败（HTTP ' + response.status + '）。');
-      return {
-        success: false,
-        validated: true,
-        message,
-      };
-    }
-
-    const items = Array.isArray(payload?.data)
-      ? payload.data
-      : Array.isArray(payload?.models)
-        ? payload.models
-        : [];
-
-    if (!items.length) {
-      const looksLikeHtml = contentType.includes('text/html') || /^<!doctype html>/i.test(text.trim());
-      if (looksLikeHtml || !payload) {
-        return {
-          success: true,
-          validated: true,
-          model: model || '',
-          message: '该平台未暴露标准模型列表，已按当前模式保存 API Key（远程返回 200，密钥有效）。生成时会继续按真实模型归属平台路由',
-        };
-      }
-      // 返回了合法 JSON 但模型列表为空（如火山方舟需先在控制台创建并部署推理端点）
-      return {
-        success: true,
-        validated: true,
-        model: model || '',
-        message: '远程返回了空模型列表，已保存 API Key（密钥有效）。若该平台需要先部署推理端点（如火山方舟），请先在控制台创建端点后再生成。',
-      };
-    }
-    const requestedModel = String(model || '').trim();
-    const matchedModel = requestedModel
-      ? items.find((item) => modelMatchesIdentifier(item, requestedModel))
-      : null;
-    const defaultModel = !requestedModel ? defaultProviderModeModel(provider, mode, items) : null;
-
-    if (requestedModel && !matchedModel) {
-      // 官方直连场景下，所选模型是平台内部目录 ID（如 seedream-4），而火山方舟等平台的
-      // /models 只返回「已部署的推理端点」，不会暴露目录 ID，无法用名称比对。
-      // 只要远程返回了 200 且可解析模型列表，即说明 API Key 有效，应视为校验通过。
-      if (isRelayEndpoint) {
-        return {
-          success: false,
-          validated: true,
-          message: '所选模型「' + requestedModel + '」未在远程模型列表中找到（' + provider + '）。请确认模型名称是否正确。',
-        };
-      }
-      return {
-        success: true,
-        validated: true,
-        model: requestedModel,
-        message: (providers.find((item) => item.id === provider)?.name || provider)
-          + ' 远程校验通过（已返回模型列表）。所选模型「' + requestedModel
-          + '」未直接出现在平台返回的列表中；部分平台（如火山方舟）需先在控制台创建并部署对应推理端点，生成时会按该平台实际模型路由。',
-      };
-    }
-
-    return {
-      success: true,
-      validated: true,
-      model: extractFirstString(matchedModel?.id) || extractFirstString(defaultModel?.id) || requestedModel,
-      message: (providers.find((item) => item.id === provider)?.name || provider) + ' 远程校验通过。',
-    };
-  } catch (error) {
-    return {
-      success: false,
-      validated: true,
-      message: error?.name === 'AbortError'
-        ? '远程校验超时，请稍后重试。'
-        : (error instanceof Error ? error.message : String(error)),
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
+// ==================== byok 服务（已迁移至 ./services/byokService.mjs） ====================
+import { createByokService } from './services/byokService.mjs';
+const __byokService = createByokService({
+  catalogModelByIdentifier,
+  catalogLifecycleFor: (...args) => catalogLifecycleFor(...args), // 惰性：对账服务在 byok 之后接线
+  ACTIVATED_PROVIDERS_FILE,
+  activatedProviders,
+  DATA_DIR,
+  providers,
+  MODEL_CATALOG,
+  extractFirstString,
+  escapePowerShellSingleQuoted,
+  pickActivatedCloudImageAnalysisRuntime,
+});
+const {
+  maskKey,
+  normalizeCatalogIdentifier,
+  relayAliasCatalogId,
+  resolveActivatedRelayModel,
+  isVisionModelId,
+  hydrateActivatedProviderRecordsFromDisk,
+  persistActivatedProviderRecordsToDisk,
+  listActivatedProviderRecords,
+  publicActivatedProviderRecord,
+  publicImageAnalysisRuntime,
+  buildRuntimeRecommendations,
+  getActivatedProviderRecord,
+  setActivatedProviderRecord,
+  isRealApiProxyEnabled,
+  deleteActivatedProviderRecord,
+  isCatalogModelActivated,
+  modelCatalogPayload,
+  activatedModelIds,
+  modelMatchesIdentifier,
+  normalizeRelayEndpointInput,
+  relayRequestUrlCandidates,
+  relayModelsEndpointCandidates,
+  requestRelayModelsEndpoint,
+  fetchRelayModelIndex,
+  buildRelayActivationRecords,
+  validateByokProvider,
+  RELAY_CONNECTIVITY_CACHE,
+  RELAY_CONNECTIVITY_SUCCESS_TTL_MS,
+  RELAY_CONNECTIVITY_FAILURE_TTL_MS,
+} = __byokService;
+// 目录查找注入对象：将 MODEL_CATALOG 相关状态函数打包，供 apimart-model-kind 模块使用（解耦主文件状态）。
+const catalogLookup = { normalizeCatalogIdentifier, catalogModelByIdentifier, relayAliasCatalogId };
+// ==================== /byok 服务 ====================
+// ==================== 目录对账服务（已迁移至 ./services/catalogReconcile.mjs） ====================
+import { createCatalogReconcileService } from './services/catalogReconcile.mjs';
+const __reconcileService = createCatalogReconcileService({
+  DATA_DIR,
+  PROVIDER_BASE_URLS,
+  getActivatedProviderRecord,
+  normalizeRelayEndpointInput,
+  requestRelayModelsEndpoint,
+  extractFirstString,
+  normalizeCatalogIdentifier,
+  hydrateActivatedProviderRecordsFromDisk,
+  listActivatedProviderRecords,
+});
+const {
+  reconcileModelCatalog,
+  catalogLifecycleFor,
+  getCatalogReconcileState,
+} = __reconcileService;
+// ==================== /目录对账服务 ====================
 function parseLatencySeconds(value) {
   const raw = String(value || '').trim().toLowerCase();
   const match = raw.match(/(\d+(?:\.\d+)?)s/);
@@ -13057,38 +8983,6 @@ function providerRegionAffinityScore(providerId, regionPreference, weights) {
   return 0;
 }
 
-function normalizeReferenceAssets(value) {
-  const items = Array.isArray(value) ? value : [];
-  return items
-    .map((item) => (item && typeof item === 'object' && !Array.isArray(item) ? item : null))
-    .filter(Boolean)
-    .map((item) => ({
-      type: String(item.type || '').trim().toLowerCase(),
-      role: String(item.role || '').trim().toLowerCase(),
-      uiRole: String(item.ui_role || '').trim().toLowerCase(),
-      weight: Number.isFinite(Number(item.weight)) ? Number(item.weight) : 0,
-      url: extractFirstString(item.url),
-      coverageRoles: Array.isArray(item.coverage_roles)
-        ? Array.from(new Set(item.coverage_roles.map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean)))
-        : [],
-      channel: String(item.channel || '').trim().toLowerCase(),
-      preserve: Array.isArray(item.preserve) ? item.preserve.map((entry) => String(entry || '').trim()).filter(Boolean) : [],
-      sourceMeta: item.source_meta && typeof item.source_meta === 'object' && !Array.isArray(item.source_meta)
-        ? {
-            width: Number.isFinite(Number(item.source_meta.width)) ? Number(item.source_meta.width) : 0,
-            height: Number.isFinite(Number(item.source_meta.height)) ? Number(item.source_meta.height) : 0,
-            duration: Number.isFinite(Number(item.source_meta.duration)) ? Number(item.source_meta.duration) : 0,
-            provider: extractFirstString(item.source_meta.provider),
-            model: extractFirstString(item.source_meta.model),
-            contentType: extractFirstString(item.source_meta.contentType),
-            source: extractFirstString(item.source_meta.source),
-          }
-        : null,
-      sourceNodeType: String(item.source_node_type || '').trim().toLowerCase(),
-    }))
-    .filter((item) => item.type && item.role && item.url);
-}
-
 function isKlingVideoModelIdentifier(value = '') {
   const normalized = normalizeCatalogIdentifier(String(value || ''));
   return normalized.includes('kling');
@@ -13107,23 +9001,6 @@ function readVideoSourceProfile(primaryAssets = [], sourceMediaType = '') {
     height: Number.isFinite(height) && height > 0 ? height : 0,
     duration: Number.isFinite(duration) && duration > 0 ? duration : 0,
   };
-}
-
-function buildVideoSourceConstraint(primaryVideoProfile = null) {
-  if (!primaryVideoProfile || !primaryVideoProfile.height) return null;
-  if (primaryVideoProfile.height < 700) {
-    return {
-      kind: 'primary-video-min-height',
-      severity: 'hard',
-      reason: `Primary video height ${primaryVideoProfile.height}px is below the upstream Kling omni minimum of 700px.`,
-      recommendedModels: ['seedance-v2'],
-    };
-  }
-  return null;
-}
-
-function isApimartRelayEndpoint(value = '') {
-  return /(apimart\.ai|suanliai\.top|comfly\.org)/i.test(String(value || '').trim());
 }
 
 function buildVideoRouteConstraint({
@@ -13162,74 +9039,6 @@ function shouldForceKlingOmniVideoRoute({
   const normalizedGenerationMode = String(generationMode || '').trim();
   if (!['referenceVideo', 'videoStyleTransfer'].includes(normalizedGenerationMode)) return false;
   return Boolean(hasImageReference || hasVideoReference || requiresAdvancedReferenceControl);
-}
-
-function normalizeIdentityController(value) {
-  const input = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-  return {
-    enabled: Boolean(input.enabled),
-    identityLockMode: String(input.identityLockMode || 'off').trim(),
-    fallbackPolicy: String(input.fallbackPolicy || 'reference_weight').trim(),
-  };
-}
-
-function modelSupportsRequirement(item, requirement) {
-  const capabilities = item?.capabilities || {};
-  switch (requirement.key) {
-    case 'generationMode':
-      return Array.isArray(capabilities.generationModes) && capabilities.generationModes.includes(requirement.value);
-    case 'referenceRole':
-      return Array.isArray(capabilities.referenceRoles) && capabilities.referenceRoles.includes(requirement.value);
-    case 'toolOperation':
-      return Array.isArray(capabilities.toolOperations) && capabilities.toolOperations.includes(requirement.value);
-    default:
-      return Boolean(capabilities?.[requirement.key]);
-  }
-}
-
-function capabilityPenalty(item, requirements = [], weights = {}) {
-  if (!requirements.length) return 0;
-  let penalty = 0;
-  for (const requirement of requirements) {
-    if (!modelSupportsRequirement(item, requirement)) {
-      penalty += Math.abs(Number(weights.disabled || -100000));
-    }
-  }
-  return penalty * -1;
-}
-
-function expandedReferenceRoles(asset = {}, options = {}) {
-  return assetCoverageRoles(asset, options);
-}
-
-function referenceRoleRoutingScore(item, referenceAssets = [], routingConfig = {}, weights = {}, options = {}) {
-  if (!referenceAssets.length) return 0;
-  let score = 0;
-  for (const asset of referenceAssets) {
-    const weightFactor = Math.max(0, Math.min(1, Number(asset.weight || 0)));
-    for (const role of expandedReferenceRoles(asset, options)) {
-      const rule = routingConfig?.[role];
-      if (!rule || typeof rule !== 'object') continue;
-      const providerHit = (rule.preferredProviders || []).includes(item.provider);
-      const modelHit = (rule.preferredModels || []).includes(item.id) || (rule.preferredModels || []).includes(item.upstreamModel);
-      if (providerHit) score += Number(weights.referenceRole || 180) * Math.max(0.2, weightFactor);
-      if (modelHit) score += Number(weights.referenceRole || 180) * 1.35 * Math.max(0.2, weightFactor);
-    }
-  }
-  return score;
-}
-
-function videoGenerationModeRoutingScore(item, generationMode = '', routingConfig = {}, weights = {}) {
-  const modeRule = routingConfig?.[generationMode];
-  if (!modeRule || typeof modeRule !== 'object') return 0;
-  let score = 0;
-  if ((modeRule.preferredProviders || []).includes(item.provider)) {
-    score += Number(weights.generationMode || 260);
-  }
-  if ((modeRule.preferredModels || []).includes(item.id) || (modeRule.preferredModels || []).includes(item.upstreamModel)) {
-    score += Number(weights.generationMode || 260) * 1.35;
-  }
-  return score;
 }
 
 function shouldPreserveRequestedModelIdentifier(requestedModel = '', catalogItem = null) {
@@ -13347,6 +9156,94 @@ async function resolveImageOperationDispatch(body = {}, requestedProvider = '', 
     operation,
     strategy,
     dispatchMode: chosen && modelMatchesIdentifier(chosen, requestedModel) ? 'requested' : 'operation-dispatch',
+  };
+}
+
+// 通用文本/脚本/分镜/AI App 节点的 LLM 分发：免费额度优先 + 多模型轮换。
+// 镜像 resolveImageOperationDispatch 的评分逻辑，但 LLM 没有 referenceRouting / capabilityRequirements，
+// 且额外返回有序 candidates 列表，供 executeGenerationRequest 在主模型失败时自动轮换到下一个。
+async function resolveLlmOperationDispatch(body = {}, requestedProvider = '', requestedModel = '') {
+  const dispatchConfig = await loadOperationDispatchConfig();
+  const strategy = dispatchConfig?.operations?.llm_text || null;
+  if (!strategy) {
+    return { provider: requestedProvider, model: requestedModel, operation: 'llm_text', strategy: null, dispatchMode: 'requested', candidates: [] };
+  }
+
+  const globalWeights = dispatchConfig?.global?.weights || {};
+  const regionHint = String(body?.region_hint || process.env.HMDAO_REGION_HINT || 'CN').toUpperCase();
+  const regionPreference = dispatchConfig?.global?.regionPreference?.[regionHint] || dispatchConfig?.global?.regionPreference?.OTHER || {};
+  const disabledModels = new Set([
+    ...(dispatchConfig?.global?.disabledModels || []),
+    ...(strategy?.disabledModels || []),
+  ]);
+
+  const candidateIndexByIdentifier = new Map();
+  (strategy.candidates || []).forEach((modelId, index) => {
+    const item = catalogModelByIdentifier(modelId);
+    if (item && item.mode === 'llm') candidateIndexByIdentifier.set(item.id, index);
+  });
+  const candidateModels = [...candidateIndexByIdentifier.keys()]
+    .map((id) => MODEL_CATALOG.find((m) => m.id === id))
+    .filter((item) => item && item.mode === 'llm');
+  const activatedModels = activatedModelIds();
+
+  const exactMatch = MODEL_CATALOG.find((item) => modelMatchesIdentifier(item, requestedModel) && item.provider === requestedProvider && item.mode === 'llm');
+  const requested = MODEL_CATALOG.find((item) => modelMatchesIdentifier(item, requestedModel) && item.mode === 'llm');
+  const providerRequested = requestedProvider
+    ? MODEL_CATALOG.find((item) => item.provider === requestedProvider && item.mode === 'llm')
+    : undefined;
+
+  const ranked = [exactMatch, requested, providerRequested, ...candidateModels]
+    .filter((item) => item)
+    .filter((item, index, array) => array.findIndex((entry) => entry?.id === item.id) === index)
+    .map((item) => {
+      const activationScore = (isCatalogModelActivated(item) || activatedModels.has(item.id) || activatedModels.has(item.upstreamModel))
+        ? Number(globalWeights.activation || 1200)
+        : 0;
+      const preferredModelScore = (strategy.candidates || []).includes(item.id) || (strategy.candidates || []).includes(item.upstreamModel)
+        ? Number(globalWeights.preferredModel || 260)
+        : 0;
+      const preferredProviderScore = (strategy.preferredProviders || []).includes(item.provider)
+        ? Number(globalWeights.preferredProvider || 140)
+        : 0;
+      const regionScore = providerRegionAffinityScore(item.provider, regionPreference, globalWeights);
+      const disabledScore = (disabledModels.has(item.id) || disabledModels.has(item.upstreamModel))
+        ? Number(globalWeights.disabled || -100000)
+        : 0;
+      const costScore = Number(item.price || 0) * Number(globalWeights.cost || -22);
+      const latencyScore = parseLatencySeconds(item.latency) * Number(globalWeights.latency || -9);
+      const orderIndex = candidateIndexByIdentifier.has(item.id) ? candidateIndexByIdentifier.get(item.id) : (strategy.candidates || []).length;
+      const orderScore = ((strategy.candidates || []).length - orderIndex) * Number(globalWeights.candidateOrder || 30);
+      return {
+        item,
+        score: activationScore + preferredModelScore + preferredProviderScore + regionScore + disabledScore + costScore + latencyScore + orderScore,
+      };
+    });
+
+  ranked.sort((left, right) => right.score - left.score);
+
+  const orderedCandidates = ranked.map((entry) => {
+    const preserve = modelMatchesIdentifier(entry.item, requestedModel) ? shouldPreserveRequestedModelIdentifier(requestedModel, entry.item) : false;
+    return {
+      provider: entry.item.provider,
+      model: preserve ? (requestedModel || entry.item.upstreamModel || entry.item.id) : (entry.item.upstreamModel || entry.item.id || requestedModel),
+    };
+  });
+
+  const exactActivated = exactMatch && (isCatalogModelActivated(exactMatch) || activatedModels.has(exactMatch.id) || activatedModels.has(exactMatch.upstreamModel));
+  const chosen = exactActivated
+    ? { provider: exactMatch.provider, model: exactMatch.upstreamModel || exactMatch.id }
+    : (orderedCandidates[0]
+      || (requested ? { provider: requested.provider, model: requested.upstreamModel || requested.id } : null)
+      || { provider: requestedProvider, model: requestedModel });
+
+  return {
+    provider: chosen.provider,
+    model: chosen.model,
+    operation: 'llm_text',
+    strategy,
+    dispatchMode: exactActivated ? 'requested' : 'operation-dispatch',
+    candidates: orderedCandidates,
   };
 }
 
@@ -13564,10 +9461,6 @@ function normalizeMediaDataUrl(buffer, contentType = 'application/octet-stream')
   return `data:${contentType};base64,${buffer.toString('base64')}`;
 }
 
-function sha256(buffer) {
-  return crypto.createHash('sha256').update(buffer).digest('hex');
-}
-
 const ASSET_HASH_LARGE_FILE_BYTES = 50 * 1024 * 1024;
 const ASSET_HASH_SAMPLE_BYTES = 4 * 1024 * 1024;
 
@@ -13725,99 +9618,6 @@ function svgDataUrl(prompt, provider, mode) {
     <text x="80" y="650" fill="#cbd5e1" font-family="Arial, sans-serif" font-size="22">Generated by local HMDao API fallback</text>
   </svg>`;
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
-}
-
-function extractFirstString(value) {
-  if (typeof value === 'string' && value.trim()) return value;
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const nested = extractFirstString(item);
-      if (nested) return nested;
-    }
-    return '';
-  }
-  if (value && typeof value === 'object') {
-    return extractFirstString(
-      value.content ||
-      value.text ||
-      value.output_text ||
-      value.url ||
-      value.b64_json ||
-      value.message?.content,
-    );
-  }
-  return '';
-}
-
-function compactObject(value) {
-  return Object.fromEntries(
-    Object.entries(value || {}).filter(([, item]) => item !== undefined && item !== null && item !== ''),
-  );
-}
-
-function classifyProxyError({ code = '', status = 0, message = '' } = {}) {
-  const normalized = String(message || '').toLowerCase();
-  if (code === 'validation_error') return 'validation';
-  if (code === 'timeout' || normalized.includes('timed out') || normalized.includes('timeout')) return 'timeout';
-  if (normalized.includes('insufficient balance') || normalized.includes('balance is insufficient') || normalized.includes('balance insufficient') || normalized.includes('quota exceeded') || normalized.includes('insufficient quota') || normalized.includes('token limit exceeded')) {
-    return 'quota';
-  }
-  if (status === 401 || status === 403) return 'auth';
-  if (status === 404 || normalized.includes('not found')) return 'routing';
-  if (status >= 500) return 'upstream';
-  return 'request';
-}
-
-function normalizeAspectRatio(value, fallback = '16:9') {
-  const raw = String(value || fallback).trim();
-  return /^\d+:\d+$/.test(raw) ? raw : fallback;
-}
-
-const INTERNAL_GENERATION_FIELDS = new Set([
-  'base_prompt',
-  'tool_prompt',
-  'tool_operation',
-  'tool_capability',
-  'tool_config',
-  'image_tool',
-  'video_tool',
-  'generation_mode',
-  'motion_preset',
-  'style_preset',
-  'motion_strength',
-  'consistency_strength',
-  'reference_weight',
-  'source_media_type',
-  'primary_assets',
-  'reference_assets',
-  'reference_summary',
-  'conditioning_strategy',
-  'workflow_graph',
-  'identity_controller',
-  'shared_memory_ids',
-  'shared_memory_layers',
-  'shared_memory_context',
-  'shared_memory_refs',
-  'linked_audio_url',
-  'linked_audio_asset_id',
-  'linked_audio_mode',
-  'linked_audio_label',
-  'linked_audio_backend',
-  'audio_mix_mode',
-  'audio_gain',
-  'video_gain',
-  'panorama',
-  'multi_angle',
-  'lighting',
-  'camera_control',
-  'grid',
-  'split',
-]);
-
-function stripInternalGenerationFields(payload = {}) {
-  return Object.fromEntries(
-    Object.entries(payload || {}).filter(([key]) => !INTERNAL_GENERATION_FIELDS.has(key)),
-  );
 }
 
 function normalizeProviderPayload(provider, mode, body = {}) {
@@ -14406,11 +10206,34 @@ async function realProxy(provider, body) {
     const upstreamBody = body.body && typeof body.body === 'object' ? normalizedBody : body.body;
     const providerApiKey = body.apiKey || getActivatedProviderRecord(provider, validation.mode)?.apiKey || '';
 
+    // 火山方舟聚合模型：model 字段必须是用户接入点 ID（ep-xxxx）。
+    // 优先用前端显式传的 endpointModel（外层或内层 body 均可），否则查两处缓存：
+    //   1) 按 catalog model id（modelId），2) 按内层 body.model 反查目录条目 id/upstreamModel。
+    if (provider === 'volcengine' && upstreamBody && typeof upstreamBody === 'object') {
+      const requestedModelId = extractFirstString(body.modelId) || extractFirstString(rawRequestBody.modelId);
+      const requestedUpstream = extractFirstString(upstreamBody.model);
+      let arkEp = extractFirstString(body.endpointModel) || extractFirstString(rawRequestBody.endpointModel)
+        || resolveArkModel(requestedModelId, null);
+      if (!arkEp && requestedUpstream && !/^ep-/i.test(requestedUpstream)) {
+        const catalogHit = MODEL_CATALOG.find((m) => m.provider === 'volcengine'
+          && (normalizeCatalogIdentifier(m.id) === normalizeCatalogIdentifier(requestedUpstream)
+            || normalizeCatalogIdentifier(m.upstreamModel) === normalizeCatalogIdentifier(requestedUpstream)));
+        if (catalogHit) arkEp = resolveArkModel(catalogHit.id, null);
+      }
+      if (arkEp) upstreamBody.model = String(arkEp);
+      delete upstreamBody.endpointModel;
+      delete upstreamBody.modelId;
+    }
+
     if (provider === 'siliconflow' && validation.mode === 'video') {
+      // P0.4：i2v 参考图若是本地相对路径，内联为 data: URL 后再提交云端。
+      const siliconflowBody = upstreamBody && typeof upstreamBody === 'object'
+        ? await inlineCloudConditioningMedia(upstreamBody, 'video')
+        : upstreamBody;
       return await executeSiliconflowVideoRequest({
         baseUrl,
         apiKey: providerApiKey,
-        payload: normalizeSiliconflowVideoSubmitBody(upstreamBody || {}),
+        payload: normalizeSiliconflowVideoSubmitBody(siliconflowBody || {}),
         timeoutMs: Number(body.timeout || 180000),
         signal: controller.signal,
       });
@@ -14468,6 +10291,12 @@ async function realProxy(provider, body) {
       });
     }
 
+    // P0.4：通用云端派发前，把本地 /api/assets/content/<id> 等仅本地可达的
+    // 参考图/参考视频引用转换为公网 URL 或 data: URL，云端 API 才能真正读到字节。
+    const cloudReadyBody = upstreamBody && typeof upstreamBody === 'object'
+      ? await inlineCloudConditioningMedia(upstreamBody, validation.mode)
+      : upstreamBody;
+
     const requestHeaders = {
       'Content-Type': 'application/json',
       Accept: '*/*',
@@ -14485,7 +10314,7 @@ async function realProxy(provider, body) {
       upstream = await fetch(`${baseUrl}${body.endpoint}`, {
         method: body.method || 'POST',
         headers: requestHeaders,
-        body: JSON.stringify(upstreamBody || {}),
+        body: JSON.stringify(cloudReadyBody || {}),
         signal: controller.signal,
       });
     } catch (fetchError) {
@@ -14494,7 +10323,7 @@ async function realProxy(provider, body) {
         url: `${baseUrl}${body.endpoint}`,
         method: body.method || 'POST',
         headers: requestHeaders,
-        body: upstreamBody || {},
+        body: cloudReadyBody || {},
         timeoutMs: Number(body.timeout || 90000),
       });
       const contentType = fallback.contentType || 'application/json';
@@ -14665,7 +10494,7 @@ async function executeGenerationRequest({ provider, endpoint, method = 'POST', b
     ? await resolveImageOperationDispatch(body || {}, provider, body?.model || '')
     : inferredMode === 'video'
       ? await resolveVideoOperationDispatch(body || {}, provider, body?.model || '')
-      : { provider, model: body?.model || '', operation: '', strategy: null, dispatchMode: 'requested' };
+      : await resolveLlmOperationDispatch(body || {}, provider, body?.model || '');
 
   const effectiveProvider = operationDispatch.provider || provider;
   const requestedModel = body && typeof body === 'object' ? extractFirstString(body.model) : '';
@@ -14686,15 +10515,37 @@ async function executeGenerationRequest({ provider, endpoint, method = 'POST', b
     requestBody.baseUrl = activatedRecord.endpoint;
   }
 
-  const upstream = await realProxy(effectiveProvider, requestBody);
+  // 通用文本 / AI App 节点：免费额度优先 + 多模型轮换（主模型失败自动切下一个候选）
+  let upstream = null;
+  let dispatchedProvider = effectiveProvider;
+  let dispatchedModel = effectiveRequestModel;
+  let dispatchedDispatchMode = operationDispatch.dispatchMode;
+  if (inferredMode === 'llm' && Array.isArray(operationDispatch.candidates) && operationDispatch.candidates.length) {
+    for (const cand of operationDispatch.candidates) {
+      const candProvider = cand.provider || effectiveProvider;
+      const candBody = body && typeof body === 'object' ? { ...body, model: cand.model } : body;
+      const candRequestBody = { ...requestBody, body: candBody };
+      const result = await realProxy(candProvider, candRequestBody);
+      if (result && result.success !== false) {
+        upstream = result;
+        dispatchedProvider = candProvider;
+        dispatchedModel = cand.model;
+        dispatchedDispatchMode = result.dispatchMode || operationDispatch.dispatchMode || 'operation-dispatch';
+        break;
+      }
+    }
+  } else {
+    upstream = await realProxy(effectiveProvider, requestBody);
+  }
+
   if (upstream) {
     return attachGenerationToolMetadata(upstream, {
       ...generationToolMetadata(body || {}),
       requestedProvider: provider,
       requestedModel,
-      dispatchedProvider: effectiveProvider,
-      dispatchedModel: effectiveRequestModel,
-      dispatchMode: operationDispatch.dispatchMode,
+      dispatchedProvider,
+      dispatchedModel,
+      dispatchMode: dispatchedDispatchMode,
       dispatchTechnique: operationDispatch.strategy?.latestTechnique,
       dispatchGenerationMode: operationDispatch.strategy?.generationMode,
       dispatchReferenceAssets: operationDispatch.strategy?.referenceAssets,
@@ -14776,7 +10627,7 @@ async function previewGenerationRequest({ provider, endpoint, method = 'POST', b
     ? await resolveImageOperationDispatch(body || {}, provider, body?.model || '')
     : inferredMode === 'video'
       ? await resolveVideoOperationDispatch(body || {}, provider, body?.model || '')
-      : { provider, model: body?.model || '', operation: '', strategy: null, dispatchMode: 'requested' };
+      : await resolveLlmOperationDispatch(body || {}, provider, body?.model || '');
 
   const effectiveProvider = operationDispatch.provider || provider;
   const requestedModel = body && typeof body === 'object' ? extractFirstString(body.model) : '';
@@ -15063,6 +10914,134 @@ async function executeWorkflowRun(run) {
   publishWorkflowEvent(run, 'workflow:completed');
 }
 
+// ==================== comfy 服务（已迁移至 ./services/comfyService.mjs） ====================
+import { createComfyService } from './services/comfyService.mjs';
+const __comfyService = createComfyService({
+  Busboy,
+  extensionFromMimeType,
+  sanitizeMultipartFieldName,
+  send,
+  getRequestOrigin,
+  COMFYUI_TEMP_DIR,
+  COMFYUI_TEMP_TTL_MS,
+  providers,
+  https,
+});
+const {
+  handleComfyUiApi,
+} = __comfyService;
+// ==================== /comfy 服务 ====================
+async function handleCuratorPreviewProxy(req, res, url) {
+  let target;
+  try {
+    const raw = String(url.searchParams.get('url') || '').trim();
+    if (!raw) return send(res, 400, { success: false, error: { message: 'missing-url' } });
+    target = new URL(raw);
+  } catch {
+    return send(res, 400, { success: false, error: { message: 'invalid-url' } });
+  }
+  if (!/^https?:$/.test(target.protocol)) {
+    return send(res, 400, { success: false, error: { message: 'only-http(s)-allowed' } });
+  }
+  // SSRF 防护：禁止内网/回环地址
+  const host = target.hostname.toLowerCase();
+  const isPrivate =
+    host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0'
+    || host.endsWith('.local') || host.endsWith('.internal')
+    || /^10\./.test(host)
+    || /^192\.168\./.test(host)
+    || /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+    || /^169\.254\./.test(host)
+    || /^127\./.test(host);
+  if (isPrivate) {
+    return send(res, 400, { success: false, error: { message: 'private-address-blocked' } });
+  }
+  // 按 host 推断合理 Referer（破解主要站点防盗链的关键）
+  const refererMap = {
+    'huaban.com': 'https://huaban.com/',
+    'hbimg.cn': 'https://huaban.com/',
+    'pinimg.com': 'https://www.pinterest.com/',
+    'pinterest.com': 'https://www.pinterest.com/',
+    'pximg.net': 'https://www.pixiv.net/',
+    'pixiv.net': 'https://www.pixiv.net/',
+    'pixabay.com': 'https://pixabay.com/',
+    'pexels.com': 'https://www.pexels.com/',
+    'unsplash.com': 'https://unsplash.com/',
+    'images.unsplash.com': 'https://unsplash.com/',
+    'artstation.com': 'https://www.artstation.com/',
+    'behance.net': 'https://www.behance.net/',
+    'mir-s3-cdn-cf.behance.net': 'https://www.behance.net/',
+    'deviantart.com': 'https://www.deviantart.com/',
+    'freepik.com': 'https://www.freepik.com/',
+    'openverse.org': 'https://openverse.org/',
+    'commons.wikimedia.org': 'https://commons.wikimedia.org/',
+  };
+  let referer = '';
+  for (const suffix of Object.keys(refererMap)) {
+    if (host === suffix || host.endsWith('.' + suffix)) {
+      referer = refererMap[suffix];
+      break;
+    }
+  }
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(new Error('preview-proxy-timeout')), 15000);
+  const upstreamFetch = fetch(target, {
+    signal: controller.signal,
+    redirect: 'follow',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+      ...(referer ? { 'Referer': referer } : {}),
+    },
+  }).catch((err) => ({ __err: err }));
+  let upstream = await upstreamFetch;
+  if (upstream && typeof upstream.__err !== 'undefined') {
+    clearTimeout(t);
+    return send(res, 502, { success: false, error: { message: `upstream-${upstream.__err?.message || 'fetch-failed'}` } });
+  }
+  if (!upstream.ok) {
+    clearTimeout(t);
+    return send(res, 502, { success: false, error: { message: `upstream-${upstream.status}` } });
+  }
+  const contentType = upstream.headers.get('content-type') || 'image/jpeg';
+  const cacheControl = upstream.headers.get('cache-control') || 'public, max-age=3600';
+  const origin = res._hmdaoOrigin || '';
+  const corsHeaders = origin
+    ? { 'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Credentials': 'true' }
+    : { 'Access-Control-Allow-Origin': '*' };
+  try {
+    res.writeHead(200, {
+      'Content-Type': contentType,
+      'Cache-Control': cacheControl,
+      ...corsHeaders,
+      'Cross-Origin-Resource-Policy': 'cross-origin',
+    });
+  } catch (e) {
+    clearTimeout(t);
+    return send(res, 500, { success: false, error: { message: 'write-head-failed' } });
+  }
+  const reader = upstream.body.getReader();
+  (async () => {
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) { res.end(); break; }
+        if (!res.write(Buffer.from(value))) {
+          await new Promise((resolve) => res.once('drain', resolve));
+        }
+      }
+    } catch (err) {
+      try { res.end(); } catch { /* noop */ }
+    } finally {
+      clearTimeout(t);
+    }
+  })();
+  req.on('close', () => {
+    try { controller.abort(new Error('client-disconnected')); } catch { /* noop */ }
+    try { reader.cancel(); } catch { /* noop */ }
+  });
+}
+
 async function route(req, res) {
   // 存储请求 Origin 用于 CORS 动态回写，避免 credentials:'include' 与通配符 * 冲突
   res._hmdaoOrigin = req.headers.origin || '';
@@ -15070,1238 +11049,10 @@ async function route(req, res) {
   const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
   try {
-    if (req.method === 'GET' && url.pathname === '/api/health') {
-      const ocioBackend = resolveLocalPostOcioBackend({ ocioExecutionMode: 'auto' });
-      const oiioBackend = resolveLocalPostOiioBackend({ ocioExecutionMode: 'auto' }, 'image', '');
-      const gmicBackend = resolveLocalPostGmicBackend();
-      const fsrBackend = resolveLocalPostUpscaleBackend({ routePolicy: 'fsr-preview', executionMode: 'auto' }, 'image');
-      const realbasicvsrBackend = resolveLocalPostUpscaleBackend({ routePolicy: 'realbasicvsr', executionMode: 'auto' }, 'video');
-      const supirBackend = resolveLocalPostUpscaleBackend({ routePolicy: 'supir', executionMode: 'auto' }, 'image');
-      return send(res, 200, {
-        success: true,
-        service: 'hmdao-api',
-        time: new Date().toISOString(),
-        realApiEnabled: isRealApiProxyEnabled(),
-        realApiDiagnostics: {
-          enabled: isRealApiProxyEnabled(),
-          source: process.env.HMDAO_REAL_API === '1' ? 'env' : 'activated-provider',
-          apiPort: PORT,
-          litellmBaseUrlConfigured: Boolean(String(process.env.HMDAO_LITELLM_BASE_URL || '').trim()),
-          litellmApiKeyConfigured: Boolean(String(process.env.HMDAO_LITELLM_API_KEY || '').trim()),
-        },
-        capabilities: {
-          dccGateway: true,
-          dccStatusPath: '/api/dcc/status',
-          dccWsPath: '/ws/dcc-capture',
-          unrealDccWsPath: '/ws/dcc/unreal',
-          workflowGateway: true,
-          workflowWsPath: '/ws/workflow',
-          catalogWsPath: '/ws/catalog',
-          localPostBackends: {
-            ocio: buildLocalPostBackendStatus('ocio', ocioBackend, path.resolve(APP_DIR, 'server', 'local_post_example_ocio.py')),
-            oiio: buildLocalPostBackendStatus('oiio', oiioBackend, 'oiiotool.exe'),
-            gmic: buildLocalPostBackendStatus('gmic', gmicBackend, 'gmic.exe'),
-            upscale: {
-              'fsr-preview': buildLocalPostBackendStatus('fsr-preview', fsrBackend, path.resolve(APP_DIR, 'server', 'local_post_example_fsr.py')),
-              realbasicvsr: buildLocalPostBackendStatus('realbasicvsr', realbasicvsrBackend, path.resolve(APP_DIR, 'server', 'local_post_example_realbasicvsr.py')),
-              supir: buildLocalPostBackendStatus('supir', supirBackend, path.resolve(APP_DIR, 'server', 'local_post_example_supir.py')),
-            },
-          },
-        },
-      });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/health/local-post/refresh') {
-      clearLocalPostRuntimeDetectionCache();
-      const ocioBackend = resolveLocalPostOcioBackend({ ocioExecutionMode: 'auto' });
-      const oiioBackend = resolveLocalPostOiioBackend({ ocioExecutionMode: 'auto' }, 'image', '');
-      const gmicBackend = resolveLocalPostGmicBackend();
-      const fsrBackend = resolveLocalPostUpscaleBackend({ routePolicy: 'fsr-preview', executionMode: 'auto' }, 'image');
-      const realbasicvsrBackend = resolveLocalPostUpscaleBackend({ routePolicy: 'realbasicvsr', executionMode: 'auto' }, 'video');
-      const supirBackend = resolveLocalPostUpscaleBackend({ routePolicy: 'supir', executionMode: 'auto' }, 'image');
-      return send(res, 200, {
-        success: true,
-        refreshedAt: new Date().toISOString(),
-        capabilities: {
-          localPostBackends: {
-            ocio: buildLocalPostBackendStatus('ocio', ocioBackend, path.resolve(APP_DIR, 'server', 'local_post_example_ocio.py')),
-            oiio: buildLocalPostBackendStatus('oiio', oiioBackend, 'oiiotool.exe'),
-            gmic: buildLocalPostBackendStatus('gmic', gmicBackend, 'gmic.exe'),
-            upscale: {
-              'fsr-preview': buildLocalPostBackendStatus('fsr-preview', fsrBackend, path.resolve(APP_DIR, 'server', 'local_post_example_fsr.py')),
-              realbasicvsr: buildLocalPostBackendStatus('realbasicvsr', realbasicvsrBackend, path.resolve(APP_DIR, 'server', 'local_post_example_realbasicvsr.py')),
-              supir: buildLocalPostBackendStatus('supir', supirBackend, path.resolve(APP_DIR, 'server', 'local_post_example_supir.py')),
-            },
-          },
-        },
-      });
-    }
-
-    if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/api/health/local-post/doctor') {
-      let body = {};
-      if (req.method === 'POST') {
-        body = await readJson(req).catch(() => ({}));
-      }
-      const forceRelease = url.searchParams.get('force') === '1' || body?.forceRelease === true;
-      const report = await buildLocalPostDoctorReport({ forceRelease });
-      return send(res, 200, {
-        success: true,
-        ...report,
-      });
-    }
-
-    if (req.method === 'GET' && url.pathname === '/api/health/local-post/runtime/install-jobs') {
-      const runtimeKey = String(url.searchParams.get('runtimeKey') || '').trim();
-      const jobs = Array.from(LOCAL_POST_RUNTIME_INSTALL_JOBS.values())
-        .filter((job) => !runtimeKey || job.runtimeKey === runtimeKey)
-        .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))
-        .map((job) => toRuntimeInstallJobResponse(job));
-      return send(res, 200, {
-        success: true,
-        jobs,
-      });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/health/local-post/runtime/install') {
-      const body = await readJson(req).catch(() => ({}));
-      const runtimeKey = String(body?.runtimeKey || '').trim();
-      if (!LOCAL_POST_INSTALLABLE_RUNTIMES[runtimeKey]) {
-        return send(res, 400, {
-          success: false,
-          error: { message: `unsupported-runtime:${runtimeKey || 'unknown'}` },
-        });
-      }
-      const job = await startRuntimeInstallJob(runtimeKey, {
-        requestedAction: String(body?.requestedAction || 'install').trim() || 'install',
-      });
-      return send(res, 200, {
-        success: true,
-        job: toRuntimeInstallJobResponse(job),
-      });
-    }
-
-    if (req.method === 'GET' && url.pathname.startsWith('/api/health/local-post/runtime/install/')) {
-      const jobId = decodeURIComponent(url.pathname.slice('/api/health/local-post/runtime/install/'.length));
-      const job = getRuntimeInstallJob(jobId);
-      if (!job) {
-        return send(res, 404, {
-          success: false,
-          error: { message: 'runtime-install-job-not-found' },
-        });
-      }
-      return send(res, 200, {
-        success: true,
-        job: toRuntimeInstallJobResponse(job),
-      });
-    }
-
-    if (req.method === 'GET' && url.pathname === '/api/dcc/status') {
-      const probeEngine = url.searchParams.get('engine') === 'blender'
-        ? 'blender'
-        : url.searchParams.get('engine') === 'unreal'
-          ? 'unreal'
-          : '';
-      const pluginStatus = await DCC_ENVIRONMENT_MANAGER.getStatus({
-        force: url.searchParams.get('force') === '1',
-        probeEngine,
-      });
-      const engines = {};
-      for (const [id, config] of Object.entries(DCC_ENGINES)) {
-        const isUnreal = id === 'unreal';
-        const pluginEngine = pluginStatus?.engines?.[id] || null;
-        const currentEnvironmentSummary = isUnreal
-          ? summarizeCurrentUnrealEnvironment(pluginEngine)
-          : pluginEngine
-            ? {
-              level: pluginEngine.level,
-              summary: pluginEngine.summary,
-              recommendedAction: pluginEngine.recommendedAction,
-              adapter: pluginEngine.adapter || null,
-            }
-            : null;
-        engines[id] = {
-          ...config,
-          reachable: isUnreal
-            ? Boolean(pluginEngine?.plugin?.directBridgeReadyForTargetProject)
-            : pluginEngine
-              ? Boolean(pluginEngine?.plugin?.serviceReachable || pluginEngine?.plugin?.readyForLiveCapture)
-              : await probeTcp(config.port),
-          gateway: true,
-          requiredPlugin: !isUnreal,
-          integration: isUnreal
-            ? (pluginEngine?.integration?.activeMode || pluginEngine?.integration?.recommendedMode || 'editor-direct')
-            : 'websocket',
-          previewProvider: isUnreal
-            ? (pluginEngine?.integration?.previewProvider || 'editor-direct')
-            : 'websocket',
-          wsPath: isUnreal ? '/ws/dcc/unreal' : '/ws/dcc-capture',
-          directBridgeOnline: isUnreal
-            ? Boolean(pluginEngine?.host?.targetProjectRunning) && Boolean(pluginEngine?.plugin?.directBridgeOnline ?? isUnrealDirectBridgeOnline())
-            : undefined,
-          directBridgeClientCount: isUnreal
-            ? Boolean(pluginEngine?.host?.targetProjectRunning)
-              ? Number(pluginEngine?.plugin?.directBridgeClientCount ?? UNREAL_DIRECT_BRIDGE.browsers.size)
-              : 0
-            : undefined,
-          pluginInstalled: isUnreal ? Boolean(pluginEngine?.plugin?.installed) : undefined,
-          pluginEnabledInProject: isUnreal ? Boolean(pluginEngine?.plugin?.enabledInProject) : undefined,
-          hostProcessRunning: isUnreal ? Boolean(pluginEngine?.host?.hostProcessRunning) : undefined,
-          targetProjectRunning: isUnreal ? Boolean(pluginEngine?.host?.targetProjectRunning) : undefined,
-          directBridgeReadyForTargetProject: isUnreal ? Boolean(pluginEngine?.plugin?.directBridgeReadyForTargetProject) : undefined,
-          cameraCount: isUnreal
-            ? (Boolean(pluginEngine?.host?.targetProjectRunning) ? Number(pluginEngine?.plugin?.cameraCount || 0) : 0)
-            : undefined,
-          projectPath: isUnreal ? (pluginEngine?.project?.path || null) : undefined,
-          directBridgePlugin: isUnreal && Boolean(pluginEngine?.host?.targetProjectRunning) ? UNREAL_DIRECT_BRIDGE.pluginInfo : undefined,
-          pixelStreamingUrl: isUnreal && ENABLE_UNREAL_PIXEL_STREAMING_LEGACY ? DEFAULT_UNREAL_PIXEL_URL : undefined,
-          remoteControlUrl: isUnreal ? DEFAULT_UNREAL_REMOTE_URL : undefined,
-          installPath: id === 'blender'
-            ? 'plugins/blender/hmdao_blender_capture'
-            : pluginEngine?.plugin?.effectivePath || 'plugins/unreal/HMDaoUnrealCapture',
-          environmentManager: currentEnvironmentSummary,
-          runtimeState: pluginEngine?.runtimeState || currentEnvironmentSummary?.runtimeState || null,
-          official: isUnreal ? pluginEngine?.official || null : undefined,
-          guidance: isUnreal ? pluginEngine?.guidance || null : undefined,
-          compatibility: isUnreal ? pluginEngine?.compatibility || null : undefined,
-        };
-      }
-      return send(res, 200, {
-        success: true,
-        service: 'hmdao-dcc-gateway',
-        wsPath: '/ws/dcc-capture',
-        environmentManagerPath: '/api/dcc/environment/status',
-        environmentManagerActionPath: '/api/dcc/environment/action',
-        environmentManagerJobsPath: '/api/dcc/environment/jobs',
-        environmentManagerLogsPath: '/api/dcc/environment/logs',
-        pluginManagerPath: '/api/dcc/plugins/status',
-        pluginManagerActionPath: '/api/dcc/plugins/action',
-        mockFallback: true,
-        features: {
-          blenderWebSocketGateway: true,
-          unrealEditorDirectAdapter: true,
-          unrealPixelStreamingLegacyAdapter: ENABLE_UNREAL_PIXEL_STREAMING_LEGACY,
-          unrealRemoteControlAdapter: true,
-        },
-        recordingLockedBy: DCC_RECORDING_LOCK.engine,
-        engines,
-      });
-    }
-
-    if (req.method === 'GET' && (url.pathname === '/api/dcc/environment/status' || url.pathname === '/api/dcc/plugins/status')) {
-      const probeEngine = url.searchParams.get('engine') === 'blender'
-        ? 'blender'
-        : url.searchParams.get('engine') === 'unreal'
-          ? 'unreal'
-          : '';
-      const status = await DCC_ENVIRONMENT_MANAGER.getStatus({
-        force: url.searchParams.get('force') === '1',
-        probeEngine,
-      });
-      return send(res, 200, status);
-    }
-
-    if (req.method === 'GET' && url.pathname === '/api/dcc/environment/jobs') {
-      const jobs = await DCC_ENVIRONMENT_MANAGER.listJobs({
-        engine: url.searchParams.get('engine') || '',
-        status: url.searchParams.get('status') || '',
-        limit: url.searchParams.get('limit') || '',
-      });
-      return send(res, 200, { success: true, jobs });
-    }
-
-    if (req.method === 'GET' && url.pathname === '/api/dcc/environment/logs') {
-      const logs = await DCC_ENVIRONMENT_MANAGER.listLogs({
-        engine: url.searchParams.get('engine') || '',
-        jobId: url.searchParams.get('jobId') || '',
-        level: url.searchParams.get('level') || '',
-        limit: url.searchParams.get('limit') || '',
-      });
-      return send(res, 200, { success: true, logs });
-    }
-
-    if (req.method === 'POST' && (url.pathname === '/api/dcc/environment/action' || url.pathname === '/api/dcc/plugins/action')) {
-      const payload = await readJson(req);
-      try {
-        const result = await DCC_ENVIRONMENT_MANAGER.runAction(payload);
-        return send(res, 200, result);
-      } catch (error) {
-        return send(res, 400, {
-          success: false,
-          error: {
-            message: error instanceof Error ? error.message : String(error),
-          },
-        });
-      }
-    }
-
-    if (
-      (req.method === 'POST' && url.pathname === '/api/dcc/unreal/pixel-streaming/start')
-      || (req.method === 'GET' && (url.pathname.startsWith('/api/dcc/unreal/pixel-proxy') || url.pathname === '/api/dcc/unreal/status'))
-    ) {
-      if (!ENABLE_UNREAL_PIXEL_STREAMING_LEGACY) {
-        return send(res, 404, { success: false, error: { message: 'Unreal Pixel Streaming legacy path is disabled by default.' } });
-      }
-      if (await UNREAL_PIXEL_STREAMING_LEGACY.handle(req, res, url)) return;
-    }
-
-    if (req.method === 'GET' && url.pathname === '/api/dcc/unreal/config') {
-      const controlConfig = await getUnrealControlConfig();
-      return send(res, 200, { success: true, ...controlConfig });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/dcc/unreal/config') {
-      const body = await readJson(req);
-      const current = await readUnrealConfig();
-      const next = {
-        ...current,
-        controlObjectPath: String(body.controlObjectPath || body.objectPath || '').trim(),
-        cameraFunction: String(body.cameraFunction || body.functionName || 'SetHMDaoCamera').trim() || 'SetHMDaoCamera',
-        signalUrl: String(body.signalUrl || current.signalUrl || process.env.HMDAO_UNREAL_SIGNAL_URL || 'ws://127.0.0.1:8888').trim(),
-      };
-      await writeUnrealConfig(next);
-      const controlConfig = await getUnrealControlConfig();
-      return send(res, 200, { success: true, ...controlConfig });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/auth/register') {
-      const { email, password } = await readJson(req);
-      const normalized = normalizeLocalEmail(email);
-      if (!normalized || !isValidLocalEmail(normalized)) {
-        return sendAuthError(res, 400, 'invalid_email', '请输入有效的邮箱地址');
-      }
-      if (!password || String(password).length < 8) {
-        return sendAuthError(res, 400, 'weak_password', '密码至少需 8 个字符');
-      }
-      const users = await readUsers();
-      if (users.some((user) => user.email === normalized)) {
-        return sendAuthError(res, 409, 'user_already_exists', '该邮箱已注册，请直接登录或重置密码');
-      }
-      const passwordData = hashPassword(String(password));
-      const user = {
-        id: crypto.randomUUID(),
-        email: normalized,
-        salt: passwordData.salt,
-        passwordHash: passwordData.hash,
-        createdAt: new Date().toISOString(),
-      };
-      users.push(user);
-      await writeUsers(users);
-      return send(res, 200, { success: true, user: publicUser(user) });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/auth/login') {
-      const { email, password } = await readJson(req);
-      const users = await readUsers();
-      const user = users.find((item) => item.email === normalizeLocalEmail(email));
-      if (!user) {
-        return sendAuthError(res, 404, 'user_not_found', '该邮箱尚未注册，请先创建账号');
-      }
-      if (!verifyPassword(String(password || ''), user)) {
-        return sendAuthError(res, 401, 'invalid_credentials', '密码错误，请重试或重置密码');
-      }
-      return send(res, 200, { success: true, user: publicUser(user), session: createSession(user) });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/auth/reset-password') {
-      const { email, password } = await readJson(req);
-      const normalized = normalizeLocalEmail(email);
-      if (!normalized || !isValidLocalEmail(normalized)) {
-        return sendAuthError(res, 400, 'invalid_email', '请输入有效的邮箱地址');
-      }
-      if (!password || String(password).length < 8) {
-        return sendAuthError(res, 400, 'weak_password', '密码至少需 8 个字符');
-      }
-      const users = await readUsers();
-      const userIndex = users.findIndex((item) => item.email === normalized);
-      if (userIndex < 0) {
-        return sendAuthError(res, 404, 'user_not_found', '该邮箱尚未注册，请先创建账号');
-      }
-      const passwordData = hashPassword(String(password));
-      users[userIndex] = {
-        ...users[userIndex],
-        salt: passwordData.salt,
-        passwordHash: passwordData.hash,
-        updatedAt: new Date().toISOString(),
-      };
-      await writeUsers(users);
-      deleteSessionsForUser(users[userIndex].id);
-      return send(res, 200, {
-        success: true,
-        message: '密码已更新，请使用新密码登录',
-        user: publicUser(users[userIndex]),
-      });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/auth/refresh') {
-      const { refresh_token: refreshToken } = await readJson(req);
-      const session = sessions.get(refreshToken);
-      if (!session || Date.now() > session.expiresAt) {
-        return send(res, 401, { success: false, error: { message: 'Session expired.' } });
-      }
-      const users = await readUsers();
-      const user = users.find((item) => item.id === session.userId);
-      if (!user) return send(res, 404, { success: false, error: { message: 'User not found.' } });
-      return send(res, 200, { success: true, session: createSession(user) });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/auth/logout') {
-      const { refresh_token: refreshToken } = await readJson(req);
-      if (refreshToken) sessions.delete(refreshToken);
-      return send(res, 200, { success: true });
-    }
-
-    if (req.method === 'GET' && url.pathname === '/api/byok/providers') {
-      return send(res, 200, { success: true, providers });
-    }
-
-    if (req.method === 'GET' && url.pathname === '/api/byok/runtime') {
-      return send(res, 200, {
-        success: true,
-        activatedProviders: listActivatedProviderRecords()
-          .map((record) => publicActivatedProviderRecord(record))
-          .filter(Boolean),
-        selectedImageAnalysisRemote: publicImageAnalysisRuntime(pickActivatedCloudImageAnalysisRuntime()),
-        recommendations: buildRuntimeRecommendations(),
-      });
-    }
-
-    if (req.method === 'GET' && url.pathname === '/api/models/catalog') {
-      const mode = String(url.searchParams.get('mode') || '').trim();
-      const nodeType = String(url.searchParams.get('nodeType') || '').trim();
-      return send(res, 200, {
-        success: true,
-        updatedAt: new Date().toISOString(),
-        models: modelCatalogPayload({
-          mode: mode || undefined,
-          nodeType: nodeType || undefined,
-        }),
-      });
-    }
-
-    // 轻量模型清单：供前端 checkPresetUpdates 比对版本（当前返回空清单，
-    // 以本地声明版本为准，避免 404 噪声）。
-    if (req.method === 'GET' && url.pathname === '/api/models/manifest') {
-      return send(res, 200, {});
-    }
-
-    if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/api/media-proxy') {
-      const mediaUrl = String(url.searchParams.get('url') || '').trim();
-      const kind = String(url.searchParams.get('kind') || '').trim().toLowerCase();
-      return proxyRemoteMediaAsset(req, res, mediaUrl, kind);
-    }
-
-    if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname.startsWith('/api/transformers/')) {
-      return serveTransformersModule(req, res, url);
-    }
-
-    if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname.startsWith('/api/hf-proxy/')) {
-      return proxyHuggingFace(req, res, url);
-    }
-
-    if (req.method === 'GET' && url.pathname === '/api/settings/dispatch') {
-      const config = await loadOperationDispatchConfig({ force: true });
-      return send(res, 200, {
-        success: true,
-        path: OPERATION_DISPATCH_CONFIG_FILE,
-        config,
-      });
-    }
-
-    if (req.method === 'PUT' && url.pathname === '/api/settings/dispatch') {
-      const body = await readJson(req);
-      const nextConfig = body?.config && typeof body.config === 'object' ? body.config : body;
-      if (!nextConfig || typeof nextConfig !== 'object' || Array.isArray(nextConfig)) {
-        return send(res, 400, { success: false, error: { message: 'Dispatch config must be an object.' } });
-      }
-      const config = await saveOperationDispatchConfig(nextConfig);
-      return send(res, 200, {
-        success: true,
-        path: OPERATION_DISPATCH_CONFIG_FILE,
-        config,
-      });
-    }
-
-    if (req.method === 'GET' && url.pathname === '/api/settings/assets') {
-      const settings = await readAssetLibrarySettings();
-      return send(res, 200, {
-        success: true,
-        path: ASSET_LIBRARY_SETTINGS_FILE,
-        catalogPath: ASSET_LIBRARY_CATALOG_FILE,
-        storagePath: settings.storagePath,
-        defaultStoragePath: DEFAULT_ASSET_LIBRARY_STORAGE_DIR,
-      });
-    }
-
-    if (req.method === 'PUT' && url.pathname === '/api/settings/assets') {
-      const body = await readJson(req);
-      const storagePath = String(body?.storagePath || '').trim();
-      if (!storagePath) {
-        return send(res, 400, { success: false, error: { message: 'Asset library storage path is required.' } });
-      }
-      const settings = await writeAssetLibrarySettings(storagePath);
-      return send(res, 200, {
-        success: true,
-        path: ASSET_LIBRARY_SETTINGS_FILE,
-        catalogPath: ASSET_LIBRARY_CATALOG_FILE,
-        storagePath: settings.storagePath,
-        defaultStoragePath: DEFAULT_ASSET_LIBRARY_STORAGE_DIR,
-      });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/settings/assets/pick-directory') {
-      const body = await readJson(req);
-      const settings = await readAssetLibrarySettings();
-      const picked = await pickLocalDirectory(
-        String(body?.initialPath || settings.storagePath || DEFAULT_ASSET_LIBRARY_STORAGE_DIR),
-        String(body?.autoSelectPath || ''),
-      );
-      return send(res, 200, {
-        success: true,
-        canceled: picked.canceled,
-        path: picked.path,
-      });
-    }
-
-    if (req.method === 'GET' && url.pathname === '/api/assets/library') {
-      const items = await readAssetLibraryCatalog();
-      return send(res, 200, {
-        success: true,
-        items,
-      });
-    }
-
-    if (req.method === 'GET' && url.pathname === '/api/assets/duplicates') {
-      const items = await readAssetLibraryCatalog();
-      const groups = buildAssetLibraryDuplicateGroups(items);
-      const duplicateIds = groups.flatMap((group) => group.duplicateIds);
-      // 持久化：把本次计算结果写入缓存文件，供「去重看板常驻视图」直接读取，
-      // 避免每次打开都重算，也使结果在多次会话间稳定可见。
-      await writeAssetLibraryDuplicates(groups).catch(() => undefined);
-      return send(res, 200, {
-        success: true,
-        groups,
-        duplicateIds,
-        total: duplicateIds.length,
-      });
-    }
-
-    if (req.method === 'GET' && url.pathname === '/api/assets/duplicates/persisted') {
-      const groups = await readAssetLibraryDuplicates().catch(() => []);
-      const duplicateIds = groups.flatMap((group) => group.duplicateIds);
-      return send(res, 200, {
-        success: true,
-        groups,
-        duplicateIds,
-        total: duplicateIds.length,
-      });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/assets/delete') {
-      const body = await readJson(req);
-      const assetIds = Array.isArray(body?.assetIds) ? body.assetIds : [];
-      const deletedIds = await deleteAssetLibraryItems(assetIds);
-      return send(res, 200, {
-        success: true,
-        deletedIds,
-      });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/assets/restore') {
-      const body = await readJson(req);
-      const inputItems = Array.isArray(body?.items) ? body.items : [];
-      const restoredIds = await restoreAssetLibraryItems(inputItems);
-      return send(res, 200, {
-        success: true,
-        restoredIds,
-      });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/assets/validate') {
-      const body = await readJson(req);
-      const assetId = String(body?.assetId || '').trim();
-      const item = await findAssetLibraryItem(assetId);
-      if (!item) return send(res, 404, { success: false, error: { message: 'asset-not-found' } });
-      if (String(item.storageLabel || '').trim().toLowerCase() === 'reference') {
-        return send(res, 200, { success: true, state: 'reference', canTranscode: false, type: item.type });
-      }
-      const probe = await probeAssetMedia(item.filePath);
-      return send(res, 200, {
-        success: true,
-        state: probe.state,
-        canTranscode: probe.canTranscode,
-        detail: probe.detail,
-        type: item.type,
-      });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/assets/repair') {
-      const body = await readJson(req);
-      const assetId = String(body?.assetId || '').trim();
-      const items = await readAssetLibraryCatalog();
-      const item = items.find((entry) => String(entry.id || '') === assetId || String(entry.backendAssetId || '') === assetId);
-      if (!item) return send(res, 404, { success: false, error: { message: 'asset-not-found' } });
-      if (String(item.storageLabel || '').trim().toLowerCase() === 'reference') {
-        return send(res, 400, { success: false, error: { message: 'reference-cannot-repair' } });
-      }
-      const repaired = await repairAssetLibraryItem(item);
-      const updatedItems = items.map((entry) => {
-        if (String(entry.id || '') === assetId || String(entry.backendAssetId || '') === assetId) {
-          return {
-            ...entry,
-            filePath: repaired.filePath,
-            size: repaired.size,
-            contentHash: repaired.contentHash,
-            updatedAt: Date.now(),
-          };
-        }
-        return entry;
-      });
-      await writeAssetLibraryCatalog(updatedItems);
-      return send(res, 200, {
-        success: true,
-        url: buildAssetLibraryContentUrl(assetId),
-        size: repaired.size,
-        contentHash: repaired.contentHash,
-      });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/assets/import') {
-      const contentType = String(req.headers['content-type'] || '').toLowerCase();
-      const body = contentType.includes('multipart/form-data')
-        ? await readAssetLibraryImportMultipart(req)
-        : await readJson(req);
-      const result = await processAssetLibraryImportRequest(body);
-      return send(res, 200, {
-        success: true,
-        item: result.item,
-        storagePath: result.storagePath,
-        duplicate: Boolean(result.duplicate),
-      });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/assets/import-directory') {
-      const body = await readJson(req);
-      const result = await processAssetLibraryImportDirectory(body);
-      return send(res, 200, {
-        success: true,
-        canceled: result.canceled,
-        path: result.path,
-        items: result.items,
-        report: result.report,
-      });
-    }
-
-    // ===== 免费图片搜索代理 =====
-    if (req.method === 'POST' && url.pathname === '/api/search/free-images') {
-      const body = await readJson(req).catch(() => ({}));
-      const query = String(body?.query || '').trim();
-      const platform = String(body?.platform || 'unsplash').trim();
-      const page = Math.max(1, parseInt(String(body?.page || '1'), 10) || 1);
-      const perPage = Math.min(50, Math.max(1, parseInt(String(body?.perPage || '24'), 10) || 24));
-      const mediaType = String(body?.type || 'image').trim() === 'video' ? 'video' : 'image';
-
-
-      if (!query) {
-        return send(res, 400, { success: false, error: { message: 'query is required' } });
-      }
-
-      try {
-        let results = [];
-        let total = 0;
-
-        switch (platform) {
-          case 'unsplash': {
-            const params = new URLSearchParams({
-              query,
-              page: String(page),
-              per_page: String(perPage),
-              order_by: 'relevant',
-            });
-            const apiResp = await fetch(`${UNSPLASH_BASE}/search/photos?${params}`, {
-              headers: { 'Accept-Version': 'v1' },
-            });
-            const data = await apiResp.json();
-            results = (data.results || []).map((item, i) => ({
-              id: `unsplash-${item.id}`,
-              url: item.urls?.regular || item.urls?.full || '',
-              thumb: item.urls?.thumb || '',
-              title: item.description || item.alt_description || `Unsplash ${i + 1}`,
-              source: 'unsplash',
-              sourceName: 'Unsplash',
-              type: 'image',
-              width: item.width,
-              height: item.height,
-              author: item.user?.name || '',
-              tags: (item.tags || []).map((t) => t.title),
-              uploadDate: item.created_at,
-            }));
-            total = data.total || results.length;
-            break;
-          }
-
-          case 'pexels': {
-            const pexelsKey = process.env.VITE_PEXELS_API_KEY || '';
-            if (!pexelsKey) {
-              return send(res, 200, { results: [], total: 0, notice: 'pexels requires API key' });
-            }
-            if (mediaType === 'video') {
-              const params = new URLSearchParams({
-                query,
-                page: String(page),
-                per_page: String(perPage),
-              });
-              const apiResp = await fetch(`${PEXELS_BASE}/videos/search?${params}`, {
-                headers: { Authorization: pexelsKey },
-              });
-              const data = await apiResp.json();
-              results = (data.videos || []).map((item, i) => {
-                const file = [...(item.video_files || [])].sort((a, b) => (b.width || 0) - (a.width || 0))[0] || {};
-                return {
-                  id: `pexels-v-${item.id}`,
-                  url: file.link || '',
-                  thumb: item.image || '',
-                  title: item.user?.name ? `视频 by ${item.user.name}` : `Pexels ${i + 1}`,
-                  source: 'pexels',
-                  sourceName: 'Pexels',
-                  type: 'video',
-                  width: file.width,
-                  height: file.height,
-                  author: item.user?.name || '',
-                  tags: [],
-                };
-              });
-              total = data.total_results || results.length;
-              break;
-            }
-            const params = new URLSearchParams({
-              query,
-              page: String(page),
-              per_page: String(perPage),
-            });
-            const apiResp = await fetch(`${PEXELS_BASE}/v1/search?${params}`, {
-              headers: { Authorization: pexelsKey },
-            });
-            const data = await apiResp.json();
-            results = (data.photos || []).map((item, i) => ({
-              id: `pexels-${item.id}`,
-              url: item.src?.original || item.src?.large || '',
-              thumb: item.src?.small || '',
-              title: item.alt || `Pexels ${i + 1}`,
-              source: 'pexels',
-              sourceName: 'Pexels',
-              type: 'image',
-              width: item.width,
-              height: item.height,
-              author: item.photographer || '',
-              tags: [],
-            }));
-            total = data.total_results || results.length;
-            break;
-          }
-
-          case 'pixabay': {
-            const pixabayKey = process.env.VITE_PIXABAY_API_KEY || '';
-            if (!pixabayKey) {
-              return send(res, 200, { results: [], total: 0, notice: 'pixabay requires API key' });
-            }
-            if (mediaType === 'video') {
-              const params = new URLSearchParams({
-                key: pixabayKey,
-                q: query,
-                page: String(page),
-                per_page: String(perPage),
-                video: 'true',
-                safesearch: 'true',
-              });
-              const apiResp = await fetch(`${PIXABAY_BASE}/?${params}`);
-              const data = await apiResp.json();
-              results = (data.hits || []).map((item) => {
-                const vid = [...(item.videos || [])].sort((a, b) => (b.width || 0) - (a.width || 0))[0] || {};
-                return {
-                  id: `pixabay-v-${item.id}`,
-                  url: vid.url || '',
-                  thumb: item.previewURL || '',
-                  title: item.tags?.split(',')[0]?.trim() || `Pixabay ${item.id}`,
-                  source: 'pixabay',
-                  sourceName: 'Pixabay',
-                  type: 'video',
-                  width: vid.width,
-                  height: vid.height,
-                  author: item.user || '',
-                  tags: (item.tags || '').split(',').map((t) => t.trim()).filter(Boolean),
-                };
-              });
-              total = data.total || results.length;
-              break;
-            }
-            const params = new URLSearchParams({
-              key: pixabayKey,
-              q: query,
-              page: String(page),
-              per_page: String(perPage),
-              image_type: 'photo',
-              safesearch: 'true',
-            });
-            const apiResp = await fetch(`${PIXABAY_BASE}/?${params}`);
-            const data = await apiResp.json();
-            results = (data.hits || []).map((item) => ({
-              id: `pixabay-${item.id}`,
-              url: item.largeImageURL || item.webformatURL || '',
-              thumb: item.previewURL || '',
-              title: item.tags?.split(',')[0]?.trim() || `Pixabay ${item.id}`,
-              source: 'pixabay',
-              sourceName: 'Pixabay',
-              type: 'image',
-              width: item.imageWidth,
-              height: item.imageHeight,
-              author: item.user || '',
-              tags: (item.tags || '').split(',').map((t) => t.trim()).filter(Boolean),
-            }));
-            total = data.total || results.length;
-            break;
-          }
-
-          case 'openverse': {
-            const params = new URLSearchParams({
-              q: query,
-              page: String(page),
-              page_size: String(Math.min(perPage, 50)),
-              license: 'cc0,pdm,by',
-              source: 'flickr,wikimedia,stocksnap,pexels,thingiverse',
-            });
-            const apiResp = await fetch(`${OPENVERSE_BASE}/images/?${params}`, {
-              headers: { Accept: 'application/json' },
-            });
-            if (!apiResp.ok) return send(res, 200, { results: [], total: 0, notice: 'openverse unavailable' });
-            const data = await apiResp.json();
-            results = (data.results || []).map((item, i) => ({
-              id: `openverse-${item.id}`,
-              url: item.url || '',
-              thumb: item.thumbnail || item.url || '',
-              title: item.title || `Openverse ${i + 1}`,
-              source: 'openverse',
-              sourceName: 'Openverse',
-              type: 'image',
-              width: item.width,
-              height: item.height,
-              author: item.creator || '',
-              license: item.license || 'CC0',
-              tags: (item.tags || []).map((t) => t.name).filter(Boolean),
-              uploadDate: item.created_on,
-            }));
-            total = data.result_count || results.length;
-            break;
-          }
-
-          case 'wikimedia': {
-            const params = new URLSearchParams({
-              action: 'query',
-              generator: 'search',
-              gsrsearch: query,
-              gsrnamespace: '6',
-              gsrlimit: String(Math.min(perPage, 50)),
-              prop: 'imageinfo',
-              iiprop: 'url|size|mime|extmetadata',
-              iiurlwidth: '400',
-              format: 'json',
-            });
-            const apiResp = await fetch(`${WIKIMEDIA_BASE}?${params}`, {
-              headers: { 'User-Agent': 'HMDaoAssetCollector/1.0' },
-            });
-            const data = await apiResp.json();
-            const pages = data.query?.pages || {};
-            results = Object.values(pages)
-              .map((item, i) => {
-                const info = (item.imageinfo && item.imageinfo[0]) || {};
-                const isVideo = /video|ogg|webm/i.test(info.mime || '');
-                return {
-                  id: `wikimedia-${item.pageid || i}`,
-                  url: info.url || '',
-                  thumb: info.thumburl || info.url || '',
-                  title: String(item.title || `Wikimedia ${i + 1}`).replace(/^File:/, ''),
-                  source: 'wikimedia',
-                  sourceName: 'Wikimedia',
-                  type: isVideo ? 'video' : 'image',
-                  width: info.width,
-                  height: info.height,
-                  author: (info.extmetadata?.Artist?.value || '').replace(/<[^>]+>/g, ''),
-                  license: info.extmetadata?.LicenseShortName?.value || 'CC',
-                  tags: [],
-                  uploadDate: info.extmetadata?.DateTimeOriginal?.value,
-                };
-              })
-              .filter((r) => r.url);
-            total = results.length;
-            break;
-          }
-
-          default:
-            return send(res, 200, { results: [], total: 0, notice: `unsupported platform: ${platform}` });
-        }
-
-        return send(res, 200, { success: true, results, total, page, query });
-      } catch (error) {
-        console.error(`[free-search] ${platform} error:`, error.message);
-        return send(res, 200, { success: true, results: [], total: 0, notice: 'search failed, try another platform' });
-      }
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/byok/relay/discover') {
-      const {
-        endpoint = '',
-        apiKey = '',
-        relayPresetId = 'generic-openai-relay',
-      } = await readJson(req);
-      const discovery = await fetchRelayModelIndex({
-        endpoint: String(endpoint || '').trim(),
-        apiKey: String(apiKey || '').trim(),
-        relayPresetId: String(relayPresetId || 'generic-openai-relay').trim(),
-      });
-      return send(res, discovery.success ? 200 : discovery.status || 400, {
-        success: discovery.success,
-        endpoint: discovery.endpoint || normalizeRelayEndpointInput(endpoint),
-        relayPresetId: discovery.relayPresetId || String(relayPresetId || 'generic-openai-relay').trim(),
-        relayName: discovery.relayName || null,
-        models: discovery.models,
-        recommended: discovery.recommended,
-        message: discovery.message,
-      });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/byok/relay/activate') {
-      const started = Date.now();
-      const {
-        endpoint = '',
-        apiKey = '',
-        relayPresetId = 'generic-openai-relay',
-      } = await readJson(req);
-      const normalizedEndpoint = normalizeRelayEndpointInput(endpoint);
-      const normalizedKey = String(apiKey || '').trim();
-      const discovery = await fetchRelayModelIndex({
-        endpoint: normalizedEndpoint,
-        apiKey: normalizedKey,
-        relayPresetId: String(relayPresetId || 'generic-openai-relay').trim(),
-      });
-      if (!discovery.success) {
-        return send(res, discovery.status || 400, {
-          success: false,
-          endpoint: discovery.endpoint || normalizedEndpoint,
-          relayPresetId: discovery.relayPresetId || String(relayPresetId || 'generic-openai-relay').trim(),
-          models: discovery.models,
-          recommended: discovery.recommended,
-          error: {
-            title: 'Relay activation failed',
-            message: discovery.message || '聚合平台模型激活失败',
-          },
-          latencyMs: Date.now() - started,
-        });
-      }
-
-      const activationRecords = buildRelayActivationRecords(discovery.models);
-      if (!activationRecords.length) {
-        return send(res, 400, {
-          success: false,
-          endpoint: normalizedEndpoint,
-          relayPresetId: discovery.relayPresetId,
-          models: discovery.models,
-          recommended: discovery.recommended,
-          error: {
-            title: 'No compatible models',
-            message: '当前中转站模型列表已返回，但暂未匹配到可直接同步到 DDUp 画布的主流模型',
-          },
-          latencyMs: Date.now() - started,
-        });
-      }
-
-      for (const record of activationRecords) {
-        setActivatedProviderRecord(record.provider, record.mode, {
-          model: record.model || null,
-          apiKey: normalizedKey,
-          maskedKey: maskKey(normalizedKey),
-          endpoint: (discovery.endpoint || normalizedEndpoint) || undefined,
-          activatedAt: Date.now(),
-          relaySource: discovery.relayName || discovery.relayPresetId || 'relay',
-          relayPresetId: String(relayPresetId || discovery.relayPresetId || 'generic-openai-relay').trim() || null,
-          catalogModelIds: record.catalogModelIds,
-          availableModels: record.availableModels,
-          primaryPrice: record.primaryPrice,
-          primaryCurrency: record.primaryCurrency,
-        });
-      }
-
-      broadcastCatalogUpdate('relay-provider-activated');
-      return send(res, 200, {
-        success: true,
-        endpoint: discovery.endpoint || normalizedEndpoint,
-        relayPresetId: discovery.relayPresetId,
-        relayName: discovery.relayName,
-        models: discovery.models,
-        recommended: discovery.recommended,
-        activations: activationRecords.map((record) => ({
-          provider: record.provider,
-          mode: record.mode,
-          model: record.model,
-          catalogModelIds: record.catalogModelIds,
-          availableModels: record.availableModels,
-          primaryPrice: record.primaryPrice,
-          primaryCurrency: record.primaryCurrency,
-          maskedKey: maskKey(normalizedKey),
-        })),
-        message: 'Activated ' + activationRecords.length + ' platform capability record(s) and synced them into the canvas model list.',
-        latencyMs: Date.now() - started,
-      });
-    }
-
-    if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname.startsWith('/api/dcc/local-artifacts/')) {
-      const token = sanitizeLocalAssetId(url.pathname.slice('/api/dcc/local-artifacts/'.length));
-      if (!token) {
-        return send(res, 400, { success: false, error: { message: 'invalid-dcc-artifact-token' } });
-      }
-      const item = getDccLocalArtifact(token);
-      if (!item?.filePath) {
-        return send(res, 404, { success: false, error: { message: 'dcc-artifact-not-found' } });
-      }
-      await sendLocalFileStream(req, res, item.filePath, {
-        mimeType: String(item.mimeType || mediaMimeTypeFromExtension(item.filePath, 'application/octet-stream')),
-        contentDisposition: buildSafeInlineContentDisposition(item.filePath),
-        headers: { 'Cache-Control': 'no-store, max-age=0', Pragma: 'no-cache', Expires: '0' },
-      });
-      return;
-    }
-
-    if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname.startsWith('/api/assets/content/')) {
-      const assetId = sanitizeLocalAssetId(url.pathname.slice('/api/assets/content/'.length));
-      if (!assetId) {
-        return send(res, 400, { success: false, error: { message: 'invalid-asset-id' } });
-      }
-      const item = await findAssetLibraryItem(assetId);
-      if (!item?.filePath) {
-        return send(res, 404, { success: false, error: { message: 'asset-not-found' } });
-      }
-      await sendLocalFileStream(req, res, item.filePath, {
-        mimeType: mediaMimeTypeFromExtension(item.filePath, 'application/octet-stream'),
-        contentDisposition: buildSafeInlineContentDisposition(item.filePath),
-      });
-      return;
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/byok/validate') {
-      const started = Date.now();
-      const {
-        provider,
-        apiKey,
-        mode = 'llm',
-        model,
-        upstreamModel = '',
-        endpoint = '',
-      } = await readJson(req);
-      const normalizedEndpoint = normalizeRelayEndpointInput(endpoint);
-      const known = providers.find((item) => item.id === provider);
-      if (!known) return send(res, 400, { success: false, provider, mode, maskedKey: '', error: { title: '未知平台', message: `平台 ${provider} 未配置。` } });
-      if (!apiKey || String(apiKey).trim().length < 8) {
-        return send(res, 400, { success: false, provider, mode, maskedKey: maskKey(apiKey), error: { title: 'API Key 无效', message: 'API Key 至少需要 8 个字符。' } });
-      }
-      const validationResult = await validateByokProvider({ provider, apiKey, model, mode, endpoint: normalizedEndpoint });
-      if (!validationResult.success) {
-        return send(res, 400, {
-          success: false,
-          provider,
-          mode,
-          model,
-          maskedKey: maskKey(String(apiKey).trim()),
-          error: {
-            title: validationResult.validated ? '远程校验失败' : '校验失败',
-            message: validationResult.message || (known.name + ' 校验失败。'),
-          },
-          latencyMs: Date.now() - started,
-        });
-      }
-      setActivatedProviderRecord(provider, mode, {
-        model: validationResult.model || String(upstreamModel || '').trim() || model || null,
-        apiKey: String(apiKey).trim(),
-        maskedKey: maskKey(String(apiKey).trim()),
-        endpoint: normalizedEndpoint || undefined,
-        activatedAt: Date.now(),
-      });
-      broadcastCatalogUpdate('provider-activated');
-      return send(res, 200, {
-        success: true,
-        provider,
-        mode,
-        model: validationResult.model || model,
-        maskedKey: maskKey(String(apiKey).trim()),
-        endpoint: normalizedEndpoint || undefined,
-        message: validationResult.message || (known.name + ' completed remote validation and activation.'),
-        latencyMs: Date.now() - started,
-      });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/byok/deactivate') {
-      const { provider, mode } = await readJson(req);
-      if (provider) {
-        deleteActivatedProviderRecord(provider, mode || '');
-      } else {
-        hydrateActivatedProviderRecordsFromDisk();
-        activatedProviders.clear();
-        persistActivatedProviderRecordsToDisk();
-      }
-      broadcastCatalogUpdate('provider-deactivated');
-      return send(res, 200, { success: true, provider: provider || null, mode: mode || null });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/byok/validate-all') {
-      const { keys = [] } = await readJson(req);
-      const results = keys.map((item) => ({
-        success: Boolean(item.apiKey && String(item.apiKey).length >= 8),
-        provider: item.provider,
-        mode: item.mode || 'llm',
-        maskedKey: maskKey(item.apiKey),
-      }));
-      return send(res, 200, {
-        success: results.every((item) => item.success),
-        results,
-        summary: { total: results.length, success: results.filter((item) => item.success).length, failed: results.filter((item) => !item.success).length },
-      });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/local-image/analyze') {
-      const contentType = String(req.headers['content-type'] || '').toLowerCase();
-      const body = contentType.includes('multipart/form-data')
-        ? await readLocalImageAnalyzeMultipart(req)
-        : await readJson(req);
-      const analysis = await processLocalImageAnalyzeRequest(body);
-      return send(res, 200, { success: true, analysis });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/local-video/edit') {
-      const body = await readJson(req);
-      const result = await processLocalVideoEditRequest(body);
-      return send(res, 200, { success: true, ...result });
-    }
-
-    if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname.startsWith('/api/local-video/result/')) {
-      const assetId = sanitizeLocalAssetId(url.pathname.slice('/api/local-video/result/'.length));
-      if (!assetId) {
-        return send(res, 400, { success: false, error: { message: 'invalid-local-video-asset-id' } });
-      }
-      const filePath = path.join(LOCAL_VIDEO_RESULT_DIR, assetId);
-      await sendLocalFileStream(req, res, filePath, {
-        mimeType: mediaMimeTypeFromExtension(filePath, 'video/webm'),
-        contentDisposition: `inline; filename="${assetId}"`,
-      });
-      return;
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/local-audio/generate') {
-      const body = await readJson(req);
-      const result = await processLocalAudioGenerateRequest(body);
-      return send(res, 200, { success: true, ...result });
-    }
-
-    if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname.startsWith('/api/local-audio/result/')) {
-      const assetId = sanitizeLocalAssetId(url.pathname.slice('/api/local-audio/result/'.length));
-      if (!assetId) {
-        return send(res, 400, { success: false, error: { message: 'invalid-local-audio-asset-id' } });
-      }
-      const filePath = path.join(LOCAL_AUDIO_RESULT_DIR, assetId);
-      await sendLocalFileStream(req, res, filePath, {
-        mimeType: mediaMimeTypeFromExtension(filePath, 'audio/wav'),
-        contentDisposition: `inline; filename="${assetId}"`,
-      });
-      return;
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/local-post/process') {
-      const contentType = String(req.headers['content-type'] || '').toLowerCase();
-      const body = contentType.includes('multipart/form-data')
-        ? await readLocalPostMultipart(req)
-        : await readJson(req);
-      const result = await processLocalPostRequest(body);
-      return send(res, 200, { success: true, ...result });
-    }
-
-    if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname.startsWith('/api/local-post/result/')) {
-      const assetId = sanitizeLocalAssetId(url.pathname.slice('/api/local-post/result/'.length));
-      if (!assetId) {
-        return send(res, 400, { success: false, error: { message: 'invalid-local-post-asset-id' } });
-      }
-      const filePath = path.join(LOCAL_POST_RESULT_DIR, assetId);
-      await sendLocalFileStream(req, res, filePath, {
-        mimeType: mediaMimeTypeFromExtension(filePath, 'application/octet-stream'),
-        contentDisposition: `inline; filename="${assetId}"`,
-      });
-      return;
-    }
-
-    if (req.method === 'POST' && url.pathname.startsWith('/api/proxy-preview/')) {
-      const provider = decodeURIComponent(url.pathname.split('/').pop() || '');
-      const body = await readJson(req);
-      const result = await previewGenerationRequest({
-        provider,
-        endpoint: body.endpoint,
-        method: body.method || 'POST',
-        body: body.body || {},
-        timeout: body.timeout,
-        apiKey: body.apiKey,
-        baseUrl: body.baseUrl,
-      });
-      return send(res, 200, result);
-    }
-
-    if (req.method === 'POST' && url.pathname.startsWith('/api/proxy/')) {
-      const provider = decodeURIComponent(url.pathname.split('/').pop() || '');
-      const body = await readJson(req);
-      const result = await executeGenerationRequest({
-        provider,
-        endpoint: body.endpoint,
-        method: body.method || 'POST',
-        body: body.body || {},
-        timeout: body.timeout,
-        apiKey: body.apiKey,
-        baseUrl: body.baseUrl,
-      });
-      return send(res, 200, result);
-    }
-
-    // ===== 扩展包信息端点 =====
-    if (req.method === 'GET' && url.pathname.startsWith('/api/extensions/')) {
-      const extensionId = decodeURIComponent(url.pathname.slice('/api/extensions/'.length));
-      const extensions = {
-        'free-search-pack': {
-          id: 'free-search-pack',
-          name: '免费搜图扩展包',
-          version: '1.0.0',
-          description: '整合 Unsplash、Pexels、Pixabay、Openverse 等免费图库 API',
-          features: ['关键词搜图', '以图搜图', '多平台聚合', '批量采集', '拖拽导入'],
-          platforms: ['unsplash', 'pexels', 'pixabay', 'openverse'],
-          status: 'active',
-        },
-        'asset-search-engine': {
-          id: 'asset-search-engine',
-          name: '智能搜索引擎',
-          version: '1.0.0',
-          description: '增强本地搜索：模糊匹配 + 拼音搜索 + 布尔语法',
-          features: ['模糊匹配', '拼音搜索', '布尔搜索', '搜索历史', '实时建议', 'AI分析结果搜索'],
-          status: 'active',
-        },
-        'ai-analysis-pack': {
-          id: 'ai-analysis-pack',
-          name: 'AI 深度分析扩展包',
-          version: '1.0.0',
-          description: '视觉大模型图片分析、提示词提取、相似图生成',
-          features: ['光影分析', '风格识别', '构图解析', '运镜检测', '提示词提取', '相似图生成'],
-          recommendedModels: ['qwen3.7-plus', 'gpt-4o', 'Qwen/Qwen2.5-VL-72B-Instruct'],
-          status: 'active',
-        },
-      };
-
-      const ext = extensions[extensionId];
-      if (!ext) {
-        return send(res, 404, { success: false, error: { message: `extension ${extensionId} not found` } });
-      }
-      return send(res, 200, { success: true, extension: ext });
-    }
-
+    // 全部 HTTP 分支已外移至 server/routes/ 下的路由组模块，由路由注册表统一分发：
+    // health / auth / byok / models / assets / dcc / comfyui / media / cobuild / search /
+    // local-ai / agent。未命中即 404，route() 不再持有任何业务 if 分支。
+    if (await apiRouter.dispatch(req, res, url)) return undefined;
     return send(res, 404, { success: false, error: { message: `No route for ${req.method} ${url.pathname}` } });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -16314,6 +11065,252 @@ async function route(req, res) {
     return send(res, localVideoEditStatusCode(message), { success: false, error: { message } });
   }
 }
+
+// ===== 路由注册表装配 =====
+// route() 中的巨型 if 链正按路由组逐步外移到 server/routes/ 下。
+// 依赖以显式注入方式传递，避免子模块反向 import 主文件造成循环依赖。
+const apiRouter = createHttpRouter({ name: 'hmdao-api' });
+
+registerHealthRoutes(apiRouter, {
+  APP_DIR,
+  PORT,
+  send,
+  readJson,
+  isRealApiProxyEnabled,
+  buildPlatformInfo,
+  buildLocalPostBackendStatus,
+  resolveLocalPostOcioBackend,
+  resolveLocalPostOiioBackend,
+  resolveLocalPostGmicBackend,
+  resolveLocalPostUpscaleBackend,
+  resolveLocalPostYtDlpBackend,
+  resolveLocalPostFlorence2Backend,
+  clearLocalPostRuntimeDetectionCache,
+  buildLocalPostDoctorReport,
+  LOCAL_POST_RUNTIME_INSTALL_JOBS,
+  LOCAL_POST_INSTALLABLE_RUNTIMES,
+  LOCAL_POST_MANAGED_RUNTIME_DIR,
+  toRuntimeInstallJobResponse,
+  getRuntimeInstallJob,
+  startRuntimeInstallJob,
+  uninstallManagedLocalPostRuntime,
+  isForbiddenInstallTarget,
+  getAvailableDiskBytes,
+  getDiskTotalBytes,
+  listManagedLocalPostBackups,
+  rollbackManagedLocalPostRuntime,
+  cleanupManagedLocalPostRuntimeTemp,
+});
+
+registerAuthRoutes(apiRouter, {
+  send,
+  readJson,
+  sendAuthError,
+  normalizeLocalEmail,
+  isValidLocalEmail,
+  readUsers,
+  writeUsers,
+  hashPassword,
+  verifyPassword,
+  publicUser,
+  createSession,
+  deleteSessionsForUser,
+  sessions,
+  randomUUID: () => crypto.randomUUID(),
+});
+
+registerExtensionLicenseRoutes(apiRouter, {
+  send,
+  readJson,
+  DATA_DIR,
+  readUsers,
+  writeUsers,
+  hashPassword,
+  verifyPassword,
+  // 方案 A：供 Edge 扩展查询本机 yt-dlp 状态（原生主机握手接口用）。
+  // 直接复用既有的托管目录探测函数，零新增探测逻辑。
+  detectYtDlpStatus: () => {
+    const p = detectManagedLocalPostYtDlpPath();
+    if (p) return Promise.resolve({ installed: true, path: p, version: 'managed' });
+    return Promise.resolve({ installed: false, path: null, version: null });
+  },
+});
+
+registerByokRoutes(apiRouter, {
+  send,
+  readJson,
+  maskKey,
+  providers,
+  listActivatedProviderRecords,
+  publicActivatedProviderRecord,
+  publicImageAnalysisRuntime,
+  pickActivatedCloudImageAnalysisRuntime,
+  buildRuntimeRecommendations,
+  fetchRelayModelIndex,
+  normalizeRelayEndpointInput,
+  buildRelayActivationRecords,
+  setActivatedProviderRecord,
+  getActivatedProviderRecord,
+  deleteActivatedProviderRecord,
+  hydrateActivatedProviderRecordsFromDisk,
+  persistActivatedProviderRecordsToDisk,
+  activatedProviders,
+  broadcastCatalogUpdate,
+  validateByokProvider,
+  syncArkEndpoints,
+  MODEL_CATALOG,
+});
+
+registerModelsRoutes(apiRouter, {
+  send,
+  // 对账状态经服务 getter 读取（服务内部可重赋值）。
+  getCatalogReconcileState,
+  reconcileModelCatalog,
+  modelCatalogPayload,
+});
+
+registerAssetsRoutes(apiRouter, {
+  send,
+  readJson,
+  // settings
+  loadOperationDispatchConfig,
+  saveOperationDispatchConfig,
+  OPERATION_DISPATCH_CONFIG_FILE,
+  readAssetLibrarySettings,
+  writeAssetLibrarySettings,
+  ASSET_LIBRARY_SETTINGS_FILE,
+  ASSET_LIBRARY_CATALOG_FILE,
+  DEFAULT_ASSET_LIBRARY_STORAGE_DIR,
+  pickLocalDirectory,
+  // asset library
+  readAssetLibraryCatalog,
+  writeAssetLibraryCatalog,
+  buildAssetLibraryDuplicateGroups,
+  writeAssetLibraryDuplicates,
+  readAssetLibraryDuplicates,
+  deleteAssetLibraryItems,
+  pruneMissingAssetLibraryItems,
+  restoreAssetLibraryItems,
+  findAssetLibraryItem,
+  probeAssetMedia,
+  repairAssetLibraryItem,
+  buildAssetLibraryContentUrl,
+  readAssetLibraryImportMultipart,
+  processAssetLibraryImportRequest,
+  processAssetLibraryImportDirectory,
+  // content stream
+  sanitizeLocalAssetId,
+  sendLocalFileStream,
+  mediaMimeTypeFromExtension,
+  buildSafeInlineContentDisposition,
+});
+
+registerDccRoutes(apiRouter, {
+  send,
+  readJson,
+  DCC_ENVIRONMENT_MANAGER,
+  DCC_ENGINES,
+  summarizeCurrentUnrealEnvironment,
+  probeTcp,
+  isUnrealDirectBridgeOnline,
+  UNREAL_DIRECT_BRIDGE,
+  DCC_RECORDING_LOCK,
+  ENABLE_UNREAL_PIXEL_STREAMING_LEGACY,
+  DEFAULT_UNREAL_PIXEL_URL,
+  DEFAULT_UNREAL_REMOTE_URL,
+  UNREAL_PIXEL_STREAMING_LEGACY,
+  getUnrealControlConfig,
+  readUnrealConfig,
+  writeUnrealConfig,
+});
+
+// ComfyUI 网关前缀组：整组早已收敛为 handleComfyUiApi，此处仅把分发点
+// 从 route() 手写 if 迁入路由表（前缀命中在精确路径之后，无遮蔽风险）。
+apiRouter.registerPrefix('*', '/api/comfyui/', handleComfyUiApi);
+
+registerMediaRoutes(apiRouter, {
+  execFileAsync,
+  handleCuratorPreviewProxy,
+  https,
+  proxyHuggingFace,
+  proxyRemoteMediaAsset,
+  resolveYtDlpPath,
+  send,
+  serveLocalModel,
+  serveTransformersModule,
+});
+
+registerCobuildRoutes(apiRouter, {
+  crypto,
+  getCobuildUserSafe,
+  getUserFromRequest,
+  maskEmailForDisplay,
+  readCobuild,
+  readJson,
+  send,
+  sendAuthError,
+  writeCobuild,
+});
+
+registerSearchRoutes(apiRouter, {
+  OPENVERSE_BASE,
+  PEXELS_BASE,
+  PIXABAY_BASE,
+  UNSPLASH_BASE,
+  WIKIMEDIA_BASE,
+  hashString,
+  http,
+  https,
+  polyhavenCatalogCache,
+  readJson,
+  send,
+});
+
+registerLocalAiRoutes(apiRouter, {
+  LOCAL_AUDIO_RESULT_DIR,
+  LOCAL_POST_RESULT_DIR,
+  LOCAL_VIDEO_RESULT_DIR,
+  buildSafeInlineContentDisposition,
+  executeGenerationRequest,
+  getDccLocalArtifact,
+  mediaMimeTypeFromExtension,
+  path,
+  previewGenerationRequest,
+  processLocalAudioGenerateRequest,
+  processLocalImageAnalyzeRequest,
+  processLocalPostRequest,
+  processLocalVideoEditRequest,
+  processRemoteAudioGenerateRequest,
+  readJson,
+  readLocalImageAnalyzeMultipart,
+  readLocalPostMultipart,
+  sanitizeLocalAssetId,
+  send,
+  sendLocalFileStream,
+});
+
+registerAgentRoutes(apiRouter, {
+  ASSET_LIBRARY_TEMP_DIR,
+  collectFreeLlmCandidates,
+  crypto,
+  deleteMemory,
+  extensionFromMimeType,
+  formatSseEvent,
+  fs,
+  getMemory,
+  nextFreeLlm,
+  path,
+  processAssetLibraryImportRequest,
+  readJson,
+  runAgentReasoning,
+  sanitizeAssetFileBaseName,
+  send,
+  setAllMemory,
+  setMemory,
+  sendJson: send,
+});
+
+export { apiRouter };
 
 const server = http.createServer(route);
 server.on('upgrade', (req, socket, head) => {
@@ -16337,31 +11334,199 @@ process.on('unhandledRejection', (reason) => {
   console.error('[HMDao API] unhandled rejection:', reason);
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`[HMDao API] http://127.0.0.1:${PORT}`);
+// P3-9/P3-3：注入运行时路径与重依赖，使回滚/清理模块与真实清单、探测缓存联动。
+configureRuntimeRollback({
+  managedRuntimeDir: LOCAL_POST_MANAGED_RUNTIME_DIR,
+  installableRuntimeKeys: Object.keys(LOCAL_POST_INSTALLABLE_RUNTIMES || {}),
+  persistEntry: persistManagedRuntimeManifestEntry,
+  clearCache: clearLocalPostRuntimeDetectionCache,
 });
 
+// P3-11：注入 job 状态更新函数，使全局串行安装队列能回写集中状态。
+configureRuntimeInstallQueue({ updateRuntimeInstallJob });
 
+// 单测隔离：设置 HMDAO_TEST_NO_SERVER 时仅导出函数、不启动监听，便于直接 import 测试纯逻辑。
+if (!process.env.HMDAO_TEST_NO_SERVER) {
+  server.listen(PORT, '127.0.0.1', () => {
+    console.log(`[HMDao API] http://127.0.0.1:${PORT}`);
+    // 开机自动清理 catalog 中已丢失本地文件（被移动/删除）的 disk 型死引用，避免前端反复 404。
+    void pruneMissingAssetLibraryItems()
+      .then((r) => { if (r.removedCount) console.log(`[HMDao API] pruned ${r.removedCount} missing asset refs (catalog cleanup)`); })
+      .catch((e) => console.error('[HMDao API] prune failed:', e.message));
+  });
+}
 
+// ===== P2.b：面板 SmartAgent 后端 ReAct 流式规划端点（SSE）核心工具（模块级，便于单测与复用）=====
+function formatSseEvent(name, data) {
+  return `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
+}
 
+// 从模型文本稳健提取结构化计划 JSON（容错：去 markdown 围栏、截取首尾花括号）
+function parseAgentPlan(content) {
+  let s = String(content || '').trim();
+  s = s.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start < 0 || end <= start) throw new Error('响应中未找到 JSON 计划');
+  let obj;
+  try { obj = JSON.parse(s.slice(start, end + 1)); } catch { throw new Error('计划 JSON 解析失败'); }
+  if (!obj || typeof obj !== 'object') throw new Error('计划不是有效对象');
+  const validSkills = ['text', 'image', 'video', 'audio', 'script', 'storyboard'];
+  const skillId = String(obj.skillId || '').trim().toLowerCase();
+  if (!validSkills.includes(skillId)) throw new Error('skillId 无效：' + skillId);
+  const steps = Array.isArray(obj.suggestedSteps)
+    ? obj.suggestedSteps
+      .filter((x) => x && typeof x === 'object' && typeof x.type === 'string')
+      .map((x) => ({ type: String(x.type).trim(), label: String(x.label || '').slice(0, 200), prompt: String(x.prompt || '').slice(0, 4000) }))
+    : [];
+  return {
+    skillId,
+    skillName: String(obj.skillName || skillId).slice(0, 80),
+    confidence: typeof obj.confidence === 'number' ? Math.min(1, Math.max(0, obj.confidence)) : 0.6,
+    extractedParams: obj.extractedParams && typeof obj.extractedParams === 'object' ? obj.extractedParams : {},
+    suggestedSteps: steps.length
+      ? steps
+      : [{ type: skillId, label: obj.skillName || skillId, prompt: (obj.extractedParams && obj.extractedParams.prompt) || '' }],
+  };
+}
 
+// ReAct 推理核心：构建 system+history+user(画布状态+记忆) -> 调用 AI -> 解析 thinking + 计划
+async function runAgentReasoning({ text, history = [], canvasSummary = '', scope = 'global' }) {
+  const fallbackKey = process.env.HMDAO_AI_KEY || 'sk-dAViKE9mAm0RqXdfc8nFYn4xAYyOlMjp0l0LcfnmgYdfUcni';
+  const fallbackUrl = process.env.HMDAO_AI_URL || 'https://tokenhub.tencentmaas.com/v1/chat/completions';
+  const fallbackModel = process.env.HMDAO_AI_MODEL || 'hy3';
+  // 轮换：优先用 nextFreeLlm 选中的那个免费模型，失败再依次回退其余候选
+  const chatPool = collectFreeLlmCandidates('chat');
+  const chatStart = nextFreeLlm('chat');
+  const chatOrdered = chatStart
+    ? [chatStart, ...chatPool.filter((c) => `${c.provider}/${c.model}` !== `${chatStart.provider}/${chatStart.model}`)]
+    : [{ provider: 'tokenhub', model: fallbackModel, endpoint: fallbackUrl, apiKey: fallbackKey }];
+  const memCtx = memoryContextString(scope);
+  const system = `你是 Ddayup 画布智能体（ReAct 工作流规划器）。根据用户自然语言目标，规划一个画布工作流。
+可用技能 skillId（六选一）：text(文本/文案/代码)、image(文生图/图生图)、video(文生视频/图生视频)、audio(语音/音乐/音效)、script(脚本/代码)、storyboard(分镜/多镜头)。
+请先内部推理（reasoning_content），再只输出一个严格 JSON 对象（不要 markdown 代码块、不要额外解释）：
+{
+  "skillId": "image",
+  "skillName": "文生图",
+  "confidence": 0.9,
+  "extractedParams": { "prompt": "核心提示词", "style": "风格", "negativePrompt": "不想要的元素" },
+  "suggestedSteps": [ { "type": "image", "label": "步骤说明", "prompt": "该步骤提示词" } ]
+}
+约束：skillId 必须是六者之一；suggestedSteps 至少 1 项且 type 同属六者；用户目标模糊时选最可能技能并给合理默认。${
+    memCtx ? `\n\n【用户长期记忆（优先遵循，保持人设与品牌一致性）】\n${memCtx}` : ''
+  }`;
+  const userContent = (canvasSummary ? `当前画布状态：${canvasSummary}\n` : '') + `用户目标：${text}`;
+  let data = null;
+  let lastError = null;
+  let usedModel = null;
+  for (const cand of chatOrdered) {
+    const apiKey = String(cand.apiKey || fallbackKey).trim();
+    const apiUrl = String(cand.endpoint || fallbackUrl).trim();
+    const model = String(cand.model || fallbackModel).trim();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 60000);
+    try {
+      const r = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: system },
+            ...history,
+            { role: 'user', content: userContent },
+          ],
+          temperature: 0.5,
+          max_tokens: 1500,
+        }),
+        signal: controller.signal,
+      });
+      if (!r.ok) {
+        const errText = await r.text().catch(() => '');
+        throw new Error(`AI 服务错误 ${r.status}: ${errText.slice(0, 200)}`);
+      }
+      data = await r.json().catch(() => ({}));
+      usedModel = `${cand.provider || 'tokenhub'}/${model}`;
+      break;
+    } catch (e) {
+      lastError = e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  if (!data) throw lastError || new Error('所有免费聊天模型均不可用');
+  const message = data && data.choices && data.choices[0] && data.choices[0].message;
+  const content = message && typeof message.content === 'string' ? message.content : '';
+  const thinking = message && typeof message.reasoning_content === 'string' ? message.reasoning_content.trim() : '';
+  if (!content) throw new Error('AI 返回空内容');
+  const plan = parseAgentPlan(content);
+  const summary = `已为你规划「${plan.skillName}」工作流，共 ${plan.suggestedSteps.length} 步。`;
+  return { thinking, text: summary, plan, usedModel };
+}
 
+export {
+  replaceDirectoryContents,
+  pruneOldBakBackups,
+  listManagedLocalPostBackups,
+  rollbackManagedLocalPostRuntime,
+  cleanupManagedLocalPostRuntimeTemp,
+  LOCAL_POST_MANAGED_RUNTIME_DIR,
+  resolveLlmOperationDispatch,
+  resolveImageOperationDispatch,
+  resolveVideoOperationDispatch,
+  MODEL_CATALOG,
+  loadOperationDispatchConfig,
+  inlineCloudConditioningMedia,
+  isLocalOnlyMediaReference,
+  runAgentReasoning,
+  parseAgentPlan,
+  formatSseEvent,
+  isVisionModelId,
+  resolveImageAnalysisRuntime,
+  hydrateActivatedProviderRecordsFromDisk,
+  ACTIVATED_PROVIDERS_FILE,
+  refineLocalAnalysisWithFreeLlm,
+};
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+// P1-10：以下 52 个 local-post 处理/检测函数已抽取至 lib/local-post-processing.mjs。
+import {
+  applyManagedFlorence2Env,
+  buildParseSummary,
+  clampNumber,
+  clearLocalPostRuntimeDetectionCache,
+  detectLocalPostGmicPath,
+  detectLocalPostOcioRuntimePath,
+  detectLocalPostOiioConfigPath,
+  detectLocalPostOiioPath,
+  detectManagedLocalPostFlorence2Path,
+  detectManagedLocalPostFlorence2Python,
+  detectManagedLocalPostOcioPath,
+  detectManagedLocalPostYtDlpPath,
+  detectSceneCuts,
+  extractZipArchiveToDirectory,
+  findFileRecursively,
+  getLatestRuntimeInstallJob,
+  getManagedRuntimeManifestEntry,
+  getRuntimeInstallJob,
+  inspectOcioConfigFile,
+  isPathInsideDir,
+  isSupportedBokehFile,
+  isSupportedLutFile,
+  isSupportedOcioConfigFile,
+  persistManagedRuntimeManifestEntry,
+  postTempPath,
+  removeManagedRuntimeManifestEntry,
+  replaceDirectoryContents,
+  resolveLocalPostFlorence2Backend,
+  resolveLocalPostWrapperCommand,
+  resolveLocalPostYtDlpBackend,
+  resolvePostUpscaleRoute,
+  buildLocalPostBackendStatus,
+  resolveLocalPostUpscaleBackend,
+  resolveLocalPostOcioBackend,
+  resolveLocalPostOiioBackend,
+  resolveLocalPostGmicBackend,
+  runCommand,
+  toRuntimeInstallJobResponse,
+  updateRuntimeInstallJob,
+} from './lib/local-post-processing.mjs';

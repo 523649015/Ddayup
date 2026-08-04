@@ -611,18 +611,44 @@ def build_scene_row(index, scene_count, scene, cap, width, height, fps, sample_f
 
 def build_summary(width, height, duration, sample_fps, rows):
     scenes = len(rows)
-    dominant_styles = keywords_from_parts([row["styleDescription"] for row in rows[:3]])
-    atmospheres = keywords_from_parts([row["atmosphere"] for row in rows[:3]])
-    settings = keywords_from_parts([row["sceneSetting"] for row in rows[:3]])
-    subject_lines = keywords_from_parts([row["subjectSummary"] for row in rows[:2]])
-    return (
-        f"视频分辨率为 {width}x{height}，时长 {duration:.2f}s，按 {sample_fps}fps 进行本地抽样。"
-        f"共识别 {scenes} 个镜头段。"
-        f"主体分析以 {(' / '.join(subject_lines[:2]) or '场景主体展示')} 为主。"
-        f"场景多为 {(' / '.join(settings[:2]) or '中性叙事空间')}。"
-        f"整体风格偏 {(' / '.join(dominant_styles[:2]) or '写实自然')}，"
-        f"氛围主要呈现 {(' / '.join(atmospheres[:2]) or '稳定叙事')}。"
-    )
+    if scenes == 0:
+        return (
+            f"视频分辨率为 {width}x{height}，时长 {duration:.2f}s，"
+            f"按 {sample_fps}fps 进行本地抽样，未识别到明确镜头段。"
+        )
+
+    first_row = rows[0]
+    shot_size = str(first_row.get("sceneType") or "").strip()
+    camera_angle = str(first_row.get("cameraAngle") or "").strip()
+    camera_motion = str(first_row.get("cameraMovement") or "").strip()
+    focus_depth = str(first_row.get("focusDepth") or "").strip()
+    lighting = str(first_row.get("lighting") or "").strip()
+    style = str(first_row.get("styleDescription") or "").strip()
+    atmosphere = str(first_row.get("atmosphere") or "").strip()
+    subject = str(first_row.get("subjectSummary") or "").strip()
+    setting = str(first_row.get("sceneSetting") or "").strip()
+
+    framing_parts = [part for part in [shot_size, camera_angle, camera_motion, focus_depth] if part]
+    framing_line = "、".join(framing_parts) if framing_parts else "标准取景"
+
+    lines = [
+        f"视频分辨率为 {width}x{height}，时长 {duration:.2f}s，按 {sample_fps}fps 进行本地抽样。",
+        f"共识别 {scenes} 个镜头段。",
+    ]
+    if subject:
+        lines.append(f"主体：{subject}。")
+    if framing_line:
+        lines.append(f"取景：{framing_line}。")
+    if setting:
+        lines.append(f"场景：{setting}。")
+    if lighting:
+        lines.append(f"光影：{lighting}。")
+    if style:
+        lines.append(f"风格：{style}。")
+    if atmosphere:
+        lines.append(f"氛围：{atmosphere}。")
+
+    return " ".join(lines)
 
 
 def main():

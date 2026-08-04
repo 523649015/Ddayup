@@ -194,10 +194,25 @@ def caption_to_analysis(caption: str, *, engine: str, width: int, height: int, w
             continue
         deduped_keywords.append(item)
         seen.add(lowered)
+    raw_caption = text
+    grounded_summary = f"{subject}，{scene}，{style}，{lighting}，{camera}，整体氛围偏{mood}。"
+    # R3：把 Florence-2 真实英文描述并入 summary，避免只返回泛化默认词（高完成度视觉风格等），
+    # 让用户看到与素材图实际对应的分析内容。
+    if raw_caption:
+        grounded_summary = f"{grounded_summary}\nFlorence-2 原始描述：{raw_caption}"
+    # 本地 Florence-2 是 caption 模型，无法稳定产出细粒度字段；尽量从原始描述里抽取颜色并入主体，
+    # 其余细粒度字段（细节/动作/表情）标注需在线视觉模型补充，避免前端空白。
+    palette = infer_palette(text)
+    subject_colors = "、".join(palette) if palette else ""
     return {
         "engine": engine,
-        "summary": f"{subject}，{scene}，{style}，{lighting}，{camera}，整体氛围偏{mood}。",
+        "summary": grounded_summary,
+        "rawCaption": raw_caption,
         "subject": subject,
+        "subjectColors": subject_colors,
+        "subjectDetails": f"Florence-2 原始描述中可见：{raw_caption}" if raw_caption else "（需在线视觉模型识别）",
+        "action": "（需在线视觉模型识别）",
+        "expression": "（需在线视觉模型识别）",
         "scene": scene,
         "style": style,
         "lighting": lighting,
@@ -205,7 +220,7 @@ def caption_to_analysis(caption: str, *, engine: str, width: int, height: int, w
         "camera": camera,
         "mood": mood,
         "keywords": deduped_keywords[:12],
-        "palette": infer_palette(text),
+        "palette": palette,
         "promptZh": build_prompt_zh(subject, scene, style, lighting, composition, camera, mood),
         "promptEn": text or ", ".join(deduped_keywords[:8]),
         "warnings": warnings or [],
@@ -246,6 +261,10 @@ def normalize_structured_result(raw: dict[str, Any], *, engine: str, width: int,
     camera = str(raw.get("camera") or f"{orientation}镜头").strip()
     mood = str(raw.get("mood") or "统一氛围感").strip()
     composition = str(raw.get("composition") or f"{orientation}，保持原始主体位置关系").strip()
+    subject_colors = str(raw.get("subjectColors") or "、".join(infer_palette(" ".join(map(str, raw.get("keywords") or [])))) or "（需在线视觉模型识别）).strip()
+    subject_details = str(raw.get("subjectDetails") or "（需在线视觉模型识别）").strip()
+    action = str(raw.get("action") or "（需在线视觉模型识别）").strip()
+    expression = str(raw.get("expression") or "（需在线视觉模型识别）").strip()
     keywords = raw.get("keywords") if isinstance(raw.get("keywords"), list) else []
     prompt_zh = str(raw.get("promptZh") or build_prompt_zh(subject, scene, style, lighting, composition, camera, mood)).strip()
     prompt_en = str(raw.get("promptEn") or "").strip()
@@ -260,6 +279,10 @@ def normalize_structured_result(raw: dict[str, Any], *, engine: str, width: int,
         "lighting": lighting,
         "composition": composition,
         "camera": camera,
+        "subjectColors": subject_colors,
+        "subjectDetails": subject_details,
+        "action": action,
+        "expression": expression,
         "mood": mood,
         "keywords": [str(item).strip() for item in keywords if str(item).strip()][:12],
         "palette": [str(item).strip() for item in palette if str(item).strip()][:6],

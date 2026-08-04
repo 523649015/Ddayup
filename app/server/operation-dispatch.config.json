@@ -9,6 +9,7 @@
       "regionMismatch": -80,
       "cost": -22,
       "latency": -9,
+      "candidateOrder": 30,
       "disabled": -100000,
       "referenceRole": 180,
       "generationMode": 260
@@ -108,6 +109,27 @@
       "latestTechnique": "Reference-conditioned image editing that locks composition, perspective, and framing while replacing only the hero subject using stronger identity/layout control.",
       "candidates": ["flux-pro", "gpt-image-2", "doubao-seedream-5-0-lite", "grok-imagine-1.5-edit-apimart", "Qwen/Qwen-Image", "lib-image"],
       "preferredProviders": ["fal", "openai", "volcengine", "siliconflow"],
+      "disabledModels": []
+    },
+    "llm_text": {
+      "label": "general text / script / storyboard / ai-app generation (free-quota-first, multi-model fallback)",
+      "candidates": [
+        "volc-seed-2.1-pro",
+        "volc-seed-2.1-turbo",
+        "volc-seed-2.1-evolving",
+        "volc-qwen3",
+        "volc-deepseek-v3",
+        "volc-glm-4.6",
+        "volc-minimax-text",
+        "volc-kimi",
+        "sf-qwen3-235b",
+        "sf-glm-4.6",
+        "sf-minimax-text",
+        "sf-kimi-k2",
+        "bailian-qwen3.7-plus",
+        "bailian-qwen3.7-vl"
+      ],
+      "preferredProviders": ["volcengine", "siliconflow", "bailian"],
       "disabledModels": []
     }
   }

@@ -103,7 +103,7 @@ node F:\Work\HMDAODAO\app\server\hmdao-api.mjs
 
 ```powershell
 npm run build
-node server/verify-browser-flow.mjs --asset-library-only --ui-only
+node scripts/verify-browser-flow.mjs --asset-library-only --ui-only
 ```
 
 验证重点：

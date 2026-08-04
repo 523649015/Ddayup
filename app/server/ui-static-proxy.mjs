@@ -38,6 +38,15 @@ const MIME_TYPES = {
   '.woff2': 'font/woff2',
 };
 
+// 跨域隔离响应头：启用 SharedArrayBuffer，这是 onnxruntime-web 的 WebGPU / 多线程 wasm
+// 后端创建会话的硬性前提（否则会抛 "failed to allocate a buffer" 的 SAB 分配失败）。
+// 使用 credentialless 而非 require-corp：由 Chrome/Edge 支持，可在不阻断无 CORS 的
+// 外部子资源（图片、CDN 权重等）的前提下仍使 crossOriginIsolated === true。
+const CROSS_ORIGIN_HEADERS = {
+  'Cross-Origin-Opener-Policy': 'same-origin',
+  'Cross-Origin-Embedder-Policy': 'credentialless',
+};
+
 function safeSocketClose(socket) {
   if (!socket || socket.destroyed) return;
   try {
@@ -80,10 +89,35 @@ async function serveStatic(req, res) {
       return;
     }
     const extension = path.extname(targetPath).toLowerCase();
+    const contentTypes = { ...MIME_TYPES, '.wasm': 'application/wasm' }; // 强制wasm MIME
+    if (extension === '.wasm') console.log('[proxy] serving .wasm:', targetPath, 'fallback=', fallbackToIndex);
+    // 关键：wasm 绝不能用 immutable 缓存。历史上曾因 MIME 错误把 404/index.html
+    // 以 immutable 缓存一年，导致修正后浏览器（含 Edge 硬刷新）仍用毒缓存、WebAssembly
+    // compileStreaming 报 "Incorrect response MIME type"。改为 no-cache，每次都重新校验。
+    const cacheControl =
+      // wasm 与 html 入口绝不能 immutable：
+      //  - wasm：历史上 MIME 出错会把 404/index.html 以 immutable 缓存一年，导致修正后
+      //    浏览器（含 Edge 硬刷新）仍用毒缓存、WebAssembly compileStreaming 报 MIME 错误。
+      //  - html 入口（index.html）是非哈希文件名，必须每次重新校验，否则旧入口会持续引用
+      //    旧的 JS chunk、进而命中旧的 /ort-wasm/ 毒缓存。
+      // 哈希化的 .js/.css 等仍用 immutable（内容寻址，安全）。
+      extension === '.wasm' || extension === '.html'
+        ? 'no-cache'
+        : fallbackToIndex
+          ? 'no-cache'
+          : 'public, max-age=31536000, immutable';
+    // wasm/mjs 在跨域隔离（COOP/COEP）下会被 ComfyUI/ORT 以 Worker 方式加载，
+    // 需允许同源嵌入，否则 Worker 脚本拉取被 COEP 拦截导致 wasm 初始化失败。
+    const corHeaders =
+      extension === '.wasm' || extension === '.mjs'
+        ? { 'Cross-Origin-Resource-Policy': 'same-origin' }
+        : {};
     res.writeHead(200, {
-      'Content-Type': MIME_TYPES[extension] || 'application/octet-stream',
-      'Cache-Control': fallbackToIndex ? 'no-cache' : 'public, max-age=31536000, immutable',
+      'Content-Type': contentTypes[extension] || 'application/octet-stream',
+      'Cache-Control': cacheControl,
       'Content-Length': stat.size,
+      ...CROSS_ORIGIN_HEADERS,
+      ...corHeaders,
     });
     if (req.method === 'HEAD') {
       res.end();
@@ -132,7 +166,7 @@ function proxyHttp(req, res) {
     proxyRes.on('error', () => {
       safeSocketClose(res.socket);
     });
-    res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+    res.writeHead(proxyRes.statusCode || 502, { ...proxyRes.headers, ...CROSS_ORIGIN_HEADERS });
     proxyRes.pipe(res);
   });
 
@@ -201,7 +235,7 @@ const server = http.createServer(async (req, res) => {
     proxyHttp(req, res);
     return;
   }
-
+  if (req.url.endsWith('.wasm')) console.log('[proxy] wasm:', req.url);
   await serveStatic(req, res);
 });
 
