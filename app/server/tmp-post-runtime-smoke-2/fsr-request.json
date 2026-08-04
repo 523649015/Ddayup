@@ -1,9 +1,0 @@
-﻿{
-    "outputPath":  "F:\\Work\\HMDAODAO\\app\\server\\tmp-post-runtime-smoke-2\\fsr.png",
-    "inputPath":  "F:\\Work\\HMDAODAO\\app\\server\\tmp-post-runtime-smoke-2\\input.png",
-    "seamFix":  true,
-    "mediaKind":  "image",
-    "denoise":  0.2,
-    "scale":  2,
-    "sharpen":  0.3
-}

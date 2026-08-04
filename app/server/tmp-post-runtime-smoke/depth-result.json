@@ -1,8 +1,0 @@
-{
-  "outputPath": "F:\\Work\\HMDAODAO\\app\\server\\tmp-post-runtime-smoke\\depth.png",
-  "engine": "Depth Anything Example Runtime",
-  "meta": {
-    "strength": 0.7,
-    "depthMode": "grayscale-preview"
-  }
-}

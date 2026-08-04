@@ -14,12 +14,24 @@ out/
 tools/
 artifacts/
 
+# Native host（方案 A）：安装器生成的本机 manifest 含绝对路径，不入库
+extension/native-host/com.ddayup.host.installed.json
+**/com.ddayup.host.installed.json
+
+# Python bytecode caches (should never be tracked)
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
 # Temp files & logs
 tmp/
 tmp_*
 tmp-*
 **/tmp_*
 **/tmp-*
+scripts/tmp/
 app/tmp_*
 app/tmp-*
 app/tmp-*/
@@ -50,3 +62,49 @@ Thumbs.db
 .env
 .env.*
 *.local
+
+# External project skeleton (belongs to CinStudio, not this repo)
+ai-canvas-platform/
+
+# Runtime-generated media / caches
+app/server/image/
+app/server/video/
+app/server/__pycache__/
+app/server/tmp-post-runtime-smoke*/
+
+# Local verification scripts (development-only)
+app/server/verify-*.mjs
+app/server/verify-*.mts
+scripts/verify-*.mjs
+
+# Backup / temp artifacts
+*.hmdao-encoding-backup-*
+report_hmdao_deep_analysis.html
+page.png
+page.yaml
+
+# Aigei scraping temp files
+aigei-sound-class.yaml
+aigei2.yaml
+tmp_aigei_*.html
+
+# Misc temp files
+Untitled-1.txt
+tmp_gate_now.log
+tmp_tsc_now.log
+tmp_real_parse.txt
+tmp_old_model-api-capture.js
+tmp_pp_check.html
+tmp_probe.html
+tmp-remote-files.txt
+
+# Garbage files with broken names from crashes
+({err
+{console.error('LOAD_FAIL
+{console.error('MAIN_ERR'
+{console.error(e)
+{const
+287
+console.log('BACKEND_DOWN'
+console.log(p+'
+f.endsWith('.mjs'))

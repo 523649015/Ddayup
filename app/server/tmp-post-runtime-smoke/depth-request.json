@@ -1,6 +1,0 @@
-﻿{
-    "mediaKind":  "image",
-    "inputPath":  "F:\\Work\\HMDAODAO\\app\\server\\tmp-post-runtime-smoke\\input.png",
-    "strength":  0.7,
-    "outputPath":  "F:\\Work\\HMDAODAO\\app\\server\\tmp-post-runtime-smoke\\depth.png"
-}
