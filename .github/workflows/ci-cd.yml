@@ -246,6 +246,9 @@ jobs:
           path: app/dist/
 
       - name: 部署到 Azure Static Web Apps
+        # 方案 A：当前 Azure token/实例配置暂未就绪，部署失败不应阻断整体流水线。
+        # 待配置好 AZURE_STATIC_WEB_APPS_API_TOKEN 与对应 Static Web App 实例后，可移除 continue-on-error。
+        continue-on-error: true
         uses: Azure/static-web-apps-deploy@v1
         with:
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
