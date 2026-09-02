@@ -1,6 +1,7 @@
 ﻿// LEGACY NOTICE:
 // Unreal Pixel Streaming proxy, player.html rewrite, and frontend bootstrap are kept only for explicit legacy compatibility.
 // The normal Unreal path should stay on HMDao Unreal Capture + /ws/dcc/unreal editor-direct bridging.
+import './lib/load-env.mjs'; // 最先加载：读取 app/.env 注入 process.env（零依赖）
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
@@ -115,6 +116,7 @@ import {
   accessSessions,
   createSession,
   deleteSessionsForUser,
+  loadSessions,
 } from './lib/session-store.mjs';
 // 路由注册表：替代 route() 中的顺序 if 链，路由组按 routes/ 目录逐步外移。
 import { createHttpRouter } from './core/http-router.mjs';
@@ -122,6 +124,8 @@ import { registerHealthRoutes } from './routes/health.mjs';
 import { registerAuthRoutes } from './routes/auth.mjs';
 import { registerExtensionLicenseRoutes } from './routes/extension-license.mjs';
 import { registerByokRoutes } from './routes/byok.mjs';
+import { registerAria2Routes } from './routes/aria2.mjs';
+import * as aria2Manager from './lib/aria2-manager.mjs';
 import { registerModelsRoutes } from './routes/models.mjs';
 import { registerAssetsRoutes } from './routes/assets.mjs';
 import { registerDccRoutes } from './routes/dcc.mjs';
@@ -130,6 +134,8 @@ import { registerCobuildRoutes } from './routes/cobuild.mjs';
 import { registerSearchRoutes } from './routes/search.mjs';
 import { registerLocalAiRoutes } from './routes/local-ai.mjs';
 import { registerAgentRoutes } from './routes/agent.mjs';
+import { registerNetdiskRoutes } from './routes/netdisk.mjs';
+import { registerNetdiskScrapeRoutes } from './routes/netdisk-scrape.mjs';
 import { createAssetLibraryService } from './services/assetLibrary.mjs';
 
 const PORT = Number(process.env.HMDAO_API_PORT || 8792);
@@ -346,26 +352,67 @@ const DCC_CAMERA_SETS = {
 };
 
 const DCC_RECORDING_LOCK = { engine: null };
-const UNREAL_DIRECT_BRIDGE = {
-  pluginSocket: null,
-  pluginInfo: null,
-  browsers: new Map(),
-  lastCameraList: null,
-  lastTimeline: null,
-};
+// 多用户隔离：每个 owner（默认 'local' 兼容本机单用户）拥有独立的 DCC 桥接桶，
+// 插件流与浏览器流按 owner 分桶，互不串流。owner 取自 WS query 的 ?owner= 或鉴权 token。
+const UNREAL_DIRECT_BRIDES = new Map();
 const DCC_LOCAL_ARTIFACTS = new Map();
 
-function isSyntheticUnrealDirectPluginSession() {
-  return String(UNREAL_DIRECT_BRIDGE.pluginInfo?.pluginVersion || '').trim().toLowerCase() === 'verify';
+function resolveDccOwner(raw) {
+  const owner = typeof raw === 'string' ? raw.trim() : '';
+  return owner && /^[A-Za-z0-9_-]{1,64}$/.test(owner) ? owner : 'local';
 }
 
-function isUnrealDirectBridgeOnline() {
-  if (isSyntheticUnrealDirectPluginSession()) return false;
-  return Boolean(UNREAL_DIRECT_BRIDGE.pluginSocket && !UNREAL_DIRECT_BRIDGE.pluginSocket.destroyed);
+function getUnrealDirectBridge(owner) {
+  const key = resolveDccOwner(owner);
+  let bridge = UNREAL_DIRECT_BRIDES.get(key);
+  if (!bridge) {
+    bridge = {
+      owner: key,
+      pluginSocket: null,
+      pluginInfo: null,
+      browsers: new Map(),
+      lastCameraList: null,
+      lastTimeline: null,
+    };
+    UNREAL_DIRECT_BRIDES.set(key, bridge);
+  }
+  return bridge;
 }
 
-function getUnrealDirectBridgeCameraCount() {
-  const cameraList = UNREAL_DIRECT_BRIDGE.lastCameraList;
+// 从 DCC WebSocket 握手的 query 解析 owner。
+// 优先级：?token=<accessToken>（云端多用户隔离，从登录态解析 userId）> ?owner=<任意串>（向后兼容）> 本机回退 'local'。
+// 注意：浏览器 WS 无法设置自定义头，故 token 走 query；本机插件不传 token 时回退 local 桶以保持单机兼容。
+function resolveDccOwnerFromWs(req) {
+  const url = new URL(req.url || '/', `http://${req.headers.host}`);
+  const token = (url.searchParams.get('token') || '').toString().trim();
+  if (token) {
+    const entry = accessSessions.get(token);
+    if (entry && (!entry.expiresAt || Date.now() <= entry.expiresAt)) {
+      const uid = String(entry.userId || '').trim();
+      if (/^[A-Za-z0-9_-]{1,64}$/.test(uid)) return uid;
+    }
+  }
+  return resolveDccOwner(url.searchParams.get('owner'));
+}
+
+// 是否允许无鉴权（本机 127.0.0.1/localhost）回退到 local 桶。
+// 云端部署（非本机 HOST）下，未带有效 token 的连接一律拒绝，避免串流/越权。
+function isDccLocalOnlyConnection(req) {
+  const host = (req.headers.host || '').split(':')[0];
+  return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+}
+
+function isSyntheticUnrealDirectPluginSession(bridge) {
+  return String(bridge?.pluginInfo?.pluginVersion || '').trim().toLowerCase() === 'verify';
+}
+
+function isUnrealDirectBridgeOnline(bridge) {
+  if (isSyntheticUnrealDirectPluginSession(bridge)) return false;
+  return Boolean(bridge?.pluginSocket && !bridge.pluginSocket.destroyed);
+}
+
+function getUnrealDirectBridgeCameraCount(bridge) {
+  const cameraList = bridge?.lastCameraList;
   if (Array.isArray(cameraList?.camera_list)) return cameraList.camera_list.length;
   if (Array.isArray(cameraList?.cameras)) return cameraList.cameras.length;
   return 0;
@@ -446,7 +493,7 @@ function summarizeCurrentUnrealEnvironment(pluginEngine) {
       runtimeState: pluginEngine.runtimeState || null,
     };
   }
-  if (!directBridgeReadyForTargetProject || !isUnrealDirectBridgeOnline()) {
+  if (!directBridgeReadyForTargetProject || !isUnrealDirectBridgeOnline(getUnrealDirectBridge('local'))) {
     return {
       level: 'warning',
       summary: 'The plugin is ready, but Unreal has not bridged the editor back to HMDao yet.',
@@ -455,7 +502,7 @@ function summarizeCurrentUnrealEnvironment(pluginEngine) {
       runtimeState: pluginEngine.runtimeState || null,
     };
   }
-  if (getUnrealDirectBridgeCameraCount() <= 0) {
+  if (getUnrealDirectBridgeCameraCount(getUnrealDirectBridge('local')) <= 0) {
     return {
       level: 'warning',
       summary: 'Unreal is connected back to HMDao, but no viewport or camera source has been reported yet. Even without an explicit camera, it should normally fall back to Editor Viewport.',
@@ -490,12 +537,20 @@ function logUnrealBridgeEvent(event, details = null) {
 const DCC_ENVIRONMENT_MANAGER = createDccEnvironmentManager({
   repoRoot: REPO_ROOT,
   dataDir: DATA_DIR,
-  getUnrealBridgeState: () => ({
-    directBridgeOnline: isUnrealDirectBridgeOnline(),
-    clientCount: UNREAL_DIRECT_BRIDGE.browsers.size,
-    pluginInfo: isSyntheticUnrealDirectPluginSession() ? null : UNREAL_DIRECT_BRIDGE.pluginInfo,
-    cameraList: UNREAL_DIRECT_BRIDGE.lastCameraList,
-  }),
+  getUnrealBridgeState: () => {
+    const local = getUnrealDirectBridge('local');
+    return {
+      directBridgeOnline: isUnrealDirectBridgeOnline(local),
+      clientCount: local.browsers.size,
+      pluginInfo: isSyntheticUnrealDirectPluginSession(local) ? null : local.pluginInfo,
+      cameraList: local.lastCameraList,
+    };
+  },
+  // 云端多用户隔离：写连接意图文件时的 token 回退来源。
+  // 主路径已由 DCC action 路由通过 runAction({ connectToken }) 参数透传（见 routes/dcc.mjs），
+  // 此处回调仅作兜底（兼容非 REST 调用方）。不再依赖 globalThis 全局变量——
+  // 非 REST 调用方无 owner 上下文，无法安全解析 token，统一回退空串（由 adapter 落为本机 local 桶）。
+  resolveConnectToken: () => '',
 });
 
 function engineConfig(engine) {
@@ -648,22 +703,31 @@ import {
 } from './lib/http-fetch-utils.mjs';
 
 // ———— yt-dlp 辅助函数 ————
+// ★2026-08-18 修复：删除硬编码 C:\Users\123\yt-dlp.exe 兜底 —— 该路径遗留的是 PyInstaller onefile 旧版，
+// 仍会触发"运行时自解压黑窗"问题（windowsHide:true 无法抑制 onefile 内置 bootloader 的弹窗）。
+// 现仅保留「受信任位置」（全局 PATH），其他位置必须由「模型下载面板」一键安装到本机独立目录。
 const YT_DLP_PATHS = [
-  'C:\\Users\\123\\yt-dlp.exe',
   '/usr/local/bin/yt-dlp',
   '/usr/bin/yt-dlp',
   'yt-dlp',
 ];
 function resolveYtDlpPath() {
-  // 优先使用「模型下载面板」一键安装的托管运行时（用户可在任意机器下载安装）。
+  // 优先使用「模型下载面板」一键安装的托管运行时（用户可在任意机器下载安装，已强制 onedir，无黑窗）。
+  // ★2026-09-01 修复（/api/platform/ytdlp 与 /api/youtube/extract 恒 503 的真凶）：
+  //   旧代码用 require('fs').accessSync(...) —— 本文件是 ESM(.mjs)，且顶层只 import 了
+  //   `promises as fs`（注意：那是 fs.promises，**没有 accessSync**），也从未 createRequire
+  //   → require 未定义 → 抛 ReferenceError → 被 catch(_){} 静默吞掉
+  //   → 即使 yt-dlp.exe 已正确安装且可执行，本函数仍恒返回 null → 上层一律返回
+  //     503 "yt-dlp 未安装或不可执行"（提示极具误导性，让人反复重装）。
+  //   改用已 import 的 existsSync：Windows 下 X_OK 语义与"文件存在"一致，无需额外校验。
   const managed = detectManagedLocalPostYtDlpPath();
   if (managed) {
-    try { require('fs').accessSync(managed, require('fs').constants.X_OK); return managed; } catch (_) {}
+    try { if (existsSync(managed)) return managed; } catch (_) {}
   }
   for (const p of YT_DLP_PATHS) {
-    try { require('fs').accessSync(p, require('fs').constants.X_OK); return p; } catch (_) {}
+    try { if (existsSync(p)) return p; } catch (_) {}
   }
-  return YT_DLP_PATHS[0]; // fallback
+  return null; // 找不到就返回 null，让上层 spawn 报错走「安装 yt-dlp」提示
 }
 function execFileAsync(cmd, args, opts) {
   return new Promise((resolve, reject) => {
@@ -908,7 +972,7 @@ async function proxyHuggingFace(req, res, url) {
   const origin = res._hmdaoOrigin || '';
   const corsHeaders = origin
     ? { 'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Credentials': 'true' }
-    : { 'Access-Control-Allow-Origin': '*' };
+    : {};
 
   // ---- P1：服务端磁盘缓存命中 ----
   // 命中则直接从磁盘返回（同源、带正确 Content-Length），浏览器重试/弱网下秒取，
@@ -1205,7 +1269,7 @@ async function serveLocalModel(req, res, url) {
         'Content-Length': String(stat.size),
         'Content-Disposition': `inline; filename="${id}.onnx"`,
         'Accept-Ranges': 'bytes',
-        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Origin': resolveCorsOrigin(req.headers.origin || ''),
       });
       if (req.method === 'HEAD') { res.end(); return; }
       createReadStream(localPath).pipe(res);
@@ -1229,7 +1293,7 @@ async function serveLocalModel(req, res, url) {
         const v = upstream.headers.get(h);
         if (v) passHeaders[h] = v;
       }
-      passHeaders['Access-Control-Allow-Origin'] = '*';
+      passHeaders['Access-Control-Allow-Origin'] = resolveCorsOrigin(req.headers.origin || '');
       passHeaders['Content-Disposition'] = `inline; filename="${id}.onnx"`;
       res.writeHead(upstream.status, passHeaders);
       if (req.method === 'HEAD' || !upstream.body) { res.end(); return; }
@@ -1300,7 +1364,7 @@ async function serveTransformersModule(req, res, url) {
     res.writeHead(200, {
       'Content-Type': mime,
       'Cache-Control': 'public, max-age=86400',
-      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Origin': resolveCorsOrigin(req.headers.origin || ''),
       'Cross-Origin-Resource-Policy': 'cross-origin',
     });
     if (req.method === 'HEAD') {
@@ -1830,7 +1894,7 @@ async function runFusedImageAnalysis(runtime, normalizedPayload, fallback, clean
   return merged;
 }
 
-async function processLocalImageAnalyzeRequest(payload) {
+async function processLocalImageAnalyzeRequest(payload, userId) {
   await fs.mkdir(LOCAL_IMAGE_ANALYSIS_DIR, { recursive: true });
   const requestId = crypto.randomUUID();
   const cleanupPaths = Array.isArray(payload?.cleanupPaths) ? [...payload.cleanupPaths] : [];
@@ -1858,7 +1922,7 @@ async function processLocalImageAnalyzeRequest(payload) {
           ? sanitizeLocalAssetId(sourceUrl.slice('/api/assets/content/'.length).split(/[?#]/, 1)[0])
           : '');
       if (assetId) {
-        const catalog = await readAssetLibraryCatalog().catch(() => []);
+        const catalog = await readAssetLibraryCatalog(userId).catch(() => []);
         const assetItem = Array.isArray(catalog)
           ? catalog.find((it) => String(it.id) === assetId)
           : null;
@@ -2415,32 +2479,42 @@ function normalizeUnrealCommandForPlugin(payload) {
   return payload;
 }
 
-function sendUnrealDirectToBrowsers(payload) {
+function sendUnrealDirectToBrowsers(bridge, payload) {
   const message = normalizeUnrealDirectFromPlugin(payload);
-  if (message.type === 'camera_list') UNREAL_DIRECT_BRIDGE.lastCameraList = message;
-  if (message.type === 'animation_range' || message.type === 'timeline' || message.type === 'scene_info') UNREAL_DIRECT_BRIDGE.lastTimeline = message;
-  for (const browser of UNREAL_DIRECT_BRIDGE.browsers.values()) {
+  if (message.type === 'camera_list') bridge.lastCameraList = message;
+  if (message.type === 'animation_range' || message.type === 'timeline' || message.type === 'scene_info') bridge.lastTimeline = message;
+  for (const browser of bridge.browsers.values()) {
     if (!browser.socket.destroyed) sendWs(browser.socket, message);
   }
 }
 
 function handleUnrealPluginUpgrade(req, socket, head) {
-  if (UNREAL_DIRECT_BRIDGE.pluginSocket && !UNREAL_DIRECT_BRIDGE.pluginSocket.destroyed) {
-    logUnrealBridgeEvent('plugin-session-replaced', {
-      previousPlugin: UNREAL_DIRECT_BRIDGE.pluginInfo?.plugin || 'unknown',
-      browserCount: UNREAL_DIRECT_BRIDGE.browsers.size,
-    });
-    sendWs(UNREAL_DIRECT_BRIDGE.pluginSocket, { type: 'error', message: 'A newer HMDao Unreal Capture plugin session has connected.' });
-    UNREAL_DIRECT_BRIDGE.pluginSocket.destroy();
+  const owner = resolveDccOwnerFromWs(req);
+  // 云端部署下未带有效 token 的插件连接直接拒绝，防止占满别人的桶。
+  if (owner === 'local' && !isDccLocalOnlyConnection(req) && !process.env.HMDAO_DCC_ALLOW_ANON) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+    return;
   }
-  UNREAL_DIRECT_BRIDGE.pluginSocket = socket;
-  UNREAL_DIRECT_BRIDGE.pluginInfo = { connectedAt: Date.now() };
-  UNREAL_DIRECT_BRIDGE.lastCameraList = null;
-  UNREAL_DIRECT_BRIDGE.lastTimeline = null;
+  const bridge = getUnrealDirectBridge(owner);
+  if (bridge.pluginSocket && !bridge.pluginSocket.destroyed) {
+    logUnrealBridgeEvent('plugin-session-replaced', {
+      owner: bridge.owner,
+      previousPlugin: bridge.pluginInfo?.plugin || 'unknown',
+      browserCount: bridge.browsers.size,
+    });
+    sendWs(bridge.pluginSocket, { type: 'error', message: 'A newer HMDao Unreal Capture plugin session has connected.' });
+    bridge.pluginSocket.destroy();
+  }
+  bridge.pluginSocket = socket;
+  bridge.pluginInfo = { connectedAt: Date.now() };
+  bridge.lastCameraList = null;
+  bridge.lastTimeline = null;
   logUnrealBridgeEvent('plugin-connected', {
-    browserCount: UNREAL_DIRECT_BRIDGE.browsers.size,
+    owner: bridge.owner,
+    browserCount: bridge.browsers.size,
   });
-  sendUnrealDirectToBrowsers({ type: 'connected', engine: 'unreal', mode: 'real', message: 'HMDao Unreal Capture connected.' });
+  sendUnrealDirectToBrowsers(bridge, { type: 'connected', engine: 'unreal', mode: 'real', message: 'HMDao Unreal Capture connected.' });
   let helloAckSent = false;
   const sendHelloAck = () => {
     if (helloAckSent || socket.destroyed) return;
@@ -2468,8 +2542,9 @@ function handleUnrealPluginUpgrade(req, socket, head) {
     }
     if (payload.type === 'hello') {
       sendHelloAck();
-      UNREAL_DIRECT_BRIDGE.pluginInfo = { ...UNREAL_DIRECT_BRIDGE.pluginInfo, ...payload, connectedAt: UNREAL_DIRECT_BRIDGE.pluginInfo?.connectedAt || Date.now() };
+      bridge.pluginInfo = { ...bridge.pluginInfo, ...payload, connectedAt: bridge.pluginInfo?.connectedAt || Date.now() };
       logUnrealBridgeEvent('plugin-hello', {
+        owner: bridge.owner,
         plugin: payload.plugin || 'unknown',
         pluginVersion: payload.pluginVersion || '',
         previewProvider: payload.previewProvider || '',
@@ -2482,26 +2557,28 @@ function handleUnrealPluginUpgrade(req, socket, head) {
         serverTs: Date.now(),
       });
     }
-    sendUnrealDirectToBrowsers(payload);
+    sendUnrealDirectToBrowsers(bridge, payload);
   }, () => socket.destroy(), (payload) => {
     if (!socket.destroyed) socket.write(encodeWsFrame(payload, { opcode: 0xA }));
   });
 
   socket.on('data', parser);
   socket.on('close', () => {
-    if (UNREAL_DIRECT_BRIDGE.pluginSocket === socket) {
-      UNREAL_DIRECT_BRIDGE.pluginSocket = null;
-      UNREAL_DIRECT_BRIDGE.pluginInfo = null;
-      UNREAL_DIRECT_BRIDGE.lastCameraList = null;
-      UNREAL_DIRECT_BRIDGE.lastTimeline = null;
-      sendUnrealDirectToBrowsers({ type: 'error', message: 'HMDao Unreal Capture disconnected.' });
+    if (bridge.pluginSocket === socket) {
+      bridge.pluginSocket = null;
+      bridge.pluginInfo = null;
+      bridge.lastCameraList = null;
+      bridge.lastTimeline = null;
+      sendUnrealDirectToBrowsers(bridge, { type: 'error', message: 'HMDao Unreal Capture disconnected.' });
     }
     logUnrealBridgeEvent('plugin-disconnected', {
-      browserCount: UNREAL_DIRECT_BRIDGE.browsers.size,
+      owner: bridge.owner,
+      browserCount: bridge.browsers.size,
     });
   });
   socket.on('error', (error) => {
     logUnrealBridgeEvent('plugin-socket-error', {
+      owner: bridge.owner,
       message: error instanceof Error ? error.message : String(error || ''),
     });
     socket.destroy();
@@ -2509,7 +2586,15 @@ function handleUnrealPluginUpgrade(req, socket, head) {
   if (head?.length) parser(head);
 }
 
-function handleUnrealBrowserUpgrade(socket, head) {
+function handleUnrealBrowserUpgrade(req, socket, head) {
+  const owner = resolveDccOwnerFromWs(req);
+  // 云端部署下未带有效 token 的浏览器连接直接拒绝，防止串流他人引擎。
+  if (owner === 'local' && !isDccLocalOnlyConnection(req) && !process.env.HMDAO_DCC_ALLOW_ANON) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  const bridge = getUnrealDirectBridge(owner);
   const browserId = crypto.randomUUID();
   const mockSession = new DccMockSession(socket, 'unreal');
   const browserSession = {
@@ -2518,7 +2603,7 @@ function handleUnrealBrowserUpgrade(socket, head) {
     requireReal: false,
     sawReal: false,
   };
-  UNREAL_DIRECT_BRIDGE.browsers.set(browserId, browserSession);
+  bridge.browsers.set(browserId, browserSession);
 
   const rejectMockFallback = (message) => {
     sendWs(socket, {
@@ -2536,13 +2621,13 @@ function handleUnrealBrowserUpgrade(socket, head) {
     if (String(payload.type || '') === 'connect') {
       browserSession.requireReal = payload.require_real === true || payload.allow_mock === false || browserSession.requireReal;
     }
-    const plugin = UNREAL_DIRECT_BRIDGE.pluginSocket;
+    const plugin = bridge.pluginSocket;
     if (plugin && !plugin.destroyed) {
       browserSession.sawReal = true;
       if (String(payload.type || '') === 'connect') {
         sendWs(socket, { type: 'connected', engine: 'unreal', mode: 'real', message: 'HMDao Unreal Capture is online.' });
-        if (UNREAL_DIRECT_BRIDGE.lastCameraList) sendWs(socket, UNREAL_DIRECT_BRIDGE.lastCameraList);
-        if (UNREAL_DIRECT_BRIDGE.lastTimeline) sendWs(socket, UNREAL_DIRECT_BRIDGE.lastTimeline);
+        if (bridge.lastCameraList) sendWs(socket, bridge.lastCameraList);
+        if (bridge.lastTimeline) sendWs(socket, bridge.lastTimeline);
       }
       plugin.write(encodeWsFrame(JSON.stringify(normalizeUnrealCommandForPlugin(payload))));
       return;
@@ -2561,11 +2646,11 @@ function handleUnrealBrowserUpgrade(socket, head) {
   socket.on('data', parser);
   socket.on('close', () => {
     mockSession.close();
-    UNREAL_DIRECT_BRIDGE.browsers.delete(browserId);
+    bridge.browsers.delete(browserId);
   });
   socket.on('error', () => {
     mockSession.close();
-    UNREAL_DIRECT_BRIDGE.browsers.delete(browserId);
+    bridge.browsers.delete(browserId);
   });
   if (head?.length) parser(head);
 }
@@ -2617,7 +2702,7 @@ async function handleDccUpgrade(req, socket, head) {
   if (directUnreal) {
     const role = String(url.searchParams.get('role') || 'browser').toLowerCase();
     if (role === 'plugin') handleUnrealPluginUpgrade(req, socket, head);
-    else handleUnrealBrowserUpgrade(socket, head);
+    else handleUnrealBrowserUpgrade(req, socket, head);
     return;
   }
 
@@ -2967,7 +3052,7 @@ function send(res, status, payload, headers = {}) {
         'Access-Control-Allow-Credentials': 'true',
       }
     : {
-        'Access-Control-Allow-Origin': '*',
+        // 未命中白名单：不发送 CORS 头（收紧，避免 *)
       };
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -2988,7 +3073,7 @@ function sendRaw(res, status, body, headers = {}) {
         'Access-Control-Allow-Credentials': 'true',
       }
     : {
-        'Access-Control-Allow-Origin': '*',
+        // 未命中白名单：不发送 CORS 头（收紧，避免 *)
       };
   res.writeHead(status, {
     ...corsHeaders,
@@ -3011,7 +3096,7 @@ async function sendLocalFileStream(req, res, filePath, options = {}) {
         'Access-Control-Allow-Credentials': 'true',
       }
     : {
-        'Access-Control-Allow-Origin': '*',
+        // 未命中白名单：不发送 CORS 头（收紧，避免 *)
       };
   const baseHeaders = {
     ...corsHeaders,
@@ -3413,9 +3498,20 @@ async function readAssetLibraryImportMultipart(req) {
   }
 }
 
-async function processAssetLibraryImportRequest(body = {}) {
+// ---- 资产库按用户硬隔离：每个用户的素材落在 baseStoragePath/{userId}/ 下 ----
+function sanitizeUserIdForPath(userId) {
+  const s = String(userId || '').trim().toLowerCase();
+  const safe = s.replace(/[^a-z0-9\-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 64);
+  return safe || 'anonymous';
+}
+function storageDirForUser(userId, baseStoragePath) {
+  return path.join(String(baseStoragePath || DEFAULT_ASSET_LIBRARY_STORAGE_DIR), sanitizeUserIdForPath(userId));
+}
+
+async function processAssetLibraryImportRequest(userId, body = {}) {
   const settings = await readAssetLibrarySettings();
-  const storagePath = path.resolve(String(settings.storagePath || DEFAULT_ASSET_LIBRARY_STORAGE_DIR));
+  const baseStoragePath = path.resolve(String(settings.storagePath || DEFAULT_ASSET_LIBRARY_STORAGE_DIR));
+  const storagePath = storageDirForUser(userId, baseStoragePath);
   const assetId = crypto.randomUUID();
   const sourceUrl = String(body.sourceUrl || '').trim();
   const inputPath = String(body.inputPath || '').trim();
@@ -3484,7 +3580,7 @@ async function processAssetLibraryImportRequest(body = {}) {
     type,
     duration: Number(body.duration || 0) || 0,
   });
-  const existingItems = await readAssetLibraryCatalog();
+  const existingItems = await readAssetLibraryCatalog(userId);
   const duplicateMatch = referenceSourceFile
     ? (
       existingItems.find((item) => (
@@ -3518,7 +3614,7 @@ async function processAssetLibraryImportRequest(body = {}) {
       prompt: typeof body.prompt === 'string' ? body.prompt : undefined,
       contentHash,
     });
-    await upsertAssetLibraryItem(mergedDuplicate);
+    await upsertAssetLibraryItem(userId, mergedDuplicate);
     if (!referenceSourceFile && tempResolvedPath.startsWith(path.resolve(ASSET_LIBRARY_TEMP_DIR))) {
       await fs.rm(tempResolvedPath, { force: true }).catch(() => {});
     }
@@ -3545,7 +3641,7 @@ async function processAssetLibraryImportRequest(body = {}) {
   }
   const stat = await fs.stat(targetPath);
 
-  const item = await upsertAssetLibraryItem({
+  const item = await upsertAssetLibraryItem(userId, {
     id: assetId,
     backendAssetId: assetId,
     name: rawName || fileName,
@@ -4110,7 +4206,7 @@ async function uploadTmpfilesPublicAsset(filePath, timeoutMs = 90000) {
   return tmpfilesDirectDownloadUrl(publishedUrl);
 }
 
-async function ensureStablePublicVideoUrl(value = '', timeoutMs = 90000) {
+async function ensureStablePublicVideoUrl(value = '', timeoutMs = 90000, userId) {
   const source = String(value || '').trim();
   if (!source) return source;
   if (isPublicRemoteMediaUrl(source) && /\.mp4(?:[?#]|$)/i.test(source)) {
@@ -4144,7 +4240,7 @@ async function ensureStablePublicVideoUrl(value = '', timeoutMs = 90000) {
       const sourceName = String(materialized.originalName || path.basename(inputPath)).trim();
       const publishedNameBase = path.basename(sourceName || crypto.randomUUID(), path.extname(sourceName || ''));
       const publishedName = `${publishedNameBase || crypto.randomUUID()}.mp4`;
-      const imported = await processAssetLibraryImportRequest({
+      const imported = await processAssetLibraryImportRequest(userId, {
         name: publishedName,
         originalName: publishedName,
         type: 'video',
@@ -4309,18 +4405,18 @@ async function materializeApimartImageConditioningPayload(payload = {}, baseUrl 
   return next;
 }
 
-async function materializeApimartVideoConditioningPayload(payload = {}, timeoutMs = 90000) {
+async function materializeApimartVideoConditioningPayload(payload = {}, timeoutMs = 90000, userId) {
   if (!payload || typeof payload !== 'object') return payload;
   const next = { ...payload };
   const videoUrlFields = ['source_url', 'reference_video_url', 'video_url'];
   for (const field of videoUrlFields) {
     if (typeof next[field] === 'string') {
-      next[field] = await ensureStablePublicVideoUrl(next[field], timeoutMs);
+      next[field] = await ensureStablePublicVideoUrl(next[field], timeoutMs, userId);
     }
   }
   if (Array.isArray(next.video_urls)) {
     next.video_urls = await Promise.all(next.video_urls.map((item) => (
-      typeof item === 'string' ? ensureStablePublicVideoUrl(item, timeoutMs) : item
+      typeof item === 'string' ? ensureStablePublicVideoUrl(item, timeoutMs, userId) : item
     )));
   }
   if (Array.isArray(next.video_list)) {
@@ -4329,7 +4425,7 @@ async function materializeApimartVideoConditioningPayload(payload = {}, timeoutM
       if (typeof item.video_url !== 'string') return item;
       return {
         ...item,
-        video_url: await ensureStablePublicVideoUrl(item.video_url, timeoutMs),
+        video_url: await ensureStablePublicVideoUrl(item.video_url, timeoutMs, userId),
       };
     }));
   }
@@ -4845,6 +4941,7 @@ async function executeApimartAsyncGenerationRequest({
   rawPayload = null,
   timeoutMs = 180000,
   signal,
+  userId,
 }) {
   // 标准化不同 relay 平台的端点路径
   // suanliai.top / comfly.org 使用 /video/generations（单数），非 /videos/generations（复数）
@@ -4878,6 +4975,7 @@ async function executeApimartAsyncGenerationRequest({
   const submitPayload = await materializeApimartVideoConditioningPayload(
     imageMaterializedPayload || {},
     timeoutMs,
+    userId,
   );
   const submit = await requestJsonWithOptionalPowerShellRelay({
     baseUrl,
@@ -5220,8 +5318,17 @@ const LOCAL_POST_INSTALLABLE_RUNTIMES = {
     runtimeName: LOCAL_POST_RUNTIME_GUIDES.florence2.runtimeName,
     sourceLabel: 'Hugging Face / PyPI',
   },
+  aria2: {
+    runtimeKey: 'aria2',
+    runtimeName: LOCAL_POST_RUNTIME_GUIDES.aria2.runtimeName,
+    sourceLabel: 'GitHub Releases',
+  },
+  ffmpeg: {
+    runtimeKey: 'ffmpeg',
+    runtimeName: LOCAL_POST_RUNTIME_GUIDES.ffmpeg.runtimeName,
+    sourceLabel: 'BtbN FFmpeg-Builds',
+  },
 };
-const LOCAL_POST_SELF_CHECK_TIMEOUT_MS = 12000;
 const LOCAL_POST_INSTALL_STEP_TIMEOUT_MS = 45 * 60 * 1000; // 安装步骤（建 venv / 装 torch / 下 2.3GB 权重）必须长超时，否则会被 12s 自检超时杀掉
 
 function normalizeLocalAudioBackend(value) {
@@ -6481,8 +6588,10 @@ async function resolveLatestGmicInstallAsset() {
   };
 }
 
-// yt-dlp 是单一可执行文件（自带 Python），从 GitHub Releases 拉取最新版平台二进制。
-// 各平台资产名：Windows=yt-dlp.exe / macOS=yt-dlp_macos（universal2）/ Linux=yt-dlp_linux。
+// yt-dlp 采用 onedir（目录式）构建，从 GitHub Releases 拉取最新版平台压缩包。
+// 各平台资产名：Windows=yt-dlp_win.zip / macOS=yt-dlp_macos.zip / Linux=yt-dlp_linux.zip，
+// 解压后内含 yt-dlp/ 目录（Windows 下为 yt-dlp/yt-dlp.exe）。onedir 可彻底消除 onefile 的
+// 控制台闪窗（PyInstaller onefile 解压阶段不受 Node windowsHide 控制，会弹黑窗口）。
 // 若 GitHub API 被限流/不可达，回退到已知稳定的版本直链，保证一键安装仍可用。
 const YTDLP_FALLBACK_VERSION = '2026.07.04';
 async function resolveLatestYtDlpInstallAsset() {
@@ -6524,6 +6633,119 @@ async function resolveLatestYtDlpInstallAsset() {
     executableMode: !buildPlatformInfo().isWindows,
     releaseUrl: `https://github.com/yt-dlp/yt-dlp/releases/tag/${YTDLP_FALLBACK_VERSION}`,
     // P3-8: 兜底直链无来源校验和，完整性校验将自动跳过（仅做下载体积兜底）
+    expectedSha256: null,
+    expectedSize: null,
+  };
+}
+
+// Aria2 跨平台压缩包：Windows=aria2-*.zip（内含 aria2c.exe）/ macOS=aria2-*.tar.bz2 / Linux=aria2-*.tar.bz2。
+// 安装流程将其解压到 current 目录，并从 current 递归查找 aria2c 可执行文件。
+function resolveAria2AssetNames() {
+  const { isWindows, isMac } = buildPlatformInfo();
+  if (isWindows) return { assetName: 'aria2-1.37.0-win-64bit-build1.zip', fileName: 'aria2-win.zip' };
+  if (isMac) return { assetName: 'aria2-1.37.0-osx-darwin.tar.bz2', fileName: 'aria2-osx.tar.bz2' };
+  return { assetName: 'aria2-1.37.0-linux-gnu-64bit-build1.tar.bz2', fileName: 'aria2-linux.tar.bz2' };
+}
+
+async function resolveLatestAria2InstallAsset() {
+  const { assetName, fileName } = resolveAria2AssetNames();
+  const want = String(assetName || '').toLowerCase();
+  try {
+    const response = await fetch('https://api.github.com/repos/aria2/aria2/releases/latest', {
+      headers: { 'User-Agent': 'HMDAO Runtime Installer', Accept: 'application/vnd.github+json' },
+    });
+    if (response.ok) {
+      const payload = await response.json().catch(() => null);
+      if (payload && Array.isArray(payload.assets)) {
+        const asset = payload.assets.find((item) => String(item?.name || '').toLowerCase() === want);
+        if (asset?.browser_download_url) {
+          return {
+            version: String(payload?.tag_name || '').replace(/^v/i, '').trim() || '1.37.0',
+            downloadUrl: String(asset.browser_download_url || '').trim(),
+            fileName,
+            releaseUrl: String(payload?.html_url || 'https://github.com/aria2/aria2/releases/latest').trim(),
+            expectedSha256: String(asset?.digest || '').trim() || null,
+            expectedSize: Number(asset?.size) > 0 ? Number(asset.size) : null,
+          };
+        }
+      }
+    }
+  } catch (_) { /* 走兜底 */ }
+  // 兜底：直接用已知稳定版资产直链
+  const version = '1.37.0';
+  return {
+    version,
+    downloadUrl: `https://github.com/aria2/aria2/releases/download/release-${version}/${assetName}`,
+    fileName,
+    releaseUrl: `https://github.com/aria2/aria2/releases/tag/release-${version}`,
+    expectedSha256: null,
+    expectedSize: null,
+  };
+}
+
+// 扩展采集链路零配置：服务启动时对下载类运行时（yt-dlp / aria2 / ffmpeg）自动静默安装。
+// 仅当该运行时处于「可安装 + 木安装 + 没有进行中的任务」时才触发，避免重复安装或干扰手动操作。
+const AUTO_INSTALL_RUNTIME_KEYS = ['ytdlp', 'aria2', 'ffmpeg'];
+let autoInstallBootstrapDone = false;
+async function bootstrapAutoInstallLocalPostRuntimes() {
+  if (autoInstallBootstrapDone) return;
+  autoInstallBootstrapDone = true;
+  const resolvers = {
+    ytdlp: resolveLocalPostYtDlpBackend,
+    aria2: resolveLocalPostAria2Backend,
+    ffmpeg: resolveLocalPostFfmpegBackend,
+  };
+  for (const key of AUTO_INSTALL_RUNTIME_KEYS) {
+    try {
+      const resolve = resolvers[key];
+      if (!resolve) continue;
+      const status = resolve();
+      if (status?.configured) continue;
+      const job = await startRuntimeInstallJob(key);
+      if (job) {
+        console.log(`[local-post] 自动静默安装 ${key}（后台任务 ${job.jobId}）`);
+      }
+    } catch (err) {
+      console.warn(`[local-post] 自动安装 ${key} 触发失败:`, err?.message || err);
+    }
+  }
+}
+function resolveFfmpegAssetNames() {
+  const { isWindows, isMac } = buildPlatformInfo();
+  if (isWindows) return { assetName: 'ffmpeg-master-latest-win64-gpl.zip', fileName: 'ffmpeg-win.zip' };
+  if (isMac) return { assetName: 'ffmpeg-master-latest-macos64-gpl.zip', fileName: 'ffmpeg-osx.zip' };
+  return { assetName: 'ffmpeg-master-latest-linux64-gpl.tar.xz', fileName: 'ffmpeg-linux.tar.xz' };
+}
+
+async function resolveLatestFfmpegInstallAsset() {
+  const { assetName, fileName } = resolveFfmpegAssetNames();
+  const want = String(assetName || '').toLowerCase();
+  try {
+    const response = await fetch('https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest', {
+      headers: { 'User-Agent': 'HMDAO Runtime Installer', Accept: 'application/vnd.github+json' },
+    });
+    if (response.ok) {
+      const payload = await response.json().catch(() => null);
+      if (payload && Array.isArray(payload.assets)) {
+        const asset = payload.assets.find((item) => String(item?.name || '').toLowerCase() === want);
+        if (asset?.browser_download_url) {
+          return {
+            version: String(payload?.tag_name || '').trim() || 'master',
+            downloadUrl: String(asset.browser_download_url || '').trim(),
+            fileName,
+            releaseUrl: String(payload?.html_url || 'https://github.com/BtbN/FFmpeg-Builds/releases/latest').trim(),
+            expectedSha256: String(asset?.digest || '').trim() || null,
+            expectedSize: Number(asset?.size) > 0 ? Number(asset.size) : null,
+          };
+        }
+      }
+    }
+  } catch (_) { /* 走兜底 */ }
+  return {
+    version: 'master',
+    downloadUrl: `https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/${assetName}`,
+    fileName,
+    releaseUrl: 'https://github.com/BtbN/FFmpeg-Builds/releases/tag/latest',
     expectedSha256: null,
     expectedSize: null,
   };
@@ -6621,7 +6843,27 @@ async function resolveInstallableRuntimeAsset(runtimeKey) {
       runtimeKey,
       runtimeName: LOCAL_POST_RUNTIME_GUIDES.ytdlp.runtimeName,
       sourceLabel: LOCAL_POST_INSTALLABLE_RUNTIMES.ytdlp.sourceLabel,
-      archiveType: 'raw',
+      archiveType: 'zip',
+      ...asset,
+    };
+  }
+  if (runtimeKey === 'aria2') {
+    const asset = await resolveLatestAria2InstallAsset();
+    return {
+      runtimeKey,
+      runtimeName: LOCAL_POST_RUNTIME_GUIDES.aria2.runtimeName,
+      sourceLabel: LOCAL_POST_INSTALLABLE_RUNTIMES.aria2.sourceLabel,
+      archiveType: 'zip',
+      ...asset,
+    };
+  }
+  if (runtimeKey === 'ffmpeg') {
+    const asset = await resolveLatestFfmpegInstallAsset();
+    return {
+      runtimeKey,
+      runtimeName: LOCAL_POST_RUNTIME_GUIDES.ffmpeg.runtimeName,
+      sourceLabel: LOCAL_POST_INSTALLABLE_RUNTIMES.ffmpeg.sourceLabel,
+      archiveType: 'zip',
       ...asset,
     };
   }
@@ -6658,6 +6900,24 @@ async function verifyManagedRuntimeInstall(runtimeKey, details = {}) {
   }
   if (runtimeKey === 'ytdlp') {
     const version = await detectInstalledRuntimeVersion(String(details.executablePath || ''), [{ args: ['--version'] }]);
+    return {
+      ok: Boolean(version?.ok),
+      installedVersion: String(version?.version || '').trim(),
+      probe: version,
+      configPath: '',
+    };
+  }
+  if (runtimeKey === 'aria2') {
+    const version = await detectInstalledRuntimeVersion(String(details.executablePath || ''), [{ args: ['--version'] }]);
+    return {
+      ok: Boolean(version?.ok),
+      installedVersion: String(version?.version || '').trim(),
+      probe: version,
+      configPath: '',
+    };
+  }
+  if (runtimeKey === 'ffmpeg') {
+    const version = await detectInstalledRuntimeVersion(String(details.executablePath || ''), [{ args: ['-version'] }]);
     return {
       ok: Boolean(version?.ok),
       installedVersion: String(version?.version || '').trim(),
@@ -7024,6 +7284,34 @@ async function installManagedLocalPostRuntime(runtimeKey, job) {
       releaseUrl: asset.releaseUrl,
       downloadUrl: asset.downloadUrl,
     };
+  } else if (runtimeKey === 'aria2') {
+    const executablePath = findFileRecursively(layout.stagingDir, platformExecutableCandidates('aria2c'));
+    if (!executablePath) throw new Error('aria2-executable-missing-after-prepare');
+    await ensureUnixExecutable(executablePath);
+    manifestEntry = {
+      runtimeKey,
+      runtimeName: runtimeMeta.runtimeName,
+      sourceLabel: asset.sourceLabel,
+      version: asset.version,
+      executablePath: path.resolve(layout.currentDir, path.relative(layout.stagingDir, executablePath)),
+      installedAt: new Date().toISOString(),
+      releaseUrl: asset.releaseUrl,
+      downloadUrl: asset.downloadUrl,
+    };
+  } else if (runtimeKey === 'ffmpeg') {
+    const executablePath = findFileRecursively(layout.stagingDir, platformExecutableCandidates('ffmpeg'));
+    if (!executablePath) throw new Error('ffmpeg-executable-missing-after-prepare');
+    await ensureUnixExecutable(executablePath);
+    manifestEntry = {
+      runtimeKey,
+      runtimeName: runtimeMeta.runtimeName,
+      sourceLabel: asset.sourceLabel,
+      version: asset.version,
+      executablePath: path.resolve(layout.currentDir, path.relative(layout.stagingDir, executablePath)),
+      installedAt: new Date().toISOString(),
+      releaseUrl: asset.releaseUrl,
+      downloadUrl: asset.downloadUrl,
+    };
   }
 
   // 记录安装根目录（含自定义目录，兼容中文路径）：更新/卸载时据此定位原位置
@@ -7071,14 +7359,27 @@ async function installManagedLocalPostRuntime(runtimeKey, job) {
     throw new Error(`runtime-verify-failed:${runtimeKey}`);
   }
   const doctorReport = await buildLocalPostDoctorReport({ forceRelease: true }).catch(() => null);
+  // ★2026-09-01 修复（"安装任务假成功"根因）：
+  //   旧代码只校验 verifyResult.ok，随后【无条件】写 status:'succeeded' + verified:true +
+  //   "已通过本机自检"，完全不看刚生成的 doctorReport。结果出现自相矛盾的 job：
+  //     status:succeeded / verified:true / "已通过自检"
+  //     doctor.status:error / "yt-dlp.exe was not detected"
+  //   前端与用户被误导（以为装好了，实际接口仍 503）。
+  //   改为【以 doctor 实际检测为准】：doctor 检测到可执行文件才算成功，否则标 failed
+  //   并给出可读原因（区分"下载成功但检测失败"与"下载失败"）。
+  const doctorEntry = doctorReport?.runtimes?.[runtimeKey] || null;
+  const detected = !!String(doctorEntry?.detectedPath || '').trim();
   updateRuntimeInstallJob(job, {
-    status: 'succeeded',
+    status: detected ? 'succeeded' : 'failed',
     stage: 'done',
     progress: 100,
-    message: '安装完成，并已通过本机自检',
-    verified: true,
-    installedVersion: verifyResult.installedVersion || manifestEntry?.version || '',
-    doctor: doctorReport?.runtimes?.[runtimeKey] || null,
+    message: detected
+      ? '安装完成，并已通过本机自检'
+      : `安装文件已下载，但自检未检测到可执行文件：${doctorEntry?.summary || 'not detected'}`,
+    verified: detected,
+    error: detected ? '' : String(doctorEntry?.summary || `runtime-not-detected:${runtimeKey}`),
+    installedVersion: detected ? (verifyResult.installedVersion || manifestEntry?.version || '') : '',
+    doctor: doctorEntry,
     completedAt: Date.now(),
   });
 }
@@ -7230,6 +7531,14 @@ const LOCAL_POST_LATEST_VERSION_SOURCES = {
     apiUrl: 'https://huggingface.co/api/models/microsoft/Florence-2-large',
     pinnedVersion: 'Florence-2-large · torch 2.9.0(CPU) · transformers 4.51.3 · Python 3.14 兼容',
   },
+  aria2: {
+    sourceLabel: 'GitHub Releases',
+    apiUrl: 'https://api.github.com/repos/aria2/aria2/releases/latest',
+  },
+  ffmpeg: {
+    sourceLabel: 'BtbN FFmpeg-Builds',
+    apiUrl: 'https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest',
+  },
 };
 
 async function fetchLatestLocalPostRuntimeVersion(key, { force = false } = {}) {
@@ -7358,6 +7667,8 @@ async function buildLocalPostDoctorReport({ forceRelease = false } = {}) {
   const resolvedOcioBackend = resolveLocalPostOcioBackend({ ocioExecutionMode: 'auto' });
   const resolvedOiioBackend = resolveLocalPostOiioBackend({ ocioExecutionMode: 'auto' }, 'image', '');
   const resolvedGmicBackend = resolveLocalPostGmicBackend();
+  const resolvedAria2Backend = resolveLocalPostAria2Backend();
+  const resolvedFfmpegBackend = resolveLocalPostFfmpegBackend();
   const ocioConfigPath = String(resolvedOiioBackend.detectedConfigPath || detectLocalPostOiioConfigPath()).trim();
   // ★ 复用 resolveYtDlpPath：它已包含「托管运行时目录 + 固定路径 + 系统 PATH」的完整回退，
   // 因此用户自己在 PATH 里安装的 yt-dlp 也能被模型下载面板与扩展侧栏识别到（此前 doctor 报告
@@ -7365,7 +7676,10 @@ async function buildLocalPostDoctorReport({ forceRelease = false } = {}) {
   // resolveYtDlpPath 在都找不到时会兜底返回首个固定路径（可能不存在），此处做存在性校验避免误报。
   let ytDlpDetectedPath = String(resolveYtDlpPath() || detectManagedLocalPostYtDlpPath() || '').trim();
   if (ytDlpDetectedPath) {
-    try { require('fs').accessSync(ytDlpDetectedPath, require('fs').constants.X_OK); }
+    // ★2026-09-01 修复：同 resolveYtDlpPath 的 require('fs') 问题。
+    //   旧代码 require 未定义 → 抛错 → catch 把【已成功检测到的路径清空】
+    //   → doctor 报告恒为 detectedPath:"" / "yt-dlp.exe was not detected"（与事实相反）。
+    try { if (!existsSync(ytDlpDetectedPath)) ytDlpDetectedPath = ''; }
     catch (_) { ytDlpDetectedPath = ''; }
   }
   const florence2DetectedPath = String(detectManagedLocalPostFlorence2Path() || '').trim();
@@ -7376,7 +7690,10 @@ async function buildLocalPostDoctorReport({ forceRelease = false } = {}) {
   const oiioDetectedPath = String(resolvedOiioBackend.detectedPath || '').trim();
   const ocioRuntimePath = String(detectLocalPostOcioRuntimePath() || resolvedOcioBackend.detectedPath || '').trim();
 
-  const [gmicVersion, oiioVersion, ocioVersion, ytDlpVersion, florence2Version] = await Promise.all([
+  const aria2DetectedPath = String(detectManagedLocalPostAria2Path() || '').trim();
+  const ffmpegDetectedPath = String(detectManagedLocalPostFfmpegPath() || '').trim();
+
+  const [gmicVersion, oiioVersion, ocioVersion, ytDlpVersion, florence2Version, aria2Version, ffmpegVersion] = await Promise.all([
     gmicDetectedPath
       ? detectInstalledRuntimeVersion(gmicDetectedPath, [{ args: ['version'] }, { args: ['--version'] }, { args: ['-version'] }])
       : Promise.resolve(null),
@@ -7393,6 +7710,12 @@ async function buildLocalPostDoctorReport({ forceRelease = false } = {}) {
       ? runViaShell(florence2Python, ['-c', 'import torch, transformers; print("ok")'], { cwd: path.dirname(florence2DetectedPath) })
           .then((r) => ({ ok: r.exitCode === 0, version: String(florence2Entry.version || '').trim() }))
           .catch(() => ({ ok: false, version: '' }))
+      : Promise.resolve(null),
+    aria2DetectedPath
+      ? detectInstalledRuntimeVersion(aria2DetectedPath, [{ args: ['--version'] }])
+      : Promise.resolve(null),
+    ffmpegDetectedPath
+      ? detectInstalledRuntimeVersion(ffmpegDetectedPath, [{ args: ['-version'] }])
       : Promise.resolve(null),
   ]);
 
@@ -7590,6 +7913,60 @@ async function buildLocalPostDoctorReport({ forceRelease = false } = {}) {
             : ['确认虚拟环境依赖完整（torch/transformers）', '确认模型目录已下载 Florence-2-large 权重']
           : ['在「模型下载」面板点「一键安装 Florence-2（本地免费）」', '需先安装 Python 3.10+ 并加入 PATH'],
         update: florence2Update,
+      },
+      aria2: {
+        runtimeKey: 'aria2',
+        runtimeName: LOCAL_POST_RUNTIME_GUIDES.aria2.runtimeName,
+        status: aria2DetectedPath
+          ? aria2Version?.ok
+            ? 'ok'
+            : 'error'
+          : 'error',
+        summary: aria2DetectedPath
+          ? aria2Version?.ok
+            ? 'aria2c.exe passed the --version self-check.'
+            : 'aria2c.exe was found, but self-check failed.'
+          : 'aria2c.exe was not detected.',
+        detectedPath: aria2DetectedPath,
+        executableVerified: Boolean(aria2Version?.ok),
+        installedVersion: String(aria2Version?.version || '').trim(),
+        checkedCommand: aria2Version?.commandArgs || [],
+        stdout: aria2Version?.probe?.stdout || '',
+        stderr: aria2Version?.probe?.stderr || '',
+        elapsedMs: Number(aria2Version?.probe?.elapsedMs || 0),
+        runtimeConfigured: Boolean(resolvedAria2Backend.configured),
+        suggestions: aria2DetectedPath
+          ? aria2Version?.ok
+            ? ['扩展采集的网盘直链可用 Aria2 多线程下载', '如刚升级版本可点"刷新运行时"']
+            : ['确认 aria2c.exe 可在命令行直接执行', '如在受限网络，可手动下载后写入 HMDAO_ARIA2_PATH']
+          : ['在「模型下载」面板的运行时卡片中点「一键安装 Aria2」', '或从 GitHub 手动下载 aria2c 并放到本地运行时目录'],
+      },
+      ffmpeg: {
+        runtimeKey: 'ffmpeg',
+        runtimeName: LOCAL_POST_RUNTIME_GUIDES.ffmpeg.runtimeName,
+        status: ffmpegDetectedPath
+          ? ffmpegVersion?.ok
+            ? 'ok'
+            : 'error'
+          : 'error',
+        summary: ffmpegDetectedPath
+          ? ffmpegVersion?.ok
+            ? 'ffmpeg.exe passed the -version self-check.'
+            : 'ffmpeg.exe was found, but self-check failed.'
+          : 'ffmpeg.exe was not detected.',
+        detectedPath: ffmpegDetectedPath,
+        executableVerified: Boolean(ffmpegVersion?.ok),
+        installedVersion: String(ffmpegVersion?.version || '').trim(),
+        checkedCommand: ffmpegVersion?.commandArgs || [],
+        stdout: ffmpegVersion?.probe?.stdout || '',
+        stderr: ffmpegVersion?.probe?.stderr || '',
+        elapsedMs: Number(ffmpegVersion?.probe?.elapsedMs || 0),
+        runtimeConfigured: Boolean(resolvedFfmpegBackend.configured),
+        suggestions: ffmpegDetectedPath
+          ? ffmpegVersion?.ok
+            ? ['yt-dlp 现在可完整合并音视频流', '如刚升级版本可点"刷新运行时"']
+            : ['确认 ffmpeg.exe 可在命令行直接执行', '如手动安装可写入 HMDAO_FFMPEG_PATH']
+          : ['在「模型下载」面板的运行时卡片中点「一键安装 FFmpeg」', '或从 FFmpeg-Builds 手动下载并放到本地运行时目录'],
       },
     },
   };
@@ -8811,7 +9188,11 @@ async function readUsers() {
 
 async function writeUsers(users) {
   await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
+  // P1-安全：原子写入。先写临时文件再 rename，避免并发/崩溃时 users.json 被截断损坏
+  // （原整文件 writeFile 覆盖在写入中途进程崩溃会留下半截 JSON，导致全体用户无法登录）。
+  const tmp = `${USERS_FILE}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(users, null, 2), 'utf8');
+  await fs.rename(tmp, USERS_FILE);
 }
 
 // 纯认证工具函数已抽离至 lib/auth-utils.mjs（normalizeLocalEmail / isValidLocalEmail /
@@ -8875,6 +9256,21 @@ function getUserFromRequest(req, body = {}) {
     return null;
   }
   return entry.userId;
+}
+
+// 云端多用户隔离：给定 userId，反向查找该用户当前有效（未过期）的 access token。
+// 用于在用户主动 Connect（写连接意图文件）时，把 token 注入意图文件，供本机 Unreal 插件读取后
+// 附加到 WS URL，后端据其解析 userId 作为 owner 分桶，避免串流他人引擎。
+function getValidTokenForOwner(owner) {
+  if (!owner) return '';
+  const now = Date.now();
+  for (const [token, entry] of accessSessions.entries()) {
+    if (entry && entry.userId === owner) {
+      if (entry.expiresAt && now > entry.expiresAt) continue;
+      return token;
+    }
+  }
+  return '';
 }
 
 async function getCobuildUserSafe(userId) {
@@ -10288,6 +10684,7 @@ async function realProxy(provider, body) {
         rawPayload: apimartRawPayload,
         timeoutMs: requestedTimeoutMs,
         signal: controller.signal,
+        userId: getUserFromRequest(req),
       });
     }
 
@@ -11008,7 +11405,7 @@ async function handleCuratorPreviewProxy(req, res, url) {
   const origin = res._hmdaoOrigin || '';
   const corsHeaders = origin
     ? { 'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Credentials': 'true' }
-    : { 'Access-Control-Allow-Origin': '*' };
+    : {};
   try {
     res.writeHead(200, {
       'Content-Type': contentType,
@@ -11042,9 +11439,21 @@ async function handleCuratorPreviewProxy(req, res, url) {
   });
 }
 
+// P1-安全：CORS 白名单收敛。仅允许 HMDAO_CORS_ORIGINS（逗号分隔）内的源跨域，
+// 未命中返回空串（下游据此不发送 Access-Control-Allow-Origin，而非危险的 *）。
+// 开发期可用 HMDAO_CORS_ORIGINS=* 临时放开（仅本地调试，禁止生产使用）。
+function resolveCorsOrigin(incoming) {
+  const raw = process.env.HMDAO_CORS_ORIGINS;
+  if (!raw) return ''; // 未配置：默认收紧（不跨域放行）
+  const list = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  if (list.includes('*')) return incoming || '';
+  const origin = incoming || '';
+  return list.includes(origin) ? origin : '';
+}
+
 async function route(req, res) {
   // 存储请求 Origin 用于 CORS 动态回写，避免 credentials:'include' 与通配符 * 冲突
-  res._hmdaoOrigin = req.headers.origin || '';
+  res._hmdaoOrigin = resolveCorsOrigin(req.headers.origin || '');
   if (req.method === 'OPTIONS') return send(res, 204, {});
   const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
@@ -11085,6 +11494,8 @@ registerHealthRoutes(apiRouter, {
   resolveLocalPostUpscaleBackend,
   resolveLocalPostYtDlpBackend,
   resolveLocalPostFlorence2Backend,
+  resolveLocalPostAria2Backend,
+  resolveLocalPostFfmpegBackend,
   clearLocalPostRuntimeDetectionCache,
   buildLocalPostDoctorReport,
   LOCAL_POST_RUNTIME_INSTALL_JOBS,
@@ -11169,9 +11580,21 @@ registerModelsRoutes(apiRouter, {
   modelCatalogPayload,
 });
 
+registerAria2Routes(apiRouter, {
+  send,
+  readJson,
+  getAria2Status: aria2Manager.getAria2Status,
+  aria2AddUri: aria2Manager.aria2AddUri,
+  aria2TellStatus: aria2Manager.aria2TellStatus,
+  aria2TellActive: aria2Manager.aria2TellActive,
+  aria2Remove: aria2Manager.aria2Remove,
+  aria2VerifyHash: aria2Manager.aria2VerifyHash,
+});
+
 registerAssetsRoutes(apiRouter, {
   send,
   readJson,
+  getUserFromRequest,
   // settings
   loadOperationDispatchConfig,
   saveOperationDispatchConfig,
@@ -11213,7 +11636,7 @@ registerDccRoutes(apiRouter, {
   summarizeCurrentUnrealEnvironment,
   probeTcp,
   isUnrealDirectBridgeOnline,
-  UNREAL_DIRECT_BRIDGE,
+  getUnrealDirectBridge,
   DCC_RECORDING_LOCK,
   ENABLE_UNREAL_PIXEL_STREAMING_LEGACY,
   DEFAULT_UNREAL_PIXEL_URL,
@@ -11222,6 +11645,8 @@ registerDccRoutes(apiRouter, {
   getUnrealControlConfig,
   readUnrealConfig,
   writeUnrealConfig,
+  getUserFromRequest,
+  getValidTokenForOwner,
 });
 
 // ComfyUI 网关前缀组：整组早已收敛为 handleComfyUiApi，此处仅把分发点
@@ -11234,7 +11659,10 @@ registerMediaRoutes(apiRouter, {
   https,
   proxyHuggingFace,
   proxyRemoteMediaAsset,
+  readJson,
+  resolveLocalPostFfmpegBackend,
   resolveYtDlpPath,
+  runCommand,
   send,
   serveLocalModel,
   serveTransformersModule,
@@ -11287,7 +11715,11 @@ registerLocalAiRoutes(apiRouter, {
   sanitizeLocalAssetId,
   send,
   sendLocalFileStream,
+  getUserFromRequest,
 });
+
+registerNetdiskRoutes(apiRouter, { send, readJson });
+registerNetdiskScrapeRoutes(apiRouter, { send, readJson });
 
 registerAgentRoutes(apiRouter, {
   ASSET_LIBRARY_TEMP_DIR,
@@ -11347,12 +11779,26 @@ configureRuntimeInstallQueue({ updateRuntimeInstallJob });
 
 // 单测隔离：设置 HMDAO_TEST_NO_SERVER 时仅导出函数、不启动监听，便于直接 import 测试纯逻辑。
 if (!process.env.HMDAO_TEST_NO_SERVER) {
-  server.listen(PORT, '127.0.0.1', () => {
-    console.log(`[HMDao API] http://127.0.0.1:${PORT}`);
+  // P3：启动时恢复持久化会话（重启不丢登录态，单实例下适用）。
+  loadSessions();
+  // P3：定期清理过期令牌，防止 sessions.json 无限增长。
+  setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of accessSessions.entries()) if (!v || v.expiresAt <= now) accessSessions.delete(k);
+    for (const [k, v] of sessions.entries()) if (!v || v.expiresAt <= now) sessions.delete(k);
+  }, 10 * 60 * 1000);
+
+  // 监听地址可配置：默认 127.0.0.1（本地），云端部署由 deploy/Caddyfile 反代，故保持 127.0.0.1 切勿改 0.0.0.0。
+  const HOST = process.env.HMDAO_API_HOST || '127.0.0.1';
+  server.listen(PORT, HOST, () => {
+    console.log(`[HMDao API] http://${HOST}:${PORT}`);
     // 开机自动清理 catalog 中已丢失本地文件（被移动/删除）的 disk 型死引用，避免前端反复 404。
     void pruneMissingAssetLibraryItems()
       .then((r) => { if (r.removedCount) console.log(`[HMDao API] pruned ${r.removedCount} missing asset refs (catalog cleanup)`); })
       .catch((e) => console.error('[HMDao API] prune failed:', e.message));
+    // 扩展采集链路零配置：启动后自动静默安装下载类运行时
+    void bootstrapAutoInstallLocalPostRuntimes()
+      .catch((e) => console.error('[HMDao API] auto-install bootstrap failed:', e.message));
   });
 }
 
@@ -11502,6 +11948,8 @@ import {
   detectManagedLocalPostFlorence2Python,
   detectManagedLocalPostOcioPath,
   detectManagedLocalPostYtDlpPath,
+  detectManagedLocalPostAria2Path,
+  detectManagedLocalPostFfmpegPath,
   detectSceneCuts,
   extractZipArchiveToDirectory,
   findFileRecursively,
@@ -11526,6 +11974,8 @@ import {
   resolveLocalPostOcioBackend,
   resolveLocalPostOiioBackend,
   resolveLocalPostGmicBackend,
+  resolveLocalPostAria2Backend,
+  resolveLocalPostFfmpegBackend,
   runCommand,
   toRuntimeInstallJobResponse,
   updateRuntimeInstallJob,

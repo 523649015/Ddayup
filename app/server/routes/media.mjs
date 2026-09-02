@@ -17,7 +17,10 @@ export function registerMediaRoutes(router, deps) {
     https,
     proxyHuggingFace,
     proxyRemoteMediaAsset,
+    readJson,
+    resolveLocalPostFfmpegBackend,
     resolveYtDlpPath,
+    runCommand,
     send,
     serveLocalModel,
     serveTransformersModule,
@@ -42,6 +45,9 @@ export function registerMediaRoutes(router, deps) {
     }
     try {
       const ytdlp = resolveYtDlpPath();
+      if (!ytdlp) {
+        return send(res, 503, { error: 'yt-dlp 未安装或不可执行', hint: '请在模型下载面板安装 yt-dlp 后端运行时（侧栏采集时会提示一键安装）', code: 'ytdlp-missing' });
+      }
       // 可选 format 参数：指定格式 ID 下载（如 137+140），不传则用默认最佳格式
       const reqFormat = String(url.searchParams.get('format') || '').trim();
       const fmtStr = reqFormat || 'best[ext=mp4]/bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best';
@@ -52,7 +58,7 @@ export function registerMediaRoutes(router, deps) {
         '--socket-timeout', '30',
         videoUrl,
       ];
-      const { stdout, stderr } = await execFileAsync(ytdlp, args, { timeout: 35000, maxBuffer: 10 * 1024 * 1024 });
+      const { stdout, stderr } = await execFileAsync(ytdlp, args, { timeout: 35000, maxBuffer: 10 * 1024 * 1024, windowsHide: true });
       const lines = (stdout || '').split(/\r?\n/).filter(Boolean);
       // yt-dlp 输出顺序（实测 2026-07-26）：--print 在前、--get-url 在后。
       //   行0: title（--print title）
@@ -95,11 +101,14 @@ export function registerMediaRoutes(router, deps) {
     }
     try {
       const ytdlp = resolveYtDlpPath();
+      if (!ytdlp) {
+        return send(res, 503, { error: 'yt-dlp 未安装或不可执行', hint: '请在模型下载面板安装 yt-dlp 后端运行时（侧栏采集时会提示一键安装）', code: 'ytdlp-missing' });
+      }
       const { stdout } = await execFileAsync(ytdlp, [
         '--no-playlist', '--no-warnings', '--no-check-certificates',
         '--dump-json', '--socket-timeout', '30',
         videoUrl,
-      ], { timeout: 35000, maxBuffer: 10 * 1024 * 1024 });
+      ], { timeout: 35000, maxBuffer: 10 * 1024 * 1024, windowsHide: true });
       const info = JSON.parse(stdout || '{}');
       const formats = (info.formats || []).map((f) => {
         const hasVideo = f.vcodec && f.vcodec !== 'none';
@@ -161,6 +170,9 @@ export function registerMediaRoutes(router, deps) {
     const cookiesFile = String(url.searchParams.get('cookies_file') || '').trim();
     try {
       const ytdlp = resolveYtDlpPath();
+      if (!ytdlp) {
+        return send(res, 503, { error: 'yt-dlp 未安装或不可执行', hint: '请在模型下载面板安装 yt-dlp 后端运行时（侧栏采集时会提示一键安装）', code: 'ytdlp-missing' });
+      }
       if (action === 'formats') {
         const args = [
           '--no-playlist', '--no-warnings', '--no-check-certificates',
@@ -168,7 +180,7 @@ export function registerMediaRoutes(router, deps) {
         ];
         if (cookiesFile) args.push('--cookies', cookiesFile);
         args.push(videoUrl);
-        const { stdout } = await execFileAsync(ytdlp, args, { timeout: 35000, maxBuffer: 10 * 1024 * 1024 });
+        const { stdout } = await execFileAsync(ytdlp, args, { timeout: 35000, maxBuffer: 10 * 1024 * 1024, windowsHide: true });
         const info = JSON.parse(stdout || '{}');
         const formats = (info.formats || []).map((f) => ({
           format_id: f.format_id || '',
@@ -208,7 +220,7 @@ export function registerMediaRoutes(router, deps) {
       ];
       if (cookiesFile) args.push('--cookies', cookiesFile);
       args.push(videoUrl);
-      const { stdout, stderr } = await execFileAsync(ytdlp, args, { timeout: 35000, maxBuffer: 10 * 1024 * 1024 });
+      const { stdout, stderr } = await execFileAsync(ytdlp, args, { timeout: 35000, maxBuffer: 10 * 1024 * 1024, windowsHide: true });
       const lines = (stdout || '').split(/\r?\n/).filter(Boolean);
       const allUrls = [];
       let title = '', duration = '';
@@ -241,7 +253,7 @@ export function registerMediaRoutes(router, deps) {
       ];
       if (cookiesFile) args.push('--cookies', cookiesFile);
       args.push(videoUrl);
-      const { stdout, stderr } = await execFileAsync(ytdlp, args, { timeout: 60000, maxBuffer: 20 * 1024 * 1024 });
+      const { stdout, stderr } = await execFileAsync(ytdlp, args, { timeout: 60000, maxBuffer: 20 * 1024 * 1024, windowsHide: true });
       const entries = (stdout || '').split(/\r?\n/).filter(Boolean).map((l) => {
         try { return JSON.parse(l); } catch (_) { return null; }
       }).filter(Boolean);
@@ -265,6 +277,9 @@ export function registerMediaRoutes(router, deps) {
       // 2026-08-02 新增 audio=1：仅提取 MP3 音频（借鉴 seekin.ai 的「MP3 音频提取」）。
       const audioOnly = String(url.searchParams.get('audio') || '').trim() === '1';
       const ytdlp = resolveYtDlpPath();
+      if (!ytdlp) {
+        return send(res, 503, { error: 'yt-dlp 未安装或不可执行', hint: '请在模型下载面板安装 yt-dlp 后端运行时（侧栏采集时会提示一键安装）', code: 'ytdlp-missing' });
+      }
       let fmtStr;
       let mergeExt = 'mp4';
       const audioArgs = [];
@@ -306,7 +321,7 @@ export function registerMediaRoutes(router, deps) {
         }
       } catch (_) { /* 忽略，yt-dlp 自行查找 */ }
       args.push(videoUrl);
-      const { stdout, stderr } = await execFileAsync(ytdlp, args, { timeout: 180000, maxBuffer: 20 * 1024 * 1024 });
+      const { stdout, stderr } = await execFileAsync(ytdlp, args, { timeout: 180000, maxBuffer: 20 * 1024 * 1024, windowsHide: true });
       const dir = os.tmpdir();
       // 音频模式 extract-audio 实际扩展名可能是 mp3/m4a/opus/ogg/webm 之一（取决于音轨），
       // 视频模式是 mp4。这里把两者都纳入候选。
@@ -357,6 +372,167 @@ export function registerMediaRoutes(router, deps) {
     const ext = audioExts.find((e) => candidates[0].endsWith(e)) || '.mp4';
     res.setHeader('Content-Type', isAudio ? (mimeMap[ext] || 'audio/mpeg') : 'video/mp4');
     res.setHeader('Content-Disposition', `attachment; filename="${candidates[0]}"`);
+    res.setHeader('Content-Length', String(fs.statSync(filePath).size));
+    fs.createReadStream(filePath).pipe(res);
+  });
+
+  // ==================================================================
+  // DASH 分轨后端合并（ffmpeg -c copy）→ 单文件 MP4
+  // ------------------------------------------------------------------
+  // 为什么必须由后端做（2026-09-02 实测结论，勿凭直觉改回前端方案）：
+  //   1) chrome.downloads 直连 CDN 分轨必 403 —— declarativeNetRequest 注入的 Referer
+  //      对 downloads 发起的请求完全无效（4 种 resourceTypes 组合实测全部 SERVER_FORBIDDEN，
+  //      服务端收不到任何 Referer）。
+  //   2) 前端 Worker 合并（dash-merge-worker.js）产出的 MP4 缺少 avcC，
+  //      ffprobe 报 "No start code is found / Invalid data found"，是不可解码的坏文件。
+  //   3) 后端 fetch 可自由设置 Referer（无 CORS / 禁止头限制），ffmpeg -c copy 合并零重编码，
+  //      且落盘后能用 ffprobe 自检；扩展只需从本地 fileUrl 下载——本地直连无防盗链，
+  //      浏览器流式写盘，不受浏览器内存限制（大文件同样适用）。
+  // ==================================================================
+  const DASH_MERGE_TTL_MS = 2 * 60 * 60 * 1000;
+  const dashMergePath = (ticket, suffix) => path.join(os.tmpdir(), `hmdao-dashmerge-${ticket}${suffix}`);
+
+  function resolveFfmpegBins() {
+    let managed = '';
+    try {
+      managed = (resolveLocalPostFfmpegBackend && resolveLocalPostFfmpegBackend().detectedPath) || '';
+    } catch (_) { managed = ''; }
+    if (managed && fs.existsSync(managed)) {
+      const probe = managed.replace(/ffmpeg(\.exe)?$/i, 'ffprobe$1');
+      return { ffmpeg: managed, ffprobe: fs.existsSync(probe) ? probe : 'ffprobe' };
+    }
+    // 回退 PATH（本机已装 ffmpeg 时可用）
+    return { ffmpeg: 'ffmpeg', ffprobe: 'ffprobe' };
+  }
+
+  function cleanupStaleDashMerges() {
+    try {
+      const dir = os.tmpdir();
+      const now = Date.now();
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.startsWith('hmdao-dashmerge-')) continue;
+        const p = path.join(dir, f);
+        const st = fs.statSync(p);
+        if (now - st.mtimeMs > DASH_MERGE_TTL_MS) fs.rmSync(p, { force: true });
+      }
+    } catch (_) { /* 清理失败不影响主流程 */ }
+  }
+
+  function sanitizeDashMergeName(name, fallback) {
+    const raw = String(name || '').replace(/[\\/:*?"<>|]+/g, '_').replace(/[\r\n]+/g, '').trim();
+    const clean = (raw.slice(0, 120) || fallback);
+    return /\.mp4$/i.test(clean) ? clean : clean + '.mp4';
+  }
+
+  // 流式拉取分轨并落盘（不把整个文件读进内存，大文件安全）
+  async function fetchTrackToDisk(trackUrl, referer, dest) {
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    };
+    if (referer) headers.Referer = referer;
+    const resp = await fetch(trackUrl, { headers, redirect: 'follow' });
+    if (!resp.ok) throw new Error(`拉取分轨失败 HTTP ${resp.status}`);
+    if (!resp.body) throw new Error('分轨响应无数据流');
+    const { Readable } = await import('node:stream');
+    const { createWriteStream } = await import('node:fs');
+    await new Promise((resolve, reject) => {
+      const ws = createWriteStream(dest);
+      ws.on('error', reject);
+      ws.on('finish', resolve);
+      Readable.fromWeb(resp.body).on('error', reject).pipe(ws);
+    });
+    const size = fs.statSync(dest).size;
+    if (!size) throw new Error('分轨字节为空（可能被防盗链拦截）');
+    return size;
+  }
+
+  router.register('POST', '/api/media/merge-dash', async (req, res) => {
+    let body = {};
+    try { body = (await readJson(req)) || {}; } catch (_) { body = {}; }
+    const videoUrl = String(body.videoUrl || '').trim();
+    const audioUrl = String(body.audioUrl || '').trim();
+    const referer = String(body.referer || '').trim();
+    if (!/^https?:\/\//i.test(videoUrl)) {
+      return send(res, 400, { ok: false, error: '缺少有效的 videoUrl' });
+    }
+
+    const ticket = crypto.randomBytes(12).toString('hex');
+    const vPath = dashMergePath(ticket, '-video.m4s');
+    const aPath = dashMergePath(ticket, '-audio.m4s');
+    const outPath = dashMergePath(ticket, '.mp4');
+    cleanupStaleDashMerges();
+    const bins = resolveFfmpegBins();
+    try {
+      const videoSize = await fetchTrackToDisk(videoUrl, referer, vPath);
+      let audioSize = 0;
+      if (audioUrl) audioSize = await fetchTrackToDisk(audioUrl, referer, aPath);
+
+      // -c copy 零重编码；+faststart 把 moov 前移，便于边下边播
+      const args = audioSize
+        ? ['-y', '-i', vPath, '-i', aPath, '-map', '0:v:0', '-map', '1:a:0', '-c', 'copy', '-movflags', '+faststart', outPath]
+        : ['-y', '-i', vPath, '-c', 'copy', '-movflags', '+faststart', outPath];
+      await runCommand(bins.ffmpeg, args);
+      if (!fs.existsSync(outPath)) throw new Error('ffmpeg 未产出合并文件');
+
+      // ★合并自检：前端 Worker 合并正是因为缺了这一步，把「无 avcC 的坏 MP4」当成成功交付。
+      //   这里必须确认产物真有视频流；提供了音轨时还必须有音频流，否则直接判失败。
+      let types = [];
+      try {
+        const { stdout } = await runCommand(bins.ffprobe, ['-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', outPath]);
+        types = String(stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      } catch (_) { types = []; }
+      const hasVideo = types.includes('video');
+      const hasAudio = types.includes('audio');
+      if (!hasVideo) {
+        return send(res, 500, { ok: false, error: '合并产物无视频流，已丢弃', detail: 'ffprobe 未检出 video 流' });
+      }
+      if (audioSize && !hasAudio) {
+        return send(res, 500, { ok: false, error: '音频轨未合入产物，已丢弃', detail: '提供了 audioUrl 但输出无 audio 流' });
+      }
+
+      const filename = sanitizeDashMergeName(body.filename, `dashmerge-${ticket}.mp4`);
+      return send(res, 200, {
+        ok: true,
+        ticket,
+        fileUrl: `/api/media/merge-file?ticket=${ticket}`,
+        filename,
+        size: fs.statSync(outPath).size,
+        hasVideo,
+        hasAudio,
+        trackSizes: { video: videoSize, audio: audioSize },
+        engine: 'ffmpeg-copy',
+      });
+    } catch (e) {
+      const message = String((e && e.message) || e);
+      return send(res, 500, { ok: false, error: '后端合并失败：' + message.slice(0, 300) });
+    } finally {
+      // 合并产物保留（供下载），分轨中间文件清理
+      for (const p of [vPath, aPath]) {
+        try { fs.rmSync(p, { force: true }); } catch (_) { /* 忽略 */ }
+      }
+    }
+  });
+
+  // 提供后端合并落盘的单文件（供扩展下载；本地直连无防盗链，文件名由扩展指定）
+  router.register(['GET', 'HEAD'], '/api/media/merge-file', async (req, res, url) => {
+    const ticket = String(url.searchParams.get('ticket') || '').trim();
+    if (!/^[a-f0-9]{24}$/.test(ticket)) return send(res, 400, { error: 'invalid ticket' });
+    const filePath = dashMergePath(ticket, '.mp4');
+    if (!fs.existsSync(filePath)) return send(res, 404, { error: '文件不存在或已过期' });
+    res.setHeader('Content-Type', 'video/mp4');
+    // ★服务端只在调用方显式要名字时才输出 filename=。
+    //   否则 Chrome 会用服务端的 Content-Disposition 文件名覆盖 chrome.downloads 指定的
+    //   filename（实测：文件被保存成 dashmerge-<ticket>.mp4，扩展指定的 'Ddayup/videos/xx.mp4'
+    //   子目录被丢弃）。默认不输出 → 由扩展完全控制保存路径与文件名。
+    // 注意：一旦输出 Content-Disposition（哪怕不带 filename），Chrome 都会改用 URL 推导的文件名，
+    // 覆盖 chrome.downloads.download 传入的 filename（实测得 dashmerge-<ticket>.mp4 / merge-file.mp4）。
+    // 因此默认完全不输出该头，把命名权交回调用方（扩展），仅在调用方显式要名时才输出。
+    const nameParam = String(url.searchParams.get('filename') || '').trim();
+    if (nameParam) {
+      const name = sanitizeDashMergeName(nameParam, `dashmerge-${ticket}.mp4`);
+      const asciiName = name.replace(/[^\x20-\x7e]/g, '_');
+      res.setHeader('Content-Disposition', `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(name)}`);
+    }
     res.setHeader('Content-Length', String(fs.statSync(filePath).size));
     fs.createReadStream(filePath).pipe(res);
   });
