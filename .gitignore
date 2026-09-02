@@ -83,6 +83,15 @@ scripts/verify-*.cjs
 scripts/tmp-diag*.txt
 scripts/tmp-embed.txt
 
+# 临时/调试脚本（可能含明文凭据，绝不入库）
+scripts/_dbg_*.mjs
+scripts/_dbg_*.cjs
+scripts/_start_*.mjs
+scripts/_splice_*.mjs
+scripts/_splice_*.cjs
+scripts/_verify_*.mjs
+scripts/_archive/
+
 # Backup / temp artifacts
 *.hmdao-encoding-backup-*
 report_hmdao_deep_analysis.html
@@ -114,3 +123,11 @@ tmp-remote-files.txt
 console.log('BACKEND_DOWN'
 console.log(p+'
 f.endsWith('.mjs'))
+
+# 扩展大二进制 / 构建产物（Node 运行时副本 91MB、打包 exe 37MB、录像产物 79MB —— 绝不入库）
+extension/*.zip
+extension/native-host/*.exe
+extension/native-host/*.blob
+extension/native-host/*.bin
+extension/native-host/*.txt
+extension/demo-recorder/output/
