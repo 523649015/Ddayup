@@ -1,0 +1,5 @@
+﻿{
+    "main":  "ddayup-host.js",
+    "disableExperimentalSEAWarning":  true,
+    "output":  "sea-prep.blob"
+}

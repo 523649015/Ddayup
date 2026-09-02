@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "Ddayup Web Media Collector",
+    "description": "Extension display name (English)"
+  },
+  "appDesc": {
+    "message": "Scan web pages for images, videos, audio and 3D models. Download to local folder or import into the Ddayup asset library.",
+    "description": "Extension description (English)"
+  },
+  "actionDefaultTitle": {
+    "message": "Ddayup Web Media Collector",
+    "description": "Toolbar button tooltip (English)"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "Ddayup网页素材采集扩展",
+    "description": "扩展显示名称（中文）"
+  },
+  "appDesc": {
+    "message": "扫描当前网页的图片、视频、音效和3D模型资源，支持下载到本地、保存到自定义目录、导入Ddayup素材库。",
+    "description": "扩展描述（中文）"
+  },
+  "actionDefaultTitle": {
+    "message": "Ddayup网页素材采集扩展",
+    "description": "工具栏按钮悬停提示（中文）"
+  }
+}

@@ -1,0 +1,9 @@
+﻿{
+  "name": "com.ddayup.host",
+  "description": "Ddayup 网页素材采集扩展原生主机：仅管理本机 yt-dlp 生命周期与下载，不读取/拦截任何浏览器导航或页面内容。",
+  "path": "ddayup-host.js",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://PLACEHOLDER_EXTENSION_ID/"
+  ]
+}

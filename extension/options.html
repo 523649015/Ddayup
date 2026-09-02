@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ddayup 设置</title>
+  <style>
+    body {
+      font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      max-width: 560px;
+      margin: 32px auto;
+      padding: 0 16px;
+      color: #1f2329;
+      background: #fff;
+    }
+    h1 { font-size: 18px; margin-bottom: 4px; }
+    .hint { color: #6b7280; font-size: 13px; line-height: 1.6; margin-bottom: 20px; }
+    label { display: block; font-weight: 600; margin-bottom: 6px; font-size: 14px; }
+    input[type="text"] {
+      width: 100%; box-sizing: border-box; padding: 10px 12px;
+      border: 1px solid #d0d5dd; border-radius: 8px; font-size: 14px;
+    }
+    input[type="text"]:focus { outline: 2px solid #2563eb33; border-color: #2563eb; }
+    .row { display: flex; gap: 10px; margin-top: 14px; }
+    button {
+      padding: 9px 18px; border: none; border-radius: 8px; cursor: pointer;
+      font-size: 14px; font-weight: 600;
+    }
+    .primary { background: #2563eb; color: #fff; }
+    .ghost { background: #f0f2f5; color: #1f2329; }
+    .status { margin-top: 14px; font-size: 13px; min-height: 18px; }
+    .status.ok { color: #167a44; }
+    .status.err { color: #d92d20; }
+    code { background: #f0f2f5; padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Ddayup 扩展设置</h1>
+  <div class="hint">
+    云端地址用于让扩展的素材采集功能连接你部署在云端的 Ddayup 后端（含登录注册、订阅与模型网关）。
+    留空或恢复默认则连接本机 <code>http://127.0.0.1:3000</code>（本机运行后端时适用）。
+    须为 <code>http(s)://</code> 开头的完整地址，例如 <code>https://ddayup.example.com</code>。
+  </div>
+
+  <label for="apiBase">云端 API 地址</label>
+  <input type="text" id="apiBase" placeholder="https://your-cloud.example.com" autocomplete="off" spellcheck="false" />
+
+  <label for="apiKey" style="margin-top:18px;">运维 API Key（可选）</label>
+  <input type="text" id="apiKey" placeholder="仅在云端部署且需自助安装运行时填写" autocomplete="off" spellcheck="false" />
+  <div class="hint" style="margin-bottom:0;">
+    仅当云端后端设置了服务端 API Key（<code>HMDAO_API_KEY</code>）时需要。填写后扩展可自助触发 yt-dlp 等运行时安装；
+    留空则云端运行时未就绪时仅提示联系站长。
+  </div>
+
+  <div class="row">
+    <button class="primary" id="saveBtn">保存</button>
+    <button class="ghost" id="resetBtn">恢复默认（本机 3000）</button>
+  </div>
+
+  <div class="status" id="status"></div>
+
+  <script src="config-runtime.js"></script>
+  <script src="options.js" type="module"></script>
+</body>
+</html>
