@@ -276,9 +276,16 @@
 
   // 真实进度回流（来自 background 转发 onChanged，比侧栏自监听更可靠）
   function progressByDownloadId(downloadId, received, total) {
-    if (!knownDownloadIds.has(downloadId)) return false;
     for (const t of tasks.values()) {
       if (t.downloadId === downloadId) { progress(t.dlId, received, total); return true; }
+    }
+    // ★2026-09-10：onChanged 的第一帧广播可能早于 onCreated（异步广播不保证顺序），
+    //   此时 knownDownloadIds 还没 add 这个 id → 上面的 for 找不到。自动 fallback 到
+    //   "最近未绑 downloadId 的进行中卡"绑定，绝不丢首屏字节。
+    if (bindLatestPending(downloadId)) {
+      for (const t of tasks.values()) {
+        if (t.downloadId === downloadId) { progress(t.dlId, received, total); return true; }
+      }
     }
     return false;
   }

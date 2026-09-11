@@ -3,6 +3,7 @@ import { Navigate, Route, Routes } from 'react-router-dom';
 import { AuthGuard } from '@/components/AuthGuard';
 import { initExtensionAiBridge } from '@/services/extensionBridge';
 import { useCanvasStore } from '@/store/useCanvasStore';
+import { ImportWorkflowModal } from '@/components/ImportWorkflowModal';
 import './App.css';
 
 const LaunchCanvasPage = lazy(() => import('@/pages/LaunchCanvasPage'));
@@ -12,6 +13,11 @@ const ForgotPasswordPage = lazy(() => import('@/pages/ForgotPasswordPage'));
 const ApiKeysPage = lazy(() => import('@/pages/ApiKeysPage'));
 const DispatchSettingsPage = lazy(() => import('@/pages/DispatchSettingsPage'));
 const PosterEditorPage = lazy(() => import('@/pages/PosterEditorPage'));
+const LandingHome = lazy(() => import('@/pages/LandingHome'));
+const ServicesPage = lazy(() => import('@/pages/ServicesPage'));
+const SubscribePage = lazy(() => import('@/pages/SubscribePage'));
+// 懒加载：避免 PricingDemo/ScanCaptureDemo 等演示组件被打进主包，拖慢 /subscribe 首屏
+const PricingPage = lazy(() => import('@/pages/PricingPage'));
 
 function App() {
   // 始终注册扩展 AI 助手桥接监听（hmdao:ai-chat -> /api/extension-ai -> hmdao:ai-chat-reply），
@@ -38,13 +44,19 @@ function App() {
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
         <Route path="/forgot-password" element={<ForgotPasswordPage />} />
-        <Route path="/poster-editor" element={<PosterEditorPage />} />
+      <Route path="/pricing" element={<PricingPage />} />
+      <Route path="/poster-editor" element={<PosterEditorPage />} />
+      <Route path="/landing" element={<LandingHome />} />
+      <Route path="/services" element={<ServicesPage />} />
+      <Route path="/subscribe" element={<SubscribePage />} />
         <Route element={<AuthGuard />}>
           <Route path="/settings/api-keys" element={<ApiKeysPage />} />
           <Route path="/settings/dispatch" element={<DispatchSettingsPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
+      {/* 全局工作流模板面板（含导入/导出 JSON）：顶栏不放按钮，按 Ctrl/Cmd+Shift+W 打开 */}
+      <ImportWorkflowModal />
     </Suspense>
   );
 }

@@ -513,8 +513,34 @@ export function detectManagedLocalPostYtDlpPath() {
     || findFileRecursively(buildManagedRuntimePaths('ytdlp').currentDir, platformExecutableCandidates('yt-dlp'));
 }
 
+export function detectManagedLocalPostAria2Path() {
+  return readManagedRuntimeFile('aria2', 'executablePath')
+    || findFileRecursively(buildManagedRuntimePaths('aria2').currentDir, platformExecutableCandidates('aria2c'));
+}
+
+export function detectManagedLocalPostFfmpegPath() {
+  return readManagedRuntimeFile('ffmpeg', 'executablePath')
+    || findFileRecursively(buildManagedRuntimePaths('ffmpeg').currentDir, platformExecutableCandidates('ffmpeg'));
+}
+
 export function resolveLocalPostYtDlpBackend() {
   const detectedPath = detectManagedLocalPostYtDlpPath();
+  return {
+    configured: Boolean(detectedPath),
+    detectedPath,
+  };
+}
+
+export function resolveLocalPostAria2Backend() {
+  const detectedPath = detectManagedLocalPostAria2Path();
+  return {
+    configured: Boolean(detectedPath),
+    detectedPath,
+  };
+}
+
+export function resolveLocalPostFfmpegBackend() {
+  const detectedPath = detectManagedLocalPostFfmpegPath();
   return {
     configured: Boolean(detectedPath),
     detectedPath,

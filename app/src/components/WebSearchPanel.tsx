@@ -77,10 +77,17 @@ export function WebSearchPanel({
   const [lightbox, setLightbox] = useState<WebSearchResult | null>(null);
   const [browserMode, setBrowserMode] = useState(false);
   const [browserPlatform, setBrowserPlatform] = useState<SearchPlatformMeta>(SEARCH_PLATFORMS[0]);
-  const [customPlatforms, setCustomPlatforms] = useState<SearchPlatformMeta[]>([]);
+  const [customPlatforms, setCustomPlatforms] = useState<SearchPlatformMeta[]>(() => {
+    try {
+      const raw = localStorage.getItem('ddayup_custom_platforms');
+      if (raw) return JSON.parse(raw) as SearchPlatformMeta[];
+    } catch (_) { /* ignore */ }
+    return [];
+  });
   const [showAddPlatform, setShowAddPlatform] = useState(false);
   const [newPlatformName, setNewPlatformName] = useState('');
   const [newPlatformUrl, setNewPlatformUrl] = useState('');
+  const [newPlatformType, setNewPlatformType] = useState<MediaType>('image');
   const [newPlatformDesc, setNewPlatformDesc] = useState('');
   const [newPlatformColor, setNewPlatformColor] = useState('#00d4aa');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -122,32 +129,45 @@ export function WebSearchPanel({
   }, [searchMode]);
 
   // ===== Callbacks =====
+  const persistCustomPlatforms = useCallback((list: SearchPlatformMeta[]) => {
+    try { localStorage.setItem('ddayup_custom_platforms', JSON.stringify(list)); } catch (_) { /* ignore */ }
+  }, []);
+
   const addCustomPlatform = useCallback(() => {
     if (!newPlatformName.trim() || !newPlatformUrl.trim()) return;
     const id = `custom_${Date.now()}` as SearchPlatform;
     const newPlatform: SearchPlatformMeta = {
       id,
       name: newPlatformName.trim(),
-      supports: ['image'],
-      description: newPlatformDesc.trim() || '自定义搜索平台',
+      supports: [newPlatformType],
+      description: newPlatformDesc.trim() || '自定义收藏网站',
       searchUrl: newPlatformUrl.trim(),
       isCustom: true,
       color: newPlatformColor,
     };
-    setCustomPlatforms((prev) => [...prev, newPlatform]);
+    setCustomPlatforms((prev) => {
+      const next = [...prev, newPlatform];
+      persistCustomPlatforms(next);
+      return next;
+    });
     setNewPlatformName('');
     setNewPlatformUrl('');
     setNewPlatformDesc('');
+    setNewPlatformType('image');
     setShowAddPlatform(false);
-  }, [newPlatformName, newPlatformUrl, newPlatformDesc, newPlatformColor]);
+  }, [newPlatformName, newPlatformUrl, newPlatformDesc, newPlatformType, newPlatformColor, persistCustomPlatforms]);
 
   const removeCustomPlatform = useCallback((id: SearchPlatform) => {
-    setCustomPlatforms((prev) => prev.filter((p) => p.id !== id));
+    setCustomPlatforms((prev) => {
+      const next = prev.filter((p) => p.id !== id);
+      persistCustomPlatforms(next);
+      return next;
+    });
     setFilters((prev) => ({
       ...prev,
       platforms: prev.platforms.filter((p) => p !== id),
     }));
-  }, []);
+  }, [persistCustomPlatforms]);
 
   // Toggle platform filter
   const togglePlatform = useCallback((platform: SearchPlatform) => {
@@ -634,6 +654,56 @@ export function WebSearchPanel({
             ) : (
               searchMode === 'scrape' ? '抓取' : '搜索'
             )}          </button>
+          {/* ===== 素材源分组（始终可见，支持自定义收藏）===== */}
+          {!browserMode && (
+            <div className="w-full flex flex-col gap-2 px-3 py-2 border-t border-[#21262d]">
+              {([
+                { key: 'video', label: '🎬 专业视频源', types: ['video'] as MediaType[] },
+                { key: 'image', label: '📸 专业图片源', types: ['image'] as MediaType[] },
+                { key: 'audio', label: '🎵 音效 / 音乐源', types: ['audio'] as MediaType[] },
+                { key: 'model', label: '🧊 3D 模型源', types: ['model'] as MediaType[] },
+              ] as const).map((grp) => {
+                const items = allPlatforms.filter((p) => (p.supports || []).some((s) => grp.types.includes(s)));
+                if (items.length === 0) return null;
+                return (
+                  <div key={grp.key} className="flex items-start gap-2">
+                    <span className="text-[10px] text-[#6e7681] w-24 shrink-0 pt-1 select-none">{grp.label}</span>
+                    <div className="flex flex-wrap gap-1.5 flex-1">
+                      {items.map((p) => (
+                        <button
+                          key={p.id}
+                          onClick={() => { setBrowserPlatform(p); setBrowserMode(true); }}
+                          className="group relative flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-[#161b22] text-[#8b949e] hover:text-[#c9d1d9] hover:bg-[#21262d] border border-[#30363d] transition-colors"
+                          title={`在 ${p.name} 页面搜索`}
+                        >
+                          <span className="w-2 h-2 rounded-full shrink-0" style={{ background: p.color || '#00d4aa' }} />
+                          {p.name}
+                          {p.isCustom && (
+                            <span
+                              onClick={(e) => { e.stopPropagation(); removeCustomPlatform(p.id); }}
+                              className="ml-0.5 text-[#6e7681] hover:text-[#f85149] cursor-pointer"
+                              title="移除收藏"
+                            >
+                              <X className="w-2.5 h-2.5" />
+                            </span>
+                          )}
+                        </button>
+                      ))}
+                      {(grp.key === 'video' || grp.key === 'image' || grp.key === 'audio' || grp.key === 'model') && (
+                        <button
+                          onClick={() => { setNewPlatformType(grp.key as MediaType); setShowAddPlatform(true); }}
+                          className="flex items-center gap-0.5 px-2 py-1 rounded-md text-[11px] bg-transparent text-[#6e7681] hover:text-[#00d4aa] border border-dashed border-[#30363d] hover:border-[#00d4aa] transition-colors"
+                          title={`收藏自定义${grp.label.slice(2)}网站`}
+                        >
+                          <Plus className="w-2.5 h-2.5" />收藏
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
           {/* Browser mode */}
           {searchQuery.trim() && searchMode !== 'scrape' && (
             <button
@@ -784,6 +854,20 @@ export function WebSearchPanel({
                   placeholder="平台描述（可选）"
                   className="w-full bg-[#161b22] text-[#e6edf3] text-[10px] rounded px-2 py-1.5 border border-[#30363d] focus:border-[#00d4aa] outline-none"
                 />
+                <div className="flex items-center gap-1.5">
+                  <Tag className="w-3 h-3 text-[#6e7681] shrink-0" />
+                  <select
+                    value={newPlatformType}
+                    onChange={(e) => setNewPlatformType(e.target.value as MediaType)}
+                    aria-label="素材类型"
+                    className="flex-1 bg-[#161b22] text-[#c9d1d9] text-[10px] rounded px-2 py-1.5 border border-[#30363d] focus:border-[#00d4aa] outline-none"
+                  >
+                    <option value="video">🎬 视频源</option>
+                    <option value="image">📸 图片源</option>
+                    <option value="audio">🎵 音效源</option>
+                    <option value="model">🧊 模型源</option>
+                  </select>
+                </div>
                 <div className="flex items-center gap-1.5">
                   <Palette className="w-3 h-3 text-[#6e7681] shrink-0" />
                   <input

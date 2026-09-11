@@ -1245,6 +1245,26 @@ export function ModelDownloadPanel() {
         doctor: runtimeDoctor.runtimes.florence2,
         job: runtimeJobs.florence2 || null,
       },
+      {
+        id: 'aria2',
+        title: 'Aria2 下载引擎（网盘多线程直链下载）',
+        scope: '浏览器扩展采集的迅雷 / 百度 / 夸克等网盘直链，由后端转发 Aria2 接管下载',
+        purpose: '高性能多线程下载引擎：为采集扩展提供网盘直链高速下载（断点续传、多线程），不占用浏览器内存；与 yt-dlp 同属素材下载引擎组',
+        sourceNode: '素材库 · 网络资产采集（浏览器扩展）',
+        status: localPostBackends?.aria2 || null,
+        doctor: runtimeDoctor.runtimes.aria2,
+        job: runtimeJobs.aria2 || null,
+      },
+      {
+        id: 'ffmpeg',
+        title: 'FFmpeg（yt-dlp 音视频合并依赖）',
+        scope: 'yt-dlp 处理 m3u8 分片 / 合并音视频流所必需的独立命令行工具',
+        purpose: '音视频处理核心工具：yt-dlp 下载后自动合并音视频流、转码；与 aria2 / yt-dlp 同属素材下载引擎组',
+        sourceNode: '素材库 · 网络资产采集（浏览器扩展）',
+        status: localPostBackends?.ffmpeg || null,
+        doctor: runtimeDoctor.runtimes.ffmpeg,
+        job: runtimeJobs.ffmpeg || null,
+      },
     ];
   }, [runtimeDoctor, runtimeJobs, runtimeStatus]);
 

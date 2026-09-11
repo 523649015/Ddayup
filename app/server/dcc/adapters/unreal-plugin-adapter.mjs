@@ -110,6 +110,8 @@ export class UnrealPluginAdapter {
 
     getBridgeState = () => ({}),
 
+    resolveConnectToken = null,
+
   }) {
 
     this.id = 'unreal';
@@ -127,6 +129,10 @@ export class UnrealPluginAdapter {
     this.installScriptPath = installScriptPath;
 
     this.getBridgeState = getBridgeState;
+
+    // 云端多用户隔离：写连接意图文件时，若调用方未显式传 token，则回退到该回调
+    // （由 hmdao-api.mjs 在用户主动 Connect 的 REST 请求上下文注入，返回当前登录用户的有效 token）。
+    this.resolveConnectToken = typeof resolveConnectToken === 'function' ? resolveConnectToken : null;
 
     this.pluginSourcePath = path.join(repoRoot, 'plugins', 'unreal', UNREAL_PLUGIN_NAME);
 
@@ -206,10 +212,19 @@ export class UnrealPluginAdapter {
 
     ttlMs = 35 * 60 * 1000,
     targetPid = 0,
+    token = '',
 
   } = {}) {
 
     const safeTtlMs = Math.max(60000, Number(ttlMs || 0));
+
+    // 云端多用户隔离：优先用调用方显式传入的 token（来自 runAction 的 options.connectToken，
+    // 由 REST Connect 请求按用户参数透传，杜绝并发串号）；仅当显式为空时回退 resolveConnectToken
+    // 回调（兼容非 REST 调用方），不再依赖 globalThis 全局变量。
+    let resolvedToken = String(token || '').trim();
+    if (!resolvedToken && typeof this.resolveConnectToken === 'function') {
+      try { resolvedToken = String(this.resolveConnectToken() || '').trim(); } catch { /* 忽略 */ }
+    }
 
     const payload = {
 
@@ -223,6 +238,10 @@ export class UnrealPluginAdapter {
       expiresAt: Date.now() + safeTtlMs,
 
       source: 'hmdao-environment-manager',
+
+      // 云端多用户隔离：前端 Connect 时带上当前登录 token，插件读取后附加到 WS URL，
+      // 后端据其解析 userId 作为 owner 分桶。本机部署时可留空，后端回退 local 桶。
+      token: resolvedToken,
 
     };
 
@@ -348,6 +367,10 @@ export class UnrealPluginAdapter {
       project.name
       || path.basename(String(project.path || ''), path.extname(String(project.path || '')))
     ).trim().toLowerCase();
+    // 中文路径下，UE 进程命令行（来自 WMIC/PowerShell）的中文部分是 GBK 编码，
+    // 与内存里的 UTF-8 工程路径无法逐字符匹配。但 “<工程名>.uproject” 是纯 ASCII，
+    // 在 GBK/UTF-8 下完全一致，可作为可靠的跨编码匹配键。
+    const normalizedProjectFile = `${normalizedProjectName}.uproject`;
     const projectPid = Number(project?.pid || 0);
     const windowsByPid = new Map(
       windows
@@ -364,6 +387,9 @@ export class UnrealPluginAdapter {
         let score = 0;
         if (projectPid > 0 && pid === projectPid) score += 4;
         if (normalizedProjectPath && normalizedCommandLine.includes(normalizedProjectPath)) score += 6;
+        // 跨编码兜底：中文路径下 UE 命令行是 GBK，完整 UTF-8 路径无法匹配，
+        // 但 “<工程名>.uproject” 是纯 ASCII，可作为可靠匹配键。
+        if (normalizedProjectFile && normalizedCommandLine.includes(normalizedProjectFile)) score += 6;
         if (normalizedProjectName && normalizedWindowTitle.includes(normalizedProjectName)) score += 2;
         return {
           pid,
@@ -4849,11 +4875,15 @@ export class UnrealPluginAdapter {
 
     const pluginInstalled = pluginInstall.installed;
 
-    const pluginEnabled = Array.isArray(projectJson?.Plugins)
+    const declaredEnabled = Array.isArray(projectJson?.Plugins)
       ? projectJson.Plugins.some((item) => String(item?.Name || '').trim() === UNREAL_PLUGIN_NAME && Boolean(item?.Enabled))
       : false;
-    const buildArtifactsPresent = pluginInstalled ? await pathExists(path.join(pluginPath, 'Binaries')) : false;
     const bridgeState = this.getBridgeState() || {};
+    // 静态声明(.uproject)可能因手动启用后未落盘、或读取失败而缺失，
+    // 但只要插件实际随 Unreal 运行（direct bridge 已经在线），即可反证其已启用，
+    // 避免“UE 里明明启用了却判定未启用”导致连接被卡死。
+    const pluginEnabled = declaredEnabled || Boolean(bridgeState?.directBridgeOnline);
+    const buildArtifactsPresent = pluginInstalled ? await pathExists(path.join(pluginPath, 'Binaries')) : false;
     const pluginSync = await this.inspectPluginSync(pluginPath, bridgeState);
     const cameraCount = cameraCountFromBridgeState(bridgeState);
 
@@ -5183,11 +5213,15 @@ export class UnrealPluginAdapter {
 
     const pluginInstalled = pluginInstall.installed;
 
-    const pluginEnabled = Array.isArray(projectJson?.Plugins)
+    const declaredEnabled = Array.isArray(projectJson?.Plugins)
       ? projectJson.Plugins.some((item) => String(item?.Name || '').trim() === UNREAL_PLUGIN_NAME && Boolean(item?.Enabled))
       : false;
-    const buildArtifactsPresent = pluginInstalled ? await pathExists(path.join(pluginPath, 'Binaries')) : false;
     const bridgeState = this.getBridgeState() || {};
+    // 静态声明(.uproject)可能因手动启用后未落盘、或读取失败而缺失，
+    // 但只要插件实际随 Unreal 运行（direct bridge 已经在线），即可反证其已启用，
+    // 避免“UE 里明明启用了却判定未启用”导致连接被卡死。
+    const pluginEnabled = declaredEnabled || Boolean(bridgeState?.directBridgeOnline);
+    const buildArtifactsPresent = pluginInstalled ? await pathExists(path.join(pluginPath, 'Binaries')) : false;
     const pluginSync = await this.inspectPluginSync(pluginPath, bridgeState);
     const cameraCount = cameraCountFromBridgeState(bridgeState);
 
@@ -6248,7 +6282,11 @@ export class UnrealPluginAdapter {
 
       let enabledByRepair = false;
 
-      if (pluginState.installed && !pluginEnabled && !targetProjectRunning) {
+      // 放宽门槛：即使 Unreal 正在运行也尝试写入 .uproject 启用项。
+      // 运行时修改 .uproject 是安全的（UE 仅启动时读取），写完后用户重启一次 UE 即可生效。
+      // 此前要求 !targetProjectRunning，导致“重启 UE 后连接”永远走不到自动启用分支，
+      // 形成“重启也连不上”的死循环。
+      if (pluginState.installed && !pluginEnabled) {
 
         const enableResult = await safeNormalize(
 
@@ -6348,25 +6386,34 @@ export class UnrealPluginAdapter {
 
         });
 
-        const reinstallResult = await this.runAction('reinstall', {
+        try {
+          const reinstallResult = await this.runAction('reinstall', {
 
-          ...options,
+            ...options,
 
-          projectPath,
+            projectPath,
 
-          engineRoot,
+            engineRoot,
 
-          installScope: 'engine',
+            installScope: 'engine',
 
-          engineLevel: true,
+            engineLevel: true,
 
-        }, reporter);
+          }, reporter);
 
-        return {
+          return {
 
-          message: `${reinstallResult.message} Startup defaults were also normalized for lighter Epic / host-first launch behavior.`,
+            message: `${reinstallResult.message} Startup defaults were also normalized for lighter Epic / host-first launch behavior.`,
 
-        };
+          };
+        } catch (promoteError) {
+          // 升级为单一引擎级安装是“消重”优化，非强制步骤。中文路径下回收站式删除
+          // 可能被正在运行的 Unreal 锁定而失败；此时插件本身已安装可用，不应让整个
+          // repair 失败。降级为只做启用 + bridge，并把真实错误记录下来以便定位。
+          reporter?.warn('Unreal quick repair skipped shared-engine promotion (non-fatal). Continuing with enable + bridge.', {
+            error: promoteError instanceof Error ? (promoteError.stack || promoteError.message) : String(promoteError),
+          });
+        }
 
       }
 
@@ -6380,6 +6427,7 @@ export class UnrealPluginAdapter {
 
           ttlMs: Math.max(120000, runningHostWaitOptions.timeoutMs + 5 * 60 * 1000),
           targetPid: Number(project?.pid || 0),
+          token: String(options.connectToken || ''),
 
         });
 
@@ -6715,6 +6763,7 @@ export class UnrealPluginAdapter {
 
             ttlMs: runningHostWaitOptions.timeoutMs + 5 * 60 * 1000,
             targetPid: Number(project?.pid || 0),
+            token: String(options.connectToken || ''),
 
           });
 
@@ -6974,6 +7023,7 @@ export class UnrealPluginAdapter {
         await this.writeConnectRequestFile(projectPath, reporter, {
 
           ttlMs: 35 * 60 * 1000,
+          token: String(options.connectToken || ''),
 
         });
 
@@ -7412,8 +7462,30 @@ export class UnrealPluginAdapter {
         removedStalePath: staleRemoval.removedPath || '',
       });
 
+      // 安装即启用：复制/部署插件后务必把 HMDao Unreal Capture 写入 .uproject 的
+      // Plugins 列表（Enabled:true），否则用户点“安装插件”后插件文件存在却未启用，
+      // 重启 Unreal 再连接仍会被判定为“未启用”而连不上。此前该逻辑只在 repair 流程存在，
+      // 导致 install 流程装完却无法连接。
+      let enabledAfterInstall = false;
+      try {
+        const enableResult = await safeNormalize(
+          'enableProjectPluginAfterInstall',
+          () => updateUnrealProjectPluginState(projectPath, true),
+          { changedPlugins: [], ok: false },
+        );
+        enabledAfterInstall = Boolean(enableResult?.ok);
+        reporter?.info('Unreal plugin install enabled HMDao Unreal Capture in the project descriptor.', {
+          projectPath,
+          changedPlugins: enableResult?.changedPlugins || [],
+        });
+      } catch (enableError) {
+        reporter?.warn('Unreal plugin install could not auto-enable the plugin in the project descriptor (run Repair or enable it manually in the Unreal Plugins window).', {
+          error: enableError instanceof Error ? enableError.message : String(enableError),
+        });
+      }
+
       return {
-        message: `重建/重装成功：${buildText}已保留最新的${keptScopeLabel}插件安装（${keptInstallPath}）${staleText}。请重启 Unreal 编辑器使最新插件生效，然后在 DCC 环境管理面板点击“连接”验证桥接。`,
+        message: `重建/重装成功：${buildText}已保留最新的${keptScopeLabel}插件安装（${keptInstallPath}）${staleText}，并已将 HMDao Unreal Capture 写入工程启用列表${enabledAfterInstall ? '（已启用）' : '（自动启用失败，请在 Unreal 插件窗口手动勾选启用）'}。请重启 Unreal 编辑器使插件生效，然后在 DCC 环境管理面板点击“连接”验证桥接。`,
         backupId: backup.id,
 
         integrationMode,

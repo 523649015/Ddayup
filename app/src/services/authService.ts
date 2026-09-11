@@ -12,6 +12,7 @@ import { useByokRuntimeStore } from '@/store/useByokRuntimeStore';
 import { parseAuthError } from '@/utils/authErrors';
 import type { EmailLoginInput, EmailRegisterInput, EmailResetInput } from '@/schemas/authSchemas';
 import { normalizeEmail } from '@/schemas/authSchemas';
+import { validateByokKeys } from '@/api/byok';
 
 const API_BASE = '/api/auth';
 const SESSION_REFRESH_WINDOW_MS = 5 * 60 * 1000;
@@ -132,7 +133,6 @@ async function verifyKeyValidity(): Promise<boolean> {
     .map((item) => ({ provider: item.provider, apiKey: item.apiKey as string, mode: item.mode }));
   if (candidates.length === 0) return true;
   try {
-    const { validateByokKeys } = await import('@/api/byok');
     const result = await validateByokKeys(candidates);
     const results = result.results || [];
     if (results.length === 0) return true;

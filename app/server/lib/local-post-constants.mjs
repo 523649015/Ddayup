@@ -3,6 +3,8 @@
 import path from 'node:path';
 import { APP_DIR, DATA_DIR } from './server-paths.mjs';
 
+export const LOCAL_POST_SELF_CHECK_TIMEOUT_MS = 12000;
+
 export const LOCAL_IMAGE_ANALYSIS_BACKEND_WRAPPERS = {
   florence2: path.resolve(APP_DIR, 'server', 'local_image_florence2_wrapper.mjs'),
   'qwen35-vl': path.resolve(APP_DIR, 'server', 'local_image_qwen35_vl_wrapper.mjs'),
@@ -19,6 +21,15 @@ export const LOCAL_POST_BACKEND_WRAPPERS = {
   gmic: path.resolve(APP_DIR, 'server', 'local_post_gmic_wrapper.mjs'),
   depth: path.resolve(APP_DIR, 'server', 'local_post_depth_anything_wrapper.mjs'),
 };
+
+// ★2026-09-01 修复（"文档写 AppData、实际装在项目内"的路径脱节）：
+//   托管运行时的真实根目录 = DATA_DIR/local-post-runtimes（本项目即 app/.hmdao-data/...）。
+//   此前 LOCAL_POST_RUNTIME_GUIDES[].commonInstallPaths 硬编码了
+//   C:\Users\<用户名>\AppData\Roaming\Ddayup\local-post-runtimes\...，与真实目录不一致
+//   → 排障时按面板提示的"常见安装路径"去找文件会扑空，误判为"未安装"。
+//   现统一由真实目录推导，文档与实现永远一致。
+const MANAGED_RUNTIME_DIR = path.join(DATA_DIR, 'local-post-runtimes');
+const managedRuntimePath = (runtimeKey, ...rest) => path.join(MANAGED_RUNTIME_DIR, runtimeKey, ...rest);
 
 export const LOCAL_POST_RUNTIME_GUIDES = {
   ocio: {
@@ -76,7 +87,7 @@ export const LOCAL_POST_RUNTIME_GUIDES = {
     installHint: 'yt-dlp 是浏览器扩展采集 YouTube/B站/抖音等平台直链所依赖的独立命令行工具。点「一键安装」即可从 GitHub 下载最新版 yt-dlp.exe（自带 Python，无需安装环境），下载后后端 /api/youtube/extract 即可工作。',
     successHint: '探测成功后，扩展侧栏采集 YouTube 视频会直接返回可下载的直链，不再报错「后端返回空直链」。',
     commonInstallPaths: [
-      'C:\\Users\\<用户名>\\AppData\\Roaming\\Ddayup\\local-post-runtimes\\ytdlp\\current\\yt-dlp.exe',
+      managedRuntimePath('ytdlp', 'current', 'yt-dlp.exe'),
     ],
     supportsImage: false,
     supportsVideo: true,
@@ -90,10 +101,38 @@ export const LOCAL_POST_RUNTIME_GUIDES = {
     installHint: 'Florence-2 是微软开源的视觉理解模型，完全在本机运行，不消耗任何云端 token。点「一键安装」将自动创建 Python 虚拟环境、安装 PyTorch / Transformers，并下载 Florence-2-large 权重（约 2.3GB）。安装成功后，所有图片/视频分析都使用真实模型输出，不再使用弱占位描述。',
     successHint: '探测成功后，图片/视频素材分析会输出真实视觉理解（场景、物体、构图、风格等），智能生成与资产库检索质量显著提升。',
     commonInstallPaths: [
-      'C:\\Users\\<用户名>\\AppData\\Roaming\\Ddayup\\local-post-runtimes\\florence2\\backend\\local_image_example_florence2.py',
+      managedRuntimePath('florence2', 'backend', 'local_image_example_florence2.py'),
     ],
     supportsImage: true,
     supportsVideo: false,
+  },
+  aria2: {
+    runtimeName: 'Aria2 下载引擎（多线程直链下载）',
+    envPath: 'HMDAO_ARIA2_PATH',
+    envCommand: 'HMDAO_ARIA2_COMMAND',
+    docsUrl: 'https://aria2.github.io/',
+    downloadUrl: 'https://github.com/aria2/aria2/releases',
+    installHint: 'Aria2 是高性能多线程下载引擎，浏览器扩展采集到的网盘直链（迅雷/百度/夸克等）可由后端转发给 Aria2 接管下载，支持断点续传、多线程，且不占用浏览器内存。点「一键安装」即从 GitHub 下载 aria2c 可执行文件到本地运行时目录（可自定义安装路径）。',
+    successHint: '探测成功后，扩展侧栏采集的网盘素材可一键用 Aria2 高速下载，不再依赖浏览器内置下载。',
+    commonInstallPaths: [
+      managedRuntimePath('aria2', 'current', 'aria2c.exe'),
+    ],
+    supportsImage: false,
+    supportsVideo: true,
+  },
+  ffmpeg: {
+    runtimeName: 'FFmpeg（yt-dlp 音视频合并依赖）',
+    envPath: 'HMDAO_FFMPEG_PATH',
+    envCommand: 'HMDAO_FFMPEG_COMMAND',
+    docsUrl: 'https://ffmpeg.org/',
+    downloadUrl: 'https://github.com/BtbN/FFmpeg-Builds/releases',
+    installHint: 'FFmpeg 是 yt-dlp 处理 m3u8 分片、合并音视频流所必需的独立命令行工具。点「一键安装」即从 FFmpeg-Builds 静态构建下载 ffmpeg.exe（含 ffprobe）到本地运行时目录（可自定义安装路径），安装后 yt-dlp 即可完整合并输出。',
+    successHint: '探测成功后，yt-dlp 下载的视频将自动完成音视频合并，不再出现"缺 ffmpeg"的告警。',
+    commonInstallPaths: [
+      managedRuntimePath('ffmpeg', 'current', 'bin', 'ffmpeg.exe'),
+    ],
+    supportsImage: false,
+    supportsVideo: true,
   },
   'fsr-preview': {
     runtimeName: 'FSR Preview Wrapper',
@@ -136,7 +175,7 @@ export const LOCAL_POST_RUNTIME_GUIDES = {
 export const EXECUTABLE_DETECTION_CACHE = new Map();
 export const LOCAL_POST_RELEASE_CACHE = new Map();
 export const LOCAL_POST_RELEASE_TTL_MS = 1000 * 60 * 30;
-export const LOCAL_POST_MANAGED_RUNTIME_DIR = path.join(DATA_DIR, 'local-post-runtimes');
+export const LOCAL_POST_MANAGED_RUNTIME_DIR = MANAGED_RUNTIME_DIR;
 export const LOCAL_POST_MANAGED_RUNTIME_MANIFEST_FILE = path.join(LOCAL_POST_MANAGED_RUNTIME_DIR, 'manifest.json');
 export const LOCAL_POST_RUNTIME_INSTALL_JOBS = new Map();
 export const LOCAL_POST_RUNTIME_INSTALL_JOBS_BY_KEY = new Map();

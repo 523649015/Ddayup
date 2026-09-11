@@ -443,16 +443,35 @@ export function ImportWorkflowModal() {
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-4 py-3 border-b border-[#30363d]">
-          <h2 className="text-base font-semibold text-[#e6edf3]">导入工作流</h2>
-          <button
-            type="button"
-            onClick={close}
-            className="inline-flex items-center gap-1 rounded-md border border-[#30363d] bg-[#161b22] px-2.5 py-1 text-[11px] text-[#c9d1d9] transition-colors hover:bg-[#21262d]"
-            aria-label="关闭"
-          >
-            关闭
-            <span className="text-base leading-none">×</span>
-          </button>
+          <h2 className="text-base font-semibold text-[#e6edf3]">工作流模板</h2>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                const json = useCanvasStore.getState().exportCanvas();
+                const blob = new Blob([json], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${useCanvasStore.getState().canvas?.title || 'canvas'}.json`;
+                a.click();
+                URL.revokeObjectURL(url);
+              }}
+              className="inline-flex items-center gap-1 rounded-md border border-[#30363d] bg-[#161b22] px-2.5 py-1 text-[11px] text-[#c9d1d9] transition-colors hover:bg-[#21262d]"
+              title="导出当前画布为 JSON"
+            >
+              导出 JSON
+            </button>
+            <button
+              type="button"
+              onClick={close}
+              className="inline-flex items-center gap-1 rounded-md border border-[#30363d] bg-[#161b22] px-2.5 py-1 text-[11px] text-[#c9d1d9] transition-colors hover:bg-[#21262d]"
+              aria-label="关闭"
+            >
+              关闭
+              <span className="text-base leading-none">×</span>
+            </button>
+          </div>
         </div>
 
         <div className="flex gap-1 px-4 pt-2 border-b border-[#30363d]">

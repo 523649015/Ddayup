@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { useApiKeyStore } from '@/store/useApiKeyStore';
+import { refreshToken as refreshAuthToken } from '@/services/authService';
 
 export interface AuthUser {
   id: string;
@@ -106,6 +107,27 @@ export const useAuthStore = create<AuthState>()(
         }
 
         if (Date.now() > persisted.session.expiresAt) {
+          // ★2026-08-22 修复（关闭浏览器/重启电脑后要求重复登录）：
+          // 旧逻辑：access token 过期（2h）即直接清空 → 用户关浏览器超过 2h 再打开就被踢去登录。
+          // 但 refresh token 有 7 天，应【先尝试续期】，续期成功保留登录态，失败才清空。
+          const refreshTokenValue = persisted.session.refreshToken;
+          if (refreshTokenValue) {
+            set({ hasHydrated: true }); // 先标记 hydrated，避免登录页闪烁
+            void refreshAuthToken().then((ok) => {
+              if (!ok) {
+                useAuthStore.setState({ user: null, session: null });
+                void useApiKeyStore.getState().clearAll();
+                useApiKeyStore.getState().clearRuntimeKeys();
+                try {
+                  window.localStorage.removeItem(AUTH_STORAGE_KEY);
+                } catch {
+                  // ignore storage errors
+                }
+              }
+            });
+            return;
+          }
+          // 无 refreshToken 可续期 → 直接清空
           set({ user: null, session: null, hasHydrated: true });
           void useApiKeyStore.getState().clearAll();
           useApiKeyStore.getState().clearRuntimeKeys();
@@ -168,7 +190,27 @@ export const useAuthStore = create<AuthState>()(
       onRehydrateStorage: () => (state) => {
         state?.setHasHydrated(true);
 
+        // ★2026-08-22 修复（重新加载后要求重复登录）：
+        // 旧逻辑：session 过期（哪怕刚超 1ms）直接清空 user/session → 用户必须重新登录。
+        // 但 access token 仅 2h，refresh token 有 7 天。刷新页面时若 access 已过期，
+        // 应【先尝试用 refreshToken 续期】，续期成功则保留登录态，失败才清空。
+        // 这样即使 token 在刷新那刻刚过期，用户也不会被踢去重新登录。
         if (state?.session && Date.now() > state.session.expiresAt) {
+          const refreshTokenValue = state.session.refreshToken;
+          if (refreshTokenValue) {
+            void refreshAuthToken().then((ok) => {
+              if (!ok) {
+                // 续期失败（refresh 也过期/失效）→ 才真正清空
+                useAuthStore.setState({ user: null, session: null });
+                void useApiKeyStore.getState().clearAll();
+                useApiKeyStore.getState().clearRuntimeKeys();
+              }
+            });
+            // 注意：续期是异步的，这里不立即清空——保留旧 session 直到续期结果回来，
+            // 避免刷新瞬间 isAuthenticated() 短暂返回 false 触发登录页闪烁。
+            return;
+          }
+          // 无 refreshToken 可续期 → 直接清空
           state.setSession(null);
           state.setUser(null);
           void useApiKeyStore.getState().clearAll();

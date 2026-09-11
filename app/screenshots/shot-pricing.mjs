@@ -1,0 +1,10 @@
+import { chromium } from 'playwright';
+import fs from 'node:fs';
+const browser = await chromium.launch();
+const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1 });
+const page = await ctx.newPage();
+await page.goto('http://127.0.0.1:4100/pricing', { waitUntil: 'networkidle' });
+await page.waitForTimeout(800);
+await page.screenshot({ path: 'F:\\Work\\HMDAODAO\\app\\screenshots\\pricing.png', fullPage: true });
+console.log('saved', fs.statSync('F:\\Work\\HMDAODAO\\app\\screenshots\\pricing.png').size);
+await browser.close();

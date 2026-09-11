@@ -133,7 +133,7 @@ export function TextNode(props: NodeProps) {
         <Handle type="target" position={Position.Left} className="image-node-handle" style={hL}>
           <span className="text-xs font-bold leading-none text-[#8a8a8a]">+</span>
         </Handle>
-        <Handle type="source" position={Position.Right} className="image-node-handle" style={hR}>
+        <Handle id="media-output" type="source" position={Position.Right} className="image-node-handle" style={hR}>
           <span className="text-xs font-bold leading-none text-[#8a8a8a]">+</span>
         </Handle>
       </div>

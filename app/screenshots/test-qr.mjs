@@ -1,0 +1,14 @@
+import { chromium } from 'playwright';
+const browser = await chromium.launch();
+const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+const page = await ctx.newPage();
+page.on('console', (msg) => console.log('PAGE:', msg.type(), msg.text()));
+page.on('pageerror', (e) => console.log('PAGEERR:', e.message));
+await page.goto('http://127.0.0.1:4100/subscribe', { waitUntil: 'networkidle' });
+await page.waitForTimeout(600);
+await page.getByRole('button', { name: '微信扫码' }).first().click();
+await page.waitForTimeout(2000);
+const hasImg = await page.locator('img[alt="qr"]').count();
+console.log('qrImg count =', hasImg);
+await page.screenshot({ path: 'F:\\Work\\HMDAODAO\\app\\screenshots\\subscribe-qr.png', fullPage: false });
+await browser.close();

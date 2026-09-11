@@ -1,0 +1,8 @@
+{
+	"BuildId": "47537391",
+	"Modules": 
+	{
+		"HMDaoUnrealCapture": "UnrealEditor-HMDaoUnrealCapture.dll",
+		"HMDaoUnrealCaptureBootstrap": "UnrealEditor-HMDaoUnrealCaptureBootstrap.dll"
+	}
+}

@@ -9,6 +9,12 @@ import {
 import { useCanvasStore } from '@/store/useCanvasStore';
 import type { CanvasNode, NodeData, NodeType, RegionPackContract } from '@/types';
 import TaggingContractVerifySurface from '@/components/TaggingContractVerifySurface';
+// 这些模块已被其他核心组件静态广泛引用，必然进入初始主包；
+// 此处改用静态 import 消除 Rollup 的 "dynamic import will not move" 冗余告警（伪懒加载）。
+import * as genNs from '@/services/generation';
+import * as refNs from '@/lib/nodeReferenceGraph';
+import * as rcNs from '@/services/regionContracts';
+import { useApiKeyStore } from '@/store/useApiKeyStore';
 // 调试图（手动放到项目根的 tmp-*.jpg，构建时不存在）。
 // 关键：第一个参数必须是「变量表达式」而非字符串字面量，否则 Vite 会在构建期
 // 尝试解析该相对路径并告警 "will be resolved at runtime"。用变量拼接可消除告警，
@@ -25,17 +31,11 @@ const DEBUG_BRIDGE_EVENT_NAME = 'hmdao:debug-command';
 
 let buildDebugGenerationBodyForNodeResolved: null | ((nodeId: string) => unknown) = null;
 
-async function warmBuildGenerationBodyForNode() {
+function warmBuildGenerationBodyForNode() {
   if (buildDebugGenerationBodyForNodeResolved) return buildDebugGenerationBodyForNodeResolved;
-  const [
-    generationModule,
-    referenceGraphModule,
-    regionContractsModule,
-  ] = await Promise.all([
-    import('@/services/generation'),
-    import('@/lib/nodeReferenceGraph'),
-    import('@/services/regionContracts'),
-  ]);
+  const generationModule = genNs;
+  const referenceGraphModule = refNs;
+  const regionContractsModule = rcNs;
   buildDebugGenerationBodyForNodeResolved = (nodeId: string) => {
     const state = useCanvasStore.getState();
     const node = state.canvas?.nodes.find((item) => item.id === String(nodeId || '')) || null;
@@ -392,7 +392,7 @@ function TaggingContractVerifyShell() {
       case 'canvas:listNodes':
         return (canvasState.canvas?.nodes || []).map((node) => sanitizeNodeForBridge(node));
       case 'apiKey:setMockVideoKey':
-        return import('@/store/useApiKeyStore').then(({ useApiKeyStore }) => {
+        return (() => {
           const apiKeyState = useApiKeyStore.getState();
           const now = Date.now();
           void apiKeyState.setKey({
@@ -409,7 +409,7 @@ function TaggingContractVerifyShell() {
             metadataOnly: false,
           });
           return { ok: true };
-        });
+        })();
       default:
         throw new Error(`Unsupported debug bridge command: ${command}`);
     }
@@ -427,7 +427,7 @@ function TaggingContractVerifyShell() {
 
   useEffect(() => {
     const timerId = window.setTimeout(() => {
-      void warmBuildGenerationBodyForNode().catch(() => {});
+      void warmBuildGenerationBodyForNode();
     }, 0);
     return () => window.clearTimeout(timerId);
   }, []);

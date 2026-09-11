@@ -2,6 +2,43 @@
 @tailwind components;
 @tailwind utilities;
 
+/* 演示动画：素材淡入 */
+@keyframes demoFadeIn {
+  from { opacity: 0; transform: scale(0.92); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+/* 演示扫描线：横向 */
+@keyframes demoScan {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* 演示扫描线：纵向掠过 */
+@keyframes demoScanVertical {
+  0% { background-position: 0 -100%; }
+  100% { background-position: 0 100%; }
+}
+
+/* 演示扩散弹出（从中心向外） */
+@keyframes demoPopIn {
+  0% { opacity: 0; transform: scale(0.6); }
+  60% { opacity: 1; transform: scale(1.05); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+/* 3D 模型旋转展示 */
+@keyframes demoSpin3d {
+  0% { transform: translateX(-50%) translateY(-50%) rotateX(-18deg) rotateY(0deg); }
+  100% { transform: translateX(-50%) translateY(-50%) rotateX(-18deg) rotateY(360deg); }
+}
+
+/* 3D 模型上下轻微浮动 */
+@keyframes demoFloatY {
+  0%, 100% { transform: translateX(-50%) translateY(-50%); }
+  50% { transform: translateX(-50%) translateY(calc(-50% - 4px)); }
+}
+
 @layer base {
   :root {
     --background: 0 0% 100%;

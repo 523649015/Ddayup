@@ -20,6 +20,10 @@ import {
   createEsrganRunner,
   createLamaRunner,
 } from './inferenceWorkerClient';
+// modelLoader / presetModelInstall 已被本地模型面板/下载面板静态广泛引用，
+// 必然进入初始主包；此处静态导入以消除 Rollup 的 "dynamic import will not move" 冗余告警。
+import { loadModel } from '@/services/modelLoader';
+import { markPresetInstalled, getPresetInstallState } from '@/services/presetModelInstall';
 import { createImglyRunner } from './imglyRunner';
 
 export type LocalRunnerKind = 'esrgan' | 'lama' | 'imgly' | 'depth-anything-v2' | 'depth-anything-v3' | 'rmbg' | 'raft';
@@ -79,7 +83,6 @@ export async function activateLocalModel(
       try {
         const v2 = PRESET_MODELS.find((m) => m.id === 'depth-anything-v2-small');
         if (v2) {
-          const { loadModel } = await import('@/services/modelLoader');
           const dl = await loadModel({
             modelId: v2.id,
             version: v2.version,
@@ -89,7 +92,6 @@ export async function activateLocalModel(
             retries: 2,
           });
           if (dl.success) {
-            const { markPresetInstalled } = await import('@/services/presetModelInstall');
             markPresetInstalled(v2.id, v2.version);
             result = await loadDepthModel('depth-anything-v2-small');
           }
@@ -151,7 +153,6 @@ export async function activateLocalModel(
   sessionData = cached?.data as ArrayBuffer | undefined;
   if (!sessionData && meta.url) {
     try {
-      const { loadModel } = await import('@/services/modelLoader');
       const dl = await loadModel({
         modelId: id,
         version,
@@ -192,7 +193,6 @@ export function deactivateLocalModel(id: string): void {
  * 使刷新后仍具备真实推理能力（与面板「已安装」状态一致）。非阻塞、失败不抛。
  */
 export async function reactivateInstalledLocalModels(): Promise<void> {
-  const { getPresetInstallState } = await import('@/services/presetModelInstall');
   for (const m of PRESET_MODELS) {
     if (!m.localRunner) continue;
     if (getPresetInstallState(m.id) && !hasLocalModelRunner(m.id)) {

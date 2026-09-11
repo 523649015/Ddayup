@@ -14,6 +14,7 @@ import { useNodeFloatingPanel } from '@/hooks/useNodeFloatingPanel';
 import { extractPersistedAssetIdFromUrl, resolvePersistedAssetLibraryUrl } from '@/api/assetLibrary';
 import { toRenderableAssetUrl } from '@/services/generation';
 import { ensureLocalMediaUrl } from '@/services/localMediaRegistry';
+import { isDeadAssetUrl, markAssetDead } from '@/services/deadAssetRegistry';
 import { readRegionContract } from '@/services/regionContracts';
 import { useCanvasStore } from '@/store/useCanvasStore';
 import type {
@@ -709,6 +710,9 @@ export function RegionContractNode(props: NodeProps) {
   });
   const [selectedRegionId, setSelectedRegionId] = useState('');
   const [resolvedPreviewUrl, setResolvedPreviewUrl] = useState('');
+  // 基底素材在后端已被删除时，/api/assets/content/<id> 会返回 404。
+  // 记录加载失败，改渲染占位提示，避免长期挂着坏图并反复触发无效请求。
+  const [previewBroken, setPreviewBroken] = useState(false);
   const [selectedDrawMode, setSelectedDrawMode] = useState<DrawMode>('box');
   const [drawMode, setDrawMode] = useState<DrawMode | null>(null);
   const [draftRect, setDraftRect] = useState<RegionRect | null>(null);
@@ -808,6 +812,8 @@ export function RegionContractNode(props: NodeProps) {
     const rawUrl = String(baseSource?.url || '').trim();
     const mediaType = baseSource?.mediaType || 'image';
     const initialUrl = toRenderableAssetUrl(rawUrl, mediaType);
+    // 基底来源变化即视为新素材，清掉上一次的失效标记
+    setPreviewBroken(false);
 
     if (initialUrl) {
       setResolvedPreviewUrl(initialUrl);
@@ -1371,11 +1377,19 @@ export function RegionContractNode(props: NodeProps) {
             onPointerCancel={handlePreviewPointerCancel}
           >
             {baseSource?.url ? (
-              resolvedPreviewUrl ? (
+              previewBroken || isDeadAssetUrl(resolvedPreviewUrl) ? (
+                <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
+                  <Crosshair className="h-8 w-8 text-[#666]" />
+                  <div className="text-sm font-medium text-[#e6e6e6]">基底素材已失效</div>
+                  <div className="max-w-[320px] text-xs leading-5 text-[#9b9b9b]">
+                    原素材在后端已不存在（可能已被删除），请重新接入基底。
+                  </div>
+                </div>
+              ) : resolvedPreviewUrl ? (
                 baseSource.mediaType === 'video' ? (
-                  <video data-testid={`tagging-preview-video-${id}`} src={resolvedPreviewUrl} className="h-full w-full object-cover" muted loop autoPlay playsInline draggable={false} />
+                  <video data-testid={`tagging-preview-video-${id}`} src={resolvedPreviewUrl} className="h-full w-full object-cover" muted loop autoPlay playsInline draggable={false} onError={() => { markAssetDead(resolvedPreviewUrl); setPreviewBroken(true); }} />
                 ) : (
-                  <img data-testid={`tagging-preview-image-${id}`} src={resolvedPreviewUrl} alt={baseSource.nodeLabel} className="h-full w-full object-cover" draggable={false} />
+                  <img data-testid={`tagging-preview-image-${id}`} src={resolvedPreviewUrl} alt={baseSource.nodeLabel} className="h-full w-full object-cover" draggable={false} onError={() => { markAssetDead(resolvedPreviewUrl); setPreviewBroken(true); }} />
                 )
               ) : (
                 <div className="flex h-full flex-col items-center justify-center gap-2 text-center">

@@ -32,6 +32,21 @@ export function registerAuthRoutes(router, deps) {
 
   const MIN_PASSWORD_LENGTH = 8;
 
+  // P3-安全：登录防爆破。内存级限流（单进程足够；多实例需外接 Redis，见下方注释）。
+  // - 账户维度：同一 email 连续失败 MAX_FAILS 次后锁定 LOCK_MS 毫秒。
+  // - IP 维度：同一来源每分钟最多 MAX_PER_MIN 次尝试（粗粒度防批量爆破）。
+  // 注：多实例水平扩展时，这些 Map 不共享，应改为 Redis 计数器；当前 pm2 instances:1。
+  const MAX_FAILS = 5;
+  const LOCK_MS = 15 * 60 * 1000;
+  const MAX_PER_MIN = 20;
+  const accountFails = new Map(); // key: email -> { count, lockedUntil }
+  const ipWindow = new Map();     // key: ip -> { count, resetAt }
+  function getClientIp(req) {
+    const xff = req.headers['x-forwarded-for'];
+    if (typeof xff === 'string' && xff.length) return xff.split(',')[0].trim();
+    return req.socket?.remoteAddress || 'unknown';
+  }
+
   /**
    * 注册与重置密码共用的入参校验。
    * 原实现在两处各写了一遍完全相同的 6 行校验，此处收敛为单一实现，
@@ -72,15 +87,44 @@ export function registerAuthRoutes(router, deps) {
   });
 
   router.register('POST', '/api/auth/login', async (req, res) => {
+    // ---- 速率限制 / 失败锁定 ----
+    const ip = getClientIp(req);
+    const now = Date.now();
+
+    // IP 维度：滑动窗口（每分钟 MAX_PER_MIN 次）
+    const ipState = ipWindow.get(ip) || { count: 0, resetAt: now + 60_000 };
+    if (now > ipState.resetAt) { ipState.count = 0; ipState.resetAt = now + 60_000; }
+    ipState.count += 1;
+    ipWindow.set(ip, ipState);
+    if (ipState.count > MAX_PER_MIN) {
+      return sendAuthError(res, 429, 'too_many_requests', '请求过于频繁，请稍后再试');
+    }
+
     const { email, password } = await readJson(req);
+    const normalizedEmail = normalizeLocalEmail(email);
+
+    // 账户维度：锁定期内直接拒绝
+    const acct = accountFails.get(normalizedEmail);
+    if (acct && acct.lockedUntil > now) {
+      const remainMin = Math.ceil((acct.lockedUntil - now) / 60_000);
+      return sendAuthError(res, 429, 'account_locked', `账户已临时锁定，请 ${remainMin} 分钟后再试`);
+    }
+
     const users = await readUsers();
-    const user = users.find((item) => item.email === normalizeLocalEmail(email));
+    const user = users.find((item) => item.email === normalizedEmail);
     if (!user) {
       return sendAuthError(res, 404, 'user_not_found', '该邮箱尚未注册，请先创建账号');
     }
     if (!verifyPassword(String(password || ''), user)) {
-      return sendAuthError(res, 401, 'invalid_credentials', '密码错误，请重试或重置密码');
+      // 失败计数 + 锁定
+      const next = { count: (acct?.count || 0) + 1, lockedUntil: acct?.lockedUntil || 0 };
+      if (next.count >= MAX_FAILS) next.lockedUntil = now + LOCK_MS;
+      accountFails.set(normalizedEmail, next);
+      const remain = MAX_FAILS - next.count;
+      return sendAuthError(res, 401, 'invalid_credentials', remain > 0 ? `密码错误，还可尝试 ${remain} 次` : '密码错误次数过多，账户已锁定 15 分钟');
     }
+    // 成功：清零失败计数
+    accountFails.delete(normalizedEmail);
     return send(res, 200, { success: true, user: publicUser(user), session: createSession(user) });
   });
 

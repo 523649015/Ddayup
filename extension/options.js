@@ -6,6 +6,7 @@ const keyInput = document.getElementById('apiKey');
 const statusEl = document.getElementById('status');
 const saveBtn = document.getElementById('saveBtn');
 const resetBtn = document.getElementById('resetBtn');
+const featScreenshotOcr = document.getElementById('featScreenshotOcr');
 
 function showStatus(msg, kind) {
   statusEl.textContent = msg;
@@ -16,8 +17,16 @@ async function init() {
   const current = await getApiBase();
   input.value = current === defaultApiBase() ? '' : current;
   keyInput.value = (await getApiKey()) || '';
+  const f = await new Promise((res) => chrome.storage.local.get('hmdao:feature:screenshotOcr', (o) => res(o['hmdao:feature:screenshotOcr'])));
+  featScreenshotOcr.checked = (f === undefined ? true : !!f);
   showStatus('当前地址：' + current, '');
 }
+
+// 「截图识文」开关：实时写入 storage，侧栏 FeatureManager 读取后热插拔
+featScreenshotOcr.addEventListener('change', () => {
+  chrome.storage.local.set({ 'hmdao:feature:screenshotOcr': featScreenshotOcr.checked });
+  showStatus(featScreenshotOcr.checked ? '已启用「截图识文」。' : '已停用「截图识文」。', 'ok');
+});
 
 saveBtn.addEventListener('click', async () => {
   const raw = input.value.trim();

@@ -1,0 +1,124 @@
+
+=== A. media-fetch.js 占位图自学习（真实源码） ===
+  ✓ A0 真实源码导出 hmdaoNoteCoverBytes / isPlaceholderCover，且挂到 window
+  ✓ A1 同一字节内容喂 3 个不同 URL → 第 3 个起判为占位图
+  ✓ A1b 达阈值后【追溯】把此前已放行的同款 URL 一起判死
+  ✓ A2 不同字节（真实不同图）不误杀
+  ✓ A3 判死后【新 URL】命中同 hash 立即返回 true（不必再凑 3 个）
+  ✓ A4 容量上限 300 不崩、不无限增长
+  ✓ A5 空参数 / 异常输入安全（不抛、不误判）
+  ✓ A6 hmdaoCoverHash：同内容稳定 / 异内容不同 / 长度并入 key
+  ✓ A7 （已知边界，非回归）>64KB 且等长的两图只会碰撞 —— 设计取舍记录
+  ✓ A8 ★[P1 已修] 同一张真封面被带不同签名 query 反复取 4 次 → 永不判死
+  ✓ A8b ★[P1 修复不得削弱 imini] 不同 pathname 仍能凑满阈值
+  ✓ A9 ★[缺陷 P1] 期望：登记键应按 origin+pathname 归一化（去掉 query），真封面不应被误判
+
+=== B. media-fetch.js fetchMediaViaBackground 三参透传（真实源码） ===
+  ✓ B1 三参（带 maxBytes）正常透传
+  ✓ B2 两参旧调用行为不变（不传 maxBytes）
+  ✓ B3 非法 / 非正整数 maxBytes 一律不透传
+  ✓ B4 伪协议（doubao-ws-audio://）不进 fetch、不报错
+  ✓ B5 字节系 omit / B站不传（既有行为未被破坏）
+
+=== C. loadImageViaRelay：写缓存【之前】的拦截（真实源码） ===
+  ✓ C1 第 3 次同图 → 返回 null，且【追溯撤销】已缓存 blob（不写双缓存）
+  ✓ C2 已判死的 URL 不再发任何网络请求（零 SW 占用）
+  ✓ C3 真实不同的封面图不被拦截，且正常写入 __thumbCache
+  ✓ C4 命中缓存时不再重复 fetch（既有去重未被破坏）
+  ✓ C5 ★[P2 已修] 占位图命中后仍会尝试第二层源页 Cookie 重试
+
+=== D. scan.js extractVideoCovers：pairs 抽取（真实源码） ===
+  ✓ D0 抽取到的确实是 scan.js 里的真实函数体（含 4.5 段）
+  ✓ D1 ① 内联严格 JSON（__NEXT_DATA__ 风格）：mp4 与 cover 同对象成对 → 命中
+  ✓ D2 ② RSC 转义串（\" + \/）：还原后命中真封面
+  ✓ D2b ② RSC 另一种转义（\\/）：同样还原命中
+  ✓ D3 ② 非严格 JSON 的 ±800 邻近窗口也能命中
+  ✓ D4 ① <video poster>：与 src / currentSrc 成对 → 命中
+  ✓ D5 ★[缺陷] 半截串 "https:" 必须被丢弃（不得写进 pairs）
+  ✓ D5b pairs 里只允许绝对 http(s) 地址（非相对路径原样）
+  ✓ D6 非真视频直链（无视频后缀）→ 不成对
+  ✓ D7 推广图 / 埋点信标被 isPromo / isBeacon 排除
+  ✓ D8 返回值结构未变：byKey / defaultCover / pageCovers（+ 新增 pairs）
+  ✓ D9 空页面 / 无脚本不抛异常（静默降级）
+
+=== E. scan.js COVER_FIELD_RE 修复复核（工程师自查抓到的坑） ===
+  ✓ E0 能从源码里取出 COVER_FIELD_RE 字面量
+  ✓ E1 ★普通 JSON（无反斜杠）必须能命中（原 \\"? 写法必然命中不到）
+  ✓ E2 各封面字段名在纯 JSON 上均命中（cover/poster/thumbnail/image/picUrl/imgUrl/frameUrl…）
+  ✓ E3 转义串（\"）同样命中（兼容 RSC 未还原的情况）
+  ✓ E4 单个反斜杠前缀（\cover）也命中（原写法本意仍在）
+
+=== F. scan.js scanTab 2.5) 封面优先级派发（真实源码片段） ===
+  ✓ F0 能定位并抽取 scanTab 2.5) 真实片段
+  ✓ F1 ① 命中 pairs（原式）→ 直接用真封面
+  ✓ F2 ① 命中 pairs 去查询串（直链带 ?token）
+  ✓ F3 ③a 同 basename 图已在 pageCovers 里 → 直接用（零风险）
+  ✓ F4 ③b 通用文件型 CDN → 才猜同 basename .jpg
+  ✓ F5 ★平台防盗链 CDN 一律【不猜】
+  ✓ F6 已有 cover 的资产不被覆盖（幂等）
+  ✓ F7 非视频资产 / 相对 URL 不动
+  ✓ F8 pageAssets（scanPage 内联 JSON 直链）同样被派封面
+  ✓ F9 异常输入（coverMap undefined / pageAssets null）不抛
+
+=== G. sidepanel.js deriveMediaReferer（真实源码） ===
+  ✓ G1 ★新增：iminicdn / imini → 干净站根 https://imini.ai/
+  ✓ G2 既有判定未变：抖音 / TikTok / B站 / 微信QQ / 小红书 / 豆包
+  ✓ G3 通用 byteimg 分支按源页决定（即梦 / 剪映不被写成 douyin）
+  ✓ G4 未知域名回落源页（通用站点行为不变）+ 异常输入安全
+
+=== H. sidepanel.js hmdaoCardNeedsHoverFrame 悬停闸门（真实源码） ===
+  ✓ H1 无封面 + 视口内视频卡 12 → 允许抽帧（旧 >20 硬闸已换掉）
+  ✓ H2 无封面 + 视口内视频卡 13 → 拒绝抽帧（边界）
+  ✓ H3 有有效封面（coverState = pending / ok）→ 不触发
+  ✓ H4 coverState ∈ error / empty / none → 触发
+  ✓ H5 封面被判为统一占位图 → 触发（即使 coverState=ok）
+  ✓ H6 已抽过帧（a.__hoverCoverBlob）→ 不再抽
+  ✓ H7 图片卡（无 .url-row）不计入视口阈值
+  ✓ H8 异常输入（card 为 null / 无 querySelector）不抛
+
+=== I. 悬停序号 / maxBytes / 500ms 延迟（源码静态断言） ===
+  ✓ I1 sidepanel.js 旧硬闸 assets.length > 20 已被移除（注释除外）
+  ✓ I2 hoverVideoFrame 传了 maxBytes 且用序号快照丢弃在途结果
+  ✓ I3 HOVER_FRAME_MAX_BYTES = 2MB
+  ✓ I4 paintHoverFrame 上屏前二次校验序号 + 写回封面缓存
+  ✓ I5 stopHoverVideoFrame 进入即自增序号（在 return 之前）
+  ✓ I6 card-render.js mouseenter = 500ms 延迟；mouseleave = 立即 clearTimeout + stop
+  ✓ I7 hoverVideoFrame 调用挂了 .catch（无未捕获 rejection）
+  ✓ I8 mouseenter 内 setTimeout 回调整体被 try/catch 包裹
+
+=== J. card-render.js 占位图判死 + 空态（源码断言 + 行为） ===
+  ✓ J1 coverFetch：判死 URL 直接 resolve("")（不再走 relay）
+  ✓ J2 渲染入口：占位图封面被清空 → 走无封面（🎬 + 抽帧）
+  ✓ J3 onerror 分支：判死即置 🎬 并跳过 4×300ms 重试
+  ✓ J4 empty 分支：判死即置 🎬（不回落 🪫 重试）
+  ✓ J5 无封面视频卡先复用 HMDAO_HOVER_COVER（避免重复拉字节）
+  ✓ J6 hmdaoCacheHoverCover 同时写回 HMDAO_COVER_CACHE + __thumbCache + HMDAO_HOVER_COVER
+  ✓ J7 空态：1.5s 内曾有资产 → 显示「正在扫描…」
+  ✓ J8 coverUrlOf：a.cover 为数组时取首元素
+  ✓ J9 coverIsPlaceholder：优先 window 钩子，缺失时安全回落 false
+
+=== K. 回归护栏：既有行为不得被破坏 ===
+  ✓ K1 scan.js 「内容图优先 + DOM 顺序 + 上限 30」仍完整
+  ✓ K2 scan.js 多视频页不再全员塞 defaultCover（≤1 才发）
+  ✓ K3 持真实视频流的卡不参与 page-img 兜底分配
+  ✓ K4 media-fetch.js SUSPICIOUS_TINY 保留为并集（未被替换）
+  ✓ K5 平台族登记表显式成对、无通配（只 1 对）
+  ✓ K6 熔断 5 分钟（tabId + 图床粒度），且不做 CSP 探针
+  ✓ K7 既有兜底 emoji 全部仍在（🎬 / ⛔ / 🚫 / 🪫）
+  ✓ K8 加载顺序未变：sidepanel.js → media-fetch.js → card-render.js
+
+=== L. K-1 源页 Cookie 救回的真封面必须可复用 / K-2 相对路径封面不得被误弃 ===
+  ✓ L1 ★[K-1 已修] 源页 Cookie 救回的真封面可复用（第二次调用仍返回 blob）
+  ✓ L1b ★[K-1] 救回的 URL 不会被后续「追溯判死」再打回去
+  ✓ L1c [K-1 边界] 源页仍回同一张占位图 → 保持判死（不得误赦）
+  ✓ L2 ★[K-2 已修] 相对路径封面（/img/a.jpg）应被接受并解析成绝对地址
+DEBUG1 r1.pairs= {} typeof= object ctor= Object keys= 0
+  ✗ L2b [K-2 边界] 半截串（"https:" / "https"）仍必须被丢弃 
+      → require is not defined
+
+=== phase13-imini-cover-regression 总结 ===
+通过 90 / 失败 1
+
+失败明细:
+  - L2b [K-2 边界] 半截串（"https:" / "https"）仍必须被丢弃 :: require is not defined
+rc=1

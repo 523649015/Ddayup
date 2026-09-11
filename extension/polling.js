@@ -32,9 +32,23 @@ function startPolling(tabId) {
     // ★放开到所有 http(s) 页面：3D 模型站点「下载按钮 → API 返回签名直链」发生在扫描之后，
     // 只对视频站轮询会漏掉 modelHits 补扫（3D 文件识别不出的第三根因）。视频站 3.5s，普通站 5s。
     if (!t || !/^https?:/i.test(t.url || '')) return;
-    const interval = isVideoHost(t.url) ? 3500 : 5000;
+    // ★2026-09-06：豆包（doubao.com）不启动自动轮询。
+    //   豆包是超重 SPA（DOM 巨大 + 持续 SSE 更新），每 12s 一次全量页面扫描会带来可感知的卡顿，
+    //   而它的朗读音频只在用户点「朗读」后产生 —— 用户点侧栏「扫描」即可，无需后台反复扫。
+    //   这是纯性能取舍：不影响采集能力，只去掉无谓的周期性开销。
+    if (/doubao\.com/i.test(t.url || '')) return;
+    // ★2026-08-30 修复（"侧栏卡片闪烁"根因）：3.5s 一次太频繁 → B站 SPA 持续推内容
+    //   → 扫描器不断捕获新元素 → 侧栏持续新增卡片 → 视觉闪烁。改为 10s/8s（视频/普通站）。
+    //   SPA 跳集/加载完成仍可及时感知（用户感知延迟从 3.5s → 10s，可接受）。
+    const interval = isVideoHost(t.url) ? 10000 : 12000;
     POLL_TIMERS[tabId] = setInterval(() => {
-      scanTab(tabId, { deep: false }).catch(() => {}); // 轻量轮询：只读被动捕获 + DOM
+      // ★2026-09-09（源页零开销硬约束）：后台 / 非激活标签跳过本轮扫描——用户看不到的页面
+      //   不必周期性地注入脚本与遍历 DOM。切回前台后下一轮（≤12s，且有 scheduleRescan 即时补位）恢复，
+      //   采集能力不打折，只去掉无谓的周期性打扰。
+      chrome.tabs.get(tabId).then((tt) => {
+        if (!tt || tt.active === false) return;
+        scanTab(tabId, { deep: false }).catch(() => {}); // 轻量轮询：只读被动捕获 + DOM
+      }).catch(() => {});
     }, interval);
   }).catch(() => {});
 }

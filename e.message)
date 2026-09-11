@@ -1,0 +1,12 @@
+[eval]:1
+import('playwright').then(async ({chromium})= b=await chromium.launch();const p=await b.newPage();await p.goto('https://www.doubao.com/chat/38440356271895810?channel=move_tab',{waitUntil:'domcontentloaded',timeout:45000}).catch(e=,e.message));await p.waitForTimeout(4000);console.log('URL:',p.url());console.log('TITLE:',await p.title());const t=await p.evaluate(()=,400)).catch(e=;console.log('TEXT:',t);await b.close();})
+                                                ^^^^^
+Invalid assignment target
+
+SyntaxError: missing ) after argument list
+    at makeContextifyScript (node:internal/vm:194:14)
+    at compileScript (node:internal/process/execution:388:10)
+    at evalTypeScript (node:internal/process/execution:260:22)
+    at node:internal/main/eval_string:71:3
+
+Node.js v24.15.0

@@ -98,11 +98,14 @@ if (!process.env.HMDAO_SKIP_CURATOR) {
   const curatorDir = path.resolve(__dirname, '..', '..', 'tools', 'asset-curator-exe');
   const hasCurator = fs.existsSync(path.join(curatorDir, 'main.py'));
   if (hasCurator) {
+    // 探测必须覆盖「真正会用到的依赖」。只查 `python --version` 会误判：
+    // python 存在但缺 uvicorn/fastapi 时，启动后必然崩溃，并被 auto-restart 连拉 5 次，
+    // 控制台刷满红色错误，用户会误以为整个软件损坏。这里把依赖一次性探测完整。
     const py = (() => {
       for (const c of [process.env.HMDAO_CURATOR_PY, 'python', 'python3']) {
         if (!c) continue;
         try {
-          execSync(`"${c}" --version`, { stdio: 'ignore' });
+          execSync(`"${c}" -c "import uvicorn, fastapi"`, { stdio: 'ignore', timeout: 20000 });
           return c;
         } catch {
           /* try next */
@@ -119,11 +122,14 @@ if (!process.env.HMDAO_SKIP_CURATOR) {
       if (portBusy) {
         console.log('[dev-full] 9988 端口已被占用（资产采集器可能已在运行），跳过启动。');
       } else {
+        // curator 属于可选增强能力：崩溃后不再重启，避免错误刷屏掩盖主功能可用性。
         start(py, ['-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', '9988'],
-          'curator', { cwd: curatorDir });
+          'curator', { cwd: curatorDir, restart: false });
       }
     } else {
-      console.warn('[dev-full] 未找到 python，已跳过资产采集器后端（9988）。网络资产采集将不可用。');
+      console.warn('[dev-full] 未找到可用的 Python（需含 uvicorn + fastapi），已跳过资产采集器后端（9988）。');
+      console.warn('[dev-full] 网络资产采集暂不可用，其余功能不受影响。');
+      console.warn('[dev-full] 修复：pip install uvicorn fastapi，或用 HMDAO_CURATOR_PY 指定解释器路径。');
     }
   } else {
     console.warn('[dev-full] 未找到 tools/asset-curator-exe/main.py，已跳过资产采集器后端。');

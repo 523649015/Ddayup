@@ -12,7 +12,9 @@ export function registerDccRoutes(router, deps) {
     summarizeCurrentUnrealEnvironment,
     probeTcp,
     isUnrealDirectBridgeOnline,
-    UNREAL_DIRECT_BRIDGE,
+    getUserFromRequest,
+    getValidTokenForOwner,
+    getUnrealDirectBridge,
     DCC_RECORDING_LOCK,
     ENABLE_UNREAL_PIXEL_STREAMING_LEGACY,
     DEFAULT_UNREAL_PIXEL_URL,
@@ -65,11 +67,11 @@ export function registerDccRoutes(router, deps) {
           : 'websocket',
         wsPath: isUnreal ? '/ws/dcc/unreal' : '/ws/dcc-capture',
         directBridgeOnline: isUnreal
-          ? Boolean(pluginEngine?.host?.targetProjectRunning) && Boolean(pluginEngine?.plugin?.directBridgeOnline ?? isUnrealDirectBridgeOnline())
+          ? Boolean(pluginEngine?.host?.targetProjectRunning) && Boolean(pluginEngine?.plugin?.directBridgeOnline ?? isUnrealDirectBridgeOnline(getUnrealDirectBridge('local')))
           : undefined,
         directBridgeClientCount: isUnreal
           ? Boolean(pluginEngine?.host?.targetProjectRunning)
-            ? Number(pluginEngine?.plugin?.directBridgeClientCount ?? UNREAL_DIRECT_BRIDGE.browsers.size)
+            ? Number(pluginEngine?.plugin?.directBridgeClientCount ?? getUnrealDirectBridge('local').browsers.size)
             : 0
           : undefined,
         pluginInstalled: isUnreal ? Boolean(pluginEngine?.plugin?.installed) : undefined,
@@ -81,7 +83,7 @@ export function registerDccRoutes(router, deps) {
           ? (Boolean(pluginEngine?.host?.targetProjectRunning) ? Number(pluginEngine?.plugin?.cameraCount || 0) : 0)
           : undefined,
         projectPath: isUnreal ? (pluginEngine?.project?.path || null) : undefined,
-        directBridgePlugin: isUnreal && Boolean(pluginEngine?.host?.targetProjectRunning) ? UNREAL_DIRECT_BRIDGE.pluginInfo : undefined,
+        directBridgePlugin: isUnreal && Boolean(pluginEngine?.host?.targetProjectRunning) ? getUnrealDirectBridge('local').pluginInfo : undefined,
         pixelStreamingUrl: isUnreal && ENABLE_UNREAL_PIXEL_STREAMING_LEGACY ? DEFAULT_UNREAL_PIXEL_URL : undefined,
         remoteControlUrl: isUnreal ? DEFAULT_UNREAL_REMOTE_URL : undefined,
         installPath: id === 'blender'
@@ -158,8 +160,13 @@ export function registerDccRoutes(router, deps) {
   router.register('POST', '/api/dcc/plugins/action', dccEnvAction);
   async function dccEnvAction(req, res, url) {
     const payload = await readJson(req);
+    // 云端多用户隔离：用户主动 Connect 时，把当前登录用户的有效 token 通过参数透传到
+    // adapter 写连接意图文件，插件据此分桶 owner，避免串流他人引擎。
+    // 用参数透传（而非 globalThis 全局变量）彻底消除并发 Connect 请求交错时 token 串号隐患。
+    const owner = typeof getUserFromRequest === 'function' ? getUserFromRequest(req, payload) : null;
+    const ownerToken = owner && typeof getValidTokenForOwner === 'function' ? getValidTokenForOwner(owner) : '';
     try {
-      const result = await DCC_ENVIRONMENT_MANAGER.runAction(payload);
+      const result = await DCC_ENVIRONMENT_MANAGER.runAction(payload, { connectToken: ownerToken });
       return send(res, 200, result);
     } catch (error) {
       return send(res, 400, {

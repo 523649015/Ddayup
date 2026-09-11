@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DDUp 本地图像分析烟测</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #091018;
+        --panel: rgba(14, 25, 39, 0.92);
+        --panel-strong: rgba(19, 35, 54, 0.98);
+        --border: rgba(113, 170, 255, 0.28);
+        --text: #eef6ff;
+        --muted: #9fb7d6;
+        --ok: #54d38b;
+        --warn: #ffd267;
+        --bad: #ff7f7f;
+        --accent: #7ec8ff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top right, rgba(38, 91, 171, 0.32), transparent 32%),
+          radial-gradient(circle at left bottom, rgba(36, 164, 122, 0.18), transparent 30%),
+          linear-gradient(180deg, #07111c 0%, #091018 100%);
+      }
+
+      main {
+        max-width: 1280px;
+        margin: 0 auto;
+        padding: 32px 24px 48px;
+      }
+
+      .hero,
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 22px;
+        box-shadow: 0 20px 70px rgba(0, 0, 0, 0.28);
+        backdrop-filter: blur(18px);
+      }
+
+      .hero {
+        padding: 28px;
+        display: grid;
+        gap: 18px;
+      }
+
+      .badge {
+        width: fit-content;
+        padding: 6px 12px;
+        border-radius: 999px;
+        border: 1px solid rgba(126, 200, 255, 0.24);
+        color: var(--accent);
+        background: rgba(126, 200, 255, 0.1);
+        font-size: 12px;
+        letter-spacing: 0.08em;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(28px, 4vw, 42px);
+        line-height: 1.1;
+      }
+
+      .meta {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 12px;
+      }
+
+      .meta-item,
+      .summary-item {
+        padding: 14px 16px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+      }
+
+      .meta-label,
+      .summary-label,
+      .engine-label {
+        color: var(--muted);
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .meta-value,
+      .summary-value {
+        margin-top: 8px;
+        font-size: 15px;
+        word-break: break-word;
+      }
+
+      .status-ok,
+      .status-bad {
+        font-weight: 700;
+      }
+
+      .status-ok { color: var(--ok); }
+      .status-bad { color: var(--bad); }
+
+      .grid {
+        margin-top: 22px;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 18px;
+      }
+
+      .card {
+        padding: 20px;
+        display: grid;
+        gap: 14px;
+      }
+
+      .card-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .engine-name {
+        font-size: 20px;
+        font-weight: 700;
+      }
+
+      .pill {
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        background: rgba(84, 211, 139, 0.14);
+        color: var(--ok);
+        border: 1px solid rgba(84, 211, 139, 0.25);
+      }
+
+      .warnings {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .warning {
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        color: var(--warn);
+        background: rgba(255, 210, 103, 0.1);
+        border: 1px solid rgba(255, 210, 103, 0.22);
+      }
+
+      .section-title {
+        margin-top: 26px;
+        margin-bottom: 10px;
+        font-size: 18px;
+        color: var(--muted);
+      }
+
+      .summary-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 14px;
+      }
+
+      pre {
+        margin: 0;
+        padding: 16px;
+        border-radius: 16px;
+        background: rgba(4, 9, 15, 0.8);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        color: #cfe4ff;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 13px;
+        line-height: 1.55;
+      }
+
+      .empty {
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="hero">
+        <div class="badge">NO-KEY LOCAL SMOKE TEST</div>
+        <h1>Florence / Qwen 本地图像分析可用性验收</h1>
+        <div id="meta" class="meta"></div>
+      </section>
+
+      <div class="section-title">运行结果</div>
+      <section id="cards" class="grid"></section>
+
+      <div class="section-title">链路摘要</div>
+      <section id="summary" class="summary-grid"></section>
+
+      <div class="section-title">原始结果</div>
+      <pre id="raw">加载中...</pre>
+    </main>
+
+    <script>
+      const summaryPath = '/verification/local-image-analysis-smoke-summary.json';
+
+      const meta = document.getElementById('meta');
+      const cards = document.getElementById('cards');
+      const summary = document.getElementById('summary');
+      const raw = document.getElementById('raw');
+
+      function item(label, value, className = '') {
+        const div = document.createElement('div');
+        div.className = className || 'summary-item';
+        div.innerHTML = `
+          <div class="summary-label">${label}</div>
+          <div class="summary-value">${value ?? '<span class="empty">暂无</span>'}</div>
+        `;
+        return div;
+      }
+
+      function renderAnalysis(key, payload) {
+        const section = document.createElement('section');
+        section.className = 'card';
+        const warnings = Array.isArray(payload?.warnings) && payload.warnings.length
+          ? payload.warnings.map((warning) => `<span class="warning">${warning}</span>`).join('')
+          : '<span class="empty">无额外告警</span>';
+        section.innerHTML = `
+          <div class="card-head">
+            <div>
+              <div class="engine-label">${key}</div>
+              <div class="engine-name">${payload?.engine || '未返回引擎名'}</div>
+            </div>
+            <div class="pill">已调起</div>
+          </div>
+          <div class="summary-grid">
+            <div class="summary-item"><div class="summary-label">主体</div><div class="summary-value">${payload?.subject || '未返回'}</div></div>
+            <div class="summary-item"><div class="summary-label">风格</div><div class="summary-value">${payload?.style || '未返回'}</div></div>
+          </div>
+          <div class="summary-item">
+            <div class="summary-label">中文提示词</div>
+            <div class="summary-value">${payload?.promptZh || '未返回'}</div>
+          </div>
+          <div>
+            <div class="summary-label">运行痕迹</div>
+            <div class="warnings">${warnings}</div>
+          </div>
+        `;
+        return section;
+      }
+
+      async function load() {
+        try {
+          const response = await fetch(`${summaryPath}?t=${Date.now()}`);
+          const data = await response.json();
+          raw.textContent = JSON.stringify(data, null, 2);
+
+          meta.replaceChildren(
+            item('总体状态', data.success ? '<span class="status-ok">通过</span>' : '<span class="status-bad">失败</span>', 'meta-item'),
+            item('检测时间', data.checkedAt || '未知', 'meta-item'),
+            item('后端地址', data.apiUrl || '未知', 'meta-item'),
+            item('产物目录', data.artifactDir || '未知', 'meta-item'),
+          );
+
+          summary.replaceChildren(
+            item('Florence Runtime', data.runtimes?.florencePath || '未输出'),
+            item('Qwen Runtime', data.runtimes?.qwenPath || '未输出'),
+            item('Public Summary', data.publicSummaryPath || summaryPath),
+          );
+
+          cards.replaceChildren();
+          if (data.analyses) {
+            for (const [key, payload] of Object.entries(data.analyses)) {
+              cards.appendChild(renderAnalysis(key, payload));
+            }
+          }
+          if (!data.success && data.error) {
+            cards.appendChild(item('失败原因', data.error));
+          }
+        } catch (error) {
+          raw.textContent = String(error?.message || error);
+          meta.replaceChildren(item('总体状态', '<span class="status-bad">无法读取</span>', 'meta-item'));
+          cards.replaceChildren(item('读取失败', String(error?.message || error)));
+        }
+      }
+
+      load();
+    </script>
+  </body>
+</html>

@@ -61,6 +61,87 @@ function __hmdao_isDouyinExcluded() {
 }
 
 (function () {
+  // ★2026-09-05 修复（侧栏"卡一会多一会少 / 一会有封面一会没 / 集数跳变"根因）：
+  //   URL 变化（含 SPA 切集 jingxuan?modal_id=xxx）会【整体 delete】__hmdao_captures，
+  //   把按 awemeId 索引的封面/标题/集数/直链索引一并清零 → 侧栏卡数骤降、封面消失，
+  //   随后靠 API 一集一集慢慢重建（10s 轮询一轮）→ 表现为"闪烁、数量忽多忽少、封面时有时无"。
+  //   这些索引是【跨集有效的累积知识】（按 id 键控，不随播放会话失效），同页切集不该清。
+  //   只清"当前播放会话"相关的瞬时数组（dyUrls/dyUrlTs/dyAudios/dyAwemes/dyCovers/dyPlayback）。
+  // 按 awemeId 索引的累积知识键（切集保留；跨页/换站才清）
+  var HMDAO_INDEX_KEYS = ['dyCoverByAweme', 'dyFormatsByAweme', 'dyUrlsByAweme', 'dyEpisodeByAweme',
+    'dyTitlesByAweme', 'dyAudiosByAweme', 'dyVideoUrlByAweme', 'dyMixIdsByAweme'];
+
+  function hmdaoBaseCaps() {
+    return {
+      dyUrls: [], dyUrlTs: [], dyAudios: [], dyAwemes: [], dyCovers: [], dyPlayback: [],
+      tkUrls: [], tkAwemes: [], tkCovers: [], tkPlayback: [],
+      dyCoverByAweme: {}, dyFormatsByAweme: {}, dyUrlsByAweme: {}, dyEpisodeByAweme: {},
+      dyTitlesByAweme: {}, dyAudiosByAweme: {}, dyVideoUrlByAweme: {}, dyMixIdsByAweme: {},
+      curFirstFrame: null, curVideoSrc: '', curAwemeId: '', curCover: '',
+    };
+  }
+
+  // 同页导航判定：origin + pathname 相同，仅 query/hash 变化（jingxuan?modal_id= 切集即属此类）
+  function hmdaoSamePageNav(a, b) {
+    try {
+      var ua = new URL(String(a || ''), location.href);
+      var ub = new URL(String(b || ''), location.href);
+      return ua.origin === ub.origin && ua.pathname === ub.pathname;
+    } catch (_) { return false; }
+  }
+
+  function hmdaoResetCaptures(prevUrl, nextUrl) {
+    var old = (window.__hmdao_captures && typeof window.__hmdao_captures === 'object') ? window.__hmdao_captures : null;
+    var keepIndex = !!(old && hmdaoSamePageNav(prevUrl, nextUrl));
+    var fresh = hmdaoBaseCaps();
+    if (keepIndex) {
+      for (var i = 0; i < HMDAO_INDEX_KEYS.length; i++) {
+        var k = HMDAO_INDEX_KEYS[i];
+        if (old[k] && typeof old[k] === 'object') fresh[k] = old[k];
+      }
+      if (old.mixId) fresh.mixId = old.mixId;
+      if (old.mixName) fresh.mixName = old.mixName;
+      // 索引已保留 → 分辨率全量扫描无需重跑（避免每次切集重复扫）
+    } else {
+      try { window.__hmdao_dyFormatsFullScanDone = false; } catch (_) {}
+    }
+    try { delete window.__hmdao_captures; } catch (_) {}
+    window.__hmdao_captures = fresh;
+  }
+
+  // ★2026-09-05 修复（"第15集 · 第二十二集"自相矛盾根因）：
+  //   从标题/描述文本解析集数。标题是抖音自己下发的 desc，与卡片显示的标题同源，
+  //   用它派生的集数不可能与标题矛盾（此前用 API 数组下标，必然对不上）。
+  function hmdaoCn2Num(s) {
+    try {
+      var CN = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+      var t = String(s || '');
+      var total = 0, cur = 0, has = false;
+      for (var i = 0; i < t.length; i++) {
+        var ch = t[i];
+        if (ch === '十') { cur = (cur || 1) * 10; total += cur; cur = 0; has = true; }
+        else if (ch === '百') { cur = (cur || 1) * 100; total += cur; cur = 0; has = true; }
+        else if (CN[ch] != null) { cur = CN[ch]; has = true; }
+        else { has = false; break; }
+      }
+      if (!has) return 0;
+      return total + cur;
+    } catch (_) { return 0; }
+  }
+
+  function hmdaoParseEpisodeFromText(text) {
+    try {
+      var t = String(text || '');
+      var m = t.match(/第\s*([0-9]{1,4})\s*[集期话章回]/);
+      if (m) return parseInt(m[1], 10);
+      m = t.match(/第\s*([零〇一二两三四五六七八九十百]{1,6})\s*[集期话章回]/);
+      if (m) return hmdaoCn2Num(m[1]);
+      m = t.match(/[Ee][Pp]?\s*([0-9]{1,4})\b/);
+      if (m) return parseInt(m[1], 10);
+    } catch (_) {}
+    return 0;
+  }
+
   // ★2026-08-22 修复（98 条错卡根因）：SPA 路由/页面切换会重触发本 IIFE 注入，
   // 但窗口级 __hmdao_captures.dyUrls/dyAwemes 跨页面持续累积（旧 modal/旧搜索页的 CDN
   // 仍驻留数组），导致侧栏扫描时把跨页面的不同 aweme_id 全数 push 入资产表 → 98 张卡片，
@@ -74,8 +155,7 @@ function __hmdao_isDouyinExcluded() {
   //   任意一种情况触发清空：a) URL 已变化（SPA 切模态/切搜索/切合集）；b) 首注入但已有旧累积（重载扩展时 window.__hmdao_captures 残留）。
   if ((isFirstInject && window.__hmdao_captures && window.__hmdao_captures.dyUrls && window.__hmdao_captures.dyUrls.length) || isPageChanged) {
     try {
-      delete window.__hmdao_captures;
-      window.__hmdao_captures = { dyUrls: [], dyUrlTs: [], dyAudios: [], dyAwemes: [], dyCovers: [], dyPlayback: [], tkUrls: [], tkAwemes: [], tkCovers: [], tkPlayback: [], dyCoverByAweme: {}, dyFormatsByAweme: {}, curFirstFrame: null, curVideoSrc: '', curAwemeId: '', curCover: '' };
+      hmdaoResetCaptures(prevUrl, curUrl);
     } catch (_) {}
   }
   window.__hmdao_injected_url = curUrl;
@@ -87,12 +167,11 @@ function __hmdao_isDouyinExcluded() {
   // 仅注册一次（本 IIFE 首次跑，后续因 __hmdao_installed 早返回不再进入）。
   if (!window.__hmdao_spaNavHooked) {
     window.__hmdao_spaNavHooked = true;
-    const __hmdao_clearCaptures = () => {
+    // ★2026-09-05：同页切集（仅 modal_id 变化）保留按 awemeId 索引的累积知识，
+    //   只清当前播放会话的瞬时数组 —— 消除侧栏"卡数骤降/封面丢失/集数跳变"的闪烁。
+    const __hmdao_clearCaptures = (nextUrl) => {
       try {
-        delete window.__hmdao_captures;
-        window.__hmdao_captures = { dyUrls: [], dyUrlTs: [], dyAudios: [], dyAwemes: [], dyCovers: [], dyPlayback: [], tkUrls: [], tkAwemes: [], tkCovers: [], tkPlayback: [], dyCoverByAweme: {}, dyFormatsByAweme: {}, curFirstFrame: null, curVideoSrc: '', curAwemeId: '', curCover: '' };
-        // ★2026-09-01：换页必须重置"全量分辨率扫描"标记，否则新页面的 aweme 不会被重新索引
-        window.__hmdao_dyFormatsFullScanDone = false;
+        hmdaoResetCaptures(window.__hmdao_injected_url || '', nextUrl || location.href);
       } catch (_) {}
     };
     // ★2026-08-23 暴露给 background.scanTab()：重新扫描前主动清空累积，避免 SPA 不触发清空时残留旧 modal 捕获。
@@ -101,7 +180,7 @@ function __hmdao_isDouyinExcluded() {
       const newUrl = location.href;
       // 仅当 URL 真正变化才清空（避免首次/无关导航误清，抖音信息流滚动不改 URL 不触发）
       if (window.__hmdao_injected_url && window.__hmdao_injected_url !== newUrl) {
-        __hmdao_clearCaptures();
+        __hmdao_clearCaptures(newUrl);
         // ★2026-08-23 修复（问题1/3 根因）：MAIN world 里 chrome.runtime 不可用（chrome.* API
         //   仅在 ISOLATED/background 可用），旧代码 chrome.runtime.sendMessage 静默失败，
         //   SPA 导航通知从未送达 background。改为经 window.postMessage 跨 world 广播，
@@ -164,12 +243,17 @@ function __hmdao_isDouyinExcluded() {
         }
       } catch (_) {}
       const report = {
-        version: '2026.09.01-c',
+        version: '2026.09.04-a',
         injectedUrl: window.__hmdao_injected_url || '',
         curAwemeId: c.curAwemeId || '',
+        mixId: c.mixId || '',
+        mixName: c.mixName || '',
         dyUrlsCount: (c.dyUrls || []).length,
         dyAwemes: (c.dyAwemes || []).slice(-5),
         coverKeys,
+        titleKeys: Object.keys(c.dyTitlesByAweme || {}).slice(0, 20),
+        episodeKeys: c.dyEpisodeByAweme || {},
+        videoUrlByAwemeKeys: Object.keys(c.dyVideoUrlByAweme || {}).slice(0, 20),
         // ★2026-09-01 修正笔误：变量实际叫 fmtKeys（旧代码写成 formatKeys → ReferenceError，
         //   整个 __hmdao_diag 直接抛错、什么都输出不了）。键名仍对外保持 formatKeys。
         formatKeys: fmtKeys,
@@ -191,9 +275,9 @@ function __hmdao_isDouyinExcluded() {
   //   抖音 dyUrls/dyAwemes/curVideoSrc/curAwemeId 捕获【从未真正工作】，全部依赖这些字段的
   //   扫描/预览/去重/切集逻辑空转。改为：仅在尚未初始化时才建立完整结构，绝不覆盖。
   if (!window.__hmdao_captures) {
-    window.__hmdao_captures = { dyUrls: [], dyUrlTs: [], dyAudios: [], dyAwemes: [], dyCovers: [], dyPlayback: [], tkUrls: [], tkAwemes: [], tkCovers: [], tkPlayback: [], dyCoverByAweme: {}, dyFormatsByAweme: {}, curFirstFrame: null, curVideoSrc: '', curAwemeId: '', curCover: '' };
+    window.__hmdao_captures = { dyUrls: [], dyUrlTs: [], dyAudios: [], dyAwemes: [], dyCovers: [], dyPlayback: [], tkUrls: [], tkAwemes: [], tkCovers: [], tkPlayback: [], dyCoverByAweme: {}, dyFormatsByAweme: {}, dyUrlsByAweme: {}, dyEpisodeByAweme: {}, dyTitlesByAweme: {}, dyAudiosByAweme: {}, dyVideoUrlByAweme: {}, dyMixIdsByAweme: {}, curFirstFrame: null, curVideoSrc: '', curAwemeId: '', curCover: '' };
   } else if (typeof window.__hmdao_captures !== 'object') {
-    window.__hmdao_captures = { dyUrls: [], dyUrlTs: [], dyAudios: [], dyAwemes: [], dyCovers: [], dyPlayback: [], tkUrls: [], tkAwemes: [], tkCovers: [], tkPlayback: [], dyCoverByAweme: {}, dyFormatsByAweme: {}, curFirstFrame: null, curVideoSrc: '', curAwemeId: '', curCover: '' };
+    window.__hmdao_captures = { dyUrls: [], dyUrlTs: [], dyAudios: [], dyAwemes: [], dyCovers: [], dyPlayback: [], tkUrls: [], tkAwemes: [], tkCovers: [], tkPlayback: [], dyCoverByAweme: {}, dyFormatsByAweme: {}, dyUrlsByAweme: {}, dyEpisodeByAweme: {}, dyTitlesByAweme: {}, dyAudiosByAweme: {}, dyVideoUrlByAweme: {}, dyMixIdsByAweme: {}, curFirstFrame: null, curVideoSrc: '', curAwemeId: '', curCover: '' };
   } else {
     // 结构已存在但缺字段 → 补齐（防历史空对象 {} 残留）
     const caps = window.__hmdao_captures;
@@ -226,6 +310,268 @@ function __hmdao_isDouyinExcluded() {
   // 时，捕获到的抖音 CDN 才标记为"当前播放流"（isPlayback）；预加载态（paused 的视频卡）
   // 不捕获。抖音信息流视频不会自动播放（需点击），故 paused 判定可精确区分两者。
   let __hmdao_playing = null; // 当前正在播放的 <video> 元素
+  // ★2026-09-03：从页面播放器实例「实时」读取当前播放视频的真实 awemeId / 标题 / 封面。
+  //   背景：jingxuan modal 是 SPA，切集后 <script id=RENDER_DATA> 与详情 API 都不一定刷新，
+  //   旧逻辑靠 RENDER_DATA/列表 API 推断当前集，极易锁死在旧集（封面/标题不变、内容错配）。
+  //   window.player 是抖音 PC 网页播放器实例，切集后其内部状态【立即更新】，是最权威的当前集来源。
+  //   深搜其对象树找 awemeId（19 位数字）+ video，带节点数上限与 DOM 引用跳过，避免卡顿/爆栈。
+  // ★2026-09-03：从某个 video 对象里取第一个可播放直链（play_addr / download_addr 的 url_list[0]）。
+  //   播放器当前在播的视频对象本身就带着签名直链，比详情 API 更实时、更可靠（不依赖接口是否下发）。
+  function hmdaoFirstVideoUrl(v) {
+    if (!v || typeof v !== 'object') return '';
+    for (const key of ['play_addr', 'playAddr', 'download_addr', 'downloadAddr']) {
+      const u = v[key];
+      if (u && Array.isArray(u.url_list) && u.url_list.length) {
+        const s = String(u.url_list[0] || '').trim();
+        if (s) return s;
+      }
+    }
+    return '';
+  }
+  function hmdaoFindAwemeInPlayer() {
+    try {
+      const p = window.player;
+      if (!p || typeof p !== 'object') return null;
+      // ★2026-09-03 修正（推翻上一版做法）：
+      //   抖音 jingxuan 合集页的 modal_id 【就是当前正在播放那一集的真实 awemeId】。
+      //   实测证据：modal_id=7667779728996076846，而「第45集」的 awemeId 恰好也是 7667779728996076846。
+      //   上一版误以为它是"合集壳 ID"而用 `am !== modalId` 显式排除 → 真正的当前集被误杀
+      //   → curAwemeId 恒为空 → 侧栏高亮 / 📍未播放徽标 / 标题集数同步全部失效，且
+      //   scan.js 的 dyVideoUrlByAweme[pageCurAwemeId] 合成路径拿不到 key → 抖音视频卡一张都生不成。
+      //   正确策略：优先选 ≠modal_id 的候选（用户切集后当前集通常与初始 modal_id 不同）；
+      //   若一个都选不到（首次打开、播放器只挂了初始那集），再回退接受 modal_id 本身。
+      let modalId = '';
+      try { modalId = new URL(location.href).searchParams.get('modal_id') || ''; } catch (_) {}
+      const runSearch = (excludeModal) => {
+      const isRealAweme = (am) => am && /^\d{8,}$/.test(am) && (!excludeModal || am !== modalId);
+      let found = null;
+      let count = 0;
+      const seen = new WeakSet();
+      const skip = { ownerDocument: 1, document: 1, parentNode: 1, parentElement: 1, firstChild: 1,
+        childNodes: 1, nextSibling: 1, previousSibling: 1, children: 1 };
+      // ★跳过 React Fiber / 内部 DOM 引用，避免深搜爆栈/卡顿（抖音 PC 播放器是 React，window.player 链向整棵 Fiber 树）
+      const skipKey = (k) => skip[k] || /^(__react|reactFiber|_react|stateNode|memoized|pending|alternate|sibling|return$|_owner|internalInstanceHandle|__debug)/i.test(k);
+      const walk = (o, depth) => {
+        if (found || depth > 10 || count > 8000) return;
+        if (!o || typeof o !== 'object') return;
+        if (typeof o.nodeType === 'number') return; // 跳过 DOM 节点
+        try { if (seen.has(o)) return; seen.add(o); } catch (_) {}
+        count++;
+        try {
+          const am = (o.awemeId != null) ? String(o.awemeId) : (o.aweme_id != null ? String(o.aweme_id) : '');
+          const v = o.video;
+          // ★只认「真实集」(非合集 modal_id) 且带 video 对象的条目；video 对象存在说明是单条视频而非合集壳
+          if (isRealAweme(am) && v && typeof v === 'object') {
+            found = {
+              awemeId: am,
+              desc: (typeof o.desc === 'string' ? o.desc : (typeof o.caption === 'string' ? o.caption : '')),
+              cover: hmdaoPickCover(v),
+              videoUrl: hmdaoFirstVideoUrl(v),
+            };
+            return;
+          }
+        } catch (_) {}
+        try {
+          for (const k in o) {
+            if (skipKey(k)) continue;
+            if (count > 8000) break;
+            try { walk(o[k], depth + 1); } catch (_) {}
+          }
+        } catch (_) {}
+      };
+      // ★先试常见显式路径（快），再深搜兜底。显式路径（video/videoInfo/currentItem）是当前播放视频的最可能位置。
+      const probes = [p.video, p.videoInfo, p.currentVideo, p._videoInfo, p._data, p.data, p.config,
+        p._config, p.playerInfo, p._playerInfo, p.currentItem, p._state, p.state, p.getStats && p.getStats()];
+      for (const o of probes) {
+        if (found) break;
+        try {
+          const am = (o && o.awemeId != null) ? String(o.awemeId) : (o && o.aweme_id != null ? String(o.aweme_id) : '');
+          const v = o && o.video;
+          if (isRealAweme(am) && v && typeof v === 'object') {
+            found = { awemeId: am, desc: (typeof o.desc === 'string' ? o.desc : ''), cover: hmdaoPickCover(v), videoUrl: hmdaoFirstVideoUrl(v) };
+            break;
+          }
+        } catch (_) {}
+      }
+      if (!found) walk(p, 0);
+      return found;
+      };
+      // 第一轮排除 modal_id（优先拿"用户切过去的那一集"），第二轮不排除（兜底：modal_id 就是当前集）
+      return runSearch(true) || runSearch(false);
+    } catch (_) { return null; }
+  }
+
+  // ★2026-09-03：从播放列表面板读取「当前集」的绝对集数 + awemeId + 标题。
+  //   播放列表里每条项文字含「第 N 集」；带 active/current/playing 类（或 aria-current）的就是当前集。
+  //   这是对用户「标题要严格等于播放列表显示的绝对集数」的直接满足。
+  function hmdaoFindPlaylistEpisode() {
+    try {
+      const els = Array.from(document.querySelectorAll('a, li, div, span'));
+      let best = null;
+      for (const el of els) {
+        const t = (el.textContent || '').trim();
+        const m = t.match(/第\s*(\d+)\s*集/);
+        if (!m) continue;
+        const ep = parseInt(m[1], 10);
+        let aid = '';
+        const href = (el.getAttribute && el.getAttribute('href')) || '';
+        const mm = href.match(/\/video\/(\d+)/);
+        if (mm) aid = mm[1];
+        else {
+          for (const a of ['data-aweme-id', 'data-awemeid', 'data-id', 'data-cid', 'data-item-id']) {
+            const vv = el.getAttribute && el.getAttribute(a);
+            if (vv) { aid = vv; break; }
+          }
+        }
+        const cls = ((typeof el.className === 'string' ? el.className : '') + ' ' + (el.getAttribute && (el.getAttribute('aria-current') || ''))).toLowerCase();
+        const isActive = /active|current|playing|on\b|cur/.test(cls) || (el.getAttribute && el.getAttribute('aria-current') === 'true');
+        if (isActive) { best = { awemeId: aid, episode: ep, title: t }; break; }
+        if (!best) best = { awemeId: aid, episode: ep, title: t };
+      }
+      return best;
+    } catch (_) { return null; }
+  }
+
+  // ★2026-09-03：用 window.player 实时刷新「当前播放集」的 awemeId / 标题 / 封面。
+  //   在 __hmdao_refreshPlaying 与定时轮询里调用，保证切集后侧栏立刻跟到新集。
+  // ★2026-09-03：切集后自动触发侧栏重新扫描，让封面/标题/视频卡「立刻」跟随当前集刷新。
+  let hmdaoLastRescanAweme = '';
+  let hmdaoRescanTimer = null;
+  function hmdaoAutoRescanOnSwitch(newAwemeId) {
+    try {
+      if (!newAwemeId || newAwemeId === hmdaoLastRescanAweme) return;
+      hmdaoLastRescanAweme = newAwemeId;
+      // 防抖：切集瞬间可能多次刷新，合并成一次扫描；避免刷屏/死循环。
+      if (hmdaoRescanTimer) { try { clearTimeout(hmdaoRescanTimer); } catch (_) {} }
+      hmdaoRescanTimer = setTimeout(() => {
+        // ★2026-09-04 致命根因修复：inject-main 是 【MAIN world】脚本，没有 chrome.* API！
+        //   旧代码 `if (typeof chrome !== 'undefined' && chrome.runtime ...)` 在 MAIN 世界恒为假，
+        //   于是整段被静默跳过（连日志都没有）→ "切集自动重扫"从未生效 → 侧栏永远停在首集。
+        //   正确通道：dispatch window 自定义事件，由 rescan-bridge.js（ISOLATED 世界，有 chrome.*）
+        //   接收后转发给 background 的 HMDAO_RESCAN_TAB。
+        let bridged = false;
+        try {
+          window.dispatchEvent(new CustomEvent('hmdao:request-rescan', { detail: { awemeId: newAwemeId } }));
+          bridged = true;
+        } catch (_) {}
+        // 仍保留直连尝试（万一将来运行在 ISOLATED 世界），但失败必须打日志，不再静默吞掉
+        try {
+          if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+            chrome.runtime.sendMessage({ type: 'HMDAO_RESCAN_TAB' }).catch(() => {});
+          }
+        } catch (_) {}
+        try {
+          console.log('[HMDAO][inject] 请求重扫 newAwemeId=' + newAwemeId + ' 事件桥=' + (bridged ? '已派发' : '派发失败')
+            + ' chrome.runtime=' + (typeof chrome !== 'undefined' && chrome.runtime ? '可用' : '不可用(MAIN世界正常)'));
+        } catch (_) {}
+      }, 300);
+    } catch (_) {}
+  }
+  function hmdaoRefreshCurFromPlayer() {
+    try {
+      const caps = window.__hmdao_captures || (window.__hmdao_captures = {});
+      hmdaoRestoreCaps(); // 页面重载后先读回上轮集数元数据，避免 dyVideoUrlByAweme 归零
+      // ★2026-09-04 自动补拉合集剧集列表（解决"侧栏只有 1 张卡 / 没缩略图 / 没集数"）：
+      //   已知 mixId 且集数未拉满即触发；内部 30s 冷却 + 20 集上限防重，避免每次轮询重复拉 5 页。
+      //   关键修复：之前只在「切集(URL modal_id 变化)」分支触发，首次加载或重载同源页(已恢复 curAwemeId)
+      //   时该分支不进入 → 探测从不自动跑 → 只剩被动单视频详情抓到的 1 集。
+      try {
+        if (caps.mixId && !(caps.dyEpisodeByAweme && Object.keys(caps.dyEpisodeByAweme).length >= 20)) {
+          hmdaoTryFetchMixAweme(false);
+        }
+      } catch (_) {}
+      // ★2026-09-03 切集不同步【真凶修复】：优先用 URL 的 modal_id 判定"当前正在播放的那一集"。
+      //   实测证据（用户切集诊断）：切集时抖音会把 location.href 的 modal_id 更新为新的那一集
+      //   （7667779728996076846 → 7668131026677419327），但 window.player 对象常常取不到/滞后，
+      //   而上一版的兜底逻辑是 `if (!caps.curAwemeId)` 才触发 → curAwemeId 一旦设过就永远卡在旧集，
+      //   于是侧栏标题/封面/集数/高亮全部不跟随源页切换。
+      //   正确做法：只要 URL 的 modal_id 与当前记录的 curAwemeId 不同，就以 modal_id 为准（最权威、最及时）。
+      let mId = '';
+      try { mId = new URL(location.href).searchParams.get('modal_id') || new URL(location.href).searchParams.get('aweme_id') || ''; } catch (_) {}
+      if (mId && mId !== caps.curAwemeId) {
+        caps.curAwemeId = mId;
+        // 切集：清空上一集累积的分片直链（旧签名会过期 → "只有声音没画面"废卡）
+        try {
+          if (caps.__hmdaoLastClearedAweme !== mId) {
+            caps.__hmdaoLastClearedAweme = mId;
+            caps.dyUrls = [];
+            caps.dyAwemes = [];
+            caps.dyPlayback = [];
+            caps.dyUrlTs = [];
+          }
+        } catch (_) {}
+        hmdaoAutoRescanOnSwitch(mId);
+        console.log('[HMDAO][inject] curAwemeId 跟随 URL modal_id 切到新集=' + mId);
+        // mix_id 已知但剧集还没拉全时，补一次主动拉取（带防重：hmdaoMixProbeTried 上限 2 次）
+        setTimeout(() => { try { hmdaoTryFetchMixAweme(); } catch (_) {} }, 1200);
+        return true;
+      }
+      let found = hmdaoFindAwemeInPlayer();
+      // ★window.player 取不到时，用播放列表「当前集」DOM 项兜底（其 href 常含 /video/<真实 awemeId>）
+      if (!found || !found.awemeId) {
+        try {
+          const pl = hmdaoFindPlaylistEpisode();
+          if (pl && pl.awemeId) {
+            found = { awemeId: pl.awemeId, desc: pl.title || '', cover: '' };
+          }
+        } catch (_) {}
+      }
+      if (found && found.awemeId) {
+        // ★2026-09-03：切到「真实新的一集」时，清空上一集累积的 dyUrls 分片直链。
+        //   否则旧分片签名过期 → 视频轨 403、只剩配对 dashAudio 能响 → 侧栏出现一堆"没画面只有声音"的废卡。
+        //   只在真实 awemeId 跨集变化时才清（同集重复检测不清，避免正在播的流被误删）。
+        try {
+          if (caps.__hmdaoLastClearedAweme !== found.awemeId) {
+            caps.__hmdaoLastClearedAweme = found.awemeId;
+            caps.dyUrls = [];
+            caps.dyAwemes = [];
+            caps.dyPlayback = [];
+            caps.dyUrlTs = [];
+            console.log('[HMDAO][inject] 切集清空上一集 dyUrls 分片（新集=' + found.awemeId + '）');
+          }
+        } catch (_) {}
+        caps.curAwemeId = found.awemeId;
+        hmdaoAutoRescanOnSwitch(found.awemeId);
+        if (found.desc) { caps.dyTitlesByAweme = caps.dyTitlesByAweme || {}; caps.dyTitlesByAweme[found.awemeId] = found.desc; }
+        if (found.cover) { caps.dyCoverByAweme = caps.dyCoverByAweme || {}; caps.dyCoverByAweme[found.awemeId] = found.cover; }
+        // ★2026-09-03：直接从播放器当前 video 对象取到的视频直链（最实时，不依赖详情 API 是否下发 play_addr）。
+        //   写入 dyVideoUrlByAweme 后，即便 MSE 没暴露 fetch、dyUrls 为空，scan.js 也能合成当前集视频卡。
+        if (found.videoUrl) {
+          caps.dyVideoUrlByAweme = caps.dyVideoUrlByAweme || {};
+          caps.dyVideoUrlByAweme[found.awemeId] = found.videoUrl;
+        }
+        // 播放列表绝对集数（命中当前集时写入）
+        try {
+          const pl = hmdaoFindPlaylistEpisode();
+          if (pl && pl.episode && (pl.awemeId === found.awemeId || !pl.awemeId)) {
+            caps.dyEpisodeByAweme = caps.dyEpisodeByAweme || {};
+            caps.dyEpisodeByAweme[found.awemeId] = pl.episode;
+          }
+        } catch (_) {}
+        return true;
+      }
+      // ★2026-09-03 兜底（侧栏与源页脱节的最后一道防线）：
+      //   播放器对象与播放列表 DOM 都没定位到当前集时，curAwemeId 会一直空着 →
+      //   scan.js 的 dyVideoUrlByAweme[pageCurAwemeId] 合成路径拿不到 key → 抖音视频卡一张都生不成，
+      //   侧栏只剩"无 awemeId 的裸直链卡"，高亮/徽标/标题集数同步全部失效。
+      //   此时用「modal_id 命中已采集的某一集」兜底（jingxuan 页 modal_id 就是初始播放的那一集）。
+      try {
+        if (!caps.curAwemeId) {
+          let mId = '';
+          try { mId = new URL(location.href).searchParams.get('modal_id') || new URL(location.href).searchParams.get('aweme_id') || ''; } catch (_) {}
+          const vmap = caps.dyVideoUrlByAweme || {};
+          if (mId && vmap[mId]) {
+            caps.curAwemeId = mId;
+            hmdaoAutoRescanOnSwitch(mId);
+            console.log('[HMDAO][inject] curAwemeId 兜底：用 modal_id 命中已采集集 ' + mId);
+            return true;
+          }
+        }
+      } catch (_) {}
+    } catch (_) {}
+    return false;
+  }
+
   function __hmdao_refreshPlaying() {
     // ★2026-08-22 修复（抖音 jingxuan modal 单视频页 99 条错采根因）：
     // 抖音 modal 播放页底部「相关推荐」是 autoplay/muted 小卡片，paused=false / readyState>2 与主播放器无异，
@@ -262,6 +608,34 @@ function __hmdao_isDouyinExcluded() {
         } catch (_) {}
       });
     }
+    // ★2026-09-04 关键兜底（dyUrls 恒为 0、卡片没画面没声音的真凶）：
+    //   上面纯 DOM 的"主播放器"判定过严，实测在 jingxuan?modal_id= 页会把【主播放器误判成推荐位】：
+    //     · isRecommendation 里 closest('[class*="feed-item" i]') 等容器类名匹配（精选页主播放器
+    //       就处在这类 feed 容器中）；或 offsetWidth/Height 在首帧尚未布局时为 0，直接被 <300x200 判死。
+    //   → found 恒为 null → hmdaoCaptureDyStream 的
+    //       `if (!isPlaying && !infoFlowAllowPaused) return;`
+    //     把【所有真实视频流全部丢弃】。而诊断实证：v26-web.douyinvod.com 这些请求
+    //     返回 206 Partial Content 且响应体以 'ftypisom' 开头（真实 MP4 字节）——流明明在拉，
+    //     只是被这条守卫丢掉了，于是 dyUrls 永远是 0、侧栏只能拿到 MSE 的 blob（后台 fetch 必失败）。
+    //   修复：DOM 判定不出播放态时，改用 window.player（诊断确认 window.player.video 存在）兜底判定。
+    if (!found) {
+      try {
+        const p = window.player;
+        const pv = p && p.video;
+        if (pv && typeof pv === 'object' && typeof pv.tagName === 'string') {
+          const playingLike = (pv.paused === false) || (typeof pv.currentTime === 'number' && pv.currentTime > 0);
+          if (playingLike) found = pv;
+        }
+        // xgplayer 把播放态挂在 player 自身而非 player.video
+        if (!found && p && typeof p === 'object') {
+          const st = (p.isPlaying === true) || (p.paused === false)
+            || (typeof p.currentTime === 'number' && p.currentTime > 0)
+            || (p.videoInfo && p.videoInfo.isPlaying === true);
+          if (st && p.video && typeof p.video === 'object' && typeof p.video.tagName === 'string') found = p.video;
+          else if (st) found = p; // 至少让 isPlaying 为真（dyUrls 捕获只需要布尔判定）
+        }
+      } catch (_) {}
+    }
     __hmdao_playing = found;
     // ★2026-09-02 修复（"帧流兜底启动失败: __hmdao_playing is not defined"根因）：
     //   __hmdao_playing 定义在 IIFE 外层作用域（let，块级），但 __hmdaofs_getVideo() 在 L1110 的
@@ -286,9 +660,16 @@ function __hmdao_isDouyinExcluded() {
           const aid = window.__hmdao_captures.dyAwemes[matchedIdx];
           window.__hmdao_captures.curAwemeId = (aid && aid !== 'unknown') ? aid : '';
         } else {
-          window.__hmdao_captures.curAwemeId = ''; // 未匹配到（流尚未被捕获）→ 置空，scan.js 回退到末条
+          // ★2026-09-03：MSE/blob 场景下 currentSrc 不是真实 CDN URL，反查会失败。
+          //   此时用「最近捕获到的视频轨」对应的 awemeId 作为当前集兜底，避免 curAwemeId 空转。
+          const dyAwemes = window.__hmdao_captures.dyAwemes || [];
+          const lastAid = dyAwemes.length ? dyAwemes[dyAwemes.length - 1] : '';
+          window.__hmdao_captures.curAwemeId = (lastAid && lastAid !== 'unknown') ? lastAid : '';
         }
       }
+      // ★2026-09-03：window.player 是最权威的当前集来源（切集即更新），优先用它覆盖，
+      //   解决 RENDER_DATA/列表 API 锁死旧集导致的「封面标题不变 / 内容错配」。
+      try { hmdaoRefreshCurFromPlayer(); } catch (_) {}
     } catch (_) {}
   }
   function __hmdao_onVideoPlay(e) {
@@ -348,8 +729,18 @@ function __hmdao_isDouyinExcluded() {
       try { ctx.drawImage(v, 0, 0, targetW, targetH); } catch (_) { return; }
       if (wasPlaying && v.paused) {
         try {
-          const pr = v.play();
-          if (pr && pr.catch) pr.catch(() => {});
+          // ★2026-09-04：只恢复【主播放器】，绝不恢复"相关推荐"等小卡片视频。
+          //   抖音 modal 播放页底部的推荐位是 autoplay 小卡片（paused=false），
+          //   若被逐个当成播放态并 play()，就会出现"多个视频同时出声"（用户实测）。
+          //   主播放器判定：可见尺寸足够大（≥300x200），排除推荐位小卡片。
+          const rect = (v.getBoundingClientRect ? v.getBoundingClientRect() : null) || { width: 0, height: 0 };
+          const dw = v.offsetWidth || rect.width || 0;
+          const dh = v.offsetHeight || rect.height || 0;
+          const isMainPlayer = dw >= 300 && dh >= 200;
+          if (isMainPlayer) {
+            const pr = v.play();
+            if (pr && pr.catch) pr.catch(() => {});
+          }
         } catch (_) {}
       }
       const dataUrl = c.toDataURL('image/jpeg', 0.7);
@@ -489,20 +880,35 @@ function __hmdao_isDouyinExcluded() {
     if (!v || typeof v !== 'object') return out;
     const list = Array.isArray(v.bit_rate) ? v.bit_rate
       : (Array.isArray(v.bitRateList) ? v.bitRateList : []);
-    const seen = new Set();
+    // ★2026-09-02：按 label 去重。抖音 bitRateList 同档位（1080P/720P）有多个 CDN 备份 URL，
+    //   之前按 URL 去重 → 同一档位显示 N 次；现在 label 由 width×height 统一构造后变成同字串。
+    //   按 label 去重后弹窗清爽。备份 CDN 走另一条路（预览时 altDiv 备选源，见 sidepanel.js:1886）。
+    const seenLabels = new Set();
     const isAudioTrack = (u) => /(media-audio|audio|\.m4a|\.mp3|\.aac|ies-music)(\?|$)/i.test(u || '');
     const push = (label, url, isDefault) => {
       try {
-        if (!url || seen.has(url)) return;
+        if (!url || !label) return;
+        if (seenLabels.has(label)) return;
         if (isAudioTrack(url)) return; // 纯音频轨：无画面，不能作为分辨率选项
-        seen.add(url);
-        out.push({ label: String(label || '默认'), url: String(url).replace(/\\\//g, '/'), is_default: !!isDefault });
+        seenLabels.add(label);
+        out.push({ label: String(label), url: String(url).replace(/\\\//g, '/'), is_default: !!isDefault });
       } catch (_) {}
     };
     for (const br of list) {
       if (!br || typeof br !== 'object') continue;
-      const q = br.gear_name || br.quality_type || br.gearName
+      // ★2026-09-02：抖音 gearName（adapt_lowest_4_1 / low_540_0 / 720_1_1 等）原始字串，
+      //   侧栏 sidepanel.js:1904 humanizeResLabel 一个都不认，全部 fallback '抖音源'。
+      //   优先用宽高构造人话 label（实测 dump：br.width / br.height 直接可用，bitRate0=3840x2160），
+      //   humanizeResLabel 二次归一化为 '4K /1080P /720P' 等展示。保持 gearName 兜底以防宽高缺失。
+      let q = br.gear_name || br.quality_type || br.gearName
         || ('q' + (br.quality_value != null ? br.quality_value : ''));
+      const brW = br.width || (br.play_addr && br.play_addr.width) || (br.playAddr && br.playAddr.width);
+      const brH = br.height || (br.play_addr && br.play_addr.height) || (br.playAddr && br.playAddr.height);
+      if (brW && brH) {
+        const tier = brH >= 2160 ? '4K' : brH >= 1440 ? '2K' : brH >= 1080 ? '1080P'
+          : brH >= 720 ? '720P' : brH >= 540 ? '540P' : brH >= 480 ? '480P' : (brH + 'P');
+        q = tier + ' ' + brW + 'x' + brH;
+      }
       // 兼容 play_addr(下划线) 与 playAddr/PlayUrl(驼峰)
       const pu = br.play_addr || br.backup_play_addr || br.play_addr_h265 || br.download_addr
         || br.playAddr || br.PlayUrl;
@@ -535,6 +941,58 @@ function __hmdao_isDouyinExcluded() {
   // ★2026-09-01 封面提取（独立函数，供 RENDER_DATA 路径与「详情 API 响应」路径共用）。
   //   抖音封面字段在不同接口/版本下形态不一：字符串、{url_list:[]}、或直接是数组。
   //   统一在此收敛，避免在调用处各写一套导致漏字段。
+  // ★2026-09-03：把「按集索引的元数据」持久化到 sessionStorage（同标签页内跨重载存活）。
+  //   实测问题：dyVideoUrlByAweme 上一轮明明采到 12 集，切集/重载后变成 0 → 12 张卡一张都生不成，
+  //   侧栏只剩通用扫描捡到的"野卡"（title 竟然是网页标题「发现更多精彩视频 - 抖音搜索」）。
+  //   原因：window.__hmdao_captures 是页面级全局变量，页面一重载就清空；而合集列表 API
+  //   并非每次进页面都会重新请求（命中缓存就不再发网络请求 → fetch/xhr 钩子拦不到）。
+  //   sessionStorage 在同一标签页内可跨重载保留，正好兜住这个场景。带 2 小时 TTL 防止跨合集串数据。
+  const HMDAO_CAPS_KEY = '__hmdao_caps_v1';
+  const HMDAO_CAPS_TTL = 2 * 60 * 60 * 1000;
+  let __hmdaoCapsRestored = false;
+  function hmdaoRestoreCaps() {
+    if (__hmdaoCapsRestored) return;
+    __hmdaoCapsRestored = true;
+    try {
+      const raw = sessionStorage.getItem(HMDAO_CAPS_KEY);
+      if (!raw) return;
+      const box = JSON.parse(raw);
+      if (!box || !box.ts || (Date.now() - box.ts) > HMDAO_CAPS_TTL) return;
+      const d = box.data || {};
+      const caps = window.__hmdao_captures || (window.__hmdao_captures = {});
+      // ★2026-09-05：持久化盒里记录了 mixId 且与当前合集不同 → 这是上一个合集的数据，
+      //   恢复进来就是「切换合集后新旧封面来回跳动」的来源之一，直接丢弃。
+      if (d.mixId && caps.mixId && String(d.mixId) !== String(caps.mixId)) {
+        console.log('[HMDAO][inject] sessionStorage 缓存属于上一合集(' + d.mixId + ')，跳过恢复(当前=' + caps.mixId + ')');
+        return;
+      }
+      let n = 0;
+      for (const k of Object.keys(d)) {
+        if (d[k] && typeof d[k] === 'object' && !Array.isArray(d[k])) {
+          caps[k] = Object.assign({}, d[k], caps[k] || {});
+          n += Object.keys(d[k]).length;
+        }
+      }
+      console.log('[HMDAO][inject] 从 sessionStorage 恢复上轮集数元数据，键数=' + n);
+    } catch (_) {}
+  }
+  function hmdaoPersistCaps() {
+    try {
+      const caps = window.__hmdao_captures;
+      if (!caps) return;
+      const data = {
+        mixId: caps.mixId || '',
+        dyCoverByAweme: caps.dyCoverByAweme || {},
+        dyTitlesByAweme: caps.dyTitlesByAweme || {},
+        dyEpisodeByAweme: caps.dyEpisodeByAweme || {},
+        dyVideoUrlByAweme: caps.dyVideoUrlByAweme || {},
+        dyFormatsByAweme: caps.dyFormatsByAweme || {},
+        dyAudiosByAweme: caps.dyAudiosByAweme || {},
+      };
+      sessionStorage.setItem(HMDAO_CAPS_KEY, JSON.stringify({ ts: Date.now(), data }));
+    } catch (_) {}
+  }
+
   function hmdaoPickCover(v) {
     try {
       if (!v || typeof v !== 'object') return '';
@@ -543,12 +1001,25 @@ function __hmdao_isDouyinExcluded() {
         v.coverUrlList, v.cover169UrlList, v.originCoverUrlList,
         v.rawCover, v.blurCover,
       ].reduce((acc, x) => acc.concat(Array.isArray(x) ? x : (x ? [x] : [])), []);
+      // ★2026-09-03：封面绝不能是监控/埋点信标（mssdk.bytedance.com/web/common?msToken=...）。
+      //   这类 URL 会被当成缩略图传进 /api/media-proxy → 必然 404 → "视频卡缩略图显示失败"。
+      // ★2026-09-04 追加：封面绝不能是 HTML/JS/CSS 等【非图片资源】。
+      //   实测（用户控制台）：封面被填成
+      //     https://lf-zt.douyin.com/obj/uc-assets/zt/@byted/x-storage-web/4.0.5/dist/latest/index.html
+      //   这是 x-storage-web 的 iframe 页面（HTML 文档），被当成缩略图后
+      //   → /api/media-proxy 去拉 → 422 / ERR_BLOCKED_BY_RESPONSE → 缩略图永远显示不出来。
+      const badCover = (s) => /^https?:/i.test(s) === false
+        || /\.(html?|js|css|json|txt|xml|svg\+xml)(\?|#|$)/i.test(s)
+        || /(mssdk|msToken|ms_appid|slardar|apm\.|beacon|log-sdk|webid|tea\.|toblog|\/web\/common|monitor\.|\/monitor\/|report\.|\/report\?|metrics|\/collect\?|pixel\.)/i.test(s);
       for (const c of cands) {
-        if (typeof c === 'string' && /^https?:/i.test(c)) return c.replace(/\\\//g, '/');
+        if (typeof c === 'string' && /^https?:/i.test(c) && !badCover(c)) return c.replace(/\\\//g, '/');
         if (c && typeof c === 'object') {
-          if (Array.isArray(c.url_list) && c.url_list[0]) return String(c.url_list[0]).replace(/\\\//g, '/');
-          if (typeof c.src === 'string' && /^https?:/i.test(c.src)) return c.src.replace(/\\\//g, '/');
-          if (typeof c.url === 'string' && /^https?:/i.test(c.url)) return c.url.replace(/\\\//g, '/');
+          if (Array.isArray(c.url_list) && c.url_list[0]) {
+            const s0 = String(c.url_list[0]).replace(/\\\//g, '/');
+            if (!badCover(s0)) return s0;
+          }
+          if (typeof c.src === 'string' && /^https?:/i.test(c.src) && !badCover(c.src)) return c.src.replace(/\\\//g, '/');
+          if (typeof c.url === 'string' && /^https?:/i.test(c.url) && !badCover(c.url)) return c.url.replace(/\\\//g, '/');
         }
       }
     } catch (_) {}
@@ -561,64 +1032,526 @@ function __hmdao_isDouyinExcluded() {
   //   当前视频的 bitRateList / cover / desc 全都在这类 XHR 详情接口的响应体里。
   //   而旧 fetch 钩子在抖音页只捕获 URL 就 return 透传，从不读响应体
   //   → dyCoverByAweme / dyFormatsByAweme 恒空 → 卡片无封面、无分辨率选项。
-  function hmdaoCaptureDyDetail(j) {
+  // ★2026-09-04 降噪计数器（见 hmdaoCaptureDyDetail else 分支）
+  const hmdaoZeroHitWarned = {};
+  let hmdaoZeroHitWarnedCount = 0;
+
+  // ★2026-09-04 主动拉取合集剧集列表 —— 当下核心问题（合集侧栏只有 1 张卡、无缩略图/标题/集数）的直接解法。
+  //   被动拦截只有在用户手动打开「选集」面板时才能看到 /mix/aweme/ 的响应；
+  //   现在一旦知道 mix_id 就主动调一次。策略（全部在页面主世界 fetch，自动带登录 Cookie）：
+  //     ① 直接 GET（实测部分场景无需签名）
+  //     ② window.byted_acrawler.frontierSign(url) 签名后重试（X-Bogus 以查询参数附加）
+  //     ③ 都失败 → 静默放弃，保留被动拦截兜底，不打扰用户
+  //   成功的响应直接交给 hmdaoCaptureDyDetail 解析（它已支持 aweme_list + 按数组下标编集数），
+  //   于是 dyVideoUrlByAweme / dyCoverByAweme / dyTitlesByAweme / dyEpisodeByAweme 一次补齐，
+  //   scan.js 的「合集批量合成」自然把 N 张带缩略图/标题/集数的卡建出来。
+  let hmdaoMixProbeTried = 0;
+  let hmdaoLastMixProbeTs = 0; // ★2026-09-04：30s 冷却，避免每次轮询重复拉 5 页
+
+  // 多来源猜 mix_id：①已捕获 ②RENDER_DATA ③window.player ④页面上的 /collection/ 链接
+  function hmdaoGuessMixId(caps) {
     try {
+      if (caps.mixId) return String(caps.mixId);
+      // URL 查询参数兜底：合集页有时直接把 mix_id / collection_id 带在地址栏
+      try {
+        const u = new URL(location.href);
+        const qid = u.searchParams.get('mix_id') || u.searchParams.get('collection_id') || u.searchParams.get('playlist_id') || u.searchParams.get('series_id');
+        if (qid) return String(qid);
+      } catch (_) {}
+      const el = document.querySelector('script#RENDER_DATA, script[id="RENDER_DATA"]');
+      if (el && el.textContent) {
+        const d = JSON.parse(decodeURIComponent(el.textContent));
+        const app = d && d.app;
+        const vd = app && app.videoDetail;
+        const mi = (vd && (vd.mixInfo || vd.mix_info)) || (app && (app.mixInfo || app.mix_info)) || null;
+        const id = mi && (mi.mixId || mi.mix_id);
+        if (id) return String(id);
+      }
+    } catch (_) {}
+    try {
+      const p = window.player;
+      const cands = [(p && p.videoInfo && (p.videoInfo.mixInfo || p.videoInfo.mix_info)),
+        (p && p.video && (p.video.mixInfo || p.video.mix_info)),
+        (p && (p.mixInfo || p.mix_info))];
+      for (const mi of cands) { const id = mi && (mi.mixId || mi.mix_id); if (id) return String(id); }
+    } catch (_) {}
+    try {
+      const a = document.querySelector('a[href*="/collection/"]');
+      if (a) {
+        const m = String(a.getAttribute('href') || '').match(/\/collection\/(\d+)/);
+        if (m) return m[1];
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function hmdaoTryFetchMixAweme(verbose, force) {
+    try {
+      const caps = window.__hmdao_captures || (window.__hmdao_captures = {});
+      const mid = hmdaoGuessMixId(caps);
+      if (mid && !caps.mixId) caps.mixId = mid;
+      // ★2026-09-04：30s 冷却 + 20 集上限，避免每次轮询都重复拉 5 页 / 已拉满还拉。
+      if (!force && hmdaoLastMixProbeTs && (Date.now() - hmdaoLastMixProbeTs) < 30000) {
+        if (verbose) console.log('[HMDAO][mix] 冷却中(<30s)，跳过主动拉取');
+        return false;
+      }
+      const epCount = Object.keys(caps.dyEpisodeByAweme || {}).length;
+      if (epCount >= 20) { if (verbose) console.log('[HMDAO][mix] 已足 20 集，跳过'); return true; }
+      if (verbose) {
+        console.log('[HMDAO][mix] 状态 → mixId=' + (mid || '(空)')
+          + ' mixName=' + (caps.mixName || '(空)')
+          + ' 已尝试=' + hmdaoMixProbeTried
+          + ' 已有集数=' + epCount
+          + ' 直链键数=' + Object.keys(caps.dyVideoUrlByAweme || {}).length);
+      }
+      if (!mid) {
+        if (verbose) console.warn('[HMDAO][mix] 拿不到 mix_id → 无法拉取剧集列表（合集页需先打开/播放一次）');
+        return false;
+      }
+      if (!force && hmdaoMixProbeTried >= 2) {
+        if (verbose) console.warn('[HMDAO][mix] 已自动尝试 2 次均失败 → 跳过。强制重试：__hmdao_tryMix(true, true)');
+        return false;
+      }
+      // ★2026-09-05 移除旧的「已有 2 集就不再拉」早退：它导致合集列表【永远只补到被动
+      //   捕获的 2~3 集】→ 侧栏视频卡数量（1~3 张）远少于合集总集数（42/99 集）。
+      //   现在只要 epCount < 20 就一次性把列表拉完（下方 has_more 分页）。
+      hmdaoLastMixProbeTs = Date.now();
+      hmdaoMixProbeTried++;
+      let pages = 0;
+      const grab = (cursor, tag, extraQs) => {
+        let base = '/aweme/v1/web/mix/aweme/?device_platform=webapp&aid=6383&version_code=170400'
+          + '&mix_id=' + encodeURIComponent(mid) + '&cursor=' + cursor + '&count=20';
+        if (extraQs) base += '&' + extraQs;
+        return fetch(base, { credentials: 'include' })
+          .then((r) => {
+            if (verbose) console.log('[HMDAO][mix] ' + tag + ' → HTTP ' + r.status);
+            return r.ok ? r.json() : null;
+          })
+          .then((j) => {
+            if (!j) { if (verbose) console.warn('[HMDAO][mix] ' + tag + ' 响应非 JSON 或请求失败'); return false; }
+            const list = Array.isArray(j.aweme_list) ? j.aweme_list : null;
+            if (verbose) {
+              console.log('[HMDAO][mix] ' + tag + ' 顶层键=' + Object.keys(j).slice(0, 14).join(',')
+                + ' | status_code=' + j.status_code + ' | aweme_list=' + (list ? list.length : '无'));
+            }
+            if (!list || !list.length) return false;
+            hmdaoCaptureDyDetail(j, base);
+            pages++;
+            console.log('[HMDAO][mix] ✅ ' + tag + ' 第' + pages + '页：' + list.length + ' 集，has_more=' + !!j.has_more);
+            hmdaoPersistCaps();
+            // ★2026-09-05：5 页(100集)上限不够长合集（实测 133 集），放宽到 10 页(200集)
+            if (j.has_more && pages < 10) {
+              const nc = (j.cursor != null) ? j.cursor : (pages * 20);
+              return grab(String(nc), tag, extraQs);
+            }
+            return true;
+          })
+          .catch((e) => { if (verbose) console.warn('[HMDAO][mix] ' + tag + ' 异常：' + (e && e.message)); return false; });
+      };
+      grab(0, 'unsigned').then((ok) => {
+        if (ok) return;
+        try {
+          const s = window.byted_acrawler;
+          if (s && typeof s.frontierSign === 'function') {
+            const sg = s.frontierSign('/aweme/v1/web/mix/aweme/?mix_id=' + mid);
+            if (verbose) console.log('[HMDAO][mix] frontierSign 返回键=' + (sg ? Object.keys(sg).join(',') : '(空)'));
+            if (sg && typeof sg === 'object' && Object.keys(sg).length) {
+              const q = Object.keys(sg).map((k) => k + '=' + encodeURIComponent(sg[k])).join('&');
+              return grab(0, 'frontierSign', q);
+            }
+          } else if (verbose) {
+            console.warn('[HMDAO][mix] window.byted_acrawler.frontierSign 不存在 → 无签名可用，只能靠被动拦截');
+          }
+        } catch (e) { if (verbose) console.warn('[HMDAO][mix] 签名分支异常：' + (e && e.message)); }
+      });
+      return true;
+    } catch (e) {
+      if (verbose) console.warn('[HMDAO][mix] 顶层异常：' + (e && e.message));
+      return false;
+    }
+  }
+  // 诊断手动触发：__hmdao_tryMix(true) 打印详情；__hmdao_tryMix(true, true) 强制重试
+  window.__hmdao_tryMix = hmdaoTryFetchMixAweme;
+  // ★2026-09-05：供 background.scanTab 在检测到「切换合集」时调用 —— 清掉上一合集的
+  //   封面/标题/集数/直链索引与主动拉取计数，防止旧合集卡片混进新合集侧栏。
+  window.__hmdao_reset_collection_index = function () {
+    try {
+      const caps = window.__hmdao_captures || (window.__hmdao_captures = {});
+      for (const ik of ['dyCoverByAweme', 'dyFormatsByAweme', 'dyUrlsByAweme', 'dyEpisodeByAweme',
+        'dyTitlesByAweme', 'dyAudiosByAweme', 'dyVideoUrlByAweme', 'dyMixIdsByAweme']) caps[ik] = {};
+      hmdaoMixProbeTried = 0;
+      hmdaoLastMixProbeTs = 0;
+    } catch (_) {}
+  };
+
+  function hmdaoCaptureDyDetail(j, reqUrl) {
+    try {
+      hmdaoRestoreCaps(); // 页面重载后先把上轮采集到的集数元数据读回来
       if (!j || typeof j !== 'object') return;
+      // ★2026-09-03：合集列表 API 会返回 aweme_list/awemeList/item_list/items 等数组，
+      //   其中顺序就是播放列表的「第 1 集 / 第 2 集 …」。按数组下标 + URL 分页偏移建立 awemeId → 绝对集数 索引。
+      const arrays = [];
+      if (j.aweme_detail) arrays.push([j.aweme_detail]);
+      if (j.awemeDetail) arrays.push([j.awemeDetail]);
+      if (Array.isArray(j.aweme_list)) arrays.push(j.aweme_list);
+      if (Array.isArray(j.awemeList)) arrays.push(j.awemeList);
+      if (Array.isArray(j.data)) arrays.push(j.data);
+      if (Array.isArray(j.item_list)) arrays.push(j.item_list);
+      if (Array.isArray(j.items)) arrays.push(j.items);
+      // ★2026-09-04 修复：jingxuan 精选页等场景详情走 /aweme/v2/web/module/feed/ 这类模块化接口，
+      //   响应把 aweme 数组包在 module_list / cards / feeds / contents / results 等嵌套字段里，
+      //   旧逻辑只认顶层 aweme_list/data → 解析到 0 条 → 批量模式下所有集数卡都没有标题/封面。
+      if (Array.isArray(j.module_list)) arrays.push(j.module_list);
+      if (Array.isArray(j.moduleList)) arrays.push(j.moduleList);
+      if (Array.isArray(j.cards)) arrays.push(j.cards);
+      if (Array.isArray(j.feeds)) arrays.push(j.feeds);
+      if (Array.isArray(j.contents)) arrays.push(j.contents);
+      if (Array.isArray(j.results)) arrays.push(j.results);
+      // 兜底：再浅层递归（深度 2）扫一遍，避免未来接口字段改名。
+      try {
+        const findAwemeArrays = (obj, depth) => {
+          if (!obj || typeof obj !== 'object' || depth <= 0) return [];
+          const out = [];
+          for (const v of Object.values(obj)) {
+            if (Array.isArray(v) && v.length && v.some((x) => x && (x.aweme_id != null || x.awemeId != null || x.video))) out.push(v);
+            else if (v && typeof v === 'object' && !Array.isArray(v)) out.push(...findAwemeArrays(v, depth - 1));
+          }
+          return out;
+        };
+        const seen = new Set(arrays);
+        for (const arr of findAwemeArrays(j, 2)) { if (!seen.has(arr)) { arrays.push(arr); seen.add(arr); } }
+      } catch (_) {}
       const list = [];
-      if (j.aweme_detail) list.push(j.aweme_detail);
-      if (j.awemeDetail) list.push(j.awemeDetail);
-      if (Array.isArray(j.aweme_list)) j.aweme_list.forEach((x) => list.push(x));
-      if (Array.isArray(j.awemeList)) j.awemeList.forEach((x) => list.push(x));
-      if (Array.isArray(j.data)) j.data.forEach((x) => list.push(x));
-      if (Array.isArray(j.item_list)) j.item_list.forEach((x) => list.push(x));
-      if (Array.isArray(j.items)) j.items.forEach((x) => list.push(x));
+      arrays.forEach((arr) => arr.forEach((x) => list.push(x)));
       const caps = window.__hmdao_captures || (window.__hmdao_captures = {});
       caps.dyCoverByAweme = caps.dyCoverByAweme || {};
       caps.dyFormatsByAweme = caps.dyFormatsByAweme || {};
       caps.dyTitlesByAweme = caps.dyTitlesByAweme || {};
+      caps.dyEpisodeByAweme = caps.dyEpisodeByAweme || {};
       let hit = 0;
-      for (const a of list) {
-        if (!a || typeof a !== 'object') continue;
-        const id = (a.awemeId != null) ? String(a.awemeId)
-          : (a.aweme_id != null ? String(a.aweme_id) : '');
-        const v = a.video;
-        if (!id || !v) continue;
-        const cov = hmdaoPickCover(v);
-        if (cov) caps.dyCoverByAweme[id] = cov;
-        const fmts = hmdaoExtractVideoFormats(v);
-        if (fmts.length) caps.dyFormatsByAweme[id] = fmts;
-        if (a.desc) caps.dyTitlesByAweme[id] = String(a.desc);
-        // ★2026-09-01 诊断：记录【详情 API 里 video 对象的真实结构】。
-        //   实测现象：dyCoverByAweme 有值（封面取得到）但 dyFormatsByAweme 为空 →
-        //   说明 hmdaoExtractVideoFormats 没认出该 video 的分辨率字段形态。
-        //   把 video 的键名与关键子结构原样落盘，据此按真实数据修正提取逻辑（不靠猜）。
+      // ★2026-09-03：只有「单条详情响应」才用来更新 curAwemeId；
+      //   合集/列表 API 会返回多集，取最后一集当 current 会错配（如播放第10集时列表返回 8~13）。
+      const isSingleDetail = !!(j.aweme_detail || j.awemeDetail);
+      // 合集/播放列表 API 判定：响应含 mix_info / mixInfo / mix_id，或 URL 含 mix/collection/series/playlist
+      const reqUrlStr = String(reqUrl || '');
+      const hasMixTop = !!(j.mix_info || j.mixInfo || j.mix_id || j.mixId
+        || j.collection_info || j.collectionInfo || j.playlist_info || j.playlistInfo
+        || j.series_info || j.seriesInfo);
+      const urlLikeMix = /\/(mix|collection|series|playlist)\/|mix[_-]id|collection[_-]id|series[_-]id|playlist[_-]id/i.test(reqUrlStr);
+      // 列表项本身带 mix_info 也视为合集（部分接口把 mix 信息挂在 item 上）
+      const anyItemMix = list.some((x) => x && (x.mix_info || x.mixInfo || x.mix_id || x.mixId));
+      const isCollectionList = hasMixTop || urlLikeMix || anyItemMix;
+      // 分页偏移：抖音合集接口常用 cursor / offset 参数
+      let listOffset = 0;
+      try {
+        const u = new URL(reqUrl || '', location.href);
+        const off = parseInt(u.searchParams.get('cursor') || u.searchParams.get('offset') || '0', 10);
+        if (!isNaN(off) && off > 0) listOffset = off;
+      } catch (_) {}
+      for (const arr of arrays) {
+        for (let idx = 0; idx < arr.length; idx++) {
+          let a = arr[idx];
+          if (!a || typeof a !== 'object') continue;
+          // ★2026-09-04 修复（搜索页/推荐流"一个都抓不到"的真凶）：
+          //   抖音搜索结果、推荐流、聚合列表的每一项形如
+          //     { type: 1, aweme_info: { aweme_id, video, desc, ... } }
+          //   真实 aweme 被【包在 aweme_info（或 aweme / item）里】，顶层既没有 aweme_id 也没有 video
+          //   → 下面的 `if (!id || !v) continue` 会把每一项统统跳过
+          //   → dyVideoUrlByAweme / dyCoverByAweme / dyTitlesByAweme 恒为 0
+          //   → 卡片无封面、无标题、无集数，且只能拿到 MSE 的 blob 直链（后台 fetch 必然失败 → "没画面没声音"）。
+          //   必须先解包再取字段。
+          if (a.aweme_id == null && a.awemeId == null) {
+            const wrap = a.aweme_info || a.awemeInfo || a.aweme || a.item || a.data || null;
+            if (wrap && typeof wrap === 'object' && (wrap.aweme_id != null || wrap.awemeId != null || wrap.video)) a = wrap;
+          }
+          const id = (a.awemeId != null) ? String(a.awemeId)
+            : (a.aweme_id != null ? String(a.aweme_id) : '');
+          const v = a.video;
+          if (!id || !v) continue;
+          const cov = hmdaoPickCover(v);
+          if (cov) caps.dyCoverByAweme[id] = cov;
+          const fmts = hmdaoExtractVideoFormats(v);
+          if (fmts.length) caps.dyFormatsByAweme[id] = fmts;
+          if (a.desc) caps.dyTitlesByAweme[id] = String(a.desc);
+          // ★2026-09-03：存当前集的「视频轨直链」（play_addr.url_list[0]）。
+          //   抖音 MSE 播放时视频分片常不经过可被拦截的 fetch → dyUrls 经常为空（导致预览"没画面"）。
+          //   但详情 API 的 play_addr 是平台本次下发的签名直链，按真实 awemeId 索引后，
+          //   即便 dyUrls 为空，scan.js 也能用它对当前集拼出可播放/可预览的视频卡。
+          try {
+            const vu = (v.play_addr && v.play_addr.url_list && v.play_addr.url_list[0])
+              || (v.playAddr && v.playAddr.url_list && v.playAddr.url_list[0])
+              || (v.download_addr && v.download_addr.url_list && v.download_addr.url_list[0]) || '';
+            if (vu) {
+              caps.dyVideoUrlByAweme = caps.dyVideoUrlByAweme || {};
+              caps.dyVideoUrlByAweme[id] = String(vu);
+            }
+          } catch (_) {}
+          // ★2026-09-05 修复（"视频 · 第15集 · 第二十二集 菩提破阵救悟空"自相矛盾根因）：
+          //   集数此前 = listOffset + idx + 1，即「API 返回数组下标 + cursor 查询参数」。
+          //   但抖音合集列表的 cursor 是【分页游标】而非线性集数，且列表常以当前集为中心
+          //   返回窗口（播第 22 集时返回 20~25）→ 下标 1..6 被当成第 1..6 集，
+          //   与同一对象 desc 里的「第二十二集」直接冲突 —— 标题与集数各说各话。
+          //   权威顺序：① desc 里的「第N集」（与卡片标题同源，必然自洽）
+          //             ② mix_info.current_episode（抖音自己标注的合集内集数，权威）
+          //             ③ API 数组下标（仅兜底、只填补不覆盖）
+          const epFromDesc = hmdaoParseEpisodeFromText(a.desc || a.title || '');
+          const epFromMix = (function () {
+            try {
+              const mi = a.mix_info || a.mixInfo || null;
+              const ce = mi ? (mi.current_episode != null ? mi.current_episode : mi.currentEpisode) : null;
+              return (ce != null && Number(ce) > 0) ? Number(ce) : 0;
+            } catch (_) { return 0; }
+          })();
+          const epFromList = (isCollectionList && arr.length > 1 && !isSingleDetail) ? (listOffset + idx + 1) : 0;
+          const epFinal = epFromDesc || epFromMix;
+          if (epFinal || epFromList) {
+            caps.dyEpisodeByAweme = caps.dyEpisodeByAweme || {};
+            if (epFinal) caps.dyEpisodeByAweme[id] = epFinal;
+            else if (caps.dyEpisodeByAweme[id] == null) caps.dyEpisodeByAweme[id] = epFromList;
+          }
+          // ★2026-09-05：记录该 aweme 归属的合集 id，供 scan.js 过滤"非本合集的 feed 脏数据"
+          if (isCollectionList) {
+            try {
+              const mixOfItem = (a.mix_info && (a.mix_info.mix_id || a.mix_info.mixId))
+                || (a.mixInfo && (a.mixInfo.mix_id || a.mixInfo.mixId))
+                || (j.mix_info && (j.mix_info.mix_id || j.mix_info.mixId))
+                || (j.mixInfo && (j.mixInfo.mix_id || j.mixInfo.mixId))
+                || j.mix_id || j.mixId || caps.mixId || '';
+              if (mixOfItem) {
+                caps.dyMixIdsByAweme = caps.dyMixIdsByAweme || {};
+                if (!caps.dyMixIdsByAweme[id]) caps.dyMixIdsByAweme[id] = String(mixOfItem);
+              }
+            } catch (_) {}
+          }
+          // ★2026-09-01 诊断：记录【详情 API 里 video 对象的真实结构】。
+          try {
+            caps.__dyVideoShapeDiag = caps.__dyVideoShapeDiag || [];
+            if (caps.__dyVideoShapeDiag.length < 4) {
+              caps.__dyVideoShapeDiag.push({
+                id,
+                keys: Object.keys(v).slice(0, 60),
+                has_bit_rate: Array.isArray(v.bit_rate),
+                has_bitRateList: Array.isArray(v.bitRateList),
+                bitRateListLen: Array.isArray(v.bitRateList) ? v.bitRateList.length : 0,
+                bitRateList0Keys: (Array.isArray(v.bitRateList) && v.bitRateList[0]) ? Object.keys(v.bitRateList[0]).slice(0, 20) : [],
+                has_play_addr: !!(v.play_addr && v.play_addr.url_list && v.play_addr.url_list.length),
+                play_addr0: (v.play_addr && v.play_addr.url_list && v.play_addr.url_list[0]) ? String(v.play_addr.url_list[0]).slice(0, 70) : '',
+                has_download_addr: !!(v.download_addr && v.download_addr.url_list && v.download_addr.url_list.length),
+                has_playAddr: !!v.playAddr,
+                fmtsLen: fmts.length,
+              });
+            }
+          } catch (_) {}
+          // ★2026-09-03：单条详情才更新 curAwemeId（它代表当前播放的这 1 集）；
+          //   列表只用来补全各集元数据/绝对集数，避免 curAwemeId 被列表最后一集污染。
+          if (isSingleDetail || arr.length === 1) caps.curAwemeId = id;
+          // ★2026-09-04：单条详情里的 mix_info 是「当前合集」的权威标识（mix_id/合集名）
+          try {
+            if (isSingleDetail) {
+              const mi = a.mix_info || a.mixInfo;
+              if (mi && typeof mi === 'object') {
+                const mid = String(mi.mix_id || mi.mixId || '');
+                const mname = String(mi.mix_name || mi.mixName || '');
+                if (mid) caps.mixId = mid;
+                if (mname && !caps.mixName) caps.mixName = mname;
+              }
+            }
+          } catch (_) {}
+          hit += 1;
+        }
+      }
+      // ★2026-09-04：抓「合集」标识与名称（mix_id / mix_name）。
+      //   用途：① 主动拉取剧集列表 /mix/aweme/?mix_id=...（见 hmdaoTryFetchMixAweme）
+      //         ② 文件名 {合集名}_{第N集}_{标题}.mp4
+      try {
+        const takeMix = (mi, force) => {
+          if (!mi || typeof mi !== 'object') return;
+          const mid = String(mi.mix_id || mi.mixId || '');
+          const mname = String(mi.mix_name || mi.mixName || '');
+          // ★2026-09-05 修复（切换合集后卡片封面在新旧合集间来回跳动的根因）：
+          //   检测到【不同的 mix_id】= 用户切到了另一个合集 → 上一合集的封面/标题/集数/直链索引
+          //   全部作废（键都是旧合集的 awemeId）。不清的话它们仍会通过 episodeMap 成员检查被合成
+          //   进侧栏（「第211集 · 第五十六集」那张串合集卡就是这么来的），且与新一合集数据交替
+          //   出现 → 封面跳变。
+          if (mid && caps.mixId && String(caps.mixId) !== mid) {
+            try {
+              console.log('[HMDAO][inject] 检测到切换合集 mixId %s → %s，清空上一合集索引', caps.mixId, mid);
+              for (const ik of ['dyCoverByAweme', 'dyFormatsByAweme', 'dyUrlsByAweme', 'dyEpisodeByAweme',
+                'dyTitlesByAweme', 'dyAudiosByAweme', 'dyVideoUrlByAweme', 'dyMixIdsByAweme']) caps[ik] = {};
+              hmdaoMixProbeTried = 0;
+              hmdaoLastMixProbeTs = 0;
+            } catch (_) {}
+            caps.mixId = mid;
+            if (mname) caps.mixName = mname;
+          }
+          if (mid && (force || !caps.mixId)) caps.mixId = mid;
+          if (mname && (force || !caps.mixName)) caps.mixName = mname;
+        };
+        takeMix(j.mix_info || j.mixInfo, true); // 顶层 mix_info 最权威
+        const infos = Array.isArray(j.mix_infos) ? j.mix_infos : null;
+        if (infos && infos.length) {
+          for (const mi of infos) { takeMix(mi, false); takeMix(mi && (mi.mix_info || mi.mixInfo), false); }
+        }
+      } catch (_) {}
+
+      if (hit) {
+        try { console.log('[HMDAO][inject] dy-detail captured: awemes=' + hit + ' cur=' + caps.curAwemeId + ' fmtKeys=' + Object.keys(caps.dyFormatsByAweme).length + ' epKeys=' + Object.keys(caps.dyEpisodeByAweme).length); } catch (_) {}
+        hmdaoPersistCaps(); // 采到就落盘，供下次重载恢复
+        setTimeout(() => { try { hmdaoTryFetchMixAweme(); } catch (_) {} }, 800); // mix_id 到手后主动拉剧集列表
+      } else {
+        // ★2026-09-04 降噪（用户扩展错误页被刷出 36 条垃圾告警的根因）：
+        //   /aweme/* 下大量接口与视频无关（social/count、page/turn/offline、multicast/query、
+        //   play/progress、get/user/settings、suggest_words……），旧逻辑对它们一律 warn。
+        //   现只对【可能承载视频数据】的接口告警，且每路径只一次、全会话最多 3 条。
         try {
-          caps.__dyVideoShapeDiag = caps.__dyVideoShapeDiag || [];
-          if (caps.__dyVideoShapeDiag.length < 4) {
-            caps.__dyVideoShapeDiag.push({
-              id,
-              keys: Object.keys(v).slice(0, 60),
-              has_bit_rate: Array.isArray(v.bit_rate),
-              has_bitRateList: Array.isArray(v.bitRateList),
-              bitRateListLen: Array.isArray(v.bitRateList) ? v.bitRateList.length : 0,
-              bitRateList0Keys: (Array.isArray(v.bitRateList) && v.bitRateList[0]) ? Object.keys(v.bitRateList[0]).slice(0, 20) : [],
-              has_play_addr: !!(v.play_addr && v.play_addr.url_list && v.play_addr.url_list.length),
-              play_addr0: (v.play_addr && v.play_addr.url_list && v.play_addr.url_list[0]) ? String(v.play_addr.url_list[0]).slice(0, 70) : '',
-              has_download_addr: !!(v.download_addr && v.download_addr.url_list && v.download_addr.url_list.length),
-              has_playAddr: !!v.playAddr,
-              fmtsLen: fmts.length,
-            });
+          const path = String(reqUrl || '').split('?')[0];
+          const VIDEO_BEARING = /aweme\/detail|mix\/aweme|iteminfo|general\/search|aweme\/post|aweme\/detail/i;
+          if (VIDEO_BEARING.test(path) && !hmdaoZeroHitWarned[path] && hmdaoZeroHitWarnedCount < 3) {
+            hmdaoZeroHitWarned[path] = 1;
+            hmdaoZeroHitWarnedCount++;
+            const first = (arrays[0] && arrays[0][0]) ? Object.keys(arrays[0][0]).slice(0, 16).join(',') : '(无数组项)';
+            console.warn('[HMDAO][inject] dy-detail 命中但解析到 0 条 | url=' + path.slice(0, 88)
+              + ' | 顶层键=' + Object.keys(j || {}).slice(0, 12).join(',')
+              + ' | 首项键=' + first);
           }
         } catch (_) {}
-        // 记录最近一次详情对应的 awemeId：jingxuan modal 场景下它就是「当前播放」
-        caps.curAwemeId = id;
-        hit += 1;
-      }
-      if (hit) {
-        try { console.log('[HMDAO][inject] dy-detail captured: awemes=' + hit + ' cur=' + caps.curAwemeId + ' fmtKeys=' + Object.keys(caps.dyFormatsByAweme).length); } catch (_) {}
       }
     } catch (_) {}
   }
+
+  // ★2026-09-02 根因修复（当前播放视频「无分辨率 / 选源错 / 缺音频轨」的总入口）：
+  //   原 RENDER_DATA 扫描（hmdaoCaptureDyStream 内约 797 行）挂在【成功捕获一条新流】之后，
+  //   而视频一旦缓冲完（实测 readyState=4）就【不再发起任何请求】→ 该分支永远不执行 →
+  //   fullScanDone 恒 false，dyFormatsByAweme 里只有 XHR feed 抓到的推荐流视频，
+  //   【当前 modal 正在播放的视频一个档位都没有】→ 侧栏无分辨率选项、选源退回网络层裸轨
+  //   （滤不掉 mime_type=audio_mp4 的音频轨 → 预览「有声音没画面」）。
+  //   现提供独立于网络捕获的入口，直接扫 SSR 首屏（app.videoDetail，驼峰结构）。
+  //   与 XHR feed 接口（下划线结构，由 hmdaoCaptureDyDetail 负责）互补，互不冲突。
+  //   ★实测字段（jingxuan?modal_id=）：
+  //     videoDetail.awemeId / video.bitRateList[22]（gearName / playAddr[{src}] / width / height / isH265）
+  //     video.playApi                 → 官方含音画播放源（本结构无 download_addr 字段）
+  //     video.bitRateAudioList[0].urlList[0].src → 音频轨直链（DASH 合并的另一半）
+  //     video.cover / video.originCover → 字符串封面 URL
+  function hmdaoScanDyRenderData() {
+    try {
+      const el = document.querySelector('script#RENDER_DATA, script[id="RENDER_DATA"]');
+      if (!el || !el.textContent) return;
+      // ★2026-09-04 修复（页面卡顿 + 日志洪水真凶，用户 profiler 实测 5 分钟 596 次）：
+      //   RENDER_DATA 是服务端首屏数据，切集(SPA)后不会刷新（见下方注释）。
+      //   但本函数被定时器反复调用，每次都 JSON.parse 整份大 JSON 并遍历 bitRateList
+      //   → 主线程持续高负载 → 抖音视频播放卡顿；且每次都打一条日志（几万条消息）。
+      //   修复：按 textContent.length 做廉价指纹，内容没变就直接返回（每页只真正解析一次）。
+      const ssrSig = el.textContent.length;
+      if (window.__hmdaoSsrSig === ssrSig) return;
+      window.__hmdaoSsrSig = ssrSig;
+      let data = null;
+      try { data = JSON.parse(decodeURIComponent(el.textContent)); } catch (_) {
+        try { data = JSON.parse(el.textContent); } catch (_) { return; }
+      }
+      const vd = data && data.app && data.app.videoDetail;
+      if (!vd) return;
+      const id = String(vd.awemeId || '');
+      if (!id) return;
+      const caps = window.__hmdao_captures || (window.__hmdao_captures = {});
+      caps.dyFormatsByAweme = caps.dyFormatsByAweme || {};
+      caps.dyCoverByAweme = caps.dyCoverByAweme || {};
+      caps.dyTitlesByAweme = caps.dyTitlesByAweme || {};
+      const v = vd.video;
+      if (v) {
+        const fmts = hmdaoExtractVideoFormats(v);
+        // playApi = 官方含音画播放源（本 SSR 结构没有 download_addr，用它等价替代）
+        const api = (typeof v.playApi === 'string' ? v.playApi : '');
+        if (api) {
+          fmts.push({ label: '下载源(含音画)', url: api, is_default: true });
+          // ★2026-09-02：消除重复 is_default。hmdaoExtractVideoFormats 末尾会把 out[0]（按 height 降序，
+          //   多数情况下是 4K / 2K）设为默认，与 playApi 重复 → 弹窗出现两个「默认画质」。
+          //   保留 playApi 为唯一默认（官方含音画源、必下得到）；其他档位仅作可选。
+          for (let i = 0; i < fmts.length - 1; i++) fmts[i].is_default = false;
+        }
+        if (fmts.length) caps.dyFormatsByAweme[id] = fmts;
+        const cov = (typeof v.cover === 'string' && v.cover) ? v.cover
+          : (typeof v.originCover === 'string' ? v.originCover : '');
+        if (cov) caps.dyCoverByAweme[id] = cov.replace(/\\\//g, '/');
+        if (vd.desc) caps.dyTitlesByAweme[id] = String(vd.desc);
+        // ★音频轨直链：DASH 分离轨合并的另一半，此前只能靠网络层碰运气捞 mime_type=audio_mp4
+        const au = (v.bitRateAudioList && v.bitRateAudioList[0]) || null;
+        const auUrl = (au && au.urlList && au.urlList[0] && au.urlList[0].src) || '';
+        if (auUrl) {
+          caps.dyAudios = caps.dyAudios || [];
+          if (!caps.dyAudios.some((x) => x && x.url === auUrl)) {
+            caps.dyAudios.push({ url: auUrl, ts: Date.now(), awemeId: id });
+          }
+        }
+      }
+      // ★2026-09-03：不再用 RENDER_DATA 的 videoDetail.awemeId 更新 curAwemeId。
+      //   jingxuan modal 是 SPA，RENDER_DATA 为服务端首屏数据，切集后不会刷新；
+      //   若用它兜底写入 curAwemeId，会把旧集（如第8集）锁死成「当前播放」，导致侧栏永远显示旧集。
+      //   curAwemeId 现由「单条详情 API」+「currentSrc 反查」+「末条视频轨兜底」共同维护，更准。
+      try { console.log('[HMDAO][inject] dy-ssr scanned: id=' + id + ' fmtKeys=' + Object.keys(caps.dyFormatsByAweme).length); } catch (_) {}
+    } catch (_) {}
+  }
+  // ★2026-09-02 幂等自愈轮询（替代原先的单次 setTimeout）：
+  //   实测：注入脚本在 SPA 路由变化时执行 delete window.__hmdao_captures 并重建（约 93 行），
+  //   单次 setTimeout 写入的 curAwemeId / 档位会被随后的重置【整体冲掉】——这正是上一轮
+  //   "日志显示扫描成功、但查出来 curAwemeId 为空"的原因（本函数幂等，手动再调一次立刻有值）。
+  //   改为轮询：只要发现 curAwemeId 为空就重新填充；连续 3 次观测到非空即停止，避免长期空转；
+  //   另设 60s 无条件停止兜底。SPA 切集场景仍由 hmdaoCaptureDyDetail 补位。
+  try {
+    let ssrOk = 0;
+    const ssrTimer = setInterval(() => {
+      try {
+        if (window.__hmdao_captures && window.__hmdao_captures.curAwemeId) {
+          if (++ssrOk >= 3) { try { clearInterval(ssrTimer); } catch (_) {} }
+          return;
+        }
+        hmdaoScanDyRenderData();
+      } catch (_) {}
+    }, 1500);
+    setTimeout(() => { try { clearInterval(ssrTimer); } catch (_) {} }, 60000);
+  } catch (_) {}
+  // ★2026-09-03：常驻轮询——用 window.player 持续刷新「当前播放集」awemeId/标题/封面。
+  //   覆盖 SPA 切集后 RENDER_DATA/列表 API 不刷新的场景；与上面 ssrTimer 互补（后者只填首次空窗）。
+  try {
+    setInterval(() => {
+      try {
+        // ★2026-09-09（源页零开销硬约束）：后台标签不做常驻轮询，避免在用户看不到的
+        //   页面上持续读播放器状态。切回前台后下一拍（≤1s）立即恢复，前台行为完全不变。
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+        hmdaoRefreshCurFromPlayer();
+      } catch (_) {}
+    }, 1000);
+  } catch (_) {}
+  // 暴露到 window：便于页面控制台手动触发排查（__hmdao_captures 被注入重置后可再次填充）。
+  try { window.__hmdaoScanDyRenderData = hmdaoScanDyRenderData; } catch (_) {}
+  try { window.__hmdao_refreshCurFromPlayer = hmdaoRefreshCurFromPlayer; } catch (_) {}
+  // ★2026-09-03：诊断函数——在页面控制台执行 __hmdao_diagDouyinCurrent() 可查看当前集识别情况，
+  //   便于排查「封面/标题仍不匹配」时 window.player 的结构（若 awemeId 仍取不到，把输出贴回即可定位）。
+  try {
+    window.__hmdao_diagDouyinCurrent = function () {
+      const caps = window.__hmdao_captures || {};
+      const found = hmdaoFindAwemeInPlayer();
+      const pl = hmdaoFindPlaylistEpisode();
+      const p = window.player;
+      let pKeys = [];
+      try { pKeys = p && typeof p === 'object' ? Object.keys(p).slice(0, 40) : []; } catch (_) {}
+      return {
+        curAwemeId: caps.curAwemeId || '',
+        playerExists: !!p,
+        playerTopKeys: pKeys,
+        playerFoundAweme: found,
+        playerFoundVideoUrl: (found && found.videoUrl) || '',
+        playlistFound: pl,
+        titleKeys: Object.keys(caps.dyTitlesByAweme || {}).slice(0, 20),
+        coverKeys: Object.keys(caps.dyCoverByAweme || {}).slice(0, 20),
+        episodeKeys: caps.dyEpisodeByAweme || {},
+        urlByAwemeKeys: Object.keys(caps.dyUrlsByAweme || {}).slice(0, 20),
+        videoUrlByAwemeKeys: Object.keys(caps.dyVideoUrlByAweme || {}).slice(0, 20),
+        audioByAwemeKeys: Object.keys(caps.dyAudiosByAweme || {}).slice(0, 20),
+        dyUrlsCount: (caps.dyUrls || []).length,
+        dyAudiosCount: (caps.dyAudios || []).length,
+      };
+    };
+  } catch (_) {}
 
   function hmdaoCaptureDyStream(reqUrl) {
     try {
@@ -668,20 +1601,41 @@ function __hmdao_isDouyinExcluded() {
       if (trackKind === 'audio') {
         const cA = window.__hmdao_captures;
         if (!Array.isArray(cA.dyAudios)) cA.dyAudios = [];
+        // ★2026-09-03：音频轨按「当前集锚点」索引，确保与视频轨同源配对（切集后精确合成本集音画）。
+        //   锚点优先用已检测到的真实 awemeId（window.player / 详情 API），否则退回 URL 的 modal_id。
         let anchor = '';
         try {
-          const pa = new URL(location.href);
-          anchor = pa.searchParams.get('modal_id') || pa.searchParams.get('aweme_id') || '';
+          if (cA.curAwemeId && cA.curAwemeId !== 'unknown' && !/^fp:/.test(cA.curAwemeId)) anchor = cA.curAwemeId;
+          else {
+            const pa = new URL(location.href);
+            anchor = pa.searchParams.get('modal_id') || pa.searchParams.get('aweme_id') || '';
+          }
         } catch (_) {}
         if (!cA.dyAudios.some((x) => x && x.url === clean)) {
           cA.dyAudios.push({ url: clean, ts: Date.now(), awemeId: anchor });
           if (cA.dyAudios.length > 50) cA.dyAudios.shift();
         }
+        // ★按锚点索引音频轨直链，供 scan.js 直接取本集音频做 DASH 合并（无需再按时间配对，更稳）
+        cA.dyAudiosByAweme = cA.dyAudiosByAweme || {};
+        if (anchor) cA.dyAudiosByAweme[anchor] = clean;
+        // ★同时按 URL 的 modal_id 兜底索引（jingxuan 锚点对所有集稳定），保证切集后最新音频一定能按此键取到。
+        try {
+          const pa = new URL(location.href);
+          const mId = pa.searchParams.get('modal_id') || pa.searchParams.get('aweme_id') || '';
+          if (mId) cA.dyAudiosByAweme[mId] = clean;
+        } catch (_) {}
         return;
       }
       // 去重：不重复添加同一 URL
       if (window.__hmdao_captures.dyUrls.indexOf(clean) < 0) {
         window.__hmdao_captures.dyUrls.push(clean);
+        // ★2026-09-03：限长，避免单集内无限堆积分片（旧分片签名过期变废卡）。与 dyAwemes/dyPlayback/dyUrlTs 同步裁剪。
+        if (window.__hmdao_captures.dyUrls.length > 12) {
+          window.__hmdao_captures.dyUrls.shift();
+          if (Array.isArray(window.__hmdao_captures.dyAwemes)) window.__hmdao_captures.dyAwemes.shift();
+          if (Array.isArray(window.__hmdao_captures.dyPlayback)) window.__hmdao_captures.dyPlayback.shift();
+          if (Array.isArray(window.__hmdao_captures.dyUrlTs)) window.__hmdao_captures.dyUrlTs.shift();
+        }
         // ★2026-09-02：与 dyUrls 1:1 的捕获时间戳，供与 dyAudios 按时间邻近配对
         if (!Array.isArray(window.__hmdao_captures.dyUrlTs)) window.__hmdao_captures.dyUrlTs = [];
         window.__hmdao_captures.dyUrlTs.push(Date.now());
@@ -767,6 +1721,13 @@ function __hmdao_isDouyinExcluded() {
               }
             }
             window.__hmdao_captures.dyAwemes.push(aid || 'unknown');
+            // ★2026-09-03：按 awemeId 索引「视频轨直链」，供侧栏实时匹配当前集（切集后精确取本集 url，不再取错/取旧）
+            try {
+              if (aid && aid !== 'unknown' && !/^fp:/.test(aid)) {
+                window.__hmdao_captures.dyUrlsByAweme = window.__hmdao_captures.dyUrlsByAweme || {};
+                window.__hmdao_captures.dyUrlsByAweme[aid] = clean;
+              }
+            } catch (_) {}
             if (window.__hmdao_captures.dyAwemes.length > 50) window.__hmdao_captures.dyAwemes.shift();
           } else {
             window.__hmdao_captures.dyAwemes.push('unknown');
@@ -890,7 +1851,8 @@ function __hmdao_isDouyinExcluded() {
   window.__hmdaoCaptureDyStream = hmdaoCaptureDyStream;
 
   // 接口响应体里的视频直链捕获（针对 LiblibAI / 模型社区等"视频在 XHR/fetch 响应 JSON 里"的站点）。
-  // 扫描响应文本里出现的 mp4/webm/m3u8 等直链，去重存入 apiVideos。
+  // 扫描响应文本里出现的 mp4/webm/m3u8 等直链，去重存入 apiVideos；同时捕获同响应体中
+  // 与每条视频直链邻近的封面 URL，供 scan.js 精确配对（解决 liblib 多视频卡封面错配/缺失）。
   // 仅扫描 JSON 接口（文本含 '{'），且限制长度避免性能问题。
   const API_VIDEO_RE = /https?:\/\/[^"'\\<>()\s]+\.(mp4|webm|m3u8|mov|m4v|mkv|ogv)(\?[^\"'\\<>()\s]*)?/gi;
   function hmdaoScanApiVideoUrls(text) {
@@ -917,6 +1879,8 @@ function __hmdao_isDouyinExcluded() {
     if (text.indexOf('{') < 0 && text.indexOf('[') < 0) return; // 非 JSON 不扫
     try {
       const arr = window.__hmdao_captures.apiVideos = window.__hmdao_captures.apiVideos || [];
+      const pairs = window.__hmdao_captures.apiVideoPairs = window.__hmdao_captures.apiVideoPairs || {};
+      const titles = window.__hmdao_captures.apiVideoTitles = window.__hmdao_captures.apiVideoTitles || {};
       let m;
       API_VIDEO_RE.lastIndex = 0;
       while ((m = API_VIDEO_RE.exec(text)) && arr.length < 100) {
@@ -925,6 +1889,44 @@ function __hmdao_isDouyinExcluded() {
           arr.push(u);
           if (arr.length > 100) arr.shift();
         }
+        // ★2026-09-11→重写（liblib 封面 404 + 重复根因）：
+        //   旧逻辑在视频直链 ±800 字符窗口取"第1张图"，对 liblib 抓到 master.jpg / 720p/index.jpg /
+        //   seg001.jpg 等分片缩略图（热链 404，且多视频共用→重复封面）。
+        //   改为在 ±4096 窗口内优先提取媒体对象【结构化 cover/poster/thumbnail 字段】做封面，
+        //   并拒绝分片缩略图路径；同时提取结构化 title/name 字段写入 apiVideoTitles，多平台通用。
+        try {
+          const winStart = Math.max(0, m.index - 4096);
+          const winEnd = Math.min(text.length, m.index + m[0].length + 4096);
+          const win = text.slice(winStart, winEnd);
+          const winOff = m.index - winStart;
+          if (!pairs[u]) {
+            // 结构化封面字段：优先 cover/poster/thumbnail，其次 img/image/pic/preview/snapshot
+            const COVER_KEY_PRIORITY = ['cover', 'poster', 'thumbnail', 'first_frame', 'firstframe', 'cover_url', 'poster_url', 'coverimg', 'coverimage', 'img', 'image', 'pic', 'preview', 'snapshot', 'screenshot', 'thumb'];
+            // 分片/帧缩略图路径（liblib 的 master.jpg / 720p/index.jpg / seg001.jpg 等）热链 404，必须拒绝
+            const SEG_THUMB_RE = /\/(720p|1080p|540p|480p|360p|240p|144p|4k|2k|hd|sd|fhd|uhd)\//i
+              | /master\.jpg$/i | /index\.jpg$/i | /seg\d+\.jpg/i | /frame_\d+/i | /\/frames\//i;
+            const COVER_FIELD_RE = /"(cover|poster|thumbnail|first_frame|firstframe|cover_url|poster_url|coverimg|coverimage|img|image|pic|preview|snapshot|screenshot|thumb)"\s*:\s*"([^"]+\.(?:jpg|jpeg|png|webp|avif|gif)(?:[^"]*)?)"/gi;
+            let bestCover = null, bestScore = Infinity;
+            let cm;
+            COVER_FIELD_RE.lastIndex = 0;
+            while ((cm = COVER_FIELD_RE.exec(win))) {
+              const key = (cm[1] || '').toLowerCase();
+              const url = cm[2];
+              const rank = COVER_KEY_PRIORITY.indexOf(key);
+              if (rank < 0) continue;
+              if (SEG_THUMB_RE.test(url)) continue; // 拒绝分片缩略图（404/重复源）
+              const dist = Math.abs(cm.index - winOff);
+              const score = rank * 100000 + dist; // 优先高优先级 key，其次就近
+              if (score < bestScore) { bestScore = score; bestCover = url; }
+            }
+            if (bestCover) pairs[u] = bestCover;
+          }
+          if (!titles[u]) {
+            const TITLE_FIELD_RE = /"(?:title|name|caption|video_name|work_name|videoName|workName)"\s*:\s*"([^"]{1,200})"/i;
+            const tm = TITLE_FIELD_RE.exec(win);
+            if (tm && tm[1]) titles[u] = tm[1].replace(/\\"/g, '"').replace(/\s+/g, ' ').trim().slice(0, 120);
+          }
+        } catch (_) {}
       }
     } catch (_) {}
   }
@@ -999,7 +2001,7 @@ function __hmdao_isDouyinExcluded() {
               try {
                 if (resp && resp.ok && resp.clone) {
                   resp.clone().json().then(function (j) {
-                    try { hmdaoCaptureDyDetail(j); } catch (_) {}
+                    try { hmdaoCaptureDyDetail(j, url); } catch (_) {}
                   }).catch(function () {});
                 }
               } catch (_) {}
@@ -1066,13 +2068,27 @@ function __hmdao_isDouyinExcluded() {
   try {
     // ★2026-08-24 站点条件化包装（彻底消除非 YT/B站 站点错误栈里的 inject-main 痕迹）：
     //   仅 YouTube / B站 需要捕获视频流（googlevideo / bilibili playurl），这两站才重写
-    //   XMLHttpRequest.prototype.open/send。抖音页（视频流走 fetch+MSE，已由上方 fetch 钩子的
-    //   hmdaoCaptureDyStream 覆盖）以及任何其他站点（花瓣等）**完全不重写 XHR prototype** ——
-    //   这样网站自身 XHR 报错（如抖音同步 XHR 设 timeout 的 InvalidAccessError）的调用栈里
-    //   绝不会出现 XMLHttpRequest.open @ inject-main.js:663，从根本上消除"扩展引起错误"的误判。
+    //   XMLHttpRequest.prototype.open/send。任何其他站点（花瓣等）**完全不重写 XHR prototype** ——
+    //   这样网站自身 XHR 报错的调用栈里绝不会出现 XMLHttpRequest.open @ inject-main，
+    //   从根本上消除"扩展引起错误"的误判。
+    //   ★★2026-09-02【本注释的原结论已被实测推翻，请勿据此改回】：
+    //   原注释称"抖音页视频流走 fetch+MSE、已由 fetch 钩子覆盖，故抖音页不重写 XHR"。
+    //   实测（performance.getEntriesByType('resource') 看 initiatorType）：抖音 /aweme/v1/web/*
+    //   详情接口 17 次【全部 xmlhttprequest】、fetch 0 次 → 抖音页不 hook XHR 会导致详情响应
+    //   永远读不到，分辨率/封面/标题全空。抖音域现已加入本钩子，详见下方 2026-09-02 注释。
     var isYtBili = /(^|\.)youtube\.com$/.test(location.hostname) || /(^|\.)bilibili\.com$/.test(location.hostname);
-    if (!isYtBili) {
-      // 非 YT/B站：不碰 XHR，直接跳过整个包装块。
+    // ★2026-09-02 根因修复（侧栏「无分辨率选项 / 无封面」）：
+    //   实测手段：performance.getEntriesByType('resource') 看 initiatorType，抖音 /aweme/v1/web/*
+    //   详情接口实测 17 次【全部 xmlhttprequest】、fetch 0 次。而旧代码基于「抖音视频流走
+    //   fetch+MSE、已由 fetch 钩子覆盖」的错误假设，在抖音页【完全不重写 XHR prototype】
+    //   → 详情响应体永远读不到 → dyFormatsByAweme / dyCoverByAweme 恒空 → 拿不到 bitRateList
+    //   → 侧栏没有 1080p 等档位可选。现对抖音域一并启用 XHR 钩子，仅用于「详情 API 响应捕获」
+    //   （与上方 fetch 分支 995-1008 完全对称）。
+    //   ★代价：抖音个别同步 XHR 的报错栈会多出一层 XMLHttpRequest.open @ inject-main。
+    //   仅为调试观感问题、不影响功能；包装函数原样透传全部参数，不改变页面任何行为。
+    var isDyHost = /(^|\.)douyin\.com$/.test(location.hostname) || /(^|\.)tiktok\.com$/.test(location.hostname);
+    if (!isYtBili && !isDyHost) {
+      // 非 YT/B站/抖音：不碰 XHR，直接跳过整个包装块。
     } else {
     var origOpen = XMLHttpRequest.prototype.open;
     var origSend = XMLHttpRequest.prototype.send;
@@ -1080,6 +2096,11 @@ function __hmdao_isDouyinExcluded() {
       try {
         if (typeof url === 'string') hmdaoCaptureYtStream(url);
         if (typeof url === 'string') hmdaoCaptureDyStream(url); hmdaoCaptureTikTokStream(url);
+        // ★2026-09-02：抖音详情接口标记（供 send 阶段读取响应体）。
+        //   正则与上方 fetch 分支保持一致。jingxuan 精选页实测【既没有 aweme/detail 也没有
+        //   iteminfo】（14 条 /aweme/ XHR 全部是周边接口），详情数据走 /aweme/v2/web/module/feed/
+        //   这类模块化接口，故必须按 /\/aweme\// 宽匹配，否则一个都命中不了。
+        if (isDyHost && typeof url === 'string' && /\/aweme\/|iteminfo/i.test(url)) this._hmdao_dyDetailUrl = url;
         var isGV = typeof url === 'string' && /googlevideo\.(com|localhost)\/videoplayback/.test(url);
         if (isGV) this._hmdao_gvUrl = url;
         var isBili = typeof url === 'string' && /bilibili\.com\/x\/(web-interface\/view|player\/playurl|player\/wbi\/playurl|space\/acc\.info)/.test(url);
@@ -1089,11 +2110,28 @@ function __hmdao_isDouyinExcluded() {
       return origOpen.call(this, method, url, asyncRest);
     };
     XMLHttpRequest.prototype.send = function (body) {
-      // 此处仅在 YT/B站 域执行（外层 isYtBili 已保证），无需再判断 isDyPage。
-      var self = this;
-      var gvUrl = self._hmdao_gvUrl;
-      var ytUrl = self._hmdao_ytUrl;
-      if (gvUrl) {
+    // 此处在 YT/B站/抖音 域执行（外层 isYtBili || isDyHost 已保证）；抖音分支只做详情响应捕获。
+    var self = this;
+    var gvUrl = self._hmdao_gvUrl;
+    var ytUrl = self._hmdao_ytUrl;
+    // ★2026-09-02：抖音详情响应捕获 —— 分辨率 bitRateList / 封面 / 标题的唯一真实来源。
+    //   只读 responseText 再 JSON.parse，【不改写 responseType、不消费 response】，对页面零副作用；
+    //   非 JSON（protobuf）或不含 aweme 结构的响应由 hmdaoCaptureDyDetail 内部自然跳过。
+    //   同步 XHR 同样会派发 load / readystatechange，故两种请求形态都能覆盖；dyDone 防重复解析。
+    if (self._hmdao_dyDetailUrl) {
+      var dyDone = false;
+      var grabDy = function () {
+        if (dyDone) return;
+        dyDone = true;
+        try {
+          if (!self.responseText) return;
+          hmdaoCaptureDyDetail(JSON.parse(self.responseText), self._hmdao_dyDetailUrl);
+        } catch (_) {}
+      };
+      self.addEventListener('load', grabDy);
+      self.addEventListener('readystatechange', function () { if (self.readyState === 4) grabDy(); });
+    }
+    if (gvUrl) {
         // ★关键修复：YouTube 播放器可能用 XHR(而非 fetch)拉 googlevideo 视频。
         // 旧逻辑靠 addEventListener('load') 读取 this.response，但在默认 responseType=''
         // 时 this.response 是 DOMString 无法还原二进制→跳过捕获，导致 ytBytes 始终为空。

@@ -1,0 +1,58 @@
+[
+  {
+    "id": "1787634880344-unreal-repair-xauljk",
+    "createdAt": "2026-08-25T05:14:40.344Z",
+    "startedAt": "2026-08-25T05:14:40.348Z",
+    "endedAt": "2026-08-25T05:14:46.586Z",
+    "status": "failed",
+    "engine": "unreal",
+    "adapter": "UnrealPluginAdapter",
+    "action": "repair",
+    "request": {
+      "engine": "unreal",
+      "action": "repair",
+      "projectPath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject"
+    },
+    "title": "Unreal Engine repair",
+    "runtimeState": {
+      "stage": "plugin",
+      "state": "error",
+      "label": "插件阶段异常",
+      "message": "[safe-delete] 操作失败: ERROR F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture: Error during a `trash` operation: Unknown { description: \"Some operations were aborted\" }",
+      "reason": "plugin-activity",
+      "dedupeKey": "plugin:error:plugin-activity"
+    },
+    "shortMessage": "插件阶段异常",
+    "dedupeKey": "plugin:error:plugin-activity",
+    "message": "[safe-delete] 操作失败: ERROR F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture: Error during a `trash` operation: Unknown { description: \"Some operations were aborted\" }",
+    "error": "[safe-delete] 操作失败: ERROR F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture: Error during a `trash` operation: Unknown { description: \"Some operations were aborted\" }"
+  },
+  {
+    "id": "1787635706251-unreal-repair-ye37wk",
+    "createdAt": "2026-08-25T05:28:26.251Z",
+    "startedAt": "2026-08-25T05:28:26.254Z",
+    "endedAt": "2026-08-25T05:28:33.064Z",
+    "status": "failed",
+    "engine": "unreal",
+    "adapter": "UnrealPluginAdapter",
+    "action": "repair",
+    "request": {
+      "engine": "unreal",
+      "action": "repair",
+      "projectPath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject"
+    },
+    "title": "Unreal Engine repair",
+    "runtimeState": {
+      "stage": "plugin",
+      "state": "error",
+      "label": "插件阶段异常",
+      "message": "[safe-delete] 操作失败: ERROR F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture: Error during a `trash` operation: Unknown { description: \"Some operations were aborted\" }",
+      "reason": "plugin-activity",
+      "dedupeKey": "plugin:error:plugin-activity"
+    },
+    "shortMessage": "插件阶段异常",
+    "dedupeKey": "plugin:error:plugin-activity",
+    "message": "[safe-delete] 操作失败: ERROR F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture: Error during a `trash` operation: Unknown { description: \"Some operations were aborted\" }",
+    "error": "[safe-delete] 操作失败: ERROR F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture: Error during a `trash` operation: Unknown { description: \"Some operations were aborted\" }"
+  }
+]

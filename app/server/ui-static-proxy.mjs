@@ -15,6 +15,7 @@ function readCliFlag(name, fallback = '') {
 }
 
 const appPort = Number(process.env.HMDAO_APP_PORT || readCliFlag('--port', '3000') || 3000);
+const proxyHost = process.env.HMDAO_PROXY_HOST || '127.0.0.1';
 const apiTarget = new URL(process.env.HMDAO_API_TARGET || process.env.HMDAO_API_URL || readCliFlag('--api', 'http://127.0.0.1:8792'));
 const apiProtocol = apiTarget.protocol === 'https:' ? https : http;
 
@@ -100,8 +101,11 @@ async function serveStatic(req, res) {
       //    浏览器（含 Edge 硬刷新）仍用毒缓存、WebAssembly compileStreaming 报 MIME 错误。
       //  - html 入口（index.html）是非哈希文件名，必须每次重新校验，否则旧入口会持续引用
       //    旧的 JS chunk、进而命中旧的 /ort-wasm/ 毒缓存。
-      // 哈希化的 .js/.css 等仍用 immutable（内容寻址，安全）。
-      extension === '.wasm' || extension === '.html'
+      // DDUp 是本地开发工具，优先保证「重新构建后无需手动清缓存即可生效」：
+      // 所有静态资源（含哈希化 .js/.css）统一 no-cache，每次重新校验。
+      // 避免旧主 bundle 引用的旧 CanvasBoard 哈希 chunk 被 immutable 永久毒缓存、
+      // 导致模型下载面板卡片加载失败。
+      extension === '.wasm' || extension === '.html' || extension === '.js' || extension === '.css'
         ? 'no-cache'
         : fallbackToIndex
           ? 'no-cache'
@@ -226,6 +230,16 @@ function proxyUpgrade(req, socket, head) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // ★2026-09-10：Node http.Server 默认 socket timeout = 2 分钟（120000ms），会把长操作
+  //   （如 /api/media/merge-hls 拉流 1.5GB 视频实测 215 秒）直接截断 → 进度卡 50%。
+  //   设为 0 禁用 socket 超时；流式响应期间由上游后端 / 客户端 fetch 自行控制生命周期。
+  server.setTimeout(0);
+  // ★2026-09-10：仅 setTimeout(0) 不够。Node 18+ 还有两个独立超时：
+  //   · requestTimeout  默认 300000ms（5 分钟）—— 长拉流（1.5GB 实测 215 秒，CDN 波动时更久）会超
+  //   · headersTimeout  默认  60000ms（1 分钟）—— 请求头接收慢会被断
+  //   两者都会让长 POST 在中途被切断（客户端表现为 fetch 失败/无响应）。一并禁用。
+  server.requestTimeout = 0;
+  server.headersTimeout = 0;
   if (!req.url) {
     sendJson(res, 400, { success: false, error: 'missing-url' });
     return;
@@ -259,7 +273,7 @@ server.on('error', (error) => {
   console.error('[ui-static-proxy] server error', error);
 });
 
-server.listen(appPort, '127.0.0.1', () => {
-  console.log(`[ui-static-proxy] serving ${DIST_DIR} on http://127.0.0.1:${appPort}`);
+server.listen(appPort, proxyHost, () => {
+  console.log(`[ui-static-proxy] serving ${DIST_DIR} on http://${proxyHost}:${appPort}`);
   console.log(`[ui-static-proxy] proxying /api and /ws to ${apiTarget.origin}`);
 });

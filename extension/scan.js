@@ -12,6 +12,34 @@
 // 当前扫描到的抖音/视频号目标 aweme_id，用于在 merge 时优先保留“当前播放/当前 modal”的视频。
 let __hmdao_current_aweme_id = null;
 
+// ★2026-09-05：每标签页上一次扫描到的合集 mixId —— 用于检测「切换合集」，
+//   切合集时必须清空上一合集的全部累积（网络层资产 + 侧栏缓存 + MAIN 索引），
+//   否则旧合集的卡片/封面会混进新合集侧栏并在新旧之间来回跳动。
+const HMDAO_TAB_MIXID = {};
+
+// ★2026-09-05：卡片标题去「第N集」前缀。集数已由 episodeNo 单独展示（卡面「第X集 · 标题」），
+//   标题里再带一遍「第五十六集：」会与 episodeNo 并排出现两个集数字样（且历史数据两者还可能不一致）。
+function stripEpisodePrefix(t) {
+  return String(t || '').replace(/^第\s*(?:[0-9]{1,4}|[零〇一二两三四五六七八九十百]{1,6})\s*[集期话章回]\s*[:：、.\-—]?\s*/, '');
+}
+
+// ★2026-09-05：上一轮广播的内容签名。内容无变化时跳过 SCAN_RESULT 广播 ——
+//   否则每 10s 轮询都全量广播上百条资产（含长签名直链）→ 消息序列化 + 侧栏全量处理 +
+//   lastScan 重持久化 + 渲染抖动 → 十几分钟后侧栏与源页明显卡顿。
+let HMDAO_LAST_BCAST_SIG = '';
+
+// ★2026-09-04 日志节流（用户实测侧栏 DevTools 堆积 28,941 条消息）：
+//   轮询每 10s 一次，同样的日志行反复刷，几小时就是几万条 —— 开着 DevTools 会明显卡顿，
+//   且 console 持有对象引用造成内存膨胀。同一 key 只在【内容变化】时打印一次，未变则静默。
+const __hmdaoLogMemo = new Map();
+function logOnChange(key, msg) {
+  try {
+    if (__hmdaoLogMemo.get(key) === msg) return;
+    __hmdaoLogMemo.set(key, msg);
+  } catch (_) {}
+  console.log(msg);
+}
+
 // ★2026-08-23 修复：每张抖音卡片用自己反查出的真实 awemeId 构造唯一稳定的播放地址
 //   https://www.douyin.com/video/<awemeId>（抖音每个视频唯一独立页）。
 //   —— 点哪张卡片就开哪张视频，绝不错配（不用页面级统一 modal_id，否则所有卡片跳同一视频）。
@@ -83,9 +111,90 @@ function preferAsset(a, b) {
     if (x.coverUrl || x.cover) s += 30;
     if (x.width && x.height) s += 20;
     if (x.name && !/^stream-/i.test(x.name)) s += 10;
+    // ★2026-09-08 修复（imini 视频卡选到「被截断 URL」的根因之一）：
+    //   score 此前只看元数据（awemeId/matched/playerUrl/title/cover…），【完全不看 URL 是否完整】
+    //   → 一条"元数据更全但 URL 被截断"的候选会赢过"URL 完整"的候选，
+    //   侧栏 <video src> 指向 NoSuchKey 的残片 → 无画面也无声音。
+    //   给「URL 完整（有媒体扩展名 / 可交 yt-dlp 解析的平台页 / blob / DASH）」加权，
+    //   使其高于 cover(+30)/title(+50)/playerUrl(+100) 之和。
+    if (x.type === 'video' && isCompleteVideoUrl(x)) s += 300;
     return s;
   };
   return score(a) > score(b);
+}
+
+// ===== 视频 URL 完整性判定（防御"被截断/选中不完整候选"）=====
+// ★2026-09-08（imini.ai 视频卡 URL 被截断 → 对象存储 NoSuchKey、预览无声音）：
+//   现象：侧栏 <video src> = https://file.iminicdn.com/file/2026/06/04/206250370317222297
+//   （无媒体扩展名、比真实文件 .../2062503703172222976_vHi9PU4CtCf3.mp4 明显短一截）。
+//   成因两条：① 提取阶段正则漏/截断（内联 JSON 里的 .mp4 后紧跟引号 → 旧 script 正则永不命中；
+//      attr / <video src> 等来源又不校验扩展名，半截 URL 也能被推成 video 资产）；
+//   ② 合并阶段 preferAsset 不比较 URL 完整度。
+//   这里做最后一道防御。
+const VIDEO_MEDIA_EXT_RE = /\.(mp4|webm|mov|m4v|mkv|ogv|m3u8|flv|avi|wmv|ts|mpg|mpeg|3gp|rm|rmvb|asf|vob|m2ts|f4v|m4s)([?#]|$)/i;
+
+function isCompleteVideoUrl(a) {
+  const u = String((a && a.url) || '').split('#')[0];
+  if (!u) return false;
+  if (/^blob:/i.test(u)) return true;                      // 源页 MSE：交给源页播放，不算残片
+  if (VIDEO_MEDIA_EXT_RE.test(u)) return true;             // 明确媒体扩展名
+  if (a && a.__dash) return true;                          // DASH 音视频轨结构
+  // yt-dlp 平台卡：url 常常【就是】播放页地址（generic 卡 url===playerUrl），本身没有媒体扩展名，
+  // 但它会交给 yt-dlp 解析出真正可播的合并流（imini 这类站唯一"有声音"的入口就在yt-dlp），
+  // 故只要有 playerUrl 一律视为完整，绝不按残片丢弃。
+  if (a && a.playerUrl) return true;
+  return false;
+}
+
+// 丢弃「被截断」的 video 候选。安全边界（必须遵守，否则会误杀真实无扩展名直链）：
+//   · 只有在【同源存在完整候选】时才可能丢弃；没有任何完整候选 → 一条都不动（绝不整页视频消失）
+//   · googlevideo / douyinvod / m3u8 / blob 等无扩展名的真实直链由 isCompleteVideoUrl 放行
+//   · 能配对到完整候选时，先把封面/标题/时长过继给完整候选再丢弃，避免"修好了 URL 却丢了封面"
+function dropTruncatedVideoAssets(list) {
+  try {
+    const src = list || [];
+    const vids = src.filter((a) => a && a.type === 'video' && /^https?:/i.test(String(a.url || '')));
+    if (vids.length < 2 || vids.length > 500) return src;
+    const complete = vids.filter(isCompleteVideoUrl);
+    if (!complete.length) return src;
+    const originOf = (u) => { try { return new URL(u).origin; } catch (_) { return ''; } };
+    // 同源完整候选长度中位数 → 判定"明显短于同源其它候选"
+    const lenByOrigin = new Map();
+    for (const c of complete) {
+      const o = originOf(c.url);
+      if (!lenByOrigin.has(o)) lenByOrigin.set(o, []);
+      lenByOrigin.get(o).push(String(c.url).length);
+    }
+    const median = (arr) => {
+      const s = (arr || []).slice().sort((x, y) => x - y);
+      return s.length ? s[Math.floor(s.length / 2)] : 0;
+    };
+    const drop = new Set();
+    for (const a of vids) {
+      if (isCompleteVideoUrl(a)) continue;
+      const u = String(a.url);
+      // ① 是某条完整候选的【前缀】→ 典型截断（...222297 是 ...2222976_vHi9PU4CtCf3.mp4 的前缀）
+      let host = null;
+      for (const c of complete) {
+        const cu = String(c.url);
+        if (cu.length - u.length >= 3 && cu.indexOf(u) === 0) { host = c; break; }
+      }
+      // ② 无媒体扩展名且长度明显短于同源完整候选的中位数（<70%）→ 判为残片
+      if (!host) {
+        const med = median(lenByOrigin.get(originOf(u)));
+        if (!(med > 0 && u.length < med * 0.7)) continue;
+      }
+      if (host) {
+        if (!host.cover && a.cover) host.cover = a.cover;
+        if (!host.title && a.title) host.title = a.title;
+        if (!host.duration && a.duration) host.duration = a.duration;
+      }
+      drop.add(a);
+    }
+    if (!drop.size) return src;
+    console.log('[HMDAO][scan] 丢弃被截断/无媒体扩展名的视频候选 %d 条（同源存在更完整候选）', drop.size);
+    return src.filter((a) => !drop.has(a));
+  } catch (_) { return list; }
 }
 
 // ★2026-09-02：抖音 DASH 音视频轨配对。
@@ -129,18 +238,48 @@ function pairDouyinDashAudio(dyUrls, dyUrlTs, dyAudios, dyAwemes) {
 
 // 扫描单个标签页：深度直链解析（B：网络层捕获 + MAIN 世界直链 + YouTube 缓冲补全） + 页面 DOM 解析（A）。
 // 合并去重后回写 NETWORK_ASSETS 并广播 SCAN_RESULT 给侧栏。
+// ★2026-09-05：每 tab 扫描串行化。此前轮询每 10s 直接调 scanTab，而一轮深度扫描要
+//   3~8s（RENDER_DATA 等待 ≤3s + 多次 executeScript + DOM 解析 + 深度直链解析）→
+//   上一轮没跑完下一轮又起 → 扫描在 SW 与源页里叠加堆积 → 十几分钟后侧栏与源页
+//   都异常卡顿、点刷新半天没反应。改为：同一 tab 上一轮未结束（45s 看门狗）则跳过本轮。
+const HMDAO_SCAN_RUNNING = new Map();
 async function scanTab(tabId, opts = {}) {
+  const startedAt = HMDAO_SCAN_RUNNING.get(tabId) || 0;
+  if (startedAt && Date.now() - startedAt < 45000) {
+    console.log('[HMDAO][scan] 上一轮扫描未结束，跳过本轮（防叠加卡顿） tabId=%s', tabId);
+    return NETWORK_ASSETS[tabId] || [];
+  }
+  HMDAO_SCAN_RUNNING.set(tabId, Date.now());
+  try {
+    return await scanTabInner(tabId, opts);
+  } finally {
+    HMDAO_SCAN_RUNNING.delete(tabId);
+  }
+}
+
+async function scanTabInner(tabId, opts = {}) {
   const deep = opts.deep !== false; // 默认深度：首扫跑各站直链主动解析（B），轮询走轻量
   const batchMode = !!opts.batchMode; // ★2026-08-22 信息流批量采集：true 时采集合集多视频而非单卡
   let networkAssets = [];
   let ytPlay = [];
   __hmdao_current_aweme_id = null; // 每次扫描重置当前抖音/视频号目标 ID
+  // ★2026-09-07 修复（「重新扫描」按钮偶发清空后不再回填）：force 时清空广播签名，
+  //   强制本次扫描结果一定广播出去（不命中 bcastSig 静默跳过），保证手动重扫必定重新采集当前页。
+  if (opts.force) {
+    HMDAO_LAST_BCAST_SIG = '';
+    // ★2026-09-07 补充（重新扫描仍有残留根因）：force 重扫同时清空该 tab 的网络层累计资产。
+    //   否则 SPA 站内切模型/合集时，上一轮网络捕获的视频/音频流(googlevideo/bilivideo/音频)仍驻留
+    //   NETWORK_ASSETS，会被本轮深度扫描一并并入 → 侧栏出现"上一页"的幽灵卡。清掉后本轮只采当前页。
+    try { NETWORK_ASSETS[tabId] = []; } catch (_) {}
+  }
 
   // ===== 记录目标标签页 URL，后续合并与网盘兜底均需要 =====
   let targetTabUrl = '';
+  let targetTabTitle = '';
   try {
     const tab = await chrome.tabs.get(tabId);
     targetTabUrl = (tab && tab.url) || '';
+    targetTabTitle = (tab && tab.title) || '';
   } catch (_) {}
 
   // ★2026-08-31 修复（严格遵守边界要求——"不得引发控制台报错"）：
@@ -164,22 +303,29 @@ async function scanTab(tabId, opts = {}) {
   //   源页累积（dyUrls/dyCovers/dyAwemes）的清空职责**完全下放给 inject-main 的 SPA 导航钩子**
   //   （__hmdao_onNav 仅在 URL 真正变化时清空，见 inject-main.js:92-107）。scanTab **不再无条件清空**，
   //   否则用户在同 URL 刷新/切回标签页时，正在累积的 dyUrls 被抹掉 → 采不到 → 卡片消失。
-  //   仅当本次扫描的页面 URL 与上次记录不同（真正换页）时，才主动清空源页累积，避免旧 modal 残留。
+  //   仅当本次扫描的页面 URL 与上次记录不同（真正换页/切集）时，才主动清空源页累积，避免旧 modal 残留。
   //   注意：必须在 targetTabUrl 赋值之后访问（避免 TDZ），本段即置于 103 行获取 targetTabUrl 之后。
   let prevUrl = '';
   try { prevUrl = (NETWORK_ASSETS_URL && NETWORK_ASSETS_URL[tabId]) || ''; } catch (_) { }
-  if (!prevUrl || prevUrl !== (targetTabUrl || '')) {
+  const isSameUrl = !!prevUrl && prevUrl === (targetTabUrl || '');
+  if (!isSameUrl) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId, allFrames: false }, world: 'MAIN',
         func: () => { try { window.__hmdao_clearCaptures && window.__hmdao_clearCaptures(); } catch (_) {} },
       });
     } catch (_) { /* 非抖音/未就绪页面忽略 */ }
-    console.log('[HMDAO][scan] scanTab 换页清空源页累积 tabId=%s prev=%s now=%s', tabId, prevUrl, targetTabUrl);
+    // ★2026-09-05 关键修复：换页/切集时 background 的 NETWORK_ASSETS 也必须清空，
+    //   否则旧页的网络层捕获（audio/video）会混入新页扫描结果 → 侧栏出现"别的合集/上一页"的幽灵卡。
+    NETWORK_ASSETS[tabId] = [];
+    // 持久化侧栏缓存也一并清空，避免侧栏重载后先显示旧素材
+    try { chrome.storage.local.set({ lastScan: { assets: [], tabId, ts: Date.now() } }); } catch (_) {}
+    HMDAO_LAST_BCAST_SIG = ''; // 换页后允许重新广播
+    console.log('[HMDAO][scan] scanTab 换页清空源页累积+网络层资产 tabId=%s prev=%s now=%s', tabId, prevUrl, targetTabUrl);
   } else {
     console.log('[HMDAO][scan] scanTab 同页扫描，保留源页累积（不清空）tabId=%s url=%s', tabId, targetTabUrl);
   }
-  // ★保留 NETWORK_ASSETS[tabId] 的累积：扫描结果最终由 finalMerged 整体覆盖，无需在此清空（避免重扫抖动）。
+  // 同页扫描时保留 NETWORK_ASSETS[tabId] 的累积：扫描结果最终由 finalMerged 整体覆盖；换页时已清空。
 
   // ===== B站播放页：纯旁观模式（不干扰播放器，保声音）=====
   // 根因：此前 scanTab 在 B站播放页仍注入 scanPage(ISOLATED) + extractFreshVideoUrl(MAIN) +
@@ -207,17 +353,41 @@ async function scanTab(tabId, opts = {}) {
   //   修复：把读取提前到 readMainCaptures 之前，消除 TDZ 与执行顺序依赖。
   let curVideoSrc = '';
   let pageCurAwemeId = '';
+  let pageMixId = '';
   try {
     const srcRes = await chrome.scripting.executeScript({
       target: { tabId }, world: 'MAIN',
       func: () => ({
         curVideoSrc: (window.__hmdao_captures && window.__hmdao_captures.curVideoSrc) || '',
         curAwemeId: (window.__hmdao_captures && window.__hmdao_captures.curAwemeId) || '',
+        mixId: (window.__hmdao_captures && window.__hmdao_captures.mixId) || '',
       }),
     });
     const r = (srcRes && srcRes[0] && srcRes[0].result) || {};
     curVideoSrc = r.curVideoSrc || '';
     pageCurAwemeId = (r.curAwemeId || '').replace(/[^\w]/g, '');
+    pageMixId = (r.mixId || '').replace(/[^\w]/g, '');
+  } catch (_) {}
+
+  // ★2026-09-05 修复（切换合集后卡片封面在新旧封面间来回跳动 + 串合集卡根因）：
+  //   抖音 jingxuan 切合集只变 modal_id（同 pathname），上面按 URL 判定的「换页清空」虽会触发，
+  //   但 inject-main 的「同页切集保留索引」会把上一合集的封面/标题/集数/直链全部留着 →
+  //   新合集首轮扫描把两合集数据混播，之后才慢慢收敛。这里按 mixId 变化兜底：
+  //   mixId 变了 = 换了合集 → 清空网络层资产 + 侧栏缓存 + MAIN 世界上一合集索引。
+  try {
+    const prevMix = HMDAO_TAB_MIXID[tabId] || '';
+    if (prevMix && pageMixId && String(prevMix) !== String(pageMixId)) {
+      NETWORK_ASSETS[tabId] = [];
+      try { chrome.storage.local.set({ lastScan: { assets: [], tabId, ts: Date.now() } }); } catch (_) {}
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId, allFrames: false }, world: 'MAIN',
+          func: () => { try { window.__hmdao_reset_collection_index && window.__hmdao_reset_collection_index(); } catch (_) {} },
+        });
+      } catch (_) {}
+      console.log('[HMDAO][scan] 检测到切换合集 mixId %s → %s，已清空上一合集累积', prevMix, pageMixId);
+    }
+    if (pageMixId) HMDAO_TAB_MIXID[tabId] = pageMixId;
   } catch (_) {}
 
   // 读取 MAIN 世界被动捕获（YouTube/抖音/B站/通用音频/3D模型的真实直链）
@@ -228,7 +398,7 @@ async function scanTab(tabId, opts = {}) {
         world: 'MAIN',
         func: readAllCapturesMAIN,
       });
-      let mainRes = injected && injected[0] && injected[0].result;
+      var mainRes = injected && injected[0] && injected[0].result;
       // 迅雷分享页：文件列表 API 可能是懒加载，首次没读到就等 1.5s 重读一次。
       // 同时：顶层列表只有文件夹、子文件夹内容靠 BFS 异步展开（enterXunleiFolder）。
       // 扫描必须在 BFS 展开完成后再读取 xs.list，否则只会看到顶层文件夹（被跳过）→ 0 素材。
@@ -319,7 +489,102 @@ async function scanTab(tabId, opts = {}) {
       }
       if (mainRes) {
         if (Array.isArray(mainRes.videoPlays)) networkAssets.push(...mainRes.videoPlays);
-        if (Array.isArray(mainRes.audioPlays)) networkAssets.push(...mainRes.audioPlays);
+        // ★2026-09-06 修复：readAllCapturesMAIN 回传的 audioPlays 条目只有 {url,path,how,ts}、
+        //   【没有 type 字段】→ scanPage 的 push(url, type, source) 把 type 落成 undefined
+        //   → 合并阶段「非 media/model/image/archive/netdisk/link 一律丢弃」被整条丢掉，
+        //   通用音频播放捕获（爱给/豆包等）此前实际从未生效。此处显式补 type/source。
+        if (Array.isArray(mainRes.audioPlays)) {
+          // ★2026-09-11 修复（B站 index-legacy-de44e0de.js 等静态资源被当音频）：
+          //   音频捕获会把「页面里 fetch/XHR 过的任意 https 响应」记录为 audioPlays，其中混入
+          //   .js/.css/.json 等非媒体资源 → 侧栏出现「拿 JS 文件当音频播放」的废卡，且污染资产列表。
+          //   这里按扩展名硬性排除非媒体 URL（仅放行音视频/无扩展名的直链），从源头杜绝。
+          const NON_MEDIA_RE = /\.(js|mjs|cjs|jsx|ts|tsx|css|json|html|htm|xml|php|svg|woff2?|ttf|eot|map|wasm|png|jpg|jpeg|gif|webp|ico|txt|md)(\?|#|$)/i;
+          networkAssets.push(...mainRes.audioPlays
+            .filter((x) => x && typeof x.url === 'string' && /^https?:/i.test(x.url) && !NON_MEDIA_RE.test(x.url))
+            .map((x) => ({ url: x.url, type: 'audio', source: 'audio-playback' })));
+        }
+        // ★2026-09-06 豆包（doubao.com）朗读音频：doubao-audio-capture.js 在 MAIN 世界
+        //   旁路记录 TTS 直链（fetch/XHR 响应头 audio/* 或音频扩展名 + <audio> 播放）。
+        //   带 platform/playerUrl/title，让侧栏卡片可识别来源、文件名带会话名。
+        if (Array.isArray(mainRes.doubaoTts) && mainRes.doubaoTts.length) {
+          const ttsBase = (function () {
+            let t = String(targetTabTitle || '').replace(/^\s*豆包\s*[-—|]\s*/, '').replace(/\s*[-—|]\s*豆包\s*$/, '').trim();
+            if (!t || /^豆包$|新对话|有什么我能帮你的吗/.test(t)) t = '';
+            return t ? (t + ' · 豆包朗读') : '豆包朗读';
+          }());
+          const seenTts = new Set();
+          mainRes.doubaoTts.forEach((x, i) => {
+            if (!x || typeof x.url !== 'string' || !/^https?:/i.test(x.url)) return;
+            if (seenTts.has(x.url)) return;
+            seenTts.add(x.url);
+            networkAssets.push({
+              url: x.url,
+              type: 'audio',
+              source: 'doubao-tts',
+              platform: 'doubao',
+              playerUrl: targetTabUrl || undefined,
+              // 多段朗读时按序号区分，避免多张卡同名同 key
+              title: mainRes.doubaoTts.length > 1 ? (ttsBase + ' ' + (i + 1)) : ttsBase,
+              mime: x.mime || '',
+              size: Number(x.size) || 0,
+            });
+          });
+          console.log('[HMDAO][scan] 豆包朗读音频并入:', mainRes.doubaoTts.length, '条');
+        }
+        // ★2026-09-06 豆包朗读【WS 流式音频】（wss://.../sami/voicegenie，ogg_opus）：
+        //   SDK 静态分析已证实无 HTTP 直链、无 <audio>、不走 decodeAudioData。
+        //   doubao-audio-capture.js 旁路收集了 WS 下发的原始音频字节（留在源页，不随扫描传输），
+        //   这里只产出一张带 wsAudio/wsTs 标记的卡片；预览/下载时经 HMDAO_GET_DOUBAO_WS_AUDIO 取字节。
+        //   url 用伪协议（不可 fetch），避免任何代码把它当直链去请求。
+        if (Array.isArray(mainRes.doubaoWsAudio) && mainRes.doubaoWsAudio.length) {
+          const wsBase = (function () {
+            let t = String(targetTabTitle || '').replace(/^\s*豆包\s*[-—|]\s*/, '').replace(/\s*[-—|]\s*豆包\s*$/, '').trim();
+            if (!t || /^豆包$|新对话|有什么我能帮你的吗/.test(t)) t = '';
+            return t ? (t + ' · 豆包朗读') : '豆包朗读';
+          }());
+          // 标题带上【朗读开始时间 HHMMSS】：
+          //   ① 同一会话多次朗读可区分；② 跨会话切换时，即便豆包 tab 标题没跟着变
+          //      （实测豆包标题切换有延迟/可能不变），两张卡也能靠时间一眼分辨，不会混淆。
+          //   用纯数字而非 HH:MM:SS —— 冒号会被文件名 sanitize 处理掉，数字更安全。
+          const wsTime = (ts) => {
+            try {
+              const d = new Date(Number(ts) || Date.now());
+              const p = (n) => String(n).padStart(2, '0');
+              return p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+            } catch (_) { return ''; }
+          };
+          const wsSeen = new Set();
+          mainRes.doubaoWsAudio.forEach((x, i) => {
+            // ★只认【已完成】的朗读段（WS 已关闭 = 播完/已停止）。
+            //   正在朗读中的段（done=false）不生成卡片，避免"还没读完就冒出一张残缺卡"。
+            // ★朗读失败（0KB / 只有几十字节的信令）一律不生成卡片：阈值 4KB
+            //   （opus 32kbps 约 4KB/秒，低于 4KB 基本是空文件或握手失败产物）。
+            if (!x || Number(x.bytes) < 4096 || !x.ts || x.done !== true) return;
+            const key = 'ws:' + x.ts;
+            if (wsSeen.has(key)) return;
+            wsSeen.add(key);
+            networkAssets.push({
+              url: 'doubao-ws-audio://' + x.ts,
+              type: 'audio',
+              source: 'doubao-ws',
+              platform: 'doubao',
+              playerUrl: targetTabUrl || undefined,
+              title: wsBase + ' ' + (wsTime(x.ts) || String(Number(x.ts) || '').slice(-6)),
+              wsAudio: true,
+              wsTs: Number(x.ts) || 0,
+              size: Number(x.bytes) || 0,
+              mime: 'audio/ogg',
+            });
+          });
+          console.log('[HMDAO][scan] 豆包 WS 朗读音频并入:', mainRes.doubaoWsAudio.length, '段');
+        }
+        // ★豆包候选验证：Performance 只读探针抓到的「大响应 URL」（可能不是 audio/* 响应头），
+        //   交后台 Range GET 前 64 字节验魔数，命中音频才入 NETWORK_ASSETS 并自动重扫。
+        //   异步执行不阻塞扫描；每个 URL 只验证一次；每轮最多 3 条 → 零卡顿边界。
+        if (Array.isArray(mainRes.doubaoTtsCandidates) && mainRes.doubaoTtsCandidates.length
+            && !mainRes.doubaoTts.length && /doubao\.com/i.test(targetTabUrl || '')) {
+          verifyDoubaoAudioCandidates(tabId, mainRes.doubaoTtsCandidates).catch(() => {});
+        }
         // ★修复：抖音 MAIN 世界已捕获的 CDN 直链（dyUrls）此前没回传 → 抖音视频采不到。
         // 这里并入 networkAssets，合并阶段按 type==='video' 智能保留（不再被 VIDEO_HOST_RE 误杀）。
         // ★2026-08-18 修复：抖音 dyUrls 资产此前只有 url/type/source，缺 playerUrl 与 cover，
@@ -339,7 +604,9 @@ async function scanTab(tabId, opts = {}) {
         // ★2026-09-01：按 awemeId 索引的封面与多画质直链，精确回填到对应视频卡（不再依赖错位索引）。
         const dyCoverByAweme = (mainRes.dyCoverByAweme && typeof mainRes.dyCoverByAweme === 'object') ? mainRes.dyCoverByAweme : {};
         const dyFormatsByAweme = (mainRes.dyFormatsByAweme && typeof mainRes.dyFormatsByAweme === 'object') ? mainRes.dyFormatsByAweme : {};
-          const dyAssets = mainRes.dyUrls
+        const dyAudiosByAweme = (mainRes.dyAudiosByAweme && typeof mainRes.dyAudiosByAweme === 'object') ? mainRes.dyAudiosByAweme : {};
+        const dyVideoUrlByAweme = (mainRes.dyVideoUrlByAweme && typeof mainRes.dyVideoUrlByAweme === 'object') ? mainRes.dyVideoUrlByAweme : {};
+          let dyAssets = mainRes.dyUrls
             .map((u, i) => {
               const aid = ((mainRes.dyAwemes && mainRes.dyAwemes[i]) || '').replace(/[^\w]/g, '');
               // ★2026-08-22 深层修复：仅保留"当前播放流"（dyPlayback 标记）。搜索/信息流的预加载脏数据
@@ -348,10 +615,22 @@ async function scanTab(tabId, opts = {}) {
               const isPlayback = (dyPlayback[i] !== false);
               if (!isPlayback) return null;
               return {
-                url: u, type: 'video', source: 'douyin', platform: 'douyin',
+                // ★2026-09-03：优先用按 awemeId 索引的视频轨直链（切集后精确指向本集，避免取错/取旧），
+                //   回退到 dyUrls 当前下标对应的流（仍仅为视频轨，音频轨已分离到 dyAudios），
+                //   再回退到详情 API 的 play_addr 直链（MSE 场景下 dyUrls 常为空的兜底，保证预览"有画面"）。
+                url: ((aid && mainRes.dyUrlsByAweme && mainRes.dyUrlsByAweme[aid])
+                  || (aid && dyVideoUrlByAweme[aid])
+                  || (pageCurAwemeId && dyVideoUrlByAweme[pageCurAwemeId])
+                  || u), type: 'video', source: 'douyin', platform: 'douyin',
                 // ★2026-09-02：配对到的 DASH 音频轨直链。下载时若存在则交后端 ffmpeg
                 //   合并成含音画单文件（直连只能拿到无声视频轨）。
-                dashAudio: (dyAudioPaired[i] && dyAudioPaired[i].url) || null,
+                // ★2026-09-03：优先用按「当前集锚点」索引的音频轨（dyAudiosByAweme[当前 awemeId]），
+                //   比时间配对更稳，切集后精确拿到本集音频，避免"有画面没声音/内容不一致"。
+                dashAudio: (dyAudioPaired[i] && dyAudioPaired[i].url)
+                  || dyAudiosByAweme[aid]
+                  || (pageCurAwemeId && dyAudiosByAweme[pageCurAwemeId])
+                  || (dyAudios && dyAudios.length && dyAudios[dyAudios.length - 1].url)
+                  || null,
                 // ★2026-08-23 修复：playerUrl 优先沿用源页 jingxuan?modal_id=<feedId> 上下文，
                 // 切页时与当前播放页 modal_id 精确匹配 → 点当前视频不刷新，点别的视频最小化跳页。
                 playerUrl: douyinPlayerUrl(aid, targetTabUrl) || (targetTabUrl || undefined),
@@ -376,9 +655,96 @@ async function scanTab(tabId, opts = {}) {
                 // ★2026-08-21 修复:合集多集数场景下，每条 dyUrls 对应不同 aweme_id，dedup 必须按 awemeId 区分。
                 // 来源：inject-main 在捕获 dyUrl 时按 RENDER_DATA aweme_list 顺序填充 dyAwemes，与 dyUrls 1:1 同步。
                 awemeId: aid,
+                // ★2026-09-03：是否「浏览器未实际播放过」——仅当前正在播放的那集(aid===pageCurAwemeId)为 false。
+                //   用于侧栏打 📍 未播放 徽标 + 预览引导「切到此集播放」，避免拿过期 API play_addr 直链硬预览(403→只有声音)。
+                notPlayed: !!(pageCurAwemeId && aid && String(aid) !== String(pageCurAwemeId)),
+                // ★2026-09-03：优先用合集/列表 API 的数组顺序作为「绝对集数」，严格等于播放列表显示的「第 N 集」；
+                //   未索引到时按 dyAwemes 顺序兜底，保证文件名一定带集数。
+                episodeNo: (aid && mainRes.dyEpisodeByAweme && mainRes.dyEpisodeByAweme[aid]) || (i + 1),
+                // ★2026-09-03：用 RENDER_DATA / 详情 API 里按 awemeId 索引的真实标题（通常含「第 N 集：...」）做文件名
+                title: stripEpisodePrefix((aid && mainRes.dyTitlesByAweme && mainRes.dyTitlesByAweme[aid]) || ''),
               };
             })
             .filter(Boolean);
+          // ★2026-09-03：同一集的视频分片(DASH)在 dyUrls 里是多条不同 CDN 直链，但内容相同。
+          //   按 awemeId 去重，只保留每集第一条，避免"一个视频变 N 张卡"且旧分片签名过期→"只有声音没画面"。
+          //   无 awemeId 的分片(RENDER_DATA 反查失败)各自保留(用 url 兜底唯一性)。
+          try {
+            const seenAid = new Set();
+            const deduped = [];
+            for (const d of dyAssets) {
+              const k = d && d.awemeId;
+              if (k && seenAid.has(k)) continue;
+              if (k) seenAid.add(k);
+              deduped.push(d);
+            }
+            dyAssets = deduped;
+          } catch (_) {}
+          // ★2026-09-03 合集批量合成：
+          //   实测 dyUrls 常为 0（抖音 MSE 播放不暴露可拦截的 fetch），但详情/合集列表 API 已把
+          //   每一集的【标题 / 封面 / 绝对集数 / 视频轨直链】都抓全了（dyTitlesByAweme / dyCoverByAweme /
+          //   dyEpisodeByAweme / dyVideoUrlByAweme）。此前 scan.js 从不遍历这些映射，
+          //   只认 dyUrls → 侧栏一张抖音卡都生不成，只剩"无 awemeId 的裸直链卡"。
+          //   现按集数映射为每一集合成视频卡：当前集不打「未播放」，其余打 📍（需切源页播放才能拿到实时流）。
+          // ★2026-09-05 修复：合集页（有 mixId / episodeMap）时，无论"信息流批量采集"开关是否打开，
+          //   都要把每一集都列出来——这是合集页的基本功能；开关只控制 feed/搜索等非合集场景是否批量。
+          try {
+            const vmap = mainRes.dyVideoUrlByAweme || {};
+            const vkeys = Object.keys(vmap);
+            const episodeMap = mainRes.dyEpisodeByAweme || {};
+            const hasEpisodeIndex = Object.keys(episodeMap).length > 0;
+            const isKnownCollection = hasEpisodeIndex || !!(mainRes.mixId);
+            // ★2026-09-05 修复（"内容有当前合集不匹配" + 卡数忽多忽少根因）：
+            //   dyVideoUrlByAweme 会被推荐流/搜索/上一合集的残留污染。此前只用 episodeMap
+            //   （数组下标派生、随 chunk 变化）当成员名单 → 名单本身不稳定、且漏判归属。
+            //   现以【按 awemeId 索引的所属合集 id】为准：当前页有 mixId 时，只接受归属本合集
+            //   （或已被本合集集数索引到）的项，其余一律丢弃。
+            const mixIdsByAweme = mainRes.dyMixIdsByAweme || {};
+            const curMixId = pageMixId || mainRes.mixId || mainRes.mix_id || '';
+            if ((isKnownCollection || batchMode) && vkeys.length > 0) {
+              const liveByAid = new Map();
+              for (const d of dyAssets) if (d && d.awemeId) liveByAid.set(String(d.awemeId), d);
+              const coll = [];
+              // ★2026-09-04 修复（批量开启时"合集 3 集却凭空多出很多视频卡"真凶）：
+              //   dyVideoUrlByAweme 会被任意详情/feed/搜索响应污染，里面可能混入 20+ 个推荐流 awemeId；
+              //   旧逻辑把【所有键】都合成卡片 → 侧栏出现 N 张非合集卡。
+              //   只有合集/列表 API 才会按播放列表顺序写入 dyEpisodeByAweme，因此以它为权威成员名单：
+              //   有 episodeNo 的才认为属于当前合集；否则跳过。
+              //   episodeMap / isKnownCollection 已在外层计算好，这里直接用。
+              for (const k of vkeys) {
+                const u = vmap[k];
+                if (!u) continue;
+                if (isKnownCollection && !episodeMap[k]) continue; // 合集页：只认列表成员；非合集页：保持全部
+                // ★2026-09-05：已知当前合集 id 时，剔除归属其它合集/无归属的脏数据。
+                //   注意兜底：dyMixIdsByAweme 整体为空（旧缓存/刚重载还没采到归属）时不能启用过滤，
+                //   否则会把全部成员误杀 → 侧栏一张合集卡都不剩（比混入脏数据更糟）。
+                if (curMixId && isKnownCollection && Object.keys(mixIdsByAweme).length > 0) {
+                  const owner = mixIdsByAweme[k] ? String(mixIdsByAweme[k]) : '';
+                  if (owner !== String(curMixId)) continue;
+                }
+                if (liveByAid.has(String(k))) continue; // 已有实时流卡（更鲜），不重复生成
+                coll.push({
+                  url: u,
+                  type: 'video', source: 'douyin', platform: 'douyin',
+                  dashAudio: (mainRes.dyAudiosByAweme && mainRes.dyAudiosByAweme[k]) || null,
+                  playerUrl: douyinPlayerUrl(k, targetTabUrl) || (targetTabUrl || undefined),
+                  modalId: k,
+                  cover: dyCoverByAweme[k] || undefined,
+                  dyFormats: (dyFormatsByAweme[k] && dyFormatsByAweme[k].length)
+                    ? dyFormatsByAweme[k].map((f) => ({ label: (f && f.label) || '默认', url: (f && f.url) || '', is_default: !!(f && f.is_default) }))
+                    : undefined,
+                  awemeId: k,
+                  episodeNo: (mainRes.dyEpisodeByAweme && mainRes.dyEpisodeByAweme[k]) || undefined,
+                  title: stripEpisodePrefix((mainRes.dyTitlesByAweme && mainRes.dyTitlesByAweme[k]) || ''),
+                  notPlayed: !!(pageCurAwemeId && String(k) !== String(pageCurAwemeId)),
+                });
+              }
+              if (coll.length) {
+                dyAssets = dyAssets.concat(coll);
+                console.log('[HMDAO][scan] 抖音合集批量：合成 %d 张集数卡（共 %d 集）', coll.length, vkeys.length);
+              }
+            }
+          } catch (e) { console.warn('[HMDAO][scan] 合集批量合成失败：', e && e.message); }
           // ★2026-08-22 修复（"没开启信息流也扫出很多视频"真凶）：单视频模式（!batchMode）下，
           //   只保留「当前播放的那一条」（dyUrls 末条 isPlayback），而非所有 isPlayback 累积项。
           //   否则 inject-main 跨页面累积 + 主播放器判定抖动会产出多条错卡。
@@ -388,12 +754,36 @@ async function scanTab(tabId, opts = {}) {
             //   单视频模式必须只保留「当前 <video> 真正在播放的那条流所属的视频」，
             //   即 awemeId === 主播放器 currentSrc 反查出的 pageCurAwemeId 的资产，
             //   确保标题/缩略图/画面URL 三者与页面实际播放一致。
-            //   当 pageCurAwemeId 命中时强制只留命中项（精确匹配）；否则回退到末条（流尚未捕获的边界情况）。
+            // ★2026-09-04 修复（用户实测：单视频模式点侧栏播放的是下一集/18集而非当前17集）：
+            //   MSE 流数组 dyUrls 会被预加载、信息流推荐、切集缓存污染，用它反查的 awemeId 与 URL 可能对不上。
+            //   详情/合集 API 按 awemeId 索引的 play_addr（dyVideoUrlByAweme）才是该集的真实签名直链。
+            //   因此单视频模式【优先】用 dyVideoUrlByAweme[pageCurAwemeId] 生成当前集资产，其次才回退 dyAssets 精确匹配。
             if (pageCurAwemeId) {
-              const exact = dyAssets.filter(a => a.awemeId === pageCurAwemeId);
-              networkAssets.push(...(exact.length ? exact : []));
-              // 精确命中的同时，若仍有其它 dyAssets 但无匹配（避免完全空列表），回退保留末条
-              if (!exact.length && dyAssets.length) networkAssets.push(dyAssets[dyAssets.length - 1]);
+              const vurl = dyVideoUrlByAweme[pageCurAwemeId];
+              if (vurl) {
+                const aid = pageCurAwemeId;
+                networkAssets.push({
+                  url: vurl, type: 'video', source: 'douyin', platform: 'douyin',
+                  dashAudio: (dyAudiosByAweme[aid] || (dyAudios && dyAudios.length && dyAudios[dyAudios.length - 1].url)) || null,
+                  playerUrl: douyinPlayerUrl(aid, targetTabUrl) || (targetTabUrl || undefined),
+                  modalId: aid || '',
+                  cover: (dyCoverByAweme[aid]) || (dyCovers.length ? (dyCovers[dyCovers.length - 1]) : undefined),
+                  dyFormats: (aid && dyFormatsByAweme[aid] && dyFormatsByAweme[aid].length)
+                    ? dyFormatsByAweme[aid].map((f) => ({ label: (f && f.label) || '默认', url: (f && f.url) || '', is_default: !!(f && f.is_default) }))
+                    : undefined,
+                  awemeId: aid,
+                  episodeNo: ((mainRes.dyEpisodeByAweme && mainRes.dyEpisodeByAweme[aid]) || 1),
+                  title: stripEpisodePrefix((mainRes.dyTitlesByAweme && mainRes.dyTitlesByAweme[aid]) || ''),
+                });
+              } else {
+                const exact = dyAssets.filter(a => a.awemeId === pageCurAwemeId);
+                // 无详情直链时：先精确匹配实时流，再回退末条
+                if (exact.length) {
+                  networkAssets.push(...exact);
+                } else if (dyAssets.length) {
+                  networkAssets.push(dyAssets[dyAssets.length - 1]);
+                }
+              }
             } else if (dyAssets.length > 1) {
               networkAssets.push(dyAssets[dyAssets.length - 1]);
             } else {
@@ -469,7 +859,52 @@ async function scanTab(tabId, opts = {}) {
           //   （videoDetail 快速路径 + walk 放宽 + playAddr.src 兜底），保证 1 张当前真实视频卡。
           const isDyTikTok = /(?:^|\.)(douyin\.com|ixigua\.com|tiktok\.com|tiktokv\.com|bytedance\.com|toutiao\.com)$/i.test(targetTabUrl || '');
           if (!isDyTikTok) {
-            networkAssets.push(...mainRes.apiVideos.map((u) => ({ url: u, type: 'video', source: 'api-video' })));
+            // ★2026-09-11 修复（liblib 等站同一视频多分辨率占多张卡根因）：
+            //   apiVideos 会捕获同一视频的 1080p/720p/540p 等多个签名直链，旧 dedup 只按 URL 去签名归一，
+            //   pathname 里带 _1080p / _720p 的变体无法合并 → 同一视频出现 3~4 张重复卡。
+            //   这里按"去掉分辨率标签后的 basename"分组，最高分辨率作为 asset.url，其余收入 altUrls，
+            //   下载时用户可在分辨率面板里切换（与 aigeiVideos 的多分辨率聚合语义一致）。
+            const apiPairs = (mainRes.apiVideoPairs && typeof mainRes.apiVideoPairs === 'object') ? mainRes.apiVideoPairs : {};
+            const apiTitles = (mainRes.apiVideoTitles && typeof mainRes.apiVideoTitles === 'object') ? mainRes.apiVideoTitles : {};
+            const stripResTag = (name) => String(name || '')
+              .replace(/[_-](1080|720|540|480|360|240|1440|2160|4k|2k|hd|sd|fhd|uhd|high|low|medium|mid)[pP]?([-_]|$)/gi, '$2')
+              .replace(/(1080|720|540|480|360|240|1440|2160|4k|2k|hd|sd|fhd|uhd|high|low|medium|mid)[pP]?([-_]|$)/gi, '$2')
+              .trim();
+            const apiVideoByBase = new Map();
+            for (const u of mainRes.apiVideos) {
+              try {
+                const urlObj = new URL(u);
+                const base = stripResTag((urlObj.pathname || '').split('/').pop() || '');
+                const groupKey = base ? (urlObj.origin + urlObj.pathname.replace(/[^/]+$/, '') + base) : u;
+                const list = apiVideoByBase.get(groupKey) || [];
+                list.push(u);
+                apiVideoByBase.set(groupKey, list);
+              } catch (_) {
+                networkAssets.push({ url: u, type: 'video', source: 'api-video' });
+              }
+            }
+            for (const list of apiVideoByBase.values()) {
+              if (!list.length) continue;
+              // 按分辨率排序：数字越大越靠前（取 1080p > 720p）；无数字按 URL 原序
+              list.sort((x, y) => {
+                const rx = Number((String(x).match(/[_-]?(\d+)[pP]/) || [0, 0])[1] || 0);
+                const ry = Number((String(y).match(/[_-]?(\d+)[pP]/) || [0, 0])[1] || 0);
+                return ry - rx;
+              });
+              const main = { url: list[0], type: 'video', source: 'api-video' };
+              const cover = apiPairs[list[0]] || apiPairs[list[0].split('?')[0]];
+              if (cover) main.cover = cover;
+              // ★2026-09-11：结构化标题（多平台通用，liblib/模型社区等 API JSON 内 title/name 字段）
+              const title = apiTitles[list[0]] || apiTitles[list[0].split('?')[0]];
+              if (title) main.title = title;
+              if (list.length > 1) {
+                main.altUrls = list.slice(1).map((u) => {
+                  const q = Number((String(u).match(/[_-]?(\d+)[pP]/) || [0, 0])[1] || 0);
+                  return { url: u, quality: q ? (q + 'P') : '', source: 'api-video' };
+                });
+              }
+              networkAssets.push(main);
+            }
           }
         }
         // ★爱给视频多分辨率：用户已在源页切换过的画质版本，按 quality 保留为同一素材的候选 URL
@@ -533,6 +968,29 @@ async function scanTab(tabId, opts = {}) {
           }
         }
       }
+      // ★2026-09-05 自动触发抖音合集列表主动拉取：
+      //   仅被动扫描拿不到 episodeMap 时，自动调用页面里的 __hmdao_tryMix(true,true)，
+      //   等 2s 后再读一次 MAIN 捕获，避免用户手动在控制台执行。
+      const mixId = mainRes && (mainRes.mixId || mainRes.mix_id);
+      const episodeMap = (mainRes && mainRes.dyEpisodeByAweme) || {};
+      if (mixId && Object.keys(episodeMap).length === 0) {
+        try {
+          console.log('[HMDAO][scan] 抖音合集页缺少 episodeMap，触发主动拉取 mixId=%s', mixId);
+          await chrome.scripting.executeScript({
+            target: { tabId, allFrames: false },
+            world: 'MAIN',
+            func: () => { try { window.__hmdao_tryMix && window.__hmdao_tryMix(true, true); } catch (_) {} },
+          });
+          await new Promise((r) => setTimeout(r, 2000));
+          const reinjected = await chrome.scripting.executeScript({
+            target: { tabId, allFrames: false },
+            world: 'MAIN',
+            func: readAllCapturesMAIN,
+          });
+          mainRes = reinjected && reinjected[0] && reinjected[0].result;
+          console.log('[HMDAO][scan] 主动拉取后 episodeKeys=%d', Object.keys((mainRes && mainRes.dyEpisodeByAweme) || {}).length);
+        } catch (e) { console.warn('[HMDAO][scan] 主动拉取失败:', e && e.message); }
+      }
     } catch (e) {
       console.warn('[HMDAO][scan] readAllCapturesMAIN 注入失败（普通网页无 MAIN 捕获属正常）：', e && e.message);
     }
@@ -552,8 +1010,52 @@ async function scanTab(tabId, opts = {}) {
   // 整条漏掉 → 侧栏「音频 0 / 试听音效采不到」。改为：把 NETWORK_ASSETS 里所有 audio 类型（除 bilivideo 外）也并入。
   const audioNet = n.filter((a) => a && a.type === 'audio' && !/bilivideo\.(com|cn|tv)\b/i.test(a.url));
   if (audioNet.length) {
-    networkAssets.push(...audioNet.map((a) => ({ url: a.url, type: 'audio', source: a.source || 'network' })));
+    networkAssets.push(...audioNet.map((a) => {
+      const base = { url: a.url, type: 'audio', source: a.source || 'network' };
+      // ★2026-09-06 豆包朗读（后台魔数验证命中）：补平台/标题，卡片与文件名可读
+      if (a.source === 'doubao-tts-verified') {
+        const t = String(targetTabTitle || '').replace(/^\s*豆包\s*[-—|]\s*/, '').replace(/\s*[-—|]\s*豆包\s*$/, '').trim();
+        base.platform = 'doubao';
+        base.playerUrl = targetTabUrl || undefined;
+        base.title = (t && !/^豆包$|新对话/.test(t) ? t + ' · 豆包朗读' : '豆包朗读');
+      }
+      return base;
+    }));
     console.log('[HMDAO][scan] 网络层音频资产并入:', audioNet.length, '条');
+  }
+  // ★2026-09-10：其它站点的网络层视频直链（m3u8 / mp4 / flv 等）此前【完全未并入】
+  //   —— 只并了 googlevideo(YouTube) / bilivideo(B站) / audio 三类，导致 DPlayer、hls.js
+  //   一类播放器用 XHR 拉的 m3u8（initiatorType=xmlhttprequest 而非原生 media）
+  //   虽被 webRequest 捕获进 NETWORK_ASSETS，却永远进不了侧栏。
+  //   实测 4815.wumaheil13.icu：t27.cdn2020.com/.../index.m3u8 已被捕获，侧栏视频仍为 0。
+  //   这里并入其余 video 类型网络资产；并排除 HLS 数字分片（0000.ts / 0001.ts…），
+  //   避免几十上百张碎片卡刷屏（分片本身不可独立播放，播放列表 index.m3u8 才是素材）。
+  // ★2026-09-10 修复（占位/API 直链不应生成可播放卡）：
+  //   网络层会把 MSN 之类站点的「…/get-url」「…/asset」这类【无扩展名 API 占位直链】
+  //   （响应可能是 video/*，其实是接口而非媒体文件）也标成 type:'video' 收进来。
+  //   同一视频的 N 个签名变体被收成 N 张「点哪张都播同一个」的废卡。
+  //   真实可直接播放的媒体文件 URL，其 pathname 末段必带视频/音频扩展名（.mp4/.webm/.m3u8/.m4s/.flv…）；
+  //   API 占位直链末段是动词/无扩展名 → 直接排除。例外：少数无扩展名但确为媒体的已知 CDN（抖音 douyinvod/v26-web）放行。
+  //   YouTube/B站 已在上面单独分支处理，不依赖此判定。
+  const looksLikeMediaFileUrl = (url) => {
+    if (!url || typeof url !== 'string') return false;
+    try {
+      const u = new URL(url);
+      const path = u.pathname || '';
+      if (/\.(mp4|webm|m4s|mov|m3u8|flv|m4v|avi|mkv|ts|ogv|mpd|m3u|mp3|m4a|aac|ogg|wav|mpg|mpeg)(\?|#|$)/i.test(path)) return true;
+      const host = (u.hostname || '').toLowerCase();
+      if (/douyinvod|v26-web/.test(host)) return true; // 抖音 CDN 无扩展名但确为媒体
+      return false;
+    } catch (_) { return false; }
+  };
+  const otherVideoNet = n.filter((a) => a && a.type === 'video'
+    && !/googlevideo\.com\/videoplayback/.test(a.url)
+    && !/bilivideo\.(com|cn|tv)\b/i.test(a.url)
+    && !/\/[0-9]+\.ts(\?|$)/i.test(a.url)
+    && looksLikeMediaFileUrl(a.url));
+  if (otherVideoNet.length) {
+    networkAssets.push(...otherVideoNet.map((a) => ({ url: a.url, type: 'video', source: a.source || 'network' })));
+    console.log('[HMDAO][scan] 网络层其它视频直链并入:', otherVideoNet.length, '条');
   }
 
   // ★爱给视频多分辨率聚合（2026-08-01）：同一视频不同画质版本合并为单条素材，
@@ -659,14 +1161,17 @@ async function scanTab(tabId, opts = {}) {
     console.log('[HMDAO][scan] B站播放页：进入纯旁观模式（跳过 scanPage / extractFreshVideoUrl，保声音）');
   } else {
     try {
+      // ★2026-09-07 修复（用户实测课程/设计站 webp/avif 漏采根因）：原注入只扫顶层帧，
+      // 图片/链接若位于 <iframe>（设计评审、课程、网盘预览常把内容放隔离 iframe）则永远采不到。
+      // 改 allFrames:true 注入到所有子帧（含跨域；扩展已声明 <all_urls> host 权限），并聚合各帧结果。
       const res = await chrome.scripting.executeScript({
-        target: { tabId },
+        target: { tabId, allFrames: true },
         world: 'ISOLATED',
         func: scanPage,
         args: [networkAssets],
       });
-      pageAssets = (res && res[0] && res[0].result) || [];
-      console.log('[HMDAO][scan] DOM 解析产出', pageAssets.length, '条素材（含图片/视频/音频/3D模型/下载链接）');
+      pageAssets = (res || []).flatMap((r) => (r && r.result) || []);
+      console.log('[HMDAO][scan] DOM 解析产出', pageAssets.length, '条素材（含图片/视频/音频/3D模型/下载链接，已含 iframe 子帧）');
     } catch (e) {
       console.warn('[HMDAO][scan] scanPage 注入/执行失败（tab 未就绪或不可脚本化）：', e && e.message);
     }
@@ -727,6 +1232,7 @@ async function scanTab(tabId, opts = {}) {
                 modalId: aid || '',
                 duration: it.duration,
                 __isCurrent: !!it.__isCurrent,
+                episodeNo: it.episodeNo || 0,
               });
             }
             const cur = (r.items.find((x) => x.__isCurrent) || {}).awemeId || '';
@@ -748,6 +1254,7 @@ async function scanTab(tabId, opts = {}) {
               // 记录该卡片自身反查出的 awemeId，供 switchDouyinEpisodeTo 匹配当前源页（相等则不跳页）
               modalId: r.awemeId || '',
               platform: 'douyin',
+              episodeNo: r.episodeNo || 0,
             });
             if (r.awemeId) __hmdao_current_aweme_id = r.awemeId;
           }
@@ -856,16 +1363,96 @@ async function scanTab(tabId, opts = {}) {
       //   命中的是同张图），建议"按 pageVideoAssets 个数复制分发"——但抖音单视频过滤后只剩 1 条，
       //   所以这里直接赋 cover 即可。若批量场景（信息流）多视频，可能需要 dedup 优化——后续追加。
       if (coverMap.defaultCover) {
-        // ★额外防御：即使白名单过滤，仍校验一次不含推广特征（双保险）
-        const def = coverMap.defaultCover;
-        const looksLikePromo = /^(data:image\/jpeg|data:image\/png)/i.test(def) ? false : /(verify-|license-business|qrcode|qr-|banner|ad-|promo|advert|sponsor|avatar|emoji|logo|loading|sprite|placeholder|\bicon[/-]|user-?data|sign-|favicon)/i.test(def);
-        if (!looksLikePromo) {
-          pageVideoAssets.forEach((d) => { if (!d.cover) d.cover = coverMap.defaultCover; });
-        } else {
-          // 兜底：默认封面看起来仍像推广图 → 只给首条用一次（避免9 张同款电子营业执照）
-          if (pageVideoAssets.length && !pageVideoAssets[0].cover) pageVideoAssets[0].cover = coverMap.defaultCover;
+        // ★2026-09-08 修复（imini.ai 等多视频页「所有视频卡共用同一张封面」根因）：
+        //   本段设计前提是【单视频页】（B站 videoData.pic / 抖音 aweme.cover / YouTube og:image，
+        //   全页仅 1 条视频 → 共享页面默认封面 = 正确）。但通用多视频画廊页（imini /zh/video，
+        //   6+ 条视频）也会进到这里：defaultCover 是 og:image / 页面最大图 → 全部视频卡被塞同一张图。
+        //   修复：仅当本页视频资产 ≤1（单视频页语义）才用 defaultCover 兜底；多视频页交给下方
+        //   posters / page-img 的按序分发（本来就有），分不到的宁可空封面（显示占位图标），
+        //   绝不给所有卡发同一张错图。抖音/B站/YouTube 单视频页行为完全不变。
+        if (pageVideoAssets.length <= 1) {
+          // ★额外防御：即使白名单过滤，仍校验一次不含推广特征（双保险）
+          const def = coverMap.defaultCover;
+          // ★2026-09-08：补 og/分享图 黑名单（与上方 isPromo 同步）——即便候选漏进来，下发前再拦一道
+          const looksLikePromo = /^(data:image\/jpeg|data:image\/png)/i.test(def) ? false : /(verify-|license-business|qrcode|qr-|banner|ad-|promo|advert|sponsor|avatar|emoji|logo|loading|sprite|placeholder|\bicon[/-]|user-?data|sign-|favicon|og[-_.]?(?:image|share|poster)|social[-_]?(?:share|preview)|apple-touch|share[-_]?(?:image|icon|logo|img))/i.test(def);
+          if (!looksLikePromo) {
+            pageVideoAssets.forEach((d) => { if (!d.cover) d.cover = coverMap.defaultCover; });
+          } else {
+            // 兜底：默认封面看起来仍像推广图 → 只给首条用一次（避免9 张同款电子营业执照）
+            if (pageVideoAssets.length && !pageVideoAssets[0].cover) pageVideoAssets[0].cover = coverMap.defaultCover;
+          }
         }
       }
+      // 2.5) ★2026-09-11 修复（imini 等多视频页「封面与内容错配 / 部分卡无封面」根因）：
+      //   视频封面此前来自「页面 <img> 按 DOM 序分发」的猜测式匹配，与视频毫无对应关系。
+      //   这里先按【真封面来源优先级】给每张视频卡定封面，取不到才落回下方 posters/page-img 分发：
+      //     ① <video poster> ② 内联 JSON / RSC 中与同一条 mp4 成对出现的 cover 字段（coverMap.pairs）
+      //     ③ 与 mp4 同源同目录、同 basename 的图片（iminicdn 惯例：xxx.mp4 → xxx.jpg）
+      //   ③ 是【候选 URL、不发任何网络请求验证】，可能 404；下游有完整降级链
+      //   （media-fetch 的占位图识别 + card-render 的抽帧兜底 / 🎬），卡片不会停在"永远加载中"。
+      try {
+        const coverPairs = (coverMap && coverMap.pairs) || {};
+        const pairKeys = Object.keys(coverPairs);
+        const bareOf = (u) => { try { return String(u || '').split('?')[0]; } catch (_) { return ''; } };
+        // 与视频直链同源同目录、同 basename 的图片候选
+        //   a) 先在页面已加载的封面里找同 basename 的图（存在即真封面，零风险）
+        //   b) 否则按同名换扩展名猜 .jpg（仅对"通用文件型 CDN"启用，平台防盗链 CDN 不猜，避免误伤）
+        const SIBLING_GUESS_SKIP = /(douyinvod|douyinpic|douyinstatic|byteimg|bytetos|bytefcdn|bilivideo|bilibili|tiktokcdn|tiktokv|tiktok|googlevideo|youtu\.be|youtube|ytimg|alicdn|qpic|mmbiz|sinaimg|xhscdn|xiaohongshu|iqiyi|youku|kuaishou|\.qq\.com|pstatp|ixigua|huoshan|snssdk|akamaized)/i;
+        const siblingCoverOf = (videoUrl) => {
+          try {
+            const u = new URL(String(videoUrl || ''), 'https://x/');
+            if (!/^https?:/i.test(u.protocol)) return '';
+            const m = /^(.*)\.(mp4|webm|mov|m4v|mkv|ogv|m3u8|flv|avi|wmv|ts|mpg|mpeg)$/i.exec(u.pathname);
+            if (!m) return '';
+            const base = m[1];
+            // a) 页面已加载图里有同 basename 的 → 直接用（零风险真封面）
+            const allCovers = ((coverMap && coverMap.pageCovers) || []);
+            for (const c of allCovers) {
+              const cu = c && c.url;
+              if (!cu) continue;
+              try {
+                const pu = new URL(String(cu), 'https://x/');
+                if (pu.origin === u.origin && pu.pathname.indexOf(base + '.') === 0
+                    && /\.(jpg|jpeg|png|webp|avif|gif|bmp)(\?|$)/i.test(pu.pathname)) return String(cu);
+              } catch (_) {}
+            }
+            // b) 同名换扩展名（仅通用文件型 CDN）
+            if (SIBLING_GUESS_SKIP.test(u.hostname)) return '';
+            return u.origin + base + '.jpg';
+          } catch (_) { return ''; }
+        };
+        const findPair = (videoUrl) => {
+          if (!videoUrl) return '';
+          if (coverPairs[videoUrl]) return coverPairs[videoUrl];
+          const bare = bareOf(videoUrl);
+          if (bare && coverPairs[bare]) return coverPairs[bare];
+          for (let i = 0; i < pairKeys.length; i++) {
+            if (bareOf(pairKeys[i]) === bare) return coverPairs[pairKeys[i]];
+          }
+          return '';
+        };
+        const assignTrueCover = (d) => {
+          if (!d || d.type !== 'video' || d.cover || !d.url) return;
+          if (!/^https?:/i.test(String(d.url || ''))) return;
+          const p = findPair(d.url);      // ①②
+          if (p) { d.cover = p; return; }
+          const sib = siblingCoverOf(d.url); // ③
+          if (sib) d.cover = sib;
+        };
+        pageVideoAssets.forEach(assignTrueCover);
+        // scanPage 产出的页面资产（imini 的内联 JSON mp4 直链走这里）
+        if (Array.isArray(pageAssets)) pageAssets.forEach(assignTrueCover);
+        // ★2026-09-11：api-video 网络资产（liblib 等 XHR 捕获）同样按 coverPairs 补封面，
+        //   仅用 ①②（结构化/段配对），不触发 ③ 同名换扩展名猜测（liblib 会猜出 master.jpg 等 404 死链）。
+        if (Array.isArray(networkAssets)) {
+          for (const d of networkAssets) {
+            if (d && d.type === 'video' && d.source === 'api-video' && !d.cover && /^https?:/i.test(String(d.url || ''))) {
+              const p = findPair(d.url);
+              if (p) d.cover = p;
+            }
+          }
+        }
+      } catch (_) {}
       // 3) 通用 <video poster>：回填给同页、且无封面的视频资产（按顺序逐条分配）
       const posters = (coverMap.pageCovers || []).filter((c) => c.kind === 'poster');
       if (posters.length) {
@@ -878,8 +1465,17 @@ async function scanTab(tabId, opts = {}) {
       // 当仍有未拿到封面的视频时，按 round-robin 顺序消费 pageCovers 里 page-img 兜底资源。
       const pageImgs = (coverMap.pageCovers || []).filter((c) => c.kind === 'page-img');
       if (pageImgs.length) {
+        // ★2026-09-10（"视频卡封面与内容不一致"根因）：
+        //   page-img 是【页面图片兜底】，与视频内容毫无对应关系（实测影视站会把
+        //   横幅广告图 / 装饰图当成视频封面）。一旦给视频卡塞了这种图，
+        //   它就"有封面"了 → 侧栏不再触发抽帧 → 用户看到的永远是错的图。
+        //   故：持有【真实视频流】的卡（mp4/m3u8/…）不参与页面图兜底分配，
+        //   保持无封面 → 由 card-render 的抽帧（hls.js / ffmpeg）产出真实首帧。
+        //   只有站内链接卡（generic，无真实流，无法抽帧）才继续用页面图兜底。
+        const hasRealStream = (d) => /\.(mp4|webm|m3u8|mov|m4v|mkv|ogv|flv|ts|mpg|mpeg|3gp|rm|rmvb|asf|vob|m2ts|f4v|m4s)(\?|$)/i.test(String((d && d.url) || ''));
         let pi = 0;
         pageVideoAssets.forEach((d) => {
+          if (hasRealStream(d)) return;
           if (!d.cover && pi < pageImgs.length) { d.cover = pageImgs[pi].url; pi++; }
         });
       }
@@ -941,9 +1537,9 @@ async function scanTab(tabId, opts = {}) {
           }
         });
       }
-      console.log('[HMDAO][scan] 封面采集：byKey', coverMap.byKey ? Object.keys(coverMap.byKey).length : 0,
-        'defaultCover', !!coverMap.defaultCover, 'posters', posters.length,
-        'pageVideoAssets', pageVideoAssets.length);
+      logOnChange('cover', '[HMDAO][scan] 封面采集：byKey=' + (coverMap.byKey ? Object.keys(coverMap.byKey).length : 0)
+        + ' defaultCover=' + !!coverMap.defaultCover + ' posters=' + posters.length
+        + ' pageVideoAssets=' + pageVideoAssets.length);
     }
   } catch (e) {
     console.warn('[HMDAO][scan] extractVideoCovers 注入/执行失败（封面功能降级，不影响采集）：', e && e.message);
@@ -1048,7 +1644,12 @@ async function scanTab(tabId, opts = {}) {
   // ★2026-08-18：图片扩展名兜底——小红书/微博等图床 CDN 图片 URL 路径无扩展名，
   // 真实格式藏在 ?format=webp / imageView2 等参数里，RES_EXT_RE 的 ([?#]|$) 截断会把它丢弃。
   // 这里补一组「无扩展名但可判定为图片」的判定：已知图床 host，或 URL query 含图片格式参数。
-  const IMG_CDN_HOST_RE = /(xhscdn\.com|sns-img|xiaohongshu\.com|weibo(pic)?\.com|sinaimg\.cn|douyinpic|tiktokcdn|byteimg\.com|pstatp\.com|byteimg|iqiyipic|youku\.com|alicdn\.com|douyinpic\.com|hbimg\.|upaiyun\.com|huaban\.com)/i;
+  // ★2026-09-10 补 akamaized\.net（Akamai 图片 CDN，MSN 等大量新闻/媒体站使用）：
+  //   MSN 图片形如 https://img-s-msn-com.akamaized.net/tenant/amp/entityid/AA1xYzQ?w=300&h=200&f=jpg
+  //   ——① 路径无扩展名（RES_EXT_RE 的 ([?#]|$) 截断 → 不命中）；
+  //     ② host 原不在本白名单（不命中）；③ query 用 f= 而非 format=（query 分支不命中）。
+  //   三道判定全落空 → 网络层捕获的 MSN 图片被判为「非图片」全部丢弃，侧栏永远空白。
+  const IMG_CDN_HOST_RE = /(xhscdn\.com|sns-img|xiaohongshu\.com|weibo(pic)?\.com|sinaimg\.cn|douyinpic|tiktokcdn|byteimg\.com|pstatp\.com|byteimg|iqiyipic|youku\.com|alicdn\.com|douyinpic\.com|hbimg\.|upaiyun\.com|huaban\.com|akamaized\.net)/i;
   function looksLikeImageUrl(u) {
     if (!u) return false;
     if (RES_EXT_RE.test(u)) return true;
@@ -1056,16 +1657,34 @@ async function scanTab(tabId, opts = {}) {
       const url = new URL(u, location.href);
       if (IMG_CDN_HOST_RE.test(url.hostname)) return true;
       // query 里显式声明图片格式（format=webp/jpg/png、或 imageView2/thumbnail 图床处理参数）
-      if (/[?&](format=(webp|jpg|jpeg|png|gif|avif|bmp)|imageView2|thumbnail|imageMogr2|x-oss-process=image)/i.test(url.search)) return true;
+      // ★2026-09-07 补全：avif/svg/ico/tiff/heic/heif 也判为图片（无扩展名图床用 format 参数暗示格式）
+      // ★2026-09-10 补 f= 变体：MSN 的 Akamai 图床用 ?...&f=jpg（不是 format=），
+      //   否则 MSN 图片即便命中 host 白名单外的来源也仍会被丢。值限定为图片格式，避免误伤 f=其它语义。
+      if (/[?&]((?:format|f)=(webp|jpg|jpeg|png|gif|avif|bmp|svg|ico|tiff|heic|heif)|imageView2|thumbnail|imageMogr2|x-oss-process=image)/i.test(url.search)) return true;
     } catch (_) {}
     return false;
   }
-  for (const a of all) {
+  // ★2026-09-08 修复（即梦侧栏 200 张杂图根因）：html-fallback 是「正则扫页面 HTML 文本」的
+  //   最后兜底，会把编辑器贴纸/头像/素材库等所有 CDN 变体全捞进来（实测即梦 html-fallback:156
+  //   vs 真实 DOM img:44）。既然 DOM 里已有真实 <img>（DEF_IMG_SRC 命中），HTML 文本兜底就是
+  //   纯噪音 → 直接丢弃，只保留 DOM 收集的真实图片。
+  const hasDomImgs = all.some((x) => x && x.type === 'image' && /^(img|picture|img\[srcset\]|a>img|css-bg)$/.test(x.source || ''));
+  // ★2026-09-08：去重前先剔除「被截断 / 无媒体扩展名」的视频候选（同源存在更完整候选时）。
+  //   必须在 dedup 之前——截断 URL 与完整 URL 的 dedup key 不同（URL 不同），
+  //   两者会各自成为一张卡，去重根本拦不住，只能在这里按"同源更完整候选"消解。
+  const dedupSrc = dropTruncatedVideoAssets(all);
+  for (const a of dedupSrc) {
     if (!a) continue;
     const u = (a.url || '').split('#')[0];
     if (!u) continue;
+    if (hasDomImgs && a.type === 'image' && a.source === 'html-fallback') continue;
     // 图片：带资源扩展名 / 已知图床 / query 含图片格式参数 才保留；否则（裸页面导航 URL）丢弃
-    if (a.type === 'image' && !looksLikeImageUrl(u)) continue;
+    // ★2026-09-07 修复（avif 等真实图片被误杀根因）：仅「启发式来源」(html-fallback / img[data] 等从属性/文本
+    //   猜出的 URL) 才用 looksLikeImageUrl 过滤裸页面导航 URL；<img> / <picture> / <css-bg> / a>img 是浏览器
+    //   已渲染的真实图片元素，其 src 必为图片，绝不因「无扩展名 / 非图床 host」被丢弃（否则 fastcampus 等用
+    //   无扩展名 CDN 或 <picture> 多候选交付的 avif 永远采不到）。
+    const DEF_IMG_SRC = /^(img|img\[srcset\]|picture|css-bg|a>img)$/;
+    if (a.type === 'image' && !DEF_IMG_SRC.test(a.source || '') && !looksLikeImageUrl(u)) continue;
     // 媒体/模型/动图直链：无条件保留
     const isMediaOrModel = a.type === 'video' || a.type === 'audio' || a.type === 'model' || (a.animated === true);
     if (!isMediaOrModel && a.type !== 'image' && a.type !== 'archive' && a.type !== 'netdisk' && a.type !== 'link') continue;
@@ -1084,7 +1703,23 @@ async function scanTab(tabId, opts = {}) {
     } else if (a.playerUrl && playerUrlHasVideoId(a.playerUrl)) {
       key = (a.playerUrl || '') + '|' + (a.type || 'video');
     } else {
-      key = normalizeVideoUrl(u) + '|' + (a.type || 'video') + '|' + (a.pageUrl || '');
+      // ★2026-09-08 修复（即梦 400+ 张重复图片卡根因）：字节系图床会给同一张图生成
+      //   一堆处理变体（~tplv-xxx-aigc_resize_loss:480:480.webp / :720:720.webp / !w600_webp），
+      //   变体在【pathname】里而非 query → normalizeVideoUrl 剥不掉 → 同一张图被拆成
+      //   几百张卡。图片类去重键按「剥离处理段后的规范路径」归一，同图多尺寸合并为一张。
+      let keyUrl = normalizeVideoUrl(u);
+      if (a.type === 'image') {
+        try {
+          const ku = new URL(keyUrl);
+          ku.pathname = ku.pathname
+            .replace(/~tplv-[^/]*$/i, '')            // 字节系处理段：...~tplv-xxx-aigc_resize_loss:480:480.webp
+            .replace(/!\w+$/i, '')                   // 又拍云别名：xxx.png!w600_webp
+            .replace(/:\d{1,5}:\d{1,5}\.\w{2,5}$/i, '') // 残留 尺寸.扩展名 尾巴
+            .replace(/:\d{1,5}:\d{1,5}$/i, '');
+          keyUrl = ku.href;
+        } catch (_) {}
+      }
+      key = keyUrl + '|' + (a.type || 'video') + '|' + (a.pageUrl || '');
     }
     // ★2026-08-22 修复（封面/内容错配 + 重复扫描根因）：
     // 1. 上轮 cdnFpMap 的 continue 越权：单视频场景下所有 dyUrls 共用同一 awemeId（modal_id），
@@ -1121,9 +1756,12 @@ async function scanTab(tabId, opts = {}) {
   const isDouyinPlayPage = /(^|\.)douyin\.com\/jingxuan(\?|$)/i.test(targetTabUrl)
     || /(^|\.)douyin\.com\/(video|note|discover|search|recommend|explore)(\/|\?|$)/i.test(targetTabUrl)
     || /(^|\.)iesdouyin\.com/i.test(targetTabUrl);
-  console.log('[HMDAO][scan] 单视频过滤判定: batchMode=%s isDouyinPlayPage=%s targetTabUrl=%s mergedLen=%d',
-    !!batchMode, isDouyinPlayPage, targetTabUrl, merged.length);
-  if (!batchMode && isDouyinPlayPage) {
+  logOnChange('filterJudge', '[HMDAO][scan] 单视频过滤判定: batchMode=' + !!batchMode
+    + ' isDouyinPlayPage=' + isDouyinPlayPage + ' url=' + targetTabUrl + ' mergedLen=' + merged.length);
+  // ★2026-09-05 修复：jingxuan?modal_id=... 同时可能是抖音合集页（有 mixId）。
+  //   合集页应列出全部集数，不能按单视频模式过滤成 1 条；只有无 mixId 的单视频/播放页才走单视频过滤。
+  const hasMixId = !!pageMixId;
+  if (!batchMode && isDouyinPlayPage && !hasMixId) {
     const curAweme = __hmdao_current_aweme_id || '';
     // ★2026-09-01 修复（用户实测「侧栏视频资产是充值页」「深度解析产出 1 条但最终 0 条」根因）：
     //   抖音 /falcon/ 是 H5 功能页容器（充值页 douyin_recharge、webcast_openpc、活动页、
@@ -1239,6 +1877,14 @@ async function scanTab(tabId, opts = {}) {
                     const def = formats.find((x) => x.is_default) || formats[0];
                     url = (def && def.url) || '';
                   }
+                  // ★2026-09-04 再兜一层：详情/合集列表 API 抓到的 play_addr 直链（dyVideoUrlByAweme）。
+                  //   window.player.url 与 dyFormatsByAweme 都可能为空（页面刚切过来、档位未下发），
+                  //   这时 play_addr 是最后能拿到真实直链的来源。
+                  if (!url) url = (c.dyVideoUrlByAweme || {})[String(id)] || '';
+                  if (!url) {
+                    const vKeys = Object.keys(c.dyVideoUrlByAweme || {});
+                    if (vKeys.length === 1) url = c.dyVideoUrlByAweme[vKeys[0]] || '';
+                  }
                   // 详情索引无档位但 player 有多条真直链（不同 CDN 节点）→ 都列为可选项
                   if (!formats.length && playerUrls.length > 1) {
                     playerUrls.forEach((u, i) => formats.push({ label: '源 ' + (i + 1), url: u, is_default: i === 0 }));
@@ -1272,13 +1918,32 @@ async function scanTab(tabId, opts = {}) {
           }
         } catch (_) {}
       }
+      // ★2026-09-04 修复（"切换集数后没画面没声音"根因）：
+      //   blob: 是创建它的那个文档私有的，扩展后台/侧栏跨上下文 fetch 必然失败
+      //   （日志：FETCH_MEDIA failed url=blob:https://www.douyin.com/... detail={ok:false,error:'Failed to fetch'}）。
+      //   上面若没能把它升级成 http 直链，继续保留就是一张"点了只有加载失败"的废卡。
+      //   处理：优先在同 awemeId 的其它资产里换一条真实直链；换不到就丢弃，宁缺勿废。
+      if (keepVideo && !/^https?:/i.test(keepVideo.url || '')) {
+        const kbAid = String(keepVideo.awemeId || '').replace(/[^\w]/g, '');
+        const alt = allVideoAssets.find((a) => a && a !== keepVideo && /^https?:/i.test(a.url || '')
+          && (!kbAid || String(a.awemeId || '').replace(/[^\w]/g, '') === kbAid || !a.awemeId));
+        if (alt) {
+          keepVideo = alt;
+          console.log('[HMDAO][scan] blob 升级失败 → 改用同 awemeId 的真实直链资产');
+        } else {
+          console.log('[HMDAO][scan] blob 升级失败且无替代直链 → 丢弃该视频卡（避免"没画面没声音"废卡）');
+          keepVideo = null;
+        }
+      }
       // 仅保留当前视频 + 其关联音频（同 awemeId，供预览配音），其余全部丢弃
       finalMerged = merged.filter((a) =>
         a === keepVideo
         || (a && a.type === 'audio' && curAweme && a.awemeId === curAweme)
-        || (a && a.type === 'audio' && !curAweme && a.url && keepVideo.url && a.url.includes(keepVideo.url.slice(0, 40)))
+        // ★keepVideo 可能因"blob 升级失败且无替代直链"被置空，此处必须先判空再取 .url，否则 TypeError
+        || (a && a.type === 'audio' && !curAweme && a.url && keepVideo && keepVideo.url && a.url.includes(keepVideo.url.slice(0, 40)))
       );
-      console.log('[HMDAO][scan] 单视频模式过滤：', merged.length, '条 →', finalMerged.length, '条（保留当前播放视频，modalId=', pageModal, '）');
+      logOnChange('singleFilter', '[HMDAO][scan] 单视频模式过滤：' + merged.length + '条 → ' + finalMerged.length
+        + '条（保留当前播放视频, modalId=' + pageModal + '）');
     } else {
       // 无任何视频资产时，DOM 嗅探到的图片/链接等仍丢弃（单视频页不应有无关素材）
       finalMerged = [];
@@ -1286,12 +1951,92 @@ async function scanTab(tabId, opts = {}) {
     }
   }
 
+  // ★2026-09-03：抖音页丢弃「野卡」。
+  //   实测（用户侧栏诊断）：唯一一张卡 title 竟然是网页标题「发现更多精彩视频 - 抖音搜索」、
+  //   platform 为空、awemeId 为无 —— 这是通用 DOM/网络扫描捡到的非视频产物，会顶替真正的视频卡误导用户。
+  //   仅在本次扫描【已经产出抖音专属卡（带 awemeId）】时才丢弃，避免抖音专属路径全失效时侧栏彻底空白。
+  try {
+    const dyHost = (function () { try { return new URL(targetTabUrl || '').hostname; } catch (_) { return ''; } })();
+    if (/(?:^|\.)(douyin\.com|ixigua\.com|tiktok\.com)$/i.test(dyHost)) {
+      const hasDyCard = finalMerged.some((a) => a && a.type === 'video' && a.awemeId);
+      if (hasDyCard) {
+        const before = finalMerged.length;
+        finalMerged = finalMerged.filter((a) => !(a && a.type === 'video' && !a.awemeId));
+        if (before !== finalMerged.length) {
+          console.log('[HMDAO][scan] 抖音页丢弃无 awemeId 的野卡：%d → %d 条', before, finalMerged.length);
+        }
+      }
+    }
+  } catch (_) {}
+
+  // ★2026-09-07 修正（画廊/课程页真实素材被误杀根因）：原硬上限 60 张，仅对抖音"百张头像/图标"降负载合理，
+  //   但在 fastcampus 这类课程/画廊页（100+ 张图，用户要采的草稿图恰是后注入、score=0 的低分项）会被整批砍掉 →
+  //   用户「等网站稳定重新扫描仍采不到 webp」的真凶。改为大幅抬高上限到 200：正常内容页(含 106 图)不再裁剪，
+  //   仍只对极端大页(>200 张)做降负载；视频/音频/3D/网盘等用户真正要采的类型不受限制。
+  try {
+    const MAX_IMAGE_ASSETS = 200;
+    const imgs = finalMerged.filter((a) => a && a.type === 'image');
+    if (imgs.length > MAX_IMAGE_ASSETS) {
+      // ★2026-09-07：真实渲染的图片元素（img/picture/css-bg/a>img）加权 +4，优先于 html-fallback 等
+      //   启发式副本保留——避免大图库页(>200 张)裁剪时把用户真正要的 avif/内容图当成低分项丢掉。
+      const score = (a) => (a.cover ? 2 : 0) + (a.dimensions ? 2 : 0) + (a.width ? 1 : 0) + (a.title ? 1 : 0) + (/^(img|img\[srcset\]|picture|css-bg|a>img)$/.test(a.source || '') ? 4 : 0);
+      const keep = new Set(imgs.slice().sort((x, y) => score(y) - score(x)).slice(0, MAX_IMAGE_ASSETS));
+      const before = finalMerged.length;
+      finalMerged = finalMerged.filter((a) => !(a && a.type === 'image') || keep.has(a));
+      console.log('[HMDAO][scan] 图片资产裁剪（降负载，上限200）：%d → %d 条', before, finalMerged.length);
+    }
+  } catch (_) {}
+
+  // ★2026-09-04：封面最终消毒（兜住所有来源，不只是 hmdaoPickCover）。
+  //   实测封面被填成 https://lf-zt.douyin.com/obj/uc-assets/zt/@byted/x-storage-web/.../index.html
+  //   —— 这是 x-storage-web 的 iframe 页面（HTML 文档），经 /api/media-proxy 代拉必然
+  //   422 / ERR_BLOCKED_BY_RESPONSE.NotSameSite → 缩略图永远空白。非图片资源一律清掉。
+  try {
+    let dropped = 0;
+    for (const a of finalMerged) {
+      if (a && a.cover && typeof a.cover === 'string') {
+        if (!/^https?:/i.test(a.cover) || /\.(html?|js|css|json|txt|xml)(\?|#|$)/i.test(a.cover)) {
+          a.cover = '';
+          dropped++;
+        }
+      }
+    }
+    if (dropped) console.log('[HMDAO][scan] 丢弃非图片封面 %d 个（HTML/JS 等不能当缩略图）', dropped);
+  } catch (_) {}
+
+  // ★2026-09-08 恢复（imini 等「页面无 <video> 元素」站点此前能出带声音视频卡的原因）：
+  //   实测 imini /zh/video：document.querySelectorAll('video') = 0，源页预览本身静音，
+  //   此前唯一能拿到【音视频合并完整流】的入口是「站内链接 → generic 平台卡 → yt-dlp 解析」。
+  //   为消除"无封面/点不开/标题是网页标题"的假卡，上一版把同站内链全部过滤 → 这类站
+  //   连视频卡都没了（用户反馈"之前有声音，现在没有"）。
+  //   折中：仅当本次扫描【一条视频/音频都没有】时，才补一张「整页 generic 卡」
+  //   （playerUrl = 页面地址，交 yt-dlp 解析合并流）。有真实素材的页面完全不受影响，
+  //   既不会回到"一堆假卡污染列表"，又能恢复 imini 这类站的带音频预览/下载。
+  try {
+    const hasMedia = finalMerged.some((a) => a && (a.type === 'video' || a.type === 'audio'));
+    if (!hasMedia && /^https?:/i.test(targetTabUrl || '')) {
+      let p = '';
+      try { p = new URL(targetTabUrl).pathname; } catch (_) { p = ''; }
+      if (/\/(video|watch|play|media|shorts|detail|mv|live)\b/i.test(p)) {
+        finalMerged.push({
+          url: targetTabUrl, type: 'video', source: 'embed-platform',
+          platform: 'generic', playerUrl: targetTabUrl, pageUrl: targetTabUrl,
+        });
+        console.log('[HMDAO][scan] 页面无 DOM 媒体 → 补整页 generic 卡交 yt-dlp 解析（恢复带音频的合并流）');
+      }
+    }
+  } catch (_) {}
   NETWORK_ASSETS[tabId] = finalMerged;
-  // ★2026-08-23 修复：记录本次扫描的页面 URL，供下次 scanTab 判断是否"真正换页"以决定清空源页累积。
-  try { NETWORK_ASSETS_URL[tabId] = (targetTabUrl || srcPageUrl || ''); } catch (_) { }
   // ★P2（2026-08-01）：给每个资产补 tabId/pageUrl/playerUrl，供侧栏悬停试听/yt-dlp 解析使用。
+  // ★2026-09-08 修复（TDZ）：srcPageUrl/pageTitle 原本声明在【下一次使用之后】，
+  //   上一行 NETWORK_ASSETS_URL[tabId] 读 srcPageUrl 时它还在 TDZ（let 未初始化）
+  //   → 抛 ReferenceError 被 catch(_) 静默吞掉 → NETWORK_ASSETS_URL 从未被赋值
+  //   → scanTab 的「是否真正换页」判定失去依据（换页清空/保留逻辑失效）。
+  //   把声明提到使用之前即可。
   let srcPageUrl = '';
   let pageTitle = '';
+  // ★2026-08-23 修复：记录本次扫描的页面 URL，供下次 scanTab 判断是否"真正换页"以决定清空源页累积。
+  try { NETWORK_ASSETS_URL[tabId] = (targetTabUrl || srcPageUrl || ''); } catch (_) { }
   try {
     const t = await chrome.tabs.get(tabId);
     srcPageUrl = (t && t.url) || '';
@@ -1301,7 +2046,10 @@ async function scanTab(tabId, opts = {}) {
     if (!a) continue;
     a.tabId = tabId;
     if (!a.pageUrl) a.pageUrl = srcPageUrl;
-    if (!a.title && pageTitle) a.title = pageTitle;
+    // ★2026-09-04 修复：不要把【页面标题】填给抖音视频卡。抖音视频标题应从详情 API 的 desc 取；
+    //   取不到时显示"第N集"或"视频素材"都比"抖音精选电脑版 - 抖音"这种页面标题准确一万倍，
+    //   也不会造成批量模式下几十张卡同名、用户以为"内容对应不上"。
+    if (!a.title && pageTitle && !(a.platform === 'douyin' && a.type === 'video')) a.title = pageTitle;
     if (!a.name && a.title) a.name = a.title;
     // 为抖音/新片场等资产补 playerUrl，让侧栏识别为 yt-dlp 平台并走统一解析
     if (!a.playerUrl && srcPageUrl) {
@@ -1344,7 +2092,18 @@ async function scanTab(tabId, opts = {}) {
   // ★2026-08-23 修复（确凿根因）：旧代码广播 merged（过滤前 159 条全量），单视频过滤的 finalMerged 从未触达侧栏，
   //   导致抖音 jingxuan 页侧栏一直显示几十张无关图片 + 1 条视频（用户实测 10+ 张）。
   //   修复：广播/持久化/返回值全部用 finalMerged。
-  console.log('[HMDAO][scan] broadcast assets: finalMerged=%d (vs merged=%d)', finalMerged.length, merged.length);
+  logOnChange('broadcast', '[HMDAO][scan] broadcast assets: finalMerged=' + finalMerged.length + ' (merged=' + merged.length + ')');
+  // ★2026-09-11 诊断（yunqiaonet「扫了 84 条但侧栏看不到」定位）：打印资产类型构成 + 样例图片 URL，
+  //   一眼看出 84 条是 image/video/杂项，以及图片来自哪个 CDN（判断防盗链导致裂图）。
+  try {
+    const hist = {};
+    for (const a of finalMerged) { if (a && a.type) hist[a.type] = (hist[a.type] || 0) + 1; }
+    const histStr = Object.keys(hist).map((k) => k + '=' + hist[k]).join(' ');
+    const sampleImgs = [];
+    for (const a of finalMerged) { if (a && a.type === 'image' && a.url) { sampleImgs.push(String(a.url).slice(0, 80)); if (sampleImgs.length >= 4) break; } }
+    const _host = (function () { try { return new URL(targetTabUrl).hostname; } catch (_) { return '?'; } })();
+    logOnChange('assets-diag', '[HMDAO][scan] 资产构成 host=' + _host + ' ' + histStr + ' 样例img=' + JSON.stringify(sampleImgs));
+  } catch (_) {}
   // ★2026-08-31 修复（"点击抖音视频卡预览显示别 tab 的图/视频"根因）：
   //   finalMerged 此前不带源 tabId → 侧栏点击卡片时 startDouyinFrameStream 只能靠
   //   chrome.tabs.query({active:true}) 猜源 tab，猜错就拉到别的抖音标签（直播/合集其他集）
@@ -1366,8 +2125,44 @@ async function scanTab(tabId, opts = {}) {
     }
     return out;
   })(finalMerged);
+  // ★2026-09-05 修复（封面/标题在新旧值间来回切换的【交替引擎】）：
+  //   同一集(awemeId)会从两条路径各产出一条卡：「实时流卡」(dyUrls/CDN) 与「API 合成卡」
+  //   (dyVideoUrlByAweme)，二者 url 不同 → 上面按 url 的去重拦不住 → finalMerged 同集两条。
+  //   侧栏 applyMeta 按【数组顺序】依次吸收 → 本轮实时流卡赢、下一轮 API 卡赢 →
+  //   封面/标题每 10s 在两份值之间翻转（用户实测"封面缩略图和标题前后来回切换"）。
+  //   折叠优先级：带 dashAudio（可合成音画的实时流）> 带 cover > 带 episodeNo > 先到的。
+  try {
+    const byAid = new Map();
+    const collapsed = [];
+    const aidScore = (x) => (x.dashAudio ? 4 : 0) + (x.cover ? 2 : 0) + (x.episodeNo ? 1 : 0);
+    for (const a of finalMerged) {
+      const k = (a && a.platform === 'douyin' && a.type === 'video' && a.awemeId) ? ('dy:' + a.awemeId) : null;
+      if (!k) { collapsed.push(a); continue; }
+      const prev = byAid.get(k);
+      if (!prev) { byAid.set(k, a); collapsed.push(a); continue; }
+      if (aidScore(a) > aidScore(prev)) {
+        collapsed.splice(collapsed.indexOf(prev), 1, a);
+        byAid.set(k, a);
+      }
+    }
+    if (collapsed.length !== finalMerged.length) {
+      console.log('[HMDAO][scan] 同集多来源折叠：%d → %d 条', finalMerged.length, collapsed.length);
+      finalMerged.length = 0;
+      finalMerged.push(...collapsed);
+      NETWORK_ASSETS[tabId] = finalMerged;
+    }
+  } catch (_) {}
   broadcastAssets.forEach((a) => { if (a && typeof a === 'object') a.__sourceTabId = tabId; });
-  chrome.runtime.sendMessage({ type: HMDAO_MSG.SCAN_RESULT, tabId, url: targetTabUrl, assets: broadcastAssets, batchMode: !!batchMode }).catch(() => {});
+  // ★2026-09-05 修复（十几分钟后侧栏/源页卡顿的主要推手）：
+  //   内容签名与上一轮完全一致 → 跳过广播。侧栏零动作：不处理消息、不持久化 lastScan、
+  //   不触发渲染。轮询从「每 10s 全量灌一次上百条资产」变成「只在真变化时广播一次」。
+  const bcastSig = broadcastAssets
+    .map((a) => (a.type || '') + '|' + (a.awemeId ? 'dy:' + a.awemeId : (a.url || '')) + '|cov:' + (a.cover || '') + '|tt:' + (a.title || '') + '|np:' + (a.notPlayed ? 1 : 0))
+    .sort().join('~')
+    + '#cur:' + (pageCurAwemeId || '') + '#mix:' + (pageMixId || '') + '#b:' + (batchMode ? 1 : 0);
+  if (bcastSig === HMDAO_LAST_BCAST_SIG) return broadcastAssets; // 无变化：静默返回
+  HMDAO_LAST_BCAST_SIG = bcastSig;
+  chrome.runtime.sendMessage({ type: HMDAO_MSG.SCAN_RESULT, tabId, url: targetTabUrl, assets: broadcastAssets, batchMode: !!batchMode, curAwemeId: pageCurAwemeId || '', mixId: pageMixId || '' }).catch(() => {});
   return broadcastAssets;
 }
 
@@ -1376,8 +2171,26 @@ async function scanTab(tabId, opts = {}) {
 // 2026-08-18 改为 async：huaban 等平台需要 await fetch 真实接口才能拿原图。
 async function scanPage(networkAssets) {
   let out = [];
+  // ★2026-09-06：重 SPA 会话页（豆包）性能熔断。
+  //   豆包 DOM 巨大且 SSE 打字机每秒改几十次节点，scanPage 里 5 处 querySelectorAll('*')
+  //   全量属性遍历 + MutationObserver 回调会造成明显掉帧/卡顿（用户明确要求不能卡）。
+  //   这类页面的音频走【网络层捕获 + MAIN 世界旁路捕获】，不依赖全量属性扫描，
+  //   故在此类站点跳过重量级遍历，其余站点行为完全不变。
+  let heavyDom = true;
+  try { if (/(^|\.)doubao\.com$/.test(location.hostname)) heavyDom = false; } catch (_) {}
   const push = (url, type, source, meta) => {
     if (!url) return;
+    // ★2026-09-11 修复（liblib / B站等 MSE 播放器产生"假卡"根因）：
+    //   源页 <video src="blob:..."> / <source src="blob:..."> 只在创建它的页面上下文有效，
+    //   扩展后台/侧栏跨上下文 fetch 必然 ERR_FILE_NOT_FOUND，既不能预览也不能下载。
+    //   scanPage 嗅探到这类 blob URL 后必须丢弃，避免生成点击无反应的"假卡"。
+    //   例外：豆包 WS 音频的伪 URL（doubao-ws-audio://）会在侧栏 hydrate 成真实 blob，不在这里处理。
+    if (type === 'video' || type === 'audio') {
+      try {
+        const s = String(url || '');
+        if (/^blob:/i.test(s) || /^data:/i.test(s)) return;
+      } catch (_) {}
+    }
     // 动图检测：gif/apng/动图 webp 标记 animated，预览直显（不重编码），合并阶段据此免过滤
     // 2026-08-24 扩展：动画 webp 也标记 dynamic（素材站如 liblib 用 webp 动图作"视频预览"，
     // 无 <video> 元素，需进侧栏「视频/动态」模块并自带缩略图）。
@@ -1388,7 +2201,10 @@ async function scanPage(networkAssets) {
       else if (/format=apng|format=gif|format=webp/i.test(lower)) animated = true;
     }
     let u = String(url).trim();
-    if (!/^https?:\/\//i.test(u)) return;
+    if (!u) return;
+    // 统一用 new URL 解析：① 相对/协议相对地址 → 绝对地址；② 含 raw 非 ASCII（如韩文文件名
+    // https://cdn.x/파이널.webp）→ 自动 percent-encode，保证去重键一致、缩略图请求可成功。
+    try { u = new URL(u, location.href).href; } catch (_) { return; }
     const item = { url: u, type, source };
     if (animated) {
       item.animated = true;
@@ -1411,14 +2227,32 @@ async function scanPage(networkAssets) {
       });
     }
   });
-  document.querySelectorAll('picture source').forEach((s) => push(s.srcset ? s.srcset.split(',')[0].trim().split(/\s+/)[0] : s.src, 'image', 'picture'));
+  // ★2026-09-07 修复（avif 多候选漏采根因）：<picture><source> 可能按格式协商给出多个候选
+  //   （如 webp 在前、avif 在后，或 avif 1x/2x 多档），旧逻辑只取 srcset 第 1 段 → 排在后面的 avif 永远采不到。
+  //   改为遍历 srcset 全部候选 + 兜底 s.src，确保 avif 等任一候选都被收集。
+  document.querySelectorAll('picture source').forEach((s) => {
+    if (s.srcset) {
+      s.srcset.split(',').forEach((c) => { const u = c.trim().split(/\s+/)[0]; if (u) push(u, 'image', 'picture'); });
+    } else if (s.src) {
+      push(s.src, 'image', 'picture');
+    }
+  });
   document.querySelectorAll('[style]').forEach((el) => {
     const st = el.getAttribute('style') || '';
     const m = st.match(/url\(['"]?(https?:\/\/[^'")]+)['"]?\)/i);
     if (m) push(m[1], 'image', 'css-bg');
   });
-  document.querySelectorAll('[data-src], [data-original], [data-lazy], [data-bg], [data-image], [data-img], [data-url], [data-pic], [data-thumb], [data-preview]').forEach((el) => {
-    ['data-src', 'data-original', 'data-lazy', 'data-bg', 'data-image', 'data-img', 'data-url', 'data-pic', 'data-thumb', 'data-preview'].forEach((k) => push(el.getAttribute(k), 'image', 'img[data]'));
+  // ★2026-09-07 修复（懒加载 avif 漏采根因）：设计/课程/图库站常用各站自定义的懒加载属性承载真实图片 URL，
+  //   旧清单只覆盖 10 个常见属性，fastcampus/liblib 等用 data-lazy-src / data-original-src / data-webp-src 等
+  //   → 真实 avif 永远采不到。扩到常见懒加载属性全集，并对 data-srcset 按 srcset 规则拆分多候选。
+  const LAZY_ATTRS = ['data-src', 'data-original', 'data-lazy', 'data-bg', 'data-image', 'data-img', 'data-url', 'data-pic', 'data-thumb', 'data-preview', 'data-lazy-src', 'data-original-src', 'data-webp-src', 'data-hd-src', 'data-high-res-src', 'data-full', 'data-zoom', 'data-large', 'data-big', 'data-origin', 'data-real', 'data-actual', 'data-load-src', 'data-true-src', 'data-retina', 'data-imgurl', 'data-imageurl', 'data-bigpic', 'data-poster', 'data-file', 'data-cdn', 'data-path', 'data-link', 'data-gif', 'data-srcset'];
+  document.querySelectorAll(LAZY_ATTRS.map((a) => '[' + a + ']').join(',')).forEach((el) => {
+    for (const k of LAZY_ATTRS) {
+      const v = el.getAttribute(k);
+      if (!v) continue;
+      if (k === 'data-srcset') { v.split(',').forEach((c) => { const u = c.trim().split(/\s+/)[0]; if (u) push(u, 'image', 'img[data]'); }); }
+      else push(v, 'image', 'img[data]');
+    }
   });
   document.querySelectorAll('a[href]').forEach((a) => {
     const href = a.getAttribute('href');
@@ -1437,6 +2271,15 @@ async function scanPage(networkAssets) {
       push(href, 'model', 'a>model', { title: txt || null });
     }
   });
+  // ★2026-09-11：补齐 object/embed/SVG <image>/<use> 内的图片（部分 AI 画廊/3D 预览用这些标签承载直链）。
+  try {
+    document.querySelectorAll('object, embed, svg image, use').forEach((el) => {
+      const v = el.getAttribute('data') || el.getAttribute('src') || el.getAttribute('href') || el.getAttribute('xlink:href') || '';
+      if (!v) return;
+      if (/\.(jpe?g|png|gif|webp|bmp|svg|avif|ico|tiff?)([?#]|$)/i.test(v)) push(v, 'image', 'object/embed');
+      else if (/\.(glb|gltf|obj|fbx|stl|usdz|dae|3mf)([?#]|$)/i.test(v)) push(v, 'model', 'object/embed');
+    });
+  } catch (_) {}
 
   // ★2026-08-18：小红书（SPA + 登录态注入）图片/视频提取。
   // 笔记真实媒体 URL 在页面内联 JSON（window.__INITIAL_STATE__ / 初始 state script）里，
@@ -1491,6 +2334,10 @@ async function scanPage(networkAssets) {
       try {
         let p = v.parentElement;
         for (let i = 0; i < 6 && p; i++) {
+          // ★2026-09-08 修复（多视频页封面错配根因之一）：候选祖先若已包含多个 <video>，
+          // 它的第一张 <img> 是共享资源（轮播位/页头图/推荐位）→ 会让所有视频卡拿到同一张封面。
+          // 此时停止上爬（更上层只会包含更多视频），宁可留空交给 defaultCover/pageCovers 按序分发。
+          try { if (p.querySelectorAll && p.querySelectorAll('video').length > 1) break; } catch (_) {}
           const img = p.querySelector('img');
           if (img && (img.currentSrc || img.src)) { cover = img.currentSrc || img.src; break; }
           p = p.parentElement;
@@ -1508,7 +2355,14 @@ async function scanPage(networkAssets) {
       // 用 video 的 poster 作为视频卡缩略图（侧栏视频模块据此显示封面而非 emoji 占位）
       if (it && cover) it.cover = cover;
     });
-    v.querySelectorAll('source').forEach((s) => push(s.src, 'video', 'video>source'));
+    // ★2026-09-10 修复（通用站 <video> 多 <source> 变体产生重复卡片）：
+    //   同一 <video> 的 <source> 通常是不同格式/清晰度的同一视频；若 <video> 已有有效当前源（currentSrc/src），
+    //   不再把 <source> 拆成独立卡片；仅当当前源无效（blob/空）时才用 <source> 兜底。
+    const hasActiveSrc = [v.currentSrc, v.src].some((s) => s && /^https?:/i.test(s));
+    v.querySelectorAll('source').forEach((s) => {
+      if (hasActiveSrc) return;
+      push(s.src, 'video', 'video>source');
+    });
     // <video> 的 data-* 上挂的预览视频直链
     if (v.dataset) {
       for (const k in v.dataset) {
@@ -1541,7 +2395,7 @@ async function scanPage(networkAssets) {
   // 2.5) 视频直链（含 m3u8 / 直播）：<a href="*.mp4"> 等 + 属性 + 脚本/全局变量
   const VID_RE = /\.(mp4|webm|mov|m4v|mkv|ogv|m3u8|flv|avi|wmv|ts|mpg|mpeg|3gp|rm|rmvb|asf|vob|m2ts|f4v|m4s)([?#]|$)/i;
   document.querySelectorAll('a[href]').forEach((a) => { if (VID_RE.test(a.href)) push(a.href, 'video', 'a[href]'); });
-  document.querySelectorAll('*').forEach((el) => {
+  if (heavyDom) document.querySelectorAll('*').forEach((el) => {
     el.getAttributeNames().forEach((name) => {
       const v = el.getAttribute(name);
       if (!v || typeof v !== 'string') return;
@@ -1549,9 +2403,20 @@ async function scanPage(networkAssets) {
       if (m && VID_RE.test(m[0])) push(m[0], 'video', 'attr:' + name);
     });
   });
+  // ★2026-09-08 修复（imini.ai / 所有内联 JSON 的 Next.js、RSC 站点「视频直链一条都采不到」真凶）：
+  //   旧正则在扩展名后【强制】要求 ([?#]|$)，即 .mp4 后面必须紧跟 ? / # / 整个字符串结尾。
+  //   但内联 JSON（<script id="__NEXT_DATA__">、self.__next_f.push([1,"…"]) RSC payload）里
+  //   .mp4 后面紧跟的是【引号】→ 永远不匹配。
+  //   实测：真实 imini.ai/zh/video 页面 HTML 中确有 9 条 https://file.iminicdn.com/.../*.mp4，
+  //   旧正则命中 0 条 → 内联数据里的真直链全部漏采，只剩 attr/<video>/网络层的残片候选，
+  //   这正是"侧栏视频卡 URL 是被截断的半截"的源头。
+  //   改为「惰性主体 + 媒体扩展名 + 可选查询串」：引号/空白/尖括号/括号即终止，
+  //   既能命中内联 JSON，也不会跨过引号吞掉后面的无关文本。
+  const VID_SCRIPT_RE = /https?:\/\/[^ "'()<>]+?\.(?:mp4|webm|mov|m4v|mkv|ogv|m3u8|flv|avi|wmv|ts|mpg|mpeg|3gp|rm|rmvb|asf|vob|m2ts|f4v|m4s)(?:[?#][^ "'()<>]*)?/gi;
   document.querySelectorAll('script:not([src])').forEach((s) => {
-    const urls = (s.textContent || '').match(/https?:\/\/[^ "'()]+(\.(mp4|webm|mov|m4v|mkv|ogv|m3u8|flv|avi|wmv|ts|mpg|mpeg|3gp|rm|rmvb|asf|vob|m2ts|f4v|m4s)|(\.(mp4|webm|mov|m4v|mkv|ogv|m3u8|flv|avi|wmv|ts|mpg|mpeg|3gp|rm|rmvb|asf|vob|m2ts|f4v|m4s)))([?#]|$)/ig) || [];
-    urls.forEach((u) => push(u, 'video', 'script'));
+    let m;
+    VID_SCRIPT_RE.lastIndex = 0;
+    while ((m = VID_SCRIPT_RE.exec(s.textContent || ''))) push(m[0], 'video', 'script');
   });
   try {
     ['videoList', 'videos', 'videoData', 'playerData', 'playList', 'playlist', 'videoInfo', 'mediaList', '__VIDEO__'].forEach((k) => {
@@ -1560,6 +2425,29 @@ async function scanPage(networkAssets) {
       const urls = JSON.stringify(obj).match(/https?:\/\/[^ "'()]+/g) || [];
       urls.forEach((u) => { if (VID_RE.test(u)) push(u, 'video', 'global'); });
     });
+  } catch (_) {}
+
+  // 2.6.5) ★2026-09-10 网络层遗漏补偿（Performance API 回补）
+  //   问题：MV3 Service Worker 休眠时，唤醒它的【首批 webRequest 事件会丢失】。
+  //   而 m3u8 恰恰是 hls.js 播放器发出的第一个请求（DPlayer / 各类 m3u8 站都如此），
+  //   正好撞上冷启动 → 永远进不了 NETWORK_ASSETS → 侧栏视频恒为 0（实测确认）。
+  //   方案：从 Performance API 的「已发生资源请求」里回补媒体直链，不依赖 webRequest 时序。
+  //   注意：Performance 只记录【当前 frame】的请求；本函数以 allFrames:true 注入，
+  //   故位于 iframe 内的播放器（最常见）其请求也能由各自 frame 回补。
+  //   跨域资源即使 transferSize=0（无 Timing-Allow-Origin），name(URL) 依然可用。
+  try {
+    const perfEntries = (typeof performance !== 'undefined' && performance.getEntriesByType)
+      ? performance.getEntriesByType('resource') : [];
+    let perfHit = 0;
+    for (const e of perfEntries) {
+      const u = e && e.name;
+      if (!u || !/^https?:/i.test(u)) continue;
+      // 排除 HLS 数字分片（0000.ts）：碎片不可独立播放，只认播放列表 index.m3u8
+      if (/\/[0-9]+\.ts(\?|$)/i.test(u)) continue;
+      if (VID_RE.test(u)) { push(u, 'video', 'perf-network'); perfHit++; }
+      else if (/\.(mp3|wav|flac|aac|m4a|ogg|opus|wma)(\?|$)/i.test(u)) { push(u, 'audio', 'perf-network'); perfHit++; }
+    }
+    if (perfHit) console.log('[HMDAO][scanPage] Performance 回补媒体直链', perfHit, '条');
   } catch (_) {}
 
   // 2.7) 嵌入视频平台 URL 扫描（让网页内嵌的 YouTube/B站/优酷/腾讯/iqiyi 等 走 yt-dlp 拿全清晰度）：
@@ -1643,7 +2531,23 @@ async function scanPage(networkAssets) {
       }
       // ===== 通用兼容回退（白名单未命中） =====
       // 已知视频平台域名，或路径含视频播放特征 → 按 generic 平台处理，以原始 URL 作为 playerUrl 交给 yt-dlp。
-      if (VIDEO_PLATFORM_HOST_RE.test(h) || VIDEO_PATH_RE.test(u.pathname)) {
+      // ★2026-09-08 修复（imini.ai 等站点「扫出一堆页面链接假视频卡」真凶）：
+      //   EMBED_SOURCES 收集页面上【全部 <a href>】（2082 行），而 VIDEO_PATH_RE 的
+      //   /video|play|detail|media|watch|live/ 会命中【本站自己的导航链接】——实测 imini.ai
+      //   模型卡片链接 /zh/video、/zh/video/seedance2.0… 每条内链都被生成一张 generic 视频卡
+      //   （url=页面链接）→ yt-dlp 解析 500 → 无封面(拿页面当图片 404)、点击不能播、标题是网页标题。
+      //   修复：路径回退仅对【跨站】URL 生效——候选 host 与当前页面同注册域视为站内导航，跳过。
+      //   兼容性：host 白名单分支不动（浏览快手/B站时指向本站视频页的链接仍照常采集，
+      //   走上方 host 命中）；跨站 generic（如第三方 player 页）也不受影响。
+      const sameSitePath = (function () {
+        try {
+          const reg = (x) => { const p = String(x || '').toLowerCase().split('.'); return p.slice(-2).join('.'); };
+          return reg(h) === reg(location.hostname);
+        } catch (_) { return false; }
+      }());
+      const hostHit = VIDEO_PLATFORM_HOST_RE.test(h);
+      const pathHit = !sameSitePath && VIDEO_PATH_RE.test(u.pathname);
+      if (hostHit || pathHit) {
         if (h === 'null' || u.toString() === 'null') return null; // 拒绝字面量 "null" 入库
         return { platform: 'generic', playerUrl: u.toString() };
       }
@@ -1677,7 +2581,7 @@ async function scanPage(networkAssets) {
   document.querySelectorAll('[data-audio], [data-src], [data-mp3], [data-music], [data-song], [data-track]').forEach((el) => {
     ['data-audio', 'data-src', 'data-mp3', 'data-music', 'data-song', 'data-track'].forEach((k) => push(el.getAttribute(k), 'audio', 'audio[attr]'));
   });
-  document.querySelectorAll('*').forEach((el) => {
+  if (heavyDom) document.querySelectorAll('*').forEach((el) => {
     el.getAttributeNames().forEach((name) => {
       const v = el.getAttribute(name);
       if (!v || typeof v !== 'string') return;
@@ -1733,7 +2637,7 @@ async function scanPage(networkAssets) {
   });
   // 3) 任意元素属性上含模型/归档扩展名的 URL（data-*/data-download-url/data-file/data-model/下载按钮属性等）。
   //    3D 站常把下载地址藏在按钮/div 的属性里，而非 <a href>。
-  document.querySelectorAll('*').forEach((el) => {
+  if (heavyDom) document.querySelectorAll('*').forEach((el) => {
     el.getAttributeNames().forEach((name) => {
       const v = el.getAttribute(name);
       if (!v || typeof v !== 'string') return;
@@ -1780,7 +2684,7 @@ async function scanPage(networkAssets) {
       if (el.shadowRoot) scanRoot(el.shadowRoot);
     });
   };
-  document.querySelectorAll('*').forEach((el) => {
+  if (heavyDom) document.querySelectorAll('*').forEach((el) => {
     if (el.shadowRoot) scanRoot(el.shadowRoot);
   });
 
@@ -1789,21 +2693,50 @@ async function scanPage(networkAssets) {
   // 侧栏与测试依赖 source 区分捕获来源。
   (networkAssets || []).forEach((a) => push(a.url, a.type, (a && a.source) || 'network'));
 
-  // 动态链接自动重扫：站点把下载/网盘/模型链接在「点击按钮」或「接口回调」后才注入 DOM
-  // （如 yunqiaonet 登录态）。静态扫描读不到 → 安装 MutationObserver，DOM 新增匹配链接时通知后台去抖重扫。
+  // 动态链接/图片自动重扫：站点把下载/网盘/模型链接或图片在「点击按钮 / 滚动懒加载 / 切换 Tab /
+  // 接口回调」后才注入 DOM（如 fastcampus 课程页的 커리큘럼 초안본 图、yunqiaonet 登录态链接）。
+  // 静态扫描读不到 → 安装 MutationObserver，DOM 新增节点或图片属性(src/srcset/data-src/style)变化命中
+  // 时通知后台去抖重扫。★2026-09-07 修复（用户实测课程页 webp 漏采根因）：原 RE 只匹配网盘/3D/视频扩展名，
+  // 不含图片（.webp/.png 等）→ 动态插入的图片（如 1차초안본.webp）永远触发不了重扫 → 侧栏采不到。
+  // 现把图片扩展名纳入命中，并新增 attributes 观察（懒加载图是先有 <img> 再补 src/srcset/data-src）。
   try {
-    if (!window.__hmdao_mutation_watch) {
+    if (heavyDom && !window.__hmdao_mutation_watch) {
       window.__hmdao_mutation_watch = true;
-      const RE = /(pan\.baidu\.com\/s\/|lanzou|quark|xunlei|123pan|aliyundrive|\.(glb|gltf|obj|fbx|zip|rar|7z|max|blend|c4d|dae|ply|3ds|skp|stl|usdz|mp4|webm|mov|mkv|flv|avi|wmv|ts|mpg|3gp)(\?|#|$))/i;
+      // 命中即触发重扫：网盘/3D/视频（原有）+ 图片（覆盖课程页内容图/懒加载图）。
+      // ★2026-09-07 补充：图片扩展名补全为全量网页可渲染格式
+      // （webp/png/jpg/jpeg/gif/avif/bmp/svg/ico/tiff），avif/svg 等也要能触发动态重扫，不能遗漏。
+      const RE = /(pan\.baidu\.com\/s\/|lanzou|quark|xunlei|123pan|aliyundrive|\.(glb|gltf|obj|fbx|zip|rar|7z|max|blend|c4d|dae|ply|3ds|skp|stl|usdz|mp4|webm|mov|mkv|flv|avi|wmv|ts|mpg|3gp|webp|png|jpe?g|gif|avif|bmp|svg|ico|tiff?)(\?|#|$))/i;
+      const IMG_ATTR_RE = /^(src|srcset|data-src|data-original|data-lazy|data-img|data-image|data-bg|style|data-nimg)$/i;
+      const CSS_IMG_RE = /url\(\s*['"]?(https?:\/\/[^'")]+?\.(?:webp|png|jpe?g|gif|avif|bmp|svg|ico)(?:[?#][^'")]*)?)/i;
+      const nodeHasAsset = (n) => {
+        if (!n || n.nodeType !== 1) return false;
+        // ★2026-09-07：新插入的 <iframe> 也触发重扫（重扫会 allFrames 注入进新子帧，
+        // 否则后加载的 iframe 内的图片/链接永远采不到）。
+        if (n.tagName === 'IFRAME') return true;
+        const html = n.outerHTML || '';
+        if (RE.test(html) || CSS_IMG_RE.test(html)) return true;
+        // 子节点的图片/链接也检查（新增子树里可能含 <img>/<source>/<picture>/<a href>）
+        const kids = n.querySelectorAll && n.querySelectorAll('img,source,picture,a[href]');
+        if (kids) { for (const k of kids) { if (RE.test(k.outerHTML || '') || CSS_IMG_RE.test(k.outerHTML || '')) return true; } }
+        return false;
+      };
+      const attrHasAsset = (el, name) => {
+        if (!el || el.nodeType !== 1 || !IMG_ATTR_RE.test(name || '')) return false;
+        const v = el.getAttribute(name) || '';
+        return RE.test(v) || CSS_IMG_RE.test(v);
+      };
       let _mt = 0;
       const obs = new MutationObserver((muts) => {
         let hit = false;
         for (const m of muts) {
+          if (m.type === 'attributes') {
+            // 懒加载：已有 <img> 的 src/srcset、或 div 的 style background-image 被填充
+            if (attrHasAsset(m.target, m.attributeName)) { hit = true; break; }
+            continue;
+          }
           for (const n of m.addedNodes) {
             if (n.nodeType !== 1) continue;
-            if (RE.test(n.outerHTML || '')) { hit = true; break; }
-            const as = n.querySelectorAll && n.querySelectorAll('a[href]');
-            if (as) { for (const a of as) { if (RE.test(a.href)) { hit = true; break; } } }
+            if (nodeHasAsset(n)) { hit = true; break; }
             if (hit) break;
           }
           if (hit) break;
@@ -1814,7 +2747,18 @@ async function scanPage(networkAssets) {
         _mt = now;
         if (typeof chrome !== 'undefined' && chrome.runtime) chrome.runtime.sendMessage({ type: 'HMDAO_PAGE_MUTATION' }).catch(() => {});
       });
-      obs.observe(document.documentElement, { childList: true, subtree: true });
+      // childList + attributes 双观察：覆盖「整段插入」与「先占位后补 src」两种懒加载形态
+      obs.observe(document.documentElement, {
+        childList: true, subtree: true,
+        attributes: true, attributeFilter: ['src', 'srcset', 'data-src', 'data-original', 'data-lazy', 'data-img', 'data-image', 'data-bg', 'style', 'data-nimg'],
+      });
+      // ★2026-09-04 关键修复（用户实测"几分钟几万条消息"+ 卡顿）：
+      //   scanPage 每次扫描都会执行到这里并【再装一个 MutationObserver】，而抖音每 10s 轮询一次
+      //   → 一小时累积 ~360 个 observer，全部监听 documentElement(childList+subtree)。
+      //   抖音播放器每秒改几十次 DOM（进度/时间/推荐位）→ N 个 observer × 每次变更
+      //   = 海量 HMDAO_PAGE_MUTATION 消息 + 持续 CPU 占用，且永不释放。
+      //   修复：整个页面生命周期只装一次。
+      window.__hmdaoMutationObsInstalled = true;
     }
   } catch (_) {}
 
@@ -1960,7 +2904,7 @@ async function scanPage(networkAssets) {
     //   通用 <img>/<video> 采集会漏掉未渲染项，故对 aigc 子域直接从内联数据深抓图片+视频。
     if (ph.includes('aigc.xinpianchang.com')) {
       try {
-        const XPC_IMG_RE = /https?:\/\/[^"'\\<>\s)]+?(?:\.xpccdn\.com|\.xinpianchang\.com|image\.xinpianchang|oss-xpc)[^"'\\<>\s)]*?\.(?:jpg|jpeg|png|webp|gif|avif|bmp)(?:[?#][^"'\\<>\s)]*)?/gi;
+        const XPC_IMG_RE = /https?:\/\/[^"'\\<>\s)]+?(?:\.xpccdn\.com|\.xinpianchang\.com|image\.xinpianchang|oss-xpc)[^"'\\<>\s)]*?\.(?:jpg|jpeg|png|webp|gif|avif|bmp|svg|ico|tiff?)(?:[?#][^"'\\<>\s)]*)?/gi;
         const XPC_VIDEO_RE = /https?:\/\/[^"'\\<>\s)]+?\.(?:mp4|webm|mov|m4v|m3u8)(?:[?#][^"'\\<>\s)]*)?/gi;
         const XPC_JSON_IMG_RE = /"(?:coverUrl|cover|imageUrl|image|imgUrl|picUrl|url|src|original|thumbnail|poster)"\s*:\s*"(https?:[^"]+?)"/gi;
         const collectJson = (jsonStr) => {
@@ -2154,6 +3098,52 @@ async function scanPage(networkAssets) {
     }
   } catch (_) {}
 
+  // ★通用兜底：DOM 扫描可能漏掉 CSS 背景图、JS 模板、懒加载占位、内联 JSON/脚本里的图片直链等。
+  //   把 innerHTML 里出现的图片 URL 再扫一遍，补抓 webp/png/jpg/gif/avif/svg/tiff。
+  //   ★2026-09-07 修正：原门限 ≤100 在「图片数>100 的正常内容页」会整段跳过兜底 → avif 等藏在
+  //   内联 JSON/脚本里的链接永远采不到。抬高到 ≤400（仅极端大页跳过，避免 innerHTML 全扫开销），
+  //   正常 100+ 图的内容页也能跑兜底，补回 avif 等链接。
+  try {
+    if (out.filter((a) => a && a.type === 'image').length <= 400) {
+      const htmlTxt = document.documentElement && document.documentElement.innerHTML || '';
+      const GENERIC_IMG_RE = /https?:\/\/[^"'<>\s)]+?\.(?:webp|png|jpe?g|gif|avif|bmp|svg|ico|tiff?)(?:[?#][^"'<>\s)]*)?/gi;
+      let gm;
+      while ((gm = GENERIC_IMG_RE.exec(htmlTxt))) push(gm[0], 'image', 'html-fallback');
+    }
+  } catch (_) {}
+
+  // ★2026-09-11 诊断（「侧栏扫描不到素材」定位用）：扫完 0 条 → 打印页面画像，
+  //   让用户一行 Console 看出根因：① 整页本就没 <img>（登录墙 / Canvas 渲染 / 跨域 iframe）；
+  //   ② 图片在跨域 iframe 里（allFrames 也够不到，只能用户手动开那个 iframe 页扫描）；
+  //   ③ 内联 JSON/脚本里虽有 URL 但被正则漏掉（把样例 img 也打印出来便于补正则）。
+  if (!out.length) {
+    try {
+      const iframes = [...document.querySelectorAll('iframe')];
+      const cross = iframes.filter((f) => {
+        const s = f.src || '';
+        if (!s) return false;
+        try { return new URL(s, location.href).hostname !== location.hostname; } catch (_) { return true; }
+      }).length;
+      const lazy = document.querySelectorAll('[data-src],[data-original],[data-lazy-src],[data-webp-src],[data-bg],[data-imgurl]').length;
+      const htmlImgHits = (() => {
+        const t = document.documentElement.innerHTML || '';
+        const m = t.match(/https?:\/\/[^"'<>\s)]+?\.(?:webp|png|jpe?g|gif|avif|bmp|svg)(?:[?#][^"'<>\s)]*)?/gi);
+        return m ? m.length : 0;
+      })();
+      const sampleImgs = [];
+      for (let i = 0; i < Math.min(document.images.length, 3); i++) sampleImgs.push((document.images[i].currentSrc || document.images[i].src || '').slice(0, 90));
+      console.warn('[HMDAO][scan-diag] 0 素材 host=' + location.hostname +
+        ' imgs=' + document.images.length +
+        ' videos=' + document.querySelectorAll('video').length +
+        ' canvas=' + document.querySelectorAll('canvas').length +
+        ' iframes=' + iframes.length + '(跨域=' + cross + ')' +
+        ' lazyAttrs=' + lazy +
+        ' htmlImgUrls=' + htmlImgHits +
+        ' title=' + (document.title || '').slice(0, 24));
+      if (sampleImgs.length) console.warn('[HMDAO][scan-diag] 样例 img:', sampleImgs);
+    } catch (_) {}
+  }
+
   // ★根因 B 修复：原 out.slice(0, 800) 会把排在最后的 3D/归档条目裁掉（图片/视频/音频段先跑，画廊页极易超 800）。
   // 改为：模型/归档/网盘条目永远保留，只在图片/视频/音频里做预算裁剪。
   const CAP = 800;
@@ -2165,14 +3155,18 @@ async function scanPage(networkAssets) {
 }
 
 // 视频封面采集（注入 MAIN 世界运行，自包含，禁止引用 background 作用域）。
-// 返回 { byKey:{<video直链>:<封面URL>}, defaultCover:<页面默认封面>, pageCovers:[{kind,url}] }。
+// 返回 { byKey:{<video直链>:<封面URL>}, defaultCover:<页面默认封面>, pageCovers:[{kind,url}], pairs:{<视频直链>:<真封面>} }。
 // - byKey：优先用平台直链键匹配（B站 playurl 直链↔__INITIAL_STATE__ 封面命中率有限，故主要依赖 defaultCover/pageCovers 兜底）。
 // - defaultCover：B站 videoData.pic / 抖音 aweme.cover —— 同页视频资产的最佳封面。
 // - pageCovers：页面所有 <video poster> —— 通用站点兜底封面。
+// - pairs：★2026-09-11 新增。与视频直链【一一对应】的真封面（<video poster> / 内联 JSON 成对 cover 字段），
+//   用于取代"页面 <img> 按 DOM 序猜测分发"造成的封面错配。
 function extractVideoCovers() {
   const byKey = {};
   let defaultCover = '';
   const pageCovers = [];
+  // ★2026-09-11：pairs = { <视频直链>: <与该直链一一对应的真封面> }（video[poster] / 内联 JSON 成对字段）
+  const pairs = {};
 
   // ★2026-08-31 修复（jingxuan 占位符 RENDER_DATA → byKey 空 → 封面错配根因）：
   //   现代抖音 jingxuan 页 RENDER_DATA 仅 26 字符占位符，RENDER_DATA walk 拿不到任何 aweme，
@@ -2182,7 +3176,18 @@ function extractVideoCovers() {
   // —— 抖音视频缩略图白名单（含 i/pc 段、douyinpic/byteimg/tplv-dy 等常见 CDN 指纹）——
   const isVideoThumb = (url) => /(tos-cn-(i|pc)|aweme-(subCover|image|cover)|img-video|image-view|img-web|aweme-image|video-cover|video-poster|aweme-cover|douyinpic\.com|byteimg\.com|lf-douyin-pc-web|image-cut-tos|p\d{1,2}-pc-|tplv-dy-)/i.test(url);
   // —— 推广/认证/横幅/头像/二维码黑名单（电子营业执照、verify-、license-business 等）——
-  const isPromo = (url) => /(verify-|license-business|qrcode|qr-|banner|ad-|promo|advert|sponsor|avatar|emoji|logo|loading|sprite|placeholder|thumb\d{1,2}x\d{1,2}|\bicon[/-]|user-?data|sign(?:ature)?=|favicon)/i.test(url);
+  const isPromo = (url) => /(verify-|license-business|qrcode|qr-|banner|ad-|promo|advert|sponsor|avatar|emoji|logo|loading|sprite|placeholder|thumb\d{1,2}x\d{1,2}|\bicon[/-]|user-?data|sign(?:ature)?=|favicon|og[-_.]?(?:image|share|poster)|social[-_]?(?:share|preview)|apple-touch|share[-_]?(?:image|icon|logo|img))/i.test(url);
+  // ★2026-09-08 补充（runninghub 全部视频卡共用 og 分享图根因）：
+  //   og:image / og-share / social share 是【页面级品牌分享图】，永远不是某条视频的内容封面。
+  //   实测 runninghub.cn 的 defaultCover 候选排序按「面积最大」取到 assets/images/og-share-cn.png
+  //   （品牌绿底红标图，且该文件服务端已 404）→ 全部视频卡被塞同一张品牌图。
+  //   把 og/social-share/apple-touch 一类加入推广黑名单，从候选源头排除。
+  // ★2026-09-03 修复（视频卡缩略图 404 真凶）：
+  //   抖音把监控上报做成 <img> 信标 https://mssdk.bytedance.com/web/common?ms_appid=6383&msToken=...
+  //   它的 naturalWidth/Height 均为 0 → 躲过下方 `area > 0 && area < 80*80` 的小图过滤，
+  //   又被当成"页面唯一可见缩略图"兜底成封面 → /api/media-proxy 去拉必然 404。
+  //   现新增「监控/埋点/信标」黑名单：mssdk、msToken、slardar、apm、beacon、webid、/web/common、tea. 等。
+  const isBeacon = (url) => /(mssdk|msToken|ms_appid|slardar|apm\.|beacon|log-sdk|webid|tea\.|toblog|\/web\/common|monitor\.|\/monitor\/|report\.|\/report\?|metrics|\/collect\?|pixel\.)/i.test(url);
   // 从播放器 DOM 抓「当前正在播放视频」的真实封面（jingxuan 占位 RENDER_DATA 时的唯一可靠来源）
   function extractPlayerPoster() {
     try {
@@ -2209,9 +3214,19 @@ function extractVideoCovers() {
       // 3) 播放器容器内最近的真实视频缩略图 <img>（详情页常把封面放 .video-card / .player 容器里）
       const playerWrap = document.querySelector('.xgplayer, [class*="player"], [class*="video-container"], [class*="video-card"]');
       if (playerWrap) {
+        // ★2026-09-10 修复（MSN 等通用站视频卡无封面根因）：
+        //   isVideoThumb 是【抖音专属】CDN 指纹白名单（tos-cn- / aweme- / byteimg / tplv-dy 等），
+        //   设计目的是把真视频缩略图从"电子营业执照/推广图"里挑出来。
+        //   但它对非抖音站（MSN 封面用 img-s-msn-com.akamaized.net）会把所有真实封面
+        //   全部判为「非视频缩略图」→ 播放器容器内永远选不到封面 → 视频卡一片空白。
+        //   修复：该白名单【只在抖音/字节系站点强制】；其余站点退化为"非推广图 + 面积门槛"。
+        const isDouyinSite = /(^|\.)(douyin|iesdouyin|tiktok)\.com$/i.test((location && location.hostname) || '');
         const imgs = Array.from(playerWrap.querySelectorAll('img')).filter((im) => {
           const s = im.currentSrc || im.src || '';
-          return s && !/^data:|^blob:/i.test(s) && isVideoThumb(s) && !isPromo(s);
+          if (!s || /^data:|^blob:/i.test(s)) return false;
+          if (isPromo(s)) return false;
+          if (isDouyinSite && !isVideoThumb(s)) return false; // 仅抖音站强制 CDN 指纹
+          return (im.naturalWidth || 0) >= 120;               // 通用站：面积门槛剔除小图标
         }).sort((a, b) => (b.naturalWidth || 0) - (a.naturalWidth || 0));
         if (imgs[0]) {
           const s = imgs[0].currentSrc || imgs[0].src;
@@ -2362,6 +3377,123 @@ function extractVideoCovers() {
         pageCovers.push({ kind: 'poster', url: p });
       }
     });
+    // 4.5) ★2026-09-11 修复（imini 等多视频页「封面与内容错配」根因）：
+    //   视频封面此前来自「页面 <img> 按 DOM 序分发」的猜测式匹配，与视频毫无对应关系
+    //   → 卡片拿到的是"同页另一张图"。这里采集【与视频直链一一对应】的真封面：
+    //     ① <video poster>（video 元素自身声明的封面，最权威，且天然与 src 成对）
+    //     ② 内联 JSON / RSC（__NEXT_DATA__、self.__next_f 等）中与同一条 mp4
+    //        【在同一个对象里成对出现】的 cover / poster / thumbnail / image / picUrl
+    //        / imgUrl / frameUrl 字段（imini 等 Next.js 站点的真封面就藏在这里）
+    //   结果放进 pairs：<视频直链> -> <真封面>，由 scanTab 按优先级消费。
+    //   注意：pairs 只做纯字符串解析，不发任何网络请求，也不会改动页面 DOM。
+    const COVER_KEY_RE = /^(cover|coverUrl|cover_url|coverImage|cover_image|coverImg|poster|posterUrl|poster_url|thumbnail|thumbnailUrl|thumbnail_url|thumb|thumbUrl|thumb_url|image|imgUrl|img_url|imageUrl|picUrl|pic_url|pic|frameUrl|frame_url|frame|firstFrame|first_frame|snapshot|preview|previewUrl|preview_url|videoCover|video_cover)$/i;
+    const COVER_FIELD_RE = /\\?"?(?:cover|coverUrl|cover_url|coverImage|cover_image|coverImg|poster|posterUrl|poster_url|thumbnail|thumbnailUrl|thumbnail_url|thumb|thumbUrl|thumb_url|image|imgUrl|img_url|imageUrl|picUrl|pic_url|pic|frameUrl|frame_url|frame|firstFrame|first_frame|snapshot|preview|previewUrl|preview_url|videoCover|video_cover)\\?"?\s*:\s*\\?"([^"\\]{4,600})/gi;
+    const VID_URL_TAIL_RE = /\.(mp4|webm|mov|m4v|mkv|ogv|m3u8|flv|avi|wmv|ts|mpg|mpeg)(?:[?#][^\s"'<>\\]*)?$/i;
+    const VID_IN_JSON_RE = /https?:\/\/[^ "'<>\\]+?\.(?:mp4|webm|mov|m4v|mkv|ogv|m3u8|flv|avi|wmv|ts|mpg|mpeg)(?:[?#][^ "'<>\\]*)?/gi;
+    const toAbs = (s) => { try { return new URL(String(s), location.href).href; } catch (_) { return ''; } };
+    const isImgLike = (s) => {
+      const v = String(s || '');
+      if (!/^https?:\/\/[^\s"'<>\\]+$/i.test(v)) return false;
+      if (VID_URL_TAIL_RE.test(v)) return false;      // 视频直链不是封面
+      if (isPromo(v) || isBeacon(v)) return false;    // 推广/信标图一律排除
+      return true;
+    };
+    //   RSC（self.__next_f.push([1,"…"])）会把引号/斜杠转义成 \" 与 \\/ —— 先做一次还原，
+    //   否则 URL 正则（依赖 http:// 里的连续两个 /）永远命中不到，与 scanPage:2264 同理。
+    const unescapeJsonText = (s) => {
+      try {
+        return String(s || '')
+          .replace(/\\\\/g, '\\')   // \\ -> \（先合并双反斜杠）
+          .replace(/\\\//g, '/')    // \/ -> /
+          .replace(/\\"/g, '"');    // \" -> "
+      } catch (_) { return String(s || ''); }
+    };
+    // 完整绝对地址判定：必须是 http(s):// 且后面还有内容（"https:" / "https" 这种半截串不算）
+    const isFullUrl = (s) => /^https?:\/\/[^\s"'<>\\]/i.test(String(s || ''));
+    // ★2026-09-11（QA K-2）：可接受的封面/直链写法 = 完整绝对地址，或常见相对路径
+    //   （/img/a.jpg、./a.jpg、../a.jpg、协议相对 //cdn/x.jpg）。相对路径由 toAbs 解析成绝对地址，
+    //   真正要拦的只有"只有 scheme 没有 //"的半截串。
+    const isUsableUrl = (s) => {
+      const v = String(s || '');
+      if (!v) return false;
+      if (/^\/\//.test(v)) return true;              // 协议相对 //host/path
+      if (/^\.{0,2}\/[^/\s]/.test(v)) return true;   // /a.jpg、./a.jpg、../a.jpg
+      return isFullUrl(v);
+    };
+    const addPair = (v, c) => {
+      try {
+        if (!v || !c) return;
+        // ★2026-09-11 修订（QA P2）：必须先要求原始串【已经是】完整 http(s):// 再做 toAbs。
+        //   否则 "https:" 这类半截串会被 new URL('https:', location.href) 解析成【源页 URL】
+        //   → 反而通过下面的绝对地址校验 → 该卡拿源页 HTML 当封面（白拉整页 + 🎬）。
+        if (!isUsableUrl(c)) return;
+        if (!isUsableUrl(v)) return;
+        let vv = String(v).replace(/\\\//g, '/');
+        let cc = String(c).replace(/\\\//g, '/');
+        if (!/^https?:\/\//i.test(vv)) vv = toAbs(vv);
+        if (!/^https?:\/\//i.test(cc)) cc = toAbs(cc);
+        if (!vv || !cc || !isFullUrl(vv) || !isFullUrl(cc)) return;
+        if (!VID_URL_TAIL_RE.test(vv)) return;     // 只认真正的视频直链
+        // ★兜底防御：解析结果退化成【当前页面地址】（半截串经 toAbs 的典型产物）→ 丢弃
+        try {
+          const pg = String(location.href || '');
+          const originPath = pg.split('?')[0];
+          if (cc === pg || cc === originPath || cc === (location.origin + '/')) return;
+        } catch (_) {}
+        if (isPromo(cc) || isBeacon(cc)) return;   // 推广/信标图一律排除
+        if (!pairs[vv]) pairs[vv] = cc;
+      } catch (_) {}
+    };
+    try {
+      // ① <video poster>（含 data-poster / data-cover / data-thumbnail）
+      document.querySelectorAll('video').forEach((v) => {
+        const p = v.getAttribute('poster') || v.poster
+          || (v.dataset && (v.dataset.poster || v.dataset.cover || v.dataset.thumbnail)) || '';
+        if (!p) return;
+        [v.currentSrc, v.src, v.getAttribute('data-src')].forEach((s) => {
+          if (s && /^https?:/i.test(s)) addPair(s, p);
+        });
+      });
+    } catch (_) {}
+    try {
+      // ② 内联数据：能 JSON.parse 就走对象遍历（精确）；RSC / 转义串走「邻近窗口」匹配
+      const walkPairs = (o, depth) => {
+        if (!o || typeof o !== 'object' || depth > 12) return;
+        if (Array.isArray(o)) { for (let i = 0; i < o.length && i < 3000; i++) walkPairs(o[i], depth + 1); return; }
+        let vid = '';
+        let cov = '';
+        for (const k in o) {
+          const v = o[k];
+          if (!v || typeof v !== 'string') continue;
+          if (!vid && /^https?:/i.test(v) && VID_URL_TAIL_RE.test(v)) vid = v;
+          if (!cov && COVER_KEY_RE.test(k) && isImgLike(v)) cov = v;
+        }
+        if (vid && cov) addPair(vid, cov);
+        for (const k in o) { try { walkPairs(o[k], depth + 1); } catch (_) {} }
+      };
+      const scripts = Array.from(document.querySelectorAll('script:not([src])'));
+      for (const s of scripts) {
+        const rawTxt = s.textContent || '';
+        if (!rawTxt || rawTxt.length > 2000000) continue;
+        if (!/\.(mp4|webm|mov|m4v|mkv|ogv|m3u8|flv|avi|wmv|ts|mpg|mpeg)/i.test(rawTxt)) continue;
+        let parsed = null;
+        try { parsed = JSON.parse(rawTxt); } catch (_) { parsed = null; }
+        if (parsed && typeof parsed === 'object') { try { walkPairs(parsed, 0); } catch (_) {} continue; }
+        // RSC / 转义串：先还原 \" 与 \\/ 再按「视频 URL 邻近窗口」取最近 cover 字段
+        const txt = unescapeJsonText(rawTxt);
+        try { parsed = JSON.parse(txt); } catch (_) { parsed = null; }
+        if (parsed && typeof parsed === 'object') { try { walkPairs(parsed, 0); } catch (_) {} continue; }
+        VID_IN_JSON_RE.lastIndex = 0;
+        let m = null;
+        let guard = 0;
+        while ((m = VID_IN_JSON_RE.exec(txt)) && guard++ < 400) {
+          const win = txt.slice(Math.max(0, m.index - 800), Math.min(txt.length, m.index + m[0].length + 800));
+          COVER_FIELD_RE.lastIndex = 0;
+          const cm = COVER_FIELD_RE.exec(win);
+          if (cm) addPair(m[0], cm[1]);
+        }
+      }
+    } catch (_) {}
     // 5) og:image / twitter:image 作为通用默认封面（Pexels/Coverr 等专业视频源常用）
     if (!defaultCover) {
       try {
@@ -2406,22 +3538,89 @@ function extractVideoCovers() {
           let abs;
           try { abs = new URL(src, location.href).href; } catch (_) { continue; }
           if (isPromo(abs)) continue; // ★排除推广/认证/电子营业执照
+          if (isBeacon(abs)) continue; // ★排除监控/埋点信标（mssdk 等，0 尺寸且必然 404）
           if (seen.has(abs)) continue;
           seen.add(abs);
-          candidates.push({ url: abs, area, w: img.naturalWidth || 0, h: img.naturalHeight || 0, isThumb: isVideoThumb(abs) });
+          // ★2026-09-10 isContent：区分「用户内容图」与「网站静态资源图」（本地模拟验证，见
+          //   tmp/sim-imini-cover.mjs）。imini 实测：真封面在 file.iminicdn.com/file/…，
+          //   而 logo / 定价广告 / 模型图标 / 首页营销图都在 /static/ /public/ /assets/ /resources/ 下。
+          //   借此把装饰图排到候补位，避免它们挤占前排导致卡片拿到非封面图。
+          //   idx = DOM 顺序，供下游「按序分发」与卡片顺序对齐。
+          const isContent = !/\/(static|public|assets|resources)\//i.test(abs);
+          candidates.push({ url: abs, area, w: img.naturalWidth || 0, h: img.naturalHeight || 0, isThumb: isVideoThumb(abs), idx: candidates.length, isContent });
         }
-        // ★白名单命中（视频缩略图）优先于面积
-        candidates.sort((a, b) => (b.isThumb - a.isThumb) || (b.area - a.area));
+        // ★2026-09-03 修复（"电子营业执照/认证图"被当封面的真凶）：
+        //   抖音/视频号页面里"<img>"兜底扫描会把"电子营业执照"等无 verify/license 关键字的认证图
+        //   当成候选（其域名/路径就是普通的 p3-sign.douyinpic.com，与真实视频缩略图无法靠黑名单区分）。
+        //   解决：抖音/视频号/TikTok 页强制只接受【白名单命中】的候选（已知视频缩略图域名/路径段），
+        //   否则直接清空 pageCovers、不设 defaultCover → 卡片显示空封面好过显示"电子营业执照"误导用户。
+        const isDouyinLike = /(?:^|\.)(douyin\.com|ixigua\.com|tiktok\.com|tiktokv\.com|weixin\.qq\.com|channels\.weixin\.qq\.com)$/i.test(location.hostname || '');
+        if (isDouyinLike) {
+          for (let ci = candidates.length - 1; ci >= 0; ci--) {
+            if (!candidates[ci].isThumb) candidates.splice(ci, 1);
+          }
+        }
+        // ★2026-09-10 修复（imini 等多视频页「封面错位 + 部分卡无封面」）：
+        //   本地模拟（tmp/sim-imini-cover.mjs，用真实 DOM 数据）对比结果：
+        //     原「面积排序 + slice(0,6)」              → 9 张卡仅 5 张拿到真封面，3 张无封面
+        //     「内容图优先 + DOM 顺序 + 上限 30」       → 9 张卡 9 张全部拿到正确封面
+        //   ① 原按【面积】排序打乱了 DOM 顺序，而下游是「按序分发」（卡片顺序）
+        //      → 面积顺序 ≠ 卡片顺序 → 封面与卡对不上；
+        //   ② slice(0, 6) 硬上限 → imini 9+ 张视频卡必然有卡分不到封面 → 占位圆；
+        //   ③ 装饰图（logo/定价广告/模型图标/首页营销）挤占前排 → 卡片拿到非封面图。
+        //   修复：先「用户内容图」按 DOM 顺序，再「静态资源图」按 DOM 顺序兜底，上限放宽到 30。
+        const contentImgs = candidates.filter((c) => c.isContent).sort((a, b) => a.idx - b.idx);
+        const staticImgs = candidates.filter((c) => !c.isContent).sort((a, b) => a.idx - b.idx);
         const seen2 = new Set();
-        for (const c of candidates.slice(0, 6)) {
+        for (const c of [...contentImgs, ...staticImgs].slice(0, 30)) {
           pageCovers.push({ kind: 'page-img', url: c.url });
           seen2.add(c.url);
         }
+        // ★白名单命中（视频缩略图）优先于面积 —— 仅用于挑 defaultCover，不影响上面的按序分发
+        candidates.sort((a, b) => (b.isThumb - a.isThumb) || (b.area - a.area));
         if (!defaultCover && candidates.length) defaultCover = candidates[0].url;
       } catch (_) {}
     }
   } catch (_) {}
-  return { byKey, defaultCover, pageCovers };
+  // ★2026-09-11 修复（liblib 视频卡封面缺失根因）：
+  //   inject-main 在 MAIN 世界捕获 apiVideos 时，已把响应体中「视频直链 → 邻近封面图」
+  //   的配对写入 window.__hmdao_captures.apiVideoPairs。extractVideoCovers 同样运行在 MAIN 世界，
+  //   读取该 pairs 并合并到返回结果，供 scanTab 精确回填每张视频卡封面。
+  try {
+    const apiPairs = (window.__hmdao_captures && window.__hmdao_captures.apiVideoPairs) || {};
+    for (const k in apiPairs) {
+      const v = apiPairs[k];
+      if (v && !pairs[k]) pairs[k] = v;
+    }
+    // ★2026-09-11 补充（多平台视频卡封面"对应"兜底）：
+    //   apiVideos 来自 XHR 响应体（如 liblib），其结构化 cover 字段可能缺失/热链 404。
+    //   此时用【页面已渲染的 <img> 缩略图】按"共享长路径段"配对——页面缩略图必与视频同源、
+    //   必能加载、必与该卡内容对应（即用户说的"平台自带的"封面）。
+    //   例：视频 …/88dc2eab…/master.mp4 与缩略图 …/88dc2eab…/720p/index.jpg 共享 item-id 段 88dc2eab…。
+    //   取【最长】共享段（≥12 字符）以避开通用路径词（/upload-images/ 等），确保配对到具体 item 缩略图。
+    const apiVideos = (window.__hmdao_captures && Array.isArray(window.__hmdao_captures.apiVideos)) ? window.__hmdao_captures.apiVideos : [];
+    if (apiVideos.length && pageCovers.length) {
+      const coverSeg = new Map(); // 长段 → 缩略图 URL（同段取首个）
+      const segOf = (u) => String(u || '').match(/[A-Za-z0-9_\-]{12,}/g) || [];
+      for (const c of pageCovers) {
+        const u = (c && (c.url || c)) || '';
+        if (!/^https?:/i.test(u)) continue;
+        for (const s of segOf(u)) {
+          if (!coverSeg.has(s)) coverSeg.set(s, u);
+        }
+      }
+      for (const v of apiVideos) {
+        if (!v || pairs[v]) continue; // 已有结构化封面则跳过
+        let best = '', bestLen = 0;
+        for (const s of segOf(v)) {
+          const cu = coverSeg.get(s);
+          if (cu && s.length > bestLen) { best = cu; bestLen = s.length; }
+        }
+        if (best && /^https?:/i.test(best)) pairs[v] = best;
+      }
+    }
+  } catch (_) {}
+  return { byKey, defaultCover, pageCovers, pairs };
 }
 
 if (typeof globalThis !== 'undefined') {

@@ -607,8 +607,26 @@ function sanitizePersistedValue(value: unknown, key = ''): unknown {
   return value;
 }
 
+// 判断一个值是否是浏览器可直接渲染的资源地址。
+// 历史数据里出现过把素材 ID（裸 UUID，如 a6433503-xxxx-...）直接塞进 imageUrl/videoUrl 的情况，
+// 渲染时会被当作相对 URL 请求（http://host/<uuid>），后端必然 404，且每次加载都复现。
+// 这类不可渲染的值在持久化阶段统一丢弃，避免陈旧引用无限期留存。
+function isRenderableAssetUrl(raw: unknown): boolean {
+  if (typeof raw !== 'string') return false;
+  const value = raw.trim();
+  if (!value) return false;
+  if (/^(?:https?:\/\/|data:|blob:|file:)/i.test(value)) return true;
+  if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) return true;
+  return false;
+}
+
 function sanitizePersistedNodeData(data: NodeData): NodeData {
-  return sanitizePersistedValue(data) as NodeData;
+  const next = sanitizePersistedValue(data) as NodeData;
+  const out: NodeData = { ...next };
+  // 只丢弃「不可渲染」的值（裸 UUID 等）；正常 URL 一律保留，不误伤可用素材。
+  if (out.imageUrl != null && !isRenderableAssetUrl(out.imageUrl)) out.imageUrl = '';
+  if (out.videoUrl != null && !isRenderableAssetUrl(out.videoUrl)) out.videoUrl = '';
+  return out;
 }
 
 function migratePersistedNodeData(data: NodeData, type?: NodeType): NodeData {
@@ -1812,6 +1830,33 @@ export const useCanvasStore = create<CanvasStore>()(
     })),
     {
       name: 'hmdao-canvas-store',
+      version: 2,
+      // 旧版本（无 version，视为 0）的持久化画布可能包含指向已删除素材的孤儿引用
+      // （如 /api/assets/content/<id> 反复 404）。新建工程时这些旧画布数据应丢弃，
+      // 回退到初始空白画布，避免控制台刷 404 与潜在崩溃。
+      migrate: (persisted, version) => {
+        const p = (persisted && typeof persisted === 'object' ? persisted : {}) as Record<string, unknown>;
+        if (version < 1) {
+          delete p.canvas;
+          return p;
+        }
+        // v2：一次性清理历史节点里不可渲染的死引用（裸 UUID / 已删除素材 ID）。
+        // 这类值每次加载都会发起注定 404 的请求，且不会自行消失，必须在迁移阶段修掉。
+        if (version < 2) {
+          const canvas = p.canvas as { nodes?: Array<{ data?: Record<string, unknown> }> } | undefined;
+          if (canvas && Array.isArray(canvas.nodes)) {
+            canvas.nodes = canvas.nodes.map((node) => {
+              const data = node?.data;
+              if (!data || typeof data !== 'object') return node;
+              const next = { ...data };
+              if ('imageUrl' in next && !isRenderableAssetUrl(next.imageUrl)) next.imageUrl = '';
+              if ('videoUrl' in next && !isRenderableAssetUrl(next.videoUrl)) next.videoUrl = '';
+              return { ...node, data: next };
+            });
+          }
+        }
+        return p;
+      },
       partialize: (state) => ({
         canvas: state.canvas
           ? {

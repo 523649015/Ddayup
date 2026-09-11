@@ -109,7 +109,11 @@ export type SearchPlatform =
   | 'pixabay'
   | 'huaban'
   | 'youtube'
+  | 'youtube_audio'
+  | 'bilibili'
+  | 'douyin'
   | 'pinterest'
+  | 'artstation'
   | 'deviantart';
 
 export interface SearchPlatformMeta {
@@ -229,11 +233,39 @@ export const SEARCH_PLATFORMS: SearchPlatformMeta[] = [
     searchUrl: 'https://www.youtube.com/results?search_query={query}',
   },
   {
+    id: 'youtube_audio',
+    name: 'YouTube 音频库',
+    supports: ['audio'],
+    description: 'YouTube 音效与无版权音乐素材库',
+    searchUrl: 'https://www.youtube.com/results?search_query={query}&sp=EgIQA1AU',
+  },
+  {
+    id: 'bilibili',
+    name: 'B站',
+    supports: ['video'],
+    description: '国内视频内容平台',
+    searchUrl: 'https://search.bilibili.com/all?keyword={query}',
+  },
+  {
+    id: 'douyin',
+    name: '抖音',
+    supports: ['video'],
+    description: '短视频内容平台',
+    searchUrl: 'https://www.douyin.com/search/{query}',
+  },
+  {
     id: 'pinterest',
     name: 'Pinterest',
     supports: ['image'],
     description: '全球灵感图片平台',
     searchUrl: 'https://www.pinterest.com/search/pins/?q={query}',
+  },
+  {
+    id: 'artstation',
+    name: 'ArtStation',
+    supports: ['image'],
+    description: '全球专业数字艺术与概念设计平台',
+    searchUrl: 'https://www.artstation.com/search?query={query}',
   },
   {
     id: 'deviantart',

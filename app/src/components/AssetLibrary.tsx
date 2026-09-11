@@ -15,6 +15,7 @@ import {
   Image as ImageIcon,
   List,
   Loader2,
+  LogIn,
   Music,
   Play,
   Plus,
@@ -34,6 +35,8 @@ import {
   Globe,
 } from 'lucide-react';
 import { useAssetStore } from '@/store/useAssetStore';
+import { useNavigate } from 'react-router-dom';
+import { useAuthStore } from '@/store/useAuthStore';
 import { useCanvasStore } from '@/store/useCanvasStore';
 import {
   detectHmdaoExtension,
@@ -74,7 +77,7 @@ import { parseFileNameSemantics } from '@/services/autoClassifier';
 import { AssetSearchBar } from './AssetSearchBar';
 import { LocalSimilarPanel } from './LocalSimilarPanel';
 import { AIDeepAnalysisPanel } from './AIDeepAnalysisPanel';
-import type { AssetFolder, AssetItem, WebSearchResult } from '@/types/assets';
+import type { AssetFolder, AssetItem, AIDeepAnalysis, WebSearchResult } from '@/types/assets';
 import { useUILanguage } from '@/i18n/ui';
 
 
@@ -208,6 +211,9 @@ export function AssetLibrary() {
   const [isPickingStoragePath, setIsPickingStoragePath] = useState(false);
   const [isImportingFolder, setIsImportingFolder] = useState(false);
   const [isLoadingAssetLibrary, setIsLoadingAssetLibrary] = useState(false);
+  const [needsLogin, setNeedsLogin] = useState(false);
+  const isAuthed = useAuthStore((state) => state.isAuthenticated());
+  const navigate = useNavigate();
   const [multiSelectMode, setMultiSelectMode] = useState(false);
   const [showDuplicatesOnly, setShowDuplicatesOnly] = useState(false);
   const [batchTagInput, setBatchTagInput] = useState('');
@@ -244,7 +250,7 @@ export function AssetLibrary() {
   // 新增：AI 分析与本地相似面板
   const [showAIAnalysis, setShowAIAnalysis] = useState(false);
   const [showLocalSimilar, setShowLocalSimilar] = useState(true);
-  const [aiAnalysisResult, setAiAnalysisResult] = useState<import('@/types/assets').AIDeepAnalysis | null>(null);
+  const [aiAnalysisResult, setAiAnalysisResult] = useState<AIDeepAnalysis | null>(null);
 
   // 浏览器扩展：把扫描到的网页资源导入本地素材库（collectFromUrl 会下载为本地 hmdao-local:// 句柄，画布只读本地句柄）
   const setSidebarTab = useCanvasStore((s) => s.setSidebarTab);
@@ -461,6 +467,13 @@ export function AssetLibrary() {
 
   useEffect(() => {
     let cancelled = false;
+    // 未登录：直接引导登录，避免发起请求后向用户展示 401
+    if (!isAuthed) {
+      setNeedsLogin(true);
+      setIsLoadingAssetLibrary(false);
+      return;
+    }
+    setNeedsLogin(false);
     setIsLoadingAssetLibrary(true);
     setStorageStatus(null);
     void (async () => {
@@ -476,10 +489,16 @@ export function AssetLibrary() {
         syncPersistedItems(catalog.items || []);
       } catch (error) {
         if (cancelled) return;
-        setStorageStatus({
-          type: 'error',
-          message: error instanceof Error ? error.message : '加载资产库配置失败。',
-        });
+        // 已登录但会话过期（token 失效）也会返回 401，引导重新登录而非显示技术性错误
+        const msg = error instanceof Error ? error.message : '';
+        if (msg.includes('401') || msg.toLowerCase().includes('unauthorized')) {
+          setNeedsLogin(true);
+        } else {
+          setStorageStatus({
+            type: 'error',
+            message: error instanceof Error ? error.message : '加载资产库配置失败。',
+          });
+        }
       } finally {
         if (!cancelled) {
           setIsLoadingAssetLibrary(false);
@@ -489,7 +508,7 @@ export function AssetLibrary() {
     return () => {
       cancelled = true;
     };
-  }, [setStoragePath, syncPersistedItems]);
+  }, [setStoragePath, syncPersistedItems, isAuthed]);
 
   useEffect(() => {
     setStorageDraft(storagePath || '');
@@ -1446,6 +1465,25 @@ export function AssetLibrary() {
     { id: 'workflow', label: '工作流', icon: FolderOpen as typeof Grid3X3 },
   ];
 
+  if (needsLogin) {
+    return (
+      <div className="flex h-full w-full flex-col items-center justify-center gap-4 bg-[#0d1117] px-6 text-center">
+        <LogIn className="h-10 w-10 text-[#58a6ff]" />
+        <div className="text-sm font-medium text-[#dbeafe]">请先登录后查看素材库</div>
+        <div className="max-w-[260px] text-xs leading-5 text-[#8b949e]">
+          素材库按账号隔离存储，登录后即可查看、导入并管理你的本地素材。
+        </div>
+        <button
+          type="button"
+          onClick={() => navigate('/login')}
+          className="mt-1 rounded-lg bg-[#238636] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#2ea043]"
+        >
+          前往登录
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full w-full flex-col overflow-hidden bg-[#0d1117]">
       <div className="flex items-center gap-1 border-b border-[#21262d] px-3 py-2">
@@ -1698,7 +1736,7 @@ export function AssetLibrary() {
                     key={category.id}
                     type="button"
                     data-testid={`asset-smart-folder-${category.name}`}
-                    onClick={() => handleSelectAssetFolder(category.id)}
+                    onClick={() => handleSelectAssetFolder(category.id, { tab: 'all' })}
                     className={`flex w-full items-center justify-between rounded-lg px-2 py-1 text-left text-xs transition-colors ${
                       selectedFolderId === category.id ? 'bg-[#00d4aa]/10 text-[#00d4aa]' : 'text-[#8b949e] hover:bg-[#21262d] hover:text-[#c9d1d9]'
                     }`}

@@ -1,0 +1,51 @@
+# Ddayup 后端 systemd 保活单元（无 root 权限也能用，放 ~/.config/systemd/user/）。
+# 有 root 可放 /etc/systemd/system/ddayup.service。
+#
+# 安装：
+#   mkdir -p ~/.config/systemd/user
+#   cp ddayup.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ddayup
+#   # 开机自启（用户级，需登录）：sudo loginctl enable-linger $USER
+#
+# 查看状态：systemctl --user status ddayup
+# 看日志：journalctl --user -u ddayup -f
+
+[Unit]
+Description=Ddayup Backend (hmdao-api)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/HMDAODAO/app
+ExecStart=/usr/bin/node server/hmdao-api.mjs
+Restart=always
+RestartSec=2s
+# 安全加固：8792 仅监听本机，由 Caddy(443) 反代进入；切勿设 0.0.0.0 暴露公网。
+Environment=NODE_ENV=production
+Environment=HMDAO_API_HOST=127.0.0.1
+Environment=HMDAO_API_PORT=8792
+Environment=HMDAO_APP_PORT=3000
+Environment=HMDAO_PROXY_HOST=127.0.0.1
+Environment=HMDAO_API_TARGET=http://127.0.0.1:8792
+# 运维 Key（请用 %i 实例参数传入强随机值；例如：systemd-run --property=... 或 enable --now ddayup@<随机串>）
+Environment=HMDAO_API_KEY=%i
+# CORS 白名单（逗号分隔，仅这些源可跨域；生产填你的官网域名，如 https://ddayup.com）
+Environment=HMDAO_CORS_ORIGINS=https://ddayup.com
+# 微信支付凭证（留空则订阅下单回退 mock，仅本地测试可用）
+Environment=HMDAO_WX_APP_ID=
+Environment=HMDAO_WX_MCH_ID=
+Environment=HMDAO_WX_API_KEY=
+# Paddle 凭证（留空则订阅下单回退 mock）
+Environment=HMDAO_PADDLE_VENDOR_ID=
+Environment=HMDAO_PADDLE_AUTH_TOKEN=
+Environment=HMDAO_PADDLE_PRODUCT_ID=
+Environment=HMDAO_PADDLE_SANDBOX=1
+# 对外公开基址（用于支付回跳/回调拼接）
+Environment=HMDAO_PUBLIC_BASE=https://ddayup.com
+# 防止内存泄漏导致 OOM：超过 1.2G 自动重启
+MemoryMax=1200M
+
+[Install]
+WantedBy=default.target

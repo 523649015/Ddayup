@@ -404,10 +404,27 @@ async function pickLocalDirectory(initialPath = '', autoSelectPath = '') {
   return await pickLocalDirectoryLinux(preferredPath);
 }
 
-async function readAssetLibraryCatalog() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
+// ---- 按用户硬隔离：每个用户独立 catalog 文件 + 独立素材目录，互不干扰 ----
+function sanitizeUserIdForPath(userId) {
+  const s = String(userId || '').trim().toLowerCase();
+  const safe = s.replace(/[^a-z0-9\-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 64);
+  return safe || 'anonymous';
+}
+function catalogFileForUser(userId) {
+  return path.join(DATA_DIR, `asset-library-catalog-${sanitizeUserIdForPath(userId)}.json`);
+}
+function duplicatesFileForUser(userId) {
+  return path.join(DATA_DIR, `asset-duplicates-${sanitizeUserIdForPath(userId)}.json`);
+}
+// 每个用户的素材落在 baseStoragePath/{userId}/ 下，物理隔离。
+function storageDirForUser(userId, baseStoragePath) {
+  return path.join(String(baseStoragePath || DEFAULT_ASSET_LIBRARY_STORAGE_DIR), sanitizeUserIdForPath(userId));
+}
+
+async function readAssetLibraryCatalog(userId) {
+  const file = catalogFileForUser(userId);
   try {
-    const raw = await fs.readFile(ASSET_LIBRARY_CATALOG_FILE, 'utf8');
+    const raw = await fs.readFile(file, 'utf8');
     const normalized = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
     const parsed = JSON.parse(normalized);
     const items = Array.isArray(parsed?.items) ? parsed.items : [];
@@ -417,9 +434,10 @@ async function readAssetLibraryCatalog() {
   }
 }
 
-async function writeAssetLibraryCatalog(items) {
+async function writeAssetLibraryCatalog(userId, items) {
+  const file = catalogFileForUser(userId);
   await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(ASSET_LIBRARY_CATALOG_FILE, JSON.stringify({
+  await fs.writeFile(file, JSON.stringify({
     version: 1,
     updatedAt: Date.now(),
     items,
@@ -427,34 +445,35 @@ async function writeAssetLibraryCatalog(items) {
   return items;
 }
 
-async function upsertAssetLibraryItem(item) {
+async function upsertAssetLibraryItem(userId, item) {
   const nextItem = normalizeAssetLibraryItem(item);
-  const items = await readAssetLibraryCatalog();
+  const items = await readAssetLibraryCatalog(userId);
   const nextItems = [...items.filter((entry) => entry.id !== nextItem.id), nextItem]
     .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0));
-  await writeAssetLibraryCatalog(nextItems);
+  await writeAssetLibraryCatalog(userId, nextItems);
   return nextItem;
 }
 
 // 资产回收站：删除时把物理文件移入 trash 目录（而非直接销毁），
 // 供撤销时通过 /api/assets/restore 找回，实现「云端文件找回」。
+// 注：trash 按物理文件管理（全局），catalog 已按用户隔离，互不影响。
 const ASSET_LIBRARY_TRASH_DIR = path.join(DATA_DIR, 'asset-trash');
-// 去重结果持久化缓存文件：服务端去重分组在此落盘，供去重看板常驻视图读取。
-const ASSET_LIBRARY_DUPLICATES_FILE = path.join(DATA_DIR, 'asset-duplicates.json');
 
-// 将去重分组写入缓存文件（覆盖式）。分组结构：{ canonicalId, type, name, contentHash, duplicateIds }。
-async function writeAssetLibraryDuplicates(groups = []) {
+// 将去重分组写入缓存文件（覆盖式，按用户）。分组结构：{ canonicalId, type, name, contentHash, duplicateIds }。
+async function writeAssetLibraryDuplicates(userId, groups = []) {
+  const file = duplicatesFileForUser(userId);
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.writeFile(
-    ASSET_LIBRARY_DUPLICATES_FILE,
+    file,
     JSON.stringify({ version: 1, updatedAt: Date.now(), groups: Array.isArray(groups) ? groups : [] }, null, 2),
     'utf8',
   );
 }
 
-async function readAssetLibraryDuplicates() {
+async function readAssetLibraryDuplicates(userId) {
+  const file = duplicatesFileForUser(userId);
   try {
-    const text = await fs.readFile(ASSET_LIBRARY_DUPLICATES_FILE, 'utf8');
+    const text = await fs.readFile(file, 'utf8');
     const parsed = JSON.parse(text);
     return Array.isArray(parsed?.groups) ? parsed.groups : [];
   } catch {
@@ -572,10 +591,10 @@ async function moveFileToTrash(filePath, assetId) {
   }
 }
 
-async function deleteAssetLibraryItems(assetIds = []) {
+async function deleteAssetLibraryItems(userId, assetIds = []) {
   const ids = new Set(assetIds.map((item) => String(item || '').trim()).filter(Boolean));
   if (!ids.size) return [];
-  const items = await readAssetLibraryCatalog();
+  const items = await readAssetLibraryCatalog(userId);
   const deletedItems = items.filter((item) => ids.has(String(item.id || '')));
   await fs.mkdir(ASSET_LIBRARY_TRASH_DIR, { recursive: true }).catch(() => {});
   await Promise.all(
@@ -595,14 +614,14 @@ async function deleteAssetLibraryItems(assetIds = []) {
     }),
   );
   const nextItems = items.filter((item) => !ids.has(String(item.id || '')));
-  await writeAssetLibraryCatalog(nextItems);
+  await writeAssetLibraryCatalog(userId, nextItems);
   return deletedItems.map((item) => String(item.id || ''));
 }
 
 // 清理陈旧的素材引用：catalog 中存在、但本地文件已不存在的 disk 型条目（文件被删除/移动）
 // 会导致 /api/assets/content/<id> 返回 404。此函数扫描并移除这些死引用，避免前端反复请求 404。
-async function pruneMissingAssetLibraryItems() {
-  const items = await readAssetLibraryCatalog();
+async function pruneMissingAssetLibraryItems(userId) {
+  const items = await readAssetLibraryCatalog(userId);
   const removed = [];
   const kept = [];
   for (const item of items) {
@@ -622,7 +641,7 @@ async function pruneMissingAssetLibraryItems() {
     else removed.push(item);
   }
   if (removed.length) {
-    await writeAssetLibraryCatalog(kept);
+    await writeAssetLibraryCatalog(userId, kept);
   }
   return {
     removedCount: removed.length,
@@ -632,10 +651,10 @@ async function pruneMissingAssetLibraryItems() {
 }
 
 // 撤销找回：把回收站里的文件移回原路径，并将目录项写回 catalog。
-async function restoreAssetLibraryItems(inputItems = []) {
+async function restoreAssetLibraryItems(userId, inputItems = []) {
   const list = Array.isArray(inputItems) ? inputItems : [];
   if (!list.length) return [];
-  const catalog = await readAssetLibraryCatalog();
+  const catalog = await readAssetLibraryCatalog(userId);
   const byId = new Map(catalog.map((item) => [String(item.id || ''), item]));
   const restored = [];
   for (const raw of list) {
@@ -670,12 +689,12 @@ async function restoreAssetLibraryItems(inputItems = []) {
   const nextItems = Array.from(byId.values()).sort(
     (left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0),
   );
-  await writeAssetLibraryCatalog(nextItems);
+  await writeAssetLibraryCatalog(userId, nextItems);
   return restored;
 }
 
-async function findAssetLibraryItem(assetId) {
-  const items = await readAssetLibraryCatalog();
+async function findAssetLibraryItem(userId, assetId) {
+  const items = await readAssetLibraryCatalog(userId);
   return items.find((item) => String(item.id || '') === String(assetId || '')) || null;
 }
 
@@ -717,7 +736,7 @@ async function probeAssetImportMeta(filePath, type) {
   };
 }
 
-async function processAssetLibraryImportDirectory(options = {}) {
+async function processAssetLibraryImportDirectory(userId, options = {}) {
   const folderId = String(options.folderId || 'root').trim() || 'root';
   const initialPath = String(options.initialPath || '').trim();
   const autoSelectPath = String(options.autoSelectPath || '').trim();
@@ -769,7 +788,7 @@ async function processAssetLibraryImportDirectory(options = {}) {
     try {
       const hints = inferAssetImportHints(filePath, type, picked.path);
       const meta = await probeAssetImportMeta(filePath, type);
-      const result = await processAssetLibraryImportRequest({
+      const result = await processAssetLibraryImportRequest(userId, {
         name: path.basename(filePath),
         originalName: path.basename(filePath),
         folderId,
@@ -848,6 +867,5 @@ async function processAssetLibraryImportDirectory(options = {}) {
     processAssetLibraryImportDirectory,
     ASSET_IMPORT_CATEGORY_RULES,
     ASSET_LIBRARY_TRASH_DIR,
-    ASSET_LIBRARY_DUPLICATES_FILE,
   };
 }

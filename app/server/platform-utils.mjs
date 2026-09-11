@@ -48,12 +48,15 @@ export function platformExecutableCandidates(baseName, platform = process.platfo
   return platform === 'win32' ? [`${base}.exe`, base] : [base, `${base}.exe`];
 }
 
-// P1-3: 当前平台对应的 yt-dlp GitHub 资产名与落地文件名
-// Windows=yt-dlp.exe / macOS=yt-dlp_macos（universal2）/ Linux=yt-dlp_linux
+// P1-3: 当前平台对应的 yt-dlp GitHub 资产名与落地文件名。
+// 统一采用「onedir（目录式）」构建以彻底消除 onefile 单文件 exe 启动时的控制台闪窗
+// （PyInstaller onefile 解压阶段不受 Node windowsHide 控制，会弹黑窗口）。
+// onedir 资产为压缩包：Windows=yt-dlp_win.zip / macOS=yt-dlp_macos.zip / Linux=yt-dlp_linux.zip，
+// 解压后内含 yt-dlp/ 目录（Windows 下为 yt-dlp/yt-dlp.exe），由 findFileRecursively 自动定位。
 export function resolveYtDlpAssetNames(info = buildPlatformInfo()) {
-  if (info.isWindows) return { assetName: 'yt-dlp.exe', fileName: 'yt-dlp.exe' };
-  if (info.isMac) return { assetName: 'yt-dlp_macos', fileName: 'yt-dlp' };
-  return { assetName: 'yt-dlp_linux', fileName: 'yt-dlp' };
+  if (info.isWindows) return { assetName: 'yt-dlp_win.zip', fileName: 'yt-dlp_win.zip' };
+  if (info.isMac) return { assetName: 'yt-dlp_macos.zip', fileName: 'yt-dlp_macos.zip' };
+  return { assetName: 'yt-dlp_linux.zip', fileName: 'yt-dlp_linux.zip' };
 }
 
 // P1-3: 按平台 + CPU 架构选择匹配的 PyPI wheel 平台标签正则

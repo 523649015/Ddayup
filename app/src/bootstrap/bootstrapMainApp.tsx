@@ -17,69 +17,48 @@ import type { CanvasNode, NodeData } from '@/types';
 
 startAutoRefresh();
 
-let apiKeyStoreModulePromise: Promise<typeof import('@/store/useApiKeyStore')> | null = null;
-let canvasStoreModulePromise: Promise<typeof import('@/store/useCanvasStore')> | null = null;
-let assetStoreModulePromise: Promise<typeof import('@/store/useAssetStore')> | null = null;
-let workflowModulePromise: Promise<typeof import('@/services/workflow/index')> | null = null;
-let localMediaRegistryPromise: Promise<typeof import('@/services/localMediaRegistry')> | null = null;
-let generationModulePromise: Promise<typeof import('@/services/generation')> | null = null;
-let regionContractsModulePromise: Promise<typeof import('@/services/regionContracts')> | null = null;
-let nodeReferenceGraphModulePromise: Promise<typeof import('@/lib/nodeReferenceGraph')> | null = null;
+// 这些模块已被业务组件静态广泛引用，必然进入初始主包。
+// 此处改用静态 import 并包装为已 resolved 的 Promise，消除 Rollup 的
+// "dynamic import will not move module into another chunk" 冗余告警（伪懒加载）。
+import * as apiKeyStoreModule from '@/store/useApiKeyStore';
+import * as canvasStoreModule from '@/store/useCanvasStore';
+import * as assetStoreModule from '@/store/useAssetStore';
+import * as workflowModule from '@/services/workflow/index';
+import * as localMediaRegistryModule from '@/services/localMediaRegistry';
+import * as generationModule from '@/services/generation';
+import * as regionContractsModule from '@/services/regionContracts';
+import * as nodeReferenceGraphModule from '@/lib/nodeReferenceGraph';
 
 function loadApiKeyStoreModule() {
-  if (!apiKeyStoreModulePromise) {
-    apiKeyStoreModulePromise = import('@/store/useApiKeyStore');
-  }
-  return apiKeyStoreModulePromise;
+  return Promise.resolve(apiKeyStoreModule);
 }
 
 function loadCanvasStoreModule() {
-  if (!canvasStoreModulePromise) {
-    canvasStoreModulePromise = import('@/store/useCanvasStore');
-  }
-  return canvasStoreModulePromise;
+  return Promise.resolve(canvasStoreModule);
 }
 
 function loadAssetStoreModule() {
-  if (!assetStoreModulePromise) {
-    assetStoreModulePromise = import('@/store/useAssetStore');
-  }
-  return assetStoreModulePromise;
+  return Promise.resolve(assetStoreModule);
 }
 
 function loadWorkflowModule() {
-  if (!workflowModulePromise) {
-    workflowModulePromise = import('@/services/workflow/index');
-  }
-  return workflowModulePromise;
+  return Promise.resolve(workflowModule);
 }
 
 function loadLocalMediaRegistryModule() {
-  if (!localMediaRegistryPromise) {
-    localMediaRegistryPromise = import('@/services/localMediaRegistry');
-  }
-  return localMediaRegistryPromise;
+  return Promise.resolve(localMediaRegistryModule);
 }
 
 function loadGenerationModule() {
-  if (!generationModulePromise) {
-    generationModulePromise = import('@/services/generation');
-  }
-  return generationModulePromise;
+  return Promise.resolve(generationModule);
 }
 
 function loadRegionContractsModule() {
-  if (!regionContractsModulePromise) {
-    regionContractsModulePromise = import('@/services/regionContracts');
-  }
-  return regionContractsModulePromise;
+  return Promise.resolve(regionContractsModule);
 }
 
 function loadNodeReferenceGraphModule() {
-  if (!nodeReferenceGraphModulePromise) {
-    nodeReferenceGraphModulePromise = import('@/lib/nodeReferenceGraph');
-  }
-  return nodeReferenceGraphModulePromise;
+  return Promise.resolve(nodeReferenceGraphModule);
 }
 
 function isAuthRoute(pathname?: string) {

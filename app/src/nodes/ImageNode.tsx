@@ -1260,10 +1260,17 @@ export function ImageNode({ selected, data, id }: NodeProps) {
     const userPrompt = prompt.trim();
     const contractPromptText = regionContractPrompt.trim();
     const trimmed = userPrompt || contractPromptText;
+    // 上游 text 节点作为提示词指令注入：收集已启用的文本类主输入。
+    const upstreamText = referenceInputs
+      .concat(primaryInputs)
+      .filter((item) => item.type === 'text' && item.enabled !== false && item.text)
+      .map((item) => item.text as string)
+      .join('\n\n')
+      .trim();
     const executionPrompt = contractMode && contractPromptText
       ? [userPrompt, contractPromptText].filter(Boolean).join('\n\n')
-      : trimmed;
-    if (!trimmed || !executionPrompt || data?.status === 'generating') return;
+      : [trimmed, upstreamText].filter(Boolean).join('\n\n');
+    if (!executionPrompt || data?.status === 'generating') return;
     pushImageSubmitTrace('submit:start', {
       nodeId: id,
       contractMode,
@@ -1284,6 +1291,7 @@ export function ImageNode({ selected, data, id }: NodeProps) {
       handleId: item.handleId,
       channel: item.channel,
       metadata: item.metadata,
+      ...(item.type === 'text' && item.text ? { text: item.text } : {}),
     }));
     const activePrimary = primaryInputs.find((item) => item.enabled !== false);
     const activeReferences = referenceInputs.filter((item) => item.enabled !== false);
@@ -2716,6 +2724,15 @@ const handleRight: CSSProperties = { right: -22 };
 
 function imageReferenceLaneMeta(input: ConnectedReferenceInput) {
   const handleId = String(input.handleId || '');
+  if (input.type === 'text') {
+    return {
+      lane: 'text' as const,
+      laneLabel: '文本指令',
+      roleLabel: '提示词注入',
+      toneClass: 'border-[#3b4a6b] bg-[#1c2535] text-[#9db8f6]',
+      sliderClass: 'accent-[#7aa2f7]',
+    };
+  }
   if (handleId.startsWith('image-lighting-reference') || input.role === 'omni' || input.role === 'lighting' || input.role === 'style') {
     return {
       lane: 'lighting' as const,
@@ -2737,6 +2754,7 @@ function imageReferenceLaneMeta(input: ConnectedReferenceInput) {
 function renderConnectedInputLabel(input: ConnectedReferenceInput) {
   const label = String(input.sourceNodeLabel || input.label || '').trim();
   if (label) return label;
+  if (input.type === 'text') return '文本指令';
   return input.channel === 'primary' ? '主素材' : '参考素材';
 }
 
@@ -2861,6 +2879,11 @@ function ImagePortInputSummary({
                   </label>
                   <div className="flex items-end justify-end text-sm font-semibold text-[#9ee6d9]">{input.weight}</div>
                 </div>
+                {input.type === 'text' && input.text ? (
+                  <div className="mt-2 rounded-md border border-[#3b4a6b] bg-[#161c2b] px-3 py-2 text-[11px] leading-relaxed text-[#bcd0ff]">
+                    {input.text}
+                  </div>
+                ) : null}
               </div>
             );
           })

@@ -14,6 +14,14 @@ export async function computeFileSha256(filePath) {
   });
 }
 
+function normalizeSha256(value) {
+  const trimmed = String(value || '').trim().toLowerCase();
+  // 兼容 GitHub Release Asset 的 SRI digest 格式：sha256:xxx / sha256-xxx / sha256=xxx
+  const match = trimmed.match(/^(?:sha256)[:=-]?([a-f0-9]{64})$/i);
+  if (match) return match[1];
+  return trimmed;
+}
+
 export async function verifyDownloadIntegrity(filePath, { expectedSha256 = null, expectedSize = null } = {}) {
   const resolved = path.resolve(filePath);
   if (!existsSync(resolved)) {
@@ -31,13 +39,14 @@ export async function verifyDownloadIntegrity(filePath, { expectedSha256 = null,
     }
   }
   let actualSha256 = null;
-  if (expectedSha256 && String(expectedSha256).trim()) {
+  const normalizedExpectedSha256 = normalizeSha256(expectedSha256);
+  if (normalizedExpectedSha256) {
     actualSha256 = await computeFileSha256(resolved);
-    if (actualSha256.toLowerCase() !== String(expectedSha256).trim().toLowerCase()) {
-      const err = new Error(`integrity-hash-mismatch:${path.basename(resolved)}:expected=${expectedSha256},actual=${actualSha256}`);
+    if (actualSha256.toLowerCase() !== normalizedExpectedSha256) {
+      const err = new Error(`integrity-hash-mismatch:${path.basename(resolved)}:expected=${normalizedExpectedSha256},actual=${actualSha256}`);
       err.code = 'INTEGRITY_HASH_MISMATCH';
       throw err;
     }
   }
-  return { ok: true, actualSize, actualSha256, skipped: !expectedSha256 && !expectedSize };
+  return { ok: true, actualSize, actualSha256, skipped: !normalizedExpectedSha256 && !expectedSize };
 }

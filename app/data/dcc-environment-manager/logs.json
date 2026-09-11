@@ -1,0 +1,376 @@
+[
+  {
+    "id": "1787634880347-UnrealPluginAdapter-jiddnp",
+    "timestamp": "2026-08-25T05:14:40.348Z",
+    "level": "info",
+    "engine": "unreal",
+    "scope": "UnrealPluginAdapter",
+    "jobId": "1787634880344-unreal-repair-xauljk",
+    "message": "DCC environment job queued.",
+    "shortMessage": "等待宿主启动",
+    "runtimeState": {
+      "stage": "host",
+      "state": "waiting",
+      "label": "等待宿主启动",
+      "message": "DCC environment job queued.",
+      "reason": "host-activity",
+      "dedupeKey": "host:waiting:host-activity"
+    },
+    "dedupeKey": "host:waiting:host-activity",
+    "context": {
+      "action": "repair",
+      "request": {
+        "engine": "unreal",
+        "action": "repair",
+        "projectPath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject"
+      }
+    },
+    "action": "repair"
+  },
+  {
+    "id": "1787634883804-UnrealPluginAdapter-0tjt2l",
+    "timestamp": "2026-08-25T05:14:43.804Z",
+    "level": "info",
+    "engine": "unreal",
+    "scope": "UnrealPluginAdapter",
+    "jobId": "1787634880344-unreal-repair-xauljk",
+    "message": "Unreal quick repair is promoting HMDao to one shared engine-level precompiled install before the next launch.",
+    "shortMessage": "等待插件就绪",
+    "runtimeState": {
+      "stage": "plugin",
+      "state": "waiting",
+      "label": "等待插件就绪",
+      "message": "Unreal quick repair is promoting HMDao to one shared engine-level precompiled install before the next launch.",
+      "reason": "plugin-activity",
+      "dedupeKey": "plugin:waiting:plugin-activity"
+    },
+    "dedupeKey": "plugin:waiting:plugin-activity",
+    "context": {
+      "projectPath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject",
+      "engineRoot": "F:\\Unreal Engine\\UE_5.7",
+      "installationScope": "project"
+    },
+    "action": null
+  },
+  {
+    "id": "1787634885719-UnrealPluginAdapter-twxw9n",
+    "timestamp": "2026-08-25T05:14:45.719Z",
+    "level": "info",
+    "engine": "unreal",
+    "scope": "UnrealPluginAdapter",
+    "jobId": "1787634880344-unreal-repair-xauljk",
+    "message": "Created Unreal environment backup.",
+    "shortMessage": "等待插件就绪",
+    "runtimeState": {
+      "stage": "plugin",
+      "state": "waiting",
+      "label": "等待插件就绪",
+      "message": "Created Unreal environment backup.",
+      "reason": "plugin-activity",
+      "dedupeKey": "plugin:waiting:plugin-activity"
+    },
+    "dedupeKey": "plugin:waiting:plugin-activity",
+    "context": {
+      "projectPath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject",
+      "backupId": "1787634885636-unreal-reinstall",
+      "action": "reinstall"
+    },
+    "action": "reinstall"
+  },
+  {
+    "id": "1787634886056-UnrealPluginAdapter-vgoloq",
+    "timestamp": "2026-08-25T05:14:46.056Z",
+    "level": "warn",
+    "engine": "unreal",
+    "scope": "UnrealPluginAdapter",
+    "jobId": "1787634880344-unreal-repair-xauljk",
+    "message": "Unreal plugin reinstall could not delete the stale opposite-scope copy (likely locked by a running Unreal Editor). The new copy was still installed.",
+    "shortMessage": "插件阶段异常",
+    "runtimeState": {
+      "stage": "plugin",
+      "state": "error",
+      "label": "插件阶段异常",
+      "message": "Unreal plugin reinstall could not delete the stale opposite-scope copy (likely locked by a running Unreal Editor). The new copy was still installed.",
+      "reason": "plugin-activity",
+      "dedupeKey": "plugin:error:plugin-activity"
+    },
+    "dedupeKey": "plugin:error:plugin-activity",
+    "context": {
+      "stalePath": "F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture",
+      "error": "[safe-delete] 操作失败: ERROR F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture: Error during a `trash` operation: Unknown { description: \"Some operations were aborted\" }"
+    },
+    "action": null
+  },
+  {
+    "id": "1787634886056-UnrealPluginAdapter-z5g5xk",
+    "timestamp": "2026-08-25T05:14:46.056Z",
+    "level": "info",
+    "engine": "unreal",
+    "scope": "UnrealPluginAdapter",
+    "jobId": "1787634880344-unreal-repair-xauljk",
+    "message": "Running Unreal plugin install script.",
+    "shortMessage": "等待插件就绪",
+    "runtimeState": {
+      "stage": "plugin",
+      "state": "waiting",
+      "label": "等待插件就绪",
+      "message": "Running Unreal plugin install script.",
+      "reason": "plugin-activity",
+      "dedupeKey": "plugin:waiting:plugin-activity"
+    },
+    "dedupeKey": "plugin:waiting:plugin-activity",
+    "context": {
+      "projectPath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject",
+      "engineRoot": "F:\\Unreal Engine\\UE_5.7",
+      "installScope": "engine",
+      "explicitPrecompiledPackagePath": "",
+      "args": [
+        "-UProject",
+        "F:\\练习\\ue5\\5.7\\cc\\cc.uproject",
+        "-InstallScope",
+        "engine",
+        "-EngineRoot",
+        "F:\\Unreal Engine\\UE_5.7"
+      ],
+      "normalizedAction": "reinstall",
+      "forceBuild": false
+    },
+    "action": null
+  },
+  {
+    "id": "1787634886308-UnrealPluginAdapter-mwtrkr",
+    "timestamp": "2026-08-25T05:14:46.308Z",
+    "level": "error",
+    "engine": "unreal",
+    "scope": "UnrealPluginAdapter",
+    "jobId": "1787634880344-unreal-repair-xauljk",
+    "message": "Unreal plugin action failed, restoring backup.",
+    "shortMessage": "插件阶段异常",
+    "runtimeState": {
+      "stage": "plugin",
+      "state": "error",
+      "label": "插件阶段异常",
+      "message": "Unreal plugin action failed, restoring backup.",
+      "reason": "plugin-activity",
+      "dedupeKey": "plugin:error:plugin-activity"
+    },
+    "dedupeKey": "plugin:error:plugin-activity",
+    "context": {
+      "projectPath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject",
+      "backupId": "1787634885636-unreal-reinstall",
+      "error": "HMDao Unreal Capture reinstall 失败。请按以下步骤排查后重试：\n1. 完全关闭 Unreal 编辑器（任务管理器确认无 UnrealEditor.exe 进程），避免文件被占用。\n2. 若面板仍提示“两份安装并存”，请手动删除其中一份旧副本：项目目录下的 F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture。\n3. 在 DCC 环境管理面板先执行一次 Cleanup（清理引擎备份副本与残留 receipt），再重新点击“重建/重装”。\n4. 确认引擎路径正确（当前引擎根：F:\\Unreal Engine\\UE_5.7）。\n5. 若仍失败，查看以下日志：\n& : 无法将“F:\\Work\\HMDAODAO\\app\\scripts\\dcc\\install-unreal-plugin.ps1”项识别为 cmdlet、函数、脚本文件或可运行程序的名称。请检查名称的拼写，如果包括路径，请确保路径正确\n，然后再试一次。\n所在位置 行:1 字符: 217\n+ ... catch {}; & 'F:\\Work\\HMDAODAO\\app\\scripts\\dcc\\install-unreal-plugin.p ...\n+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n    + CategoryInfo          : ObjectNotFound: (F:\\Work\\HMDAODA...real-plugin.ps1:String) [], CommandNotFoundException\n    + FullyQualifiedErrorId : CommandNotFoundException"
+    },
+    "action": null
+  },
+  {
+    "id": "1787634886587-UnrealPluginAdapter-exgi21",
+    "timestamp": "2026-08-25T05:14:46.587Z",
+    "level": "error",
+    "engine": "unreal",
+    "scope": "UnrealPluginAdapter",
+    "jobId": "1787634880344-unreal-repair-xauljk",
+    "message": "DCC environment job failed.",
+    "shortMessage": "宿主未就绪",
+    "runtimeState": {
+      "stage": "host",
+      "state": "error",
+      "label": "宿主未就绪",
+      "message": "DCC environment job failed.",
+      "reason": "host-activity",
+      "dedupeKey": "host:error:host-activity"
+    },
+    "dedupeKey": "host:error:host-activity",
+    "context": {
+      "action": "repair",
+      "error": "[safe-delete] 操作失败: ERROR F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture: Error during a `trash` operation: Unknown { description: \"Some operations were aborted\" }"
+    },
+    "action": "repair"
+  },
+  {
+    "id": "1787635706253-UnrealPluginAdapter-h3iqto",
+    "timestamp": "2026-08-25T05:28:26.253Z",
+    "level": "info",
+    "engine": "unreal",
+    "scope": "UnrealPluginAdapter",
+    "jobId": "1787635706251-unreal-repair-ye37wk",
+    "message": "DCC environment job queued.",
+    "shortMessage": "等待宿主启动",
+    "runtimeState": {
+      "stage": "host",
+      "state": "waiting",
+      "label": "等待宿主启动",
+      "message": "DCC environment job queued.",
+      "reason": "host-activity",
+      "dedupeKey": "host:waiting:host-activity"
+    },
+    "dedupeKey": "host:waiting:host-activity",
+    "context": {
+      "action": "repair",
+      "request": {
+        "engine": "unreal",
+        "action": "repair",
+        "projectPath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject"
+      }
+    },
+    "action": "repair"
+  },
+  {
+    "id": "1787635709689-UnrealPluginAdapter-b4bqip",
+    "timestamp": "2026-08-25T05:28:29.689Z",
+    "level": "info",
+    "engine": "unreal",
+    "scope": "UnrealPluginAdapter",
+    "jobId": "1787635706251-unreal-repair-ye37wk",
+    "message": "Unreal quick repair is promoting HMDao to one shared engine-level precompiled install before the next launch.",
+    "shortMessage": "等待插件就绪",
+    "runtimeState": {
+      "stage": "plugin",
+      "state": "waiting",
+      "label": "等待插件就绪",
+      "message": "Unreal quick repair is promoting HMDao to one shared engine-level precompiled install before the next launch.",
+      "reason": "plugin-activity",
+      "dedupeKey": "plugin:waiting:plugin-activity"
+    },
+    "dedupeKey": "plugin:waiting:plugin-activity",
+    "context": {
+      "projectPath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject",
+      "engineRoot": "F:\\Unreal Engine\\UE_5.7",
+      "installationScope": "project"
+    },
+    "action": null
+  },
+  {
+    "id": "1787635712197-UnrealPluginAdapter-fd0ofn",
+    "timestamp": "2026-08-25T05:28:32.197Z",
+    "level": "info",
+    "engine": "unreal",
+    "scope": "UnrealPluginAdapter",
+    "jobId": "1787635706251-unreal-repair-ye37wk",
+    "message": "Created Unreal environment backup.",
+    "shortMessage": "等待插件就绪",
+    "runtimeState": {
+      "stage": "plugin",
+      "state": "waiting",
+      "label": "等待插件就绪",
+      "message": "Created Unreal environment backup.",
+      "reason": "plugin-activity",
+      "dedupeKey": "plugin:waiting:plugin-activity"
+    },
+    "dedupeKey": "plugin:waiting:plugin-activity",
+    "context": {
+      "projectPath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject",
+      "backupId": "1787635712114-unreal-reinstall",
+      "action": "reinstall"
+    },
+    "action": "reinstall"
+  },
+  {
+    "id": "1787635712510-UnrealPluginAdapter-nlwp1f",
+    "timestamp": "2026-08-25T05:28:32.510Z",
+    "level": "info",
+    "engine": "unreal",
+    "scope": "UnrealPluginAdapter",
+    "jobId": "1787635706251-unreal-repair-ye37wk",
+    "message": "Running Unreal plugin install script.",
+    "shortMessage": "等待插件就绪",
+    "runtimeState": {
+      "stage": "plugin",
+      "state": "waiting",
+      "label": "等待插件就绪",
+      "message": "Running Unreal plugin install script.",
+      "reason": "plugin-activity",
+      "dedupeKey": "plugin:waiting:plugin-activity"
+    },
+    "dedupeKey": "plugin:waiting:plugin-activity",
+    "context": {
+      "projectPath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject",
+      "engineRoot": "F:\\Unreal Engine\\UE_5.7",
+      "installScope": "engine",
+      "explicitPrecompiledPackagePath": "",
+      "args": [
+        "-UProject",
+        "F:\\练习\\ue5\\5.7\\cc\\cc.uproject",
+        "-InstallScope",
+        "engine",
+        "-EngineRoot",
+        "F:\\Unreal Engine\\UE_5.7"
+      ],
+      "normalizedAction": "reinstall",
+      "forceBuild": false
+    },
+    "action": null
+  },
+  {
+    "id": "1787635712510-UnrealPluginAdapter-z4wckt",
+    "timestamp": "2026-08-25T05:28:32.510Z",
+    "level": "warn",
+    "engine": "unreal",
+    "scope": "UnrealPluginAdapter",
+    "jobId": "1787635706251-unreal-repair-ye37wk",
+    "message": "Unreal plugin reinstall could not delete the stale opposite-scope copy (likely locked by a running Unreal Editor). The new copy was still installed.",
+    "shortMessage": "插件阶段异常",
+    "runtimeState": {
+      "stage": "plugin",
+      "state": "error",
+      "label": "插件阶段异常",
+      "message": "Unreal plugin reinstall could not delete the stale opposite-scope copy (likely locked by a running Unreal Editor). The new copy was still installed.",
+      "reason": "plugin-activity",
+      "dedupeKey": "plugin:error:plugin-activity"
+    },
+    "dedupeKey": "plugin:error:plugin-activity",
+    "context": {
+      "stalePath": "F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture",
+      "error": "[safe-delete] 操作失败: ERROR F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture: Error during a `trash` operation: Unknown { description: \"Some operations were aborted\" }"
+    },
+    "action": null
+  },
+  {
+    "id": "1787635712772-UnrealPluginAdapter-03cdk7",
+    "timestamp": "2026-08-25T05:28:32.772Z",
+    "level": "error",
+    "engine": "unreal",
+    "scope": "UnrealPluginAdapter",
+    "jobId": "1787635706251-unreal-repair-ye37wk",
+    "message": "Unreal plugin action failed, restoring backup.",
+    "shortMessage": "插件阶段异常",
+    "runtimeState": {
+      "stage": "plugin",
+      "state": "error",
+      "label": "插件阶段异常",
+      "message": "Unreal plugin action failed, restoring backup.",
+      "reason": "plugin-activity",
+      "dedupeKey": "plugin:error:plugin-activity"
+    },
+    "dedupeKey": "plugin:error:plugin-activity",
+    "context": {
+      "projectPath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject",
+      "backupId": "1787635712114-unreal-reinstall",
+      "error": "HMDao Unreal Capture reinstall 失败。请按以下步骤排查后重试：\n1. 完全关闭 Unreal 编辑器（任务管理器确认无 UnrealEditor.exe 进程），避免文件被占用。\n2. 若面板仍提示“两份安装并存”，请手动删除其中一份旧副本：项目目录下的 F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture。\n3. 在 DCC 环境管理面板先执行一次 Cleanup（清理引擎备份副本与残留 receipt），再重新点击“重建/重装”。\n4. 确认引擎路径正确（当前引擎根：F:\\Unreal Engine\\UE_5.7）。\n5. 若仍失败，查看以下日志：\n& : 无法将“F:\\Work\\HMDAODAO\\app\\scripts\\dcc\\install-unreal-plugin.ps1”项识别为 cmdlet、函数、脚本文件或可运行程序的名称。请检查名称的拼写，如果包括路径，请确保路径正确\n，然后再试一次。\n所在位置 行:1 字符: 217\n+ ... catch {}; & 'F:\\Work\\HMDAODAO\\app\\scripts\\dcc\\install-unreal-plugin.p ...\n+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n    + CategoryInfo          : ObjectNotFound: (F:\\Work\\HMDAODA...real-plugin.ps1:String) [], CommandNotFoundException\n    + FullyQualifiedErrorId : CommandNotFoundException"
+    },
+    "action": null
+  },
+  {
+    "id": "1787635713065-UnrealPluginAdapter-u5u5mw",
+    "timestamp": "2026-08-25T05:28:33.065Z",
+    "level": "error",
+    "engine": "unreal",
+    "scope": "UnrealPluginAdapter",
+    "jobId": "1787635706251-unreal-repair-ye37wk",
+    "message": "DCC environment job failed.",
+    "shortMessage": "宿主未就绪",
+    "runtimeState": {
+      "stage": "host",
+      "state": "error",
+      "label": "宿主未就绪",
+      "message": "DCC environment job failed.",
+      "reason": "host-activity",
+      "dedupeKey": "host:error:host-activity"
+    },
+    "dedupeKey": "host:error:host-activity",
+    "context": {
+      "action": "repair",
+      "error": "[safe-delete] 操作失败: ERROR F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture: Error during a `trash` operation: Unknown { description: \"Some operations were aborted\" }"
+    },
+    "action": "repair"
+  }
+]

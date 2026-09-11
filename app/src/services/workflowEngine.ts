@@ -17,8 +17,8 @@
 import { classifyError, logError } from '@/engine/safe-fetch';
 import type { WorkflowPlan, WorkflowStep } from '@/store/useCanvasStore';
 import type { NodeType, NodeData } from '@/types';
-import { comfySubmit, comfyTaskStatus, extractComfyCloudProviders } from './comfyui/comfyuiClient';
-import { useComfyTaskStore } from '@/store/useComfyTaskStore';
+import { comfySubmit, comfyTaskStatus, extractComfyCloudProviders, type ComfyTaskStatus } from './comfyui/comfyuiClient';
+import { useComfyTaskStore, type ComfyTaskState } from '@/store/useComfyTaskStore';
 import { useApiKeyStore, findProviderKeyState } from '@/store/useApiKeyStore';
 
 // ===== 类型定义 =====
@@ -600,7 +600,7 @@ export class ComfyUIExecutor implements NodeExecutor {
       const nodeKey =
         (step.data as { params?: { comfyNodeId?: string } } | undefined)?.params?.comfyNodeId ||
         _nodeId;
-      const setTask = (patch: Partial<import('@/store/useComfyTaskStore').ComfyTaskState>) =>
+      const setTask = (patch: Partial<ComfyTaskState>) =>
         useComfyTaskStore.getState().set(nodeKey, patch);
 
       const res = await comfySubmit(raw, signal, { providerKeys, providerBaseUrls });
@@ -630,7 +630,7 @@ export class ComfyUIExecutor implements NodeExecutor {
 
       // 轮询任务进度，实时回写到节点进度 store。
       setTask({ phase: 'queued', percent: 0 });
-      let final: import('@/services/comfyui/comfyuiClient').ComfyTaskStatus | null = null;
+      let final: ComfyTaskStatus | null = null;
       const deadline = Date.now() + 30 * 60 * 1000; // 30min 兜底，避免悬挂轮询
       while (Date.now() < deadline) {
         if (signal.aborted) {

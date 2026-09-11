@@ -6,6 +6,7 @@ import {
   setDebugBridgeBootstrapState,
 } from '@/services/debugBridge';
 import { bootstrapTaggingContractVerifyApp } from '@/bootstrap/bootstrapTaggingContractVerifyApp';
+import { bootstrapMainApp } from '@/bootstrap/bootstrapMainApp'; // 静态 import：避免 Vite 将整个 App 切到独立 chunk 导致空白页
 import { getActiveHmdaoDemoMode } from '@/utils/demoMode';
 import { installPreloadRecovery } from '@/utils/preloadRecovery';
 
@@ -18,7 +19,6 @@ async function bootstrap() {
     return;
   }
 
-  const { bootstrapMainApp } = await import('@/bootstrap/bootstrapMainApp');
   bootstrapMainApp();
 }
 

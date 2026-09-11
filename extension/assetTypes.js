@@ -10,18 +10,19 @@ const ASSET_TYPES = Object.freeze({
   VIDEO: 'video',
   AUDIO: 'audio',
   MODEL: 'model',
+  DOCUMENT: 'document',
   ARCHIVE: 'archive',
   NETDISK: 'netdisk',
 });
 
 // type → 默认扩展名（deriveFilename 用作兜底后缀）
 function extForType(type) {
-  return { image: 'png', video: 'mp4', audio: 'mp3', model: 'glb', archive: 'zip' }[type] || 'bin';
+  return { image: 'png', video: 'mp4', audio: 'mp3', model: 'glb', document: 'pdf', archive: 'zip' }[type] || 'bin';
 }
 
 // type → 中文标签（UI 展示）
 function typeLabel(t) {
-  return { image: '图片', video: '视频', audio: '音频', model: '3D 模型', archive: '归档', netdisk: '网盘' }[t] || t;
+  return { image: '图片', video: '视频', audio: '音频', model: '3D 模型', document: '文档', archive: '归档', netdisk: '网盘' }[t] || t;
 }
 
 // type → 下载子目录名（Ddayup/<dir>/...）
@@ -30,6 +31,7 @@ const typeDirs = Object.freeze({
   video: 'videos',
   audio: 'audio',
   model: 'models',
+  document: 'documents',
   archive: 'archives',
   netdisk: 'netdisk',
 });
@@ -48,6 +50,7 @@ function normalizeAssetType(t) {
     vid: 'video', movie: 'video', clip: 'video',
     aud: 'audio', sound: 'audio', mp3: 'audio',
     mod: 'model', mesh: 'model', glb: 'model',
+    doc: 'document', pdf: 'document', ppt: 'document', word: 'document', xls: 'document',
     zip: 'archive', rar: 'archive', '3d': 'model',
     disk: 'netdisk', pan: 'netdisk', baidu: 'netdisk',
   }[lower];

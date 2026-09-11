@@ -42,8 +42,6 @@ export function DonationPanel() {
   const show = useDonationStore((s) => s.showDonationPanel);
   const toggleDonationPanel = useDonationStore((s) => s.toggleDonationPanel);
 
-  if (!show) return null;
-
   const { entries, load, submit, toggleLike, addComment, submitting, error } = useCobuildStore();
   const [activeTab, setActiveTab] = useState<'suggestions' | 'world'>('suggestions');
   const [message, setMessage] = useState('');
@@ -55,8 +53,10 @@ export function DonationPanel() {
   const [showAuth, setShowAuth] = useState(false);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    if (show) load();
+  }, [show, load]);
+
+  if (!show) return null;
 
   const currentUserId = user?.id || 'local-user';
   const isLiked = (e: CoBuildEntry) => (e.likedBy || []).includes(currentUserId);

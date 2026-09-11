@@ -16,6 +16,26 @@
 //   3) 安装后 600s 自动清理（与原有逻辑一致），避免常驻。
 // 这样：页面正常播 B站视频（原生 media 请求，规则不作用）→ 不受影响；
 //      后台下载/预览（other 类型 fetch）→ 带 Referer 通过防盗链。
+// ===== 优酷 CDN Referer 注入规则（按需、临时、hls.js 用）=====
+// 背景：优酷 yt-dlp 返回的直链是 `/playlist/m3u8?...`，浏览器侧栏用 hls.js 拉取时
+//       必须带 Referer=https://v.youku.com/ 否则 pl-ali.youku.com / vali-ugc 立即 403。
+//       dNR 在请求头注入 Referer 是唯一手段（fetch API 禁止设 Referer）。
+// 修复原则（同 B站规则）：
+//   1) 按需安装（仅用户点预览时），不常驻；
+//   2) 仅匹配 ['xmlhttprequest','other']，【不匹配 'media'】——避免覆盖 hls.js 的 .ts 分片时
+//      和播放器计算出的 Referer 冲突。
+//   3) 600s 自动清理。
+const YOUKU_REFERER = 'https://v.youku.com/';
+const YOUKU_ORIGIN = 'https://v.youku.com';
+const YOUKU_CDN_DOMAINS = ['pl-ali.youku.com', 'pl.youku.com', 'vali-ugc.cp31.ott.cibntv.net', 'valipl.youku.com'];
+async function installYoukuRefererRules() {
+  try {
+    for (const d of YOUKU_CDN_DOMAINS) {
+      await installRefererRuleForDomain(d, YOUKU_REFERER, YOUKU_ORIGIN, ['xmlhttprequest', 'other']);
+    }
+  } catch (_) { /* 老浏览器无该 API 时忽略 */ }
+}
+
 const BILI_REFERER = 'https://www.bilibili.com/';
 const BILI_ORIGIN = 'https://www.bilibili.com';
 const BILI_CDN_DOMAINS = ['bilivideo.com', 'bilivideo.cn', 'hdslb.com', 'mirrorakam.akamaized.net'];
@@ -58,10 +78,13 @@ async function installRefererRuleForDomain(domain, referer, origin, resourceType
     // 部分 CDN（如 B站）同时校验 origin，允许调用方一并注入
     if (origin) requestHeaders.push({ header: 'origin', operation: 'set', value: origin });
 
-    // 默认对下载和媒体资源类型生效，避免影响普通页面请求。
-    // 注意：B站路径传入 ['other']（见 installBiliRefererRules），刻意【不匹配 'media'】，
-    // 否则会覆盖页面 <video> 原生媒体流的合法 Referer/Origin，导致 B站 403 无法播放。
-    const finalResourceTypes = resourceTypes || ['media', 'xmlhttprequest', 'other', 'image'];
+    // ★零干扰原则（2026-08-02 修正）：默认【不匹配 'media'】。
+    // 页面 <video>/<audio> 原生流请求的资源类型正是 'media'；若 dNR 给 media 类型
+    // 强行 set Referer/Origin，会覆盖抖音/B站/YouTube 播放器自身精确计算的防盗链签名
+    // （a_bogus/x-bogus 等绑定原始请求头），导致 CDN 返回错误流 → 视频无法播放且无声。
+    // 扩展后台 fetch 拉媒体字节在 dNR 中归类为 'other'/'xmlhttprequest'，只在这两类上
+    // 注入 Referer 即可（与 B站 ['other'] 熔断逻辑一致）。'image' 可保留（不影响媒体流）。
+    const finalResourceTypes = resourceTypes || ['xmlhttprequest', 'other', 'image'];
 
     await chrome.declarativeNetRequest.updateSessionRules({
       addRules: [{
@@ -89,6 +112,47 @@ function removeRefererRule(id) {
   try {
     chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id] }).catch(() => {});
   } catch (_) {}
+}
+
+// ★2026-08-18 新增：少数 CDN（目前仅新片场 oss-xpc6.xpccdn.com）走 dNR 默认规则时缺 Referer：
+//   默认 installRefererRuleForDomain 排除 'media'（防覆盖页面 <video> 防盗链签名）。
+//   但 oss-xpc6 xpccdn 只校验 Referer 防盗链、不签名 URL，且页面原生 <video> 用同源 HLS 拉流
+//   （不带 CDN 资源类型），扩展 chrome.downloads 走 'media' 才会 403。
+//   此处用独立规则 ID 段（9900+）仅对 xpccdn.com / oss-xpc 等域加 'media' Referer 注入。
+const _refRuleMediaNextId = 9900;
+const _refRuleMediaMap = new Map(); // id -> { domain, referer }
+async function installMediaRefererRuleForDomain(domain, referer) {
+  try {
+    if (!chrome.declarativeNetRequest || !chrome.declarativeNetRequest.updateSessionRules) return 0;
+    if (!/^xpccdn\.com$|^oss-xpc/i.test(domain) && !/oss-xpc6\.xpccdn\.com|xpccdn/i.test(domain)) {
+      // 守门：仅允许新片场相关域，避免误伤
+      return 0;
+    }
+    // 同域已存在 → 更新
+    for (const [id, v] of _refRuleMediaMap.entries()) {
+      if (v.domain === domain) { removeMediaRefererRule(id); break; }
+    }
+    const id = _refRuleMediaNextId++;
+    _refRuleMediaMap.set(id, { domain, referer, installedAt: Date.now() });
+    await chrome.declarativeNetRequest.updateSessionRules({
+      addRules: [{
+        id,
+        priority: 1,
+        action: { type: 'modifyHeaders', requestHeaders: [{ header: 'referer', operation: 'set', value: referer }] },
+        condition: {
+          urlFilter: `||${domain}`,
+          resourceTypes: ['xmlhttprequest', 'other', 'image', 'media'],
+        },
+      }],
+    }).catch(() => {});
+    setTimeout(() => removeMediaRefererRule(id), 600_000);
+    return id;
+  } catch (_) { return 0; }
+}
+function removeMediaRefererRule(id) {
+  if (!_refRuleMediaMap.has(id)) return;
+  _refRuleMediaMap.delete(id);
+  try { chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id] }).catch(() => {}); } catch (_) {}
 }
 
 // 网络层媒体捕获（对应「F12 → Network → Media」方案）：
@@ -161,7 +225,20 @@ async function installAudioCorsRule(domain, referer, acao, cookie, setAcac = tru
         id: HMDAO_DNR_AUDIO_RULE_ID,
         priority: 100,
         action: { type: 'modifyHeaders', requestHeaders, responseHeaders },
-        condition: { urlFilter: '||' + domain, resourceTypes: ['xmlhttprequest', 'media', 'other'] },
+        // ★零干扰：不匹配 'media'（源页播放器原生媒体流类型），仅在后台 fetch 的
+        //   xmlhttprequest/other 上注入 CORS 响应头；避免任何可能触碰页面播放器请求。
+        // ★2026-09-08 关键修复（即梦页面被我们搞坏的根因）：
+        //   本规则按「注册域」匹配【所有】xmlhttprequest/other —— 包括源页自己发出的请求！
+        //   实测即梦页：我们为图片 relay 装了 ||byteimg.com 规则后，即梦页面自己的
+        //   fetch(byteimg 图) 被改写 ACAO → 与其 credentials:'include' 撞车
+        //   （"must not be the wildcard '*'"）→ 即梦页面自己的图全部 403。
+        //   与 installScopedDoubaoCorsRule 同理，这里必须加 initiatorDomains=[扩展 id]，
+        //   只作用于【扩展自身发起】的请求，源页请求（initiator=页面域）不再匹配。
+        condition: {
+          urlFilter: '||' + domain,
+          resourceTypes: ['xmlhttprequest', 'other'],
+          initiatorDomains: (function () { try { return [chrome.runtime.id]; } catch (_) { return undefined; } })(),
+        },
       }],
     });
     return true;

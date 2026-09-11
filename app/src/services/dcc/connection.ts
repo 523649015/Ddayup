@@ -21,6 +21,7 @@ import {
   getDccEngineConfig,
 } from './types';
 import { sanitizeDccVisibleText } from './runtimeState';
+import { useAuthStore } from '@/store/useAuthStore';
 
 let activeRecordingEngine: DccConnectionOptions['engine'] | null = null;
 let activeConnectionManager: DccConnectionManager | null = null;
@@ -1259,22 +1260,26 @@ export class DccConnectionManager {
     const envBase = typeof import.meta.env.VITE_HMDAO_API_BASE === 'string' ? import.meta.env.VITE_HMDAO_API_BASE.trim() : '';
     const current = window.location.origin;
     const loopback = ['http://127.0.0.1:8792', 'http://localhost:8792', 'http://127.0.0.1:8787', 'http://localhost:8787'];
-    const currentIsViteDev = /\/\/(localhost|127\.0\.0\.1):3000$/i.test(current);
-    const ordered = currentIsViteDev
-      ? [envBase, ...loopback, current]
-      : [envBase, current, ...loopback];
+    // 同源优先（与 api/dccGateway.ts 保持一致）：dev 下当前源经 Vite 代理转发 /api，
+    // 无需跨源即可连通；把 loopback 放前面会让每次连接先产生数次 CORS 失败红字。
+    const ordered = [envBase, current, ...loopback];
     return Array.from(new Set(ordered.filter(Boolean).map((item) => item.replace(/\/$/, ''))));
   }
 
   private wsUrlForGateway(base: string, engine: DccConnectionOptions['engine']): string {
     const url = new URL(base);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    // 云端多用户隔离：浏览器 WS 无法设置自定义头，故把登录 token 走 query，
+    // 后端 resolveDccOwnerFromWs 据此解析 userId 作为 owner 分桶，避免串流他人引擎。
+    const token = useAuthStore.getState().session?.accessToken;
     if (engine === 'unreal') {
       url.pathname = '/ws/dcc/unreal';
-      url.search = '?role=browser';
+      url.search = token ? `?role=browser&token=${encodeURIComponent(token)}` : '?role=browser';
     } else {
       url.pathname = '/ws/dcc-capture';
-      url.search = `?engine=${encodeURIComponent(engine)}`;
+      const params = new URLSearchParams({ engine: encodeURIComponent(engine) });
+      if (token) params.set('token', token);
+      url.search = `?${params.toString()}`;
     }
     return url.toString();
   }

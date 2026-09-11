@@ -258,7 +258,7 @@ const demoItems: AssetItem[] = [
     id: 'asset-video-city',
     name: '城市夜景.mp4',
     type: 'video',
-    url: 'https://storage.googleapis.com/coverr-main/mp4/City_Traffic.mp4',
+    url: 'https://www.w3schools.com/html/mov_bbb.mp4',
     thumbnail: 'https://images.unsplash.com/photo-1514565131-fce0801e5785?w=400',
     folderId: 'lay',
     size: 10485760,
@@ -275,7 +275,7 @@ const demoItems: AssetItem[] = [
     id: 'asset-video-product',
     name: '产品展示.mp4',
     type: 'video',
-    url: 'https://storage.googleapis.com/coverr-main/mp4/Mt_Baker.mp4',
+    url: 'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4',
     thumbnail: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=400',
     folderId: 'anker',
     size: 5242880,
@@ -630,9 +630,9 @@ const IMAGE_SEARCH_RESULTS: SimilarImageResult = [
 ];
 
 const VIDEO_SEARCH_RESULTS: SimilarVideoResult = [
-  { url: 'https://storage.googleapis.com/coverr-main/mp4/Mt_Baker.mp4', thumb: 'https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=400', title: '山景航拍', source: 'Coverr', duration: '0:15' },
-  { url: 'https://storage.googleapis.com/coverr-main/mp4/Stream_Flow.mp4', thumb: 'https://images.unsplash.com/photo-1469474968028-56623f02e42e?w=400', title: '溪流流水', source: 'Coverr', duration: '0:12' },
-  { url: 'https://storage.googleapis.com/coverr-main/mp4/City_Traffic.mp4', thumb: 'https://images.unsplash.com/photo-1514565131-fce0801e5785?w=400', title: '城市车流', source: 'Coverr', duration: '0:25' },
+  { url: 'https://www.w3schools.com/html/mov_bbb.mp4', thumb: 'https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=400', title: '卡通短片', source: 'W3Schools', duration: '0:15' },
+  { url: 'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4', thumb: 'https://images.unsplash.com/photo-1469474968028-56623f02e42e?w=400', title: '花朵慢镜', source: 'MDN', duration: '0:12' },
+  { url: 'https://www.w3schools.com/html/mov_bbb.mp4', thumb: 'https://images.unsplash.com/photo-1514565131-fce0801e5785?w=400', title: '卡通短片', source: 'W3Schools', duration: '0:25' },
 ];
 
 let suppressOperationHistory = false;
@@ -1533,6 +1533,18 @@ export const useAssetStore = create<AssetStore>()(
     })),
     {
       name: 'hmdao-asset-library',
+      version: 1,
+      // 旧版本（无 version，视为 0）持久化的图库 items 可能包含指向已删除素材的
+      // 孤儿引用（如 /api/assets/content/<id> 反复 404）。新建工程时旧数据应丢弃，
+      // 回退到默认 demoItems，再由 pruneMissingBackendAssets 保持与后端一致。
+      migrate: (persisted, version) => {
+        if (version < 1) {
+          const p = (persisted && typeof persisted === 'object' ? persisted : {}) as Record<string, unknown>;
+          delete p.items;
+          return p;
+        }
+        return (persisted && typeof persisted === 'object' ? persisted : {}) as object;
+      },
       partialize: (state) => ({
         folders: state.folders,
         items: state.items,

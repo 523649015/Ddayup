@@ -6,7 +6,10 @@
 // └──────────────────────────────────────────────────────────────┘
 
 // 版本标记：侧栏打开时打印，用于确认扩展是否加载了最新代码
-const HMDAO_SIDEPANEL_BUILD = '2026-08-31-bili-ytdlp-durl-per-qn-v7';
+// ★2026-09-10：build 号是硬编码常量，改代码时若不更新，侧栏会一直显示旧号，
+//   导致"代码到底有没有生效"无法判断（排查 m3u8 下载时反复踩这个坑）。
+//   更新为本次修复标识，便于一眼确认跑的是最新代码。
+const HMDAO_SIDEPANEL_BUILD = '2026-09-11-card-responsive-fix';
 console.log('%c[Ddayup] 侧栏已加载 build ' + HMDAO_SIDEPANEL_BUILD, 'color:#00d4aa;font-weight:bold;font-size:13px');
 
 // 云端 API 基地址：默认本机 3000，可由 chrome.storage 的 'ddayupApiBase' 覆盖（上云时配置）。
@@ -70,6 +73,10 @@ let statusTimer = null;
 const imgDimensions = {}; // url → { w, h }（图片加载后采集的真实尺寸）
 // ★ saveHandles 用 var 共享全局（const 不会跨 <script> 共享，导致 bulk-actions.js 读不到、保存目录失效）
 var saveHandles = { image: null, video: null, audio: null, model: null, archive: null, netdisk: null };
+// ★2026-09-11 双保险：相对子目录兜底。当浏览器不支持 showDirectoryPicker（选绝对目录）时，
+//   用户可在文本框填相对子目录名（如 浏览器下载素材/图片），下载落到「浏览器下载目录/Ddayup/<相对子目录>/」。
+//   同样用 var 保证跨 <script> 共享；落盘时由 download.js 的 dlViaChrome 拼接进 chrome.downloads 的 filename。
+var relDirs = { image: null, video: null, audio: null, model: null, archive: null, netdisk: null };
 // ★2026-08-22 信息流批量采集：勾选态集合（存 awemeId 或 url，独立命名空间，不污染 window.selected）
 var batchSelection = new Set();
 var batchCollectEnabled = false; // 开关态（localStorage 持久化）
@@ -80,6 +87,49 @@ var batchCollectEnabled = false; // 开关态（localStorage 持久化）
 var batchAssets = [];
 // ★2026-08-23 修复（问题3 根因）：记录当前展示页 URL，用于「增量合并 vs 换页重置」判定。
 var currentSourceUrl = '';
+// ★2026-09-05 新增：记录当前抖音合集 ID。切换不同合集时批量资产必须清空，否则旧合集卡片残留。
+var currentMixId = '';
+// ★2026-09-04 修复（合集页"一会多一会少"真凶）：旧逻辑用【整条 URL】判断"是否切站"，
+//   抖音合集页内 SPA 切集会让 modal_id 变化 → 整 URL 变 → 误判为"切到新站" → 清空全部普通卡再重建 → 数量反复掉又涨。
+// ★2026-09-04 v2：用户反馈"同一平台切换其他短视频合集也需要清理"。
+//   所以不能只比 host，要比【合集/页面身份】：去掉 modal_id/aweme_id 等会随切集变化的参数，
+//   保留 path 与稳定查询参数。这样：同合集内切集 → 身份不变 → 不清卡；
+//   换到另一个合集（path 或稳定参数不同）→ 身份变 → 清卡；换站 → host 变 → 清卡。
+// ★2026-09-07 建议1：hash 路由站点(如 example.com/#/page2 切 content) 默认不算换页(避免误清同页 SPA)；
+//   仅当用户在侧栏勾选「hash 路由也清卡」(localStorage.hashClearOnRoute==='1') 时，把 hash 纳入身份，
+//   纯 hash 路由站切换内容才会清卡。
+function hmdaoHashClearEnabled() {
+  try { return localStorage.getItem('hashClearOnRoute') === '1'; } catch (_) { return false; }
+}
+// 统一「页面身份」判定：host + path + (稳定查询参数，includeQuery) + (hash，开关开启时)。
+//   includeQuery=false → 仅 host+pathname（auto 轻量同步用，区分真正换页与同文档 SPA 切集）；
+//   includeQuery=true  → host+path+稳定查询（SCAN_RESULT 合并兜底用，更精确，避免 ?id= 同 path 误判同页）。
+function hmdaoDocKey(u, includeQuery) {
+  try {
+    const url = new URL(u);
+    const host = url.hostname.toLowerCase();
+    const path = url.pathname;
+    let key = host + path;
+    if (includeQuery) {
+      const volatile = new Set([
+        'modal_id','aweme_id','from','source','range','t','ts','_t','timestamp','referer','scene',
+        'enter_from','is_from_webapp','web_id','msToken','a_bogus','x_bogus','cursor','offset','p',
+        'start','index','spm','share_source','seid','_sm','_ss','_fs','tt_from','gd_label','u_code','dj_token'
+      ]);
+      const params = Array.from(url.searchParams.entries())
+        .filter(([k]) => !volatile.has(k) && !k.startsWith('utm_'))
+        .sort(([a],[b]) => (a < b ? -1 : 1));
+      const search = params.length ? ('?' + params.map(([k,v]) => k + '=' + encodeURIComponent(v)).join('&')) : '';
+      key += search;
+    }
+    if (hmdaoHashClearEnabled() && url.hash) key += url.hash;
+    return key;
+  } catch (_) { return (u || '').split('#')[0]; }
+}
+// 兼容别名：合并兜底用(含稳定查询)，auto 轻量同步用(仅 pathname)。
+function hmdaoSourceIdentityKey(u) { return hmdaoDocKey(u, true); }
+function pageDocKey(u) { return hmdaoDocKey(u, false); }
+try { window.__hmdaoDocKey = hmdaoDocKey; } catch (_) {}
 // 向当前源页注入/清除 window.__hmdao_batchMode（驱动 tryDouyinWeixin 走多视频分支）
 async function setBatchModeOnSource(enable) {
   try {
@@ -165,7 +215,16 @@ function saveBlockedHosts() {
 // 当前右键菜单 / 预览窗口所指的资产（基于 global index）
 let ctxAssetIdx = -1;
 
-function getAsset(idx) { return assets[idx] || null; }
+function getAsset(idx) {
+  // ★2026-09-06 修复（双击音频卡却打开图片预览的真凶）：
+  //   卡片渲染全程用 window.assets（见 SCAN_RESULT 合并段），而这里读的是模块变量 assets ——
+  //   两者不是同一份数组，assets 里是旧数据 → 按索引取到的是另一张卡（图片卡）→ "双击音频显示图片"。
+  //   改为优先读渲染用的同一份真源 window.assets，保证「点哪张开哪张」。
+  try {
+    if (typeof window !== 'undefined' && Array.isArray(window.assets)) return window.assets[idx] || null;
+  } catch (_) {}
+  return assets[idx] || null;
+}
 
 // ===== 工具函数 =====
 function fileName(url) {
@@ -203,10 +262,30 @@ function platformTag(a) {
   if (/pexels|coverr|mixkit|videvo/i.test(src)) return '素材站';
   return '';
 }
+// ★2026-09-05：从资产标题里解析「第N集」（阿拉伯数字）。标题是抖音 desc 原文，
+//   与卡片显示的标题同源——用它反推集数可自愈历史数据里被游标偏移算错的 episodeNo。
+function titleEpisodeNo(a) {
+  try {
+    const m = String((a && a.title) || '').match(/第\s*([0-9]{1,4})\s*集/);
+    if (m) return parseInt(m[1], 10);
+  } catch (_) {}
+  return 0;
+}
 function deriveFilename(a) {
   // 优先用真实标题生成文件名，避免 stream-xxx.mp4 等无意义名称
   const rawName = (a && a.title && !/^stream-/i.test(a.title)) ? a.title : fileName(a.url);
-  const base = sanitizeName(rawName);
+  let base = sanitizeName(rawName);
+  // ★2026-09-03：抖音合集多集数——文件名带「第 N 集」且匹配当前播放源。
+  //   优先用扫描/预览阶段算好的 episodeNo（按合集播放顺序），没有再回退 awemeId 保证各集不重名。
+  // ★2026-09-05：标题里已带「第N集」时以标题为准（自愈历史错误的 episodeNo，如游标偏移算出的 211/15）
+  const epNo = titleEpisodeNo(a) || ((a && a.episodeNo) ? parseInt(a.episodeNo, 10) : 0);
+  const epTag = epNo > 0 ? ('第' + epNo + '集') : '';
+  if (epTag) {
+    if (!base.includes(epTag)) base = epTag + '_' + base;
+  } else {
+    const idTag = (a && a.awemeId) ? String(a.awemeId).replace(/[^\w]/g, '') : '';
+    if (idTag && !new RegExp(idTag).test(base)) base = base + '_' + idTag;
+  }
   const dot = base.lastIndexOf('.');
   const hasExt = dot > 0 && /^\.[a-z0-9]{1,6}$/i.test(base.slice(dot));
   const core = hasExt ? base : base + '.' + extForType(a.type);
@@ -222,15 +301,27 @@ function displayName(a) {
   if (a && a.type === 'netdisk') {
     try { return new URL(a.url).host; } catch (_) { return a.url || '网盘分享'; }
   }
+  // ★2026-09-03：抖音合集卡片显示「第 N 集 · 标题」。
+  //   此前 episodeNo（绝对集数，scan.js 按合集列表顺序写入）存进了资产却【从不渲染】→ 用户看不到第几集。
+  // ★2026-09-05 修复（"视频 · 第15集 · 《枯魂道君》第40集…"双集数字样）：
+  //   ① 标题里已含「第N集」→ 以标题数字为准（自愈旧数据里游标偏移算出的错误集数），
+  //      且【不再重复加前缀】——标题自己已经把集数说清楚了；
+  //   ② 标题没带集数 → 才用 episodeNo 加「第N集 · 」前缀。
+  const __tEp = titleEpisodeNo(a);
+  if (__tEp > 0) {
+    // 标题自带集数：直接用标题（内部已含「第N集」），不再拼前缀
+    if (a && a.title && !/^stream-/i.test(a.title)) return a.title;
+  }
+  const ep = (!__tEp && a && a.episodeNo && a.platform === 'douyin') ? ('第' + a.episodeNo + '集 · ') : '';
   // 2026-08-02：优先用标题（页面/视频真实标题），避免抖音 stream-xxx.mp4 或 CDN 裸链文件名无意义。
-  if (a && a.title && !/^stream-/i.test(a.title)) return a.title;
+  if (a && a.title && !/^stream-/i.test(a.title)) return ep + a.title;
   // ★2026-08-22 P1-2 修复（真机日志实证根因：用户截图「卡片名字显示 lf3-static.bytednsdoc.com/obj/eden-cn/...」）：
   //   抖音 CDN 直链 URL 几乎不含可读文件名（仅 hash 路径），用 fileName(a.url) 会返回 CDN 路径
   //   全串，严重影响辨识。判定规则：扩展名缺失 或 形如「obj/eden-cn/xxxhash」等无意义路径 → 跳过
   const n = (a && a.url && fileName(a.url)) || '';
   if (n && !/^stream-/i.test(n) && /\.(mp4|mp3|m4a|wav|aac|flac|jpg|jpeg|png|gif|webp|avif|heic|webm|mkv|mov|ts|m3u8)(\?|$)/i.test(n)) return n;
   // ★CDN 裸链 / 无可读文件名 → 显示「视频素材 / 音频素材」，不再显示整条 CDN 路径
-  return (a && a.type ? typeLabel(a.type) : '素材') + (a && a.audioIdx != null ? ('#' + a.audioIdx) : '');
+  return ep + ((a && a.type ? typeLabel(a.type) : '素材') + (a && a.audioIdx != null ? ('#' + a.audioIdx) : ''));
 }
 // 把任意错误对象安全地转成可读字符串（避免 [object Object]）
 function errStr(e) {
@@ -524,6 +615,39 @@ function deriveMediaReferer(url, page) {
     if (h.includes('xhscdn') || h.includes('xiaohongshu') || h.includes('xhs')) return 'https://www.xiaohongshu.com/';
     // B站 CDN（bilivideo.com / bilivideo.cn / bilivideo.tv）要求 Referer=https://www.bilibili.com/
     if (h.includes('bilivideo')) return 'https://www.bilibili.com/';
+    // ★2026-09-08 修复（豆包 CDN 缩略图 403 真凶）：
+    //   豆包（doubao.com）的 imagex CDN 是 p3-/p6-/p11-flow-imagex-sign.byteimg.com，
+    //   与抖音共用 byteimg.com 但【严格校验 Referer=https://www.doubao.com/】。
+    //   该域名不含 douyin/bytedance/douyinpic 任一关键字 → 上面分支全不命中 →
+    //   落到 return page 用「源页完整 URL」（常带查询串/modal_id）当 Referer → CDN 拒 → 403，
+    //   侧栏 <img> 直连更糟（Referer 是 chrome-extension:// 源，必然 403）。
+    //   故按 imagex 命名空间精确识别豆包 CDN，固定返回干净站根 Referer。
+    if (h.includes('doubao') || h.includes('flow-imagex')) return 'https://www.doubao.com/';
+    // ★2026-09-11 新增（imini / 即梦国际版 CDN「软失败回统一占位图」根因）：
+    //   imini 的媒体 CDN（file.iminicdn.com 等）校验 Referer：传带查询串/路径的完整源页 URL
+    //   会被软失败（返回 200 + 统一绿色占位图，而不是 403）。只认【干净站根】https://imini.ai/。
+    //   注意：仅新增本分支，不动下方 byteimg 通用分支与任何既有判定。
+    if (h.includes('iminicdn') || h.includes('imini')) return 'https://imini.ai/';
+    // 通用 byteimg.com —— 字节系【共用】CDN：抖音 / 豆包 / 即梦 / 剪映等都走它，
+    //   因此只能按【源页平台】决定 Referer，绝不能对域名本身做假设。
+    // ★2026-09-08 修正：上一版对"其它 byteimg"硬编码返回 douyin，会害了同样用 byteimg 的
+    //   非抖音站点（实测即梦 jimeng.jianying.com 的图床 p3-res-place.byteimg.com，
+    //   其 CDN 校验的是即梦自己的 Referer → 用 douyin 反而 403，缩略图/字节都拿不到）。
+    //   改为：仅当源页确实是豆包/抖音/TikTok 才写死；其它站点【不做假设】，落到下方
+    //   return page（用源页自身 origin 当 Referer），与通用站点行为一致。
+    if (h.includes('byteimg')) {
+      const pg = String(page || '');
+      if (/doubao\.com/i.test(pg)) return 'https://www.doubao.com/';
+      if (/tiktok/i.test(pg)) return 'https://www.tiktok.com/';
+      if (/douyin\.com|iesdouyin\.com/i.test(pg)) return 'https://www.douyin.com/';
+      // ★2026-09-08：即梦/Dreamina（p*-dreamina-sign.byteimg.com）、剪映等同样用 byteimg 的
+      //   字节系站点 —— 只认【站点根】Referer；传整条带路径/查询的源页 URL 会被 CDN 拒（实测 403）。
+      //   故取源页 origin + '/'；解析失败再退回原样由通用分支处理。
+      try {
+        const pu = new URL(pg);
+        if (/^https?:/i.test(pu.protocol)) return pu.origin + '/';
+      } catch (_) {}
+    }
   } catch (_) {}
   return page || '';
 }
@@ -627,16 +751,25 @@ async function doRescan() {
   //   用户要求：刷新/切 tab 不再清空已有卡片；仅当 URL 真正变化时重置；切换网页也同步重置。
   let activeUrl = '';
   try {
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    // ★2026-09-11 修复（源页被污染成 devtools 调试窗口、导致列表恒空的根因）：
+    //   侧栏自身是独立窗口，{active:true, currentWindow:true} 在侧栏上下文里查到的是它挂着的 DevTools 窗口
+    //   → currentSourceUrl 被写成 devtools://... → 后续合并/换页判定全乱。改为只查【普通浏览器窗口】，
+    //   且只接受 http(s) 页面，彻底排除 devtools/chrome/edge/about/扩展页。
+    const tabs = await chrome.tabs.query({ active: true, windowType: 'normal' });
     activeUrl = (tabs && tabs[0] && tabs[0].url) || '';
+    if (activeUrl && !/^https?:/i.test(activeUrl)) activeUrl = ''; // 非内容页不更新源页
   } catch (_) { }
 
-  const urlChanged = !currentSourceUrl || (activeUrl && activeUrl !== currentSourceUrl);
+  // ★2026-09-04 修复：按【页面/合集身份】判定换页，而非整条 URL（合集内切集 modal_id/aweme_id 变化不再误判换页清空）。
+  const curId = hmdaoSourceIdentityKey(currentSourceUrl);
+  const newId = hmdaoSourceIdentityKey(activeUrl);
+  const urlChanged = !curId || (activeUrl && newId && newId !== curId);
   // 记录最新 URL（除非拿不到，保留旧值避免误判换页）
   if (activeUrl) currentSourceUrl = activeUrl;
 
-  // 1) 仅当「URL 真正变化」才重置普通扫描资产；否则保留并等待 SCAN_RESULT 增量合并。
-  //    批量资产（batchAssets）始终保留（除非用户在开关处主动清空），彻底解决素材无故消失。
+  // 1) 手动「重新扫描」= 用户主动「从头再来」→ 无论 URL 是否变化，一律清空普通扫描资产再重扫，
+  //    保证旧记录不被残留（用户明确要求：点重新扫描按钮即清除旧记录后重新识别）。
+  //    仅保留「正在下载的普通资产」+「全部批量资产」（批量永清，满足"扫描多少是多少"）。
   let preserved = [];
   try {
     const dlUrls = (window.HmdaoProgress && window.HmdaoProgress.getDownloadingAssetUrls && window.HmdaoProgress.getDownloadingAssetUrls()) || [];
@@ -645,16 +778,9 @@ async function doRescan() {
     }
   } catch (_) {}
   try {
-    if (urlChanged) {
-      // 换页：仅保留「正在下载的普通资产」+「全部批量资产」（批量永清，满足"扫描多少是多少"）。
-      // 普通扫描资产随换页重置；批量资产独立容器，无论怎么扫描都不丢。
-      const keep = batchAssets.concat(preserved.filter(a => !batchAssets.some(b => b.url === a.url)));
-      window.assets = keep.slice();
-    } else {
-      // 同页重扫：保留现有列表（含批量副本）+ 正在下载的，SCAN_RESULT 回来后增量去重合并。
-      const merged = window.assets.concat(preserved.filter(a => !window.assets.some(x => x.url === a.url)));
-      window.assets = merged;
-    }
+    // 换页/同页重扫统一走「重置」分支：仅保留「正在下载的普通资产」+「全部批量资产」，其余普通资产清空。
+    const keep = batchAssets.concat(preserved.filter(a => !batchAssets.some(b => b.url === a.url)));
+    window.assets = keep.slice();
     window.selected = new Set();
     try { batchSelection && batchSelection.clear(); } catch (_) {}
     // 卡片列表 = window.assets（已是 普通 + 批量 合并展示）；计数用合并列表
@@ -671,15 +797,55 @@ async function doRescan() {
   } catch (e) {
     setStatus('后端唤醒失败：' + (e && e.message ? e.message : String(e)));
   }
-  // 3) 发扫描请求 + 自动诊断真实数据到日志
-  chrome.runtime.sendMessage({ type: 'HMDAO_SCAN_REQUEST', batchMode: batchCollectEnabled }).catch(() => {});
+  // ★2026-09-06：每次重新扫描前清空「诊断日志」面板并折叠 —— 没在诊断时保持干净状态，
+  //   不让上一轮的日志一直堆在底部（用户要求：不诊断即清空）。
   try {
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const logEl = document.getElementById('panelLog');
+    const wrap = document.getElementById('panelLogWrap');
+    if (logEl) logEl.textContent = '';
+    if (wrap) wrap.open = false;
+  } catch (_) {}
+  // 3) 发扫描请求 + 自动诊断真实数据到日志
+  chrome.runtime.sendMessage({ type: 'HMDAO_SCAN_REQUEST', batchMode: batchCollectEnabled, force: true }).catch(() => {});
+  try {
+    const tabs = await chrome.tabs.query({ active: true, windowType: 'normal' });
     runDiagnose(tabs && tabs[0]);
   } catch (_) {}
 }
 
+// ★2026-09-07：换页清空旧资产（与 doRescan 的「换页重置」同语义，供 auto 事件轻量调用）。
+//   保留「正在下载的普通资产」+「全部批量资产」(批量永清，满足"扫描多少是多少")，其余普通资产随换页丢弃，
+//   确保不同链接的文件记录不会混在一起显示。
+function clearAssetsForNewPage() {
+  try {
+    const dlUrls = (window.HmdaoProgress && window.HmdaoProgress.getDownloadingAssetUrls && window.HmdaoProgress.getDownloadingAssetUrls()) || [];
+    const preserved = (Array.isArray(window.assets) ? window.assets.filter((a) => dlUrls.includes(a.url)) : []);
+    const keep = batchAssets.concat(preserved.filter((a) => !batchAssets.some((b) => b.url === a.url)));
+    window.assets = keep.slice();
+    window.selected = new Set();
+    try { batchSelection && batchSelection.clear(); } catch (_) {}
+    window.__hmdaoAssets = window.assets.slice();
+    try { renderNow(); } catch (_) {}
+  } catch (_) {}
+}
+
 document.getElementById('rescan').onclick = doRescan;
+
+// ★2026-09-07 建议1：hash 路由站点「切换内容也清卡」开关（默认关，避免误清同页 SPA）。
+//   改动即时写 localStorage，docKey 计算时实时读取（hmdaoHashClearEnabled），无需重载侧栏。
+try {
+  const hc = document.getElementById('hashClearOnRoute');
+  if (hc) {
+    hc.checked = hmdaoHashClearEnabled();
+    hc.addEventListener('change', () => {
+      try { localStorage.setItem('hashClearOnRoute', hc.checked ? '1' : '0'); } catch (_) {}
+      // 切换后若当前已是 hash 路由页，立即按新规则重新同步一次（避免要等下次导航才生效）。
+      try { loadPagePreview(); } catch (_) {}
+      try { chrome.runtime.sendMessage({ type: 'HMDAO_SCAN_REQUEST', batchMode: batchCollectEnabled, force: true }).catch(() => {}); } catch (_) {}
+    });
+  }
+} catch (_) {}
+
 
 // ===== 诊断：抓取当前抖音页真实数据（标题/缩略图/视频URL/合集/分辨率）=====
 // 挂载点：每次点「↻ 重新扫描」自动运行，结果写入底部「诊断日志」展开框（不新增按钮）。
@@ -1393,7 +1559,10 @@ if (batchToggle) {
     applyBatchUI();
     setStatus(batchCollectEnabled ? '信息流批量采集已开启，正在重新扫描…' : '信息流批量采集已关闭，正在重新扫描…');
     // ★2026-08-22 修复：开关变化后自动重新扫描，让「合集/多视频」立即生效，免去手动再点扫描。
-    chrome.runtime.sendMessage({ type: 'HMDAO_SCAN_REQUEST', batchMode: batchCollectEnabled }).catch(() => {});
+    chrome.runtime.sendMessage({ type: 'HMDAO_SCAN_REQUEST', batchMode: batchCollectEnabled, force: true }).catch(() => {});
+    // ★2026-09-11：开启批量即自动采集当前源页合集（B站观察模式常规扫描不出合集，必须走 BATCH_COLLECT）。
+    //   关闭时不清空（关闭逻辑已在上方处理），仅开启时触发；custom 模式无勾选会自动跳过。
+    if (batchCollectEnabled) doBatchCollect().catch(() => {});
   });
 }
 if (batchModeSel) {
@@ -1401,10 +1570,11 @@ if (batchModeSel) {
     if (batchBtn) batchBtn.style.display = (batchCollectEnabled && batchModeSel.value === 'custom') ? '' : 'none';
   });
 }
-if (batchBtn) {
-  batchBtn.onclick = async () => {
-    if (window.HMDaoLicense && !(await window.HMDaoLicense.gate())) return;
-    const mode = batchModeSel ? batchModeSel.value : 'currentPage';
+// ★2026-09-11：抽出命名函数 doBatchCollect()，供「开启批量开关」自动触发当前页合集采集。
+//   B站为观察模式（常规扫描跳过 extractFreshVideoUrl），合集不会随常规扫描出现，必须走 BATCH_COLLECT。
+async function doBatchCollect() {
+  if (window.HMDaoLicense && !(await window.HMDaoLicense.gate())) return;
+  const mode = batchModeSel ? batchModeSel.value : 'currentPage';
     // 自定义模式必须有勾选；合集/当前页模式由源页 RENDER_DATA 决定范围
     const ids = [...batchSelection].filter(Boolean);
     if (mode === 'custom' && ids.length === 0) { setStatus('请先勾选至少一张卡片', true); return; }
@@ -1413,6 +1583,25 @@ if (batchBtn) {
     if (res && res.ok) {
       const items = res.items || [];
       if (items.length) {
+        // ★2026-09-11 范围隔离（用户要求：批量采集只显示当前源页合集，不混入其他平台/其他合集）：
+        //   按 collectionId 比对本次采集与已有批量卡——
+        //     · 不同合集/不同平台 → 先清空旧批量卡，再并入本次（侧栏只显示当前源页合集）；
+        //     · 同合集（仅切集/换分P）→ 保留旧卡、增量更新，符合「批量采集累积不丢」语义。
+        let __incColl = '';
+        for (const it of items) { if (it && it.collectionId) { __incColl = it.collectionId; break; } }
+        if (!__incColl) {
+          const __fb = items.find((x) => x && (x.biliVideoId || x.bvid));
+          __incColl = __fb ? ('bili-video:' + (__fb.biliVideoId || __fb.bvid)) : '';
+        }
+        if (__incColl && batchAssets.length) {
+          const __oldColl = batchAssets[0].collectionId
+            || ('bili-video:' + (batchAssets[0].biliVideoId || batchAssets[0].bvid || ''));
+          if (__oldColl && __oldColl !== __incColl) {
+            batchAssets.length = 0; // 清空旧合集卡（换合集/换平台），避免混入当前源页
+            if (typeof batchSelection !== 'undefined' && batchSelection && batchSelection.clear) batchSelection.clear();
+            console.log('[HMDAO][sidepanel] 批量采集换合集：清空旧合集卡', __oldColl, '→', __incColl);
+          }
+        }
         // ★2026-08-23 修复（问题4 根因）：批量采集资产独立归位 batchAssets，重扫/切 tab 不清空。
         //   图片/音频/文档/模型由 setBatchModeOnSource 已排除（一律不进批量），此处只收视频流。
         const existingKeys = new Set(window.assets.map((x) => x.url).concat(batchAssets.map((x) => x.url)));
@@ -1438,8 +1627,8 @@ if (batchBtn) {
     } else {
       setStatus('批量采集失败：' + errStr(res && res.error), true);
     }
-  };
 }
+if (batchBtn) batchBtn.onclick = () => { doBatchCollect().catch(() => {}); };
 // 初始化时若开关曾开启，恢复源页 batchMode 注入（侧栏重开不丢态）
 if (batchCollectEnabled) setBatchModeOnSource(true);
 
@@ -1812,10 +2001,13 @@ function openPreview(idx) {
   // 试听按钮默认隐藏，仅音频资产显示
   document.getElementById('pvPlay').style.display = 'none';
   document.getElementById('pvCopyImage').style.display = 'none'; // 仅图片预览显示「复制图片」
+  try { const t = document.getElementById('pvToMp3'); if (t) { t.style.display = 'none'; t.onclick = null; } } catch (_) {} // 仅音频预览显示「转 MP3」
   // 停止播放并彻底释放 WebMediaPlayer（removeAttribute('src') 后必须 load() 才能释放解码器）
   const v = document.getElementById('previewVideo'); v.pause(); v.removeAttribute('src'); try { v.load(); } catch (_) {}
   const au = document.getElementById('previewAudio'); au.pause(); au.removeAttribute('src'); try { au.load(); } catch (_) {}
   stopHoverAudio(); // 打开大窗时停掉悬停试听，避免两个音频叠播
+  // ★2026-09-04 修复：打开大窗时立即停掉悬停抽帧 video，避免 hover video 与大窗同时出声/占内存。
+  try { if (typeof stopHoverVideoFrame === 'function') stopHoverVideoFrame(); } catch (_) {}
   stopModelSandbox(); // 离开 3D 预览时停掉沙箱后台渲染，释放 GPU
 
   // 各类型预览子视图（渲染逻辑抽离至 preview-render.js，按 type 分发）
@@ -1844,16 +2036,31 @@ function openPreview(idx) {
   const switchBtn = document.getElementById('pvSwitchDouyinEpisode');
   if (switchBtn) {
     const isDouyinVideo = a.type === 'video' && a.platform === 'douyin' && a.awemeId && a.source && a.source !== 'network';
-    const curModal = (function () {
-      try {
-        const u = new URL(window.__sourcePageUrl || '');
-        return u.searchParams.get('modal_id') || u.searchParams.get('aweme_id') || '';
-      } catch (_) { return ''; }
-    })();
-    const needSwitch = isDouyinVideo && curModal && a.awemeId && String(curModal) !== String(a.awemeId);
+    // ★2026-09-03 修复：判定从「对比 modal_id」改为「对比当前正在播放的那集」(window.__hmdao_curAwemeId) 或 a.notPlayed。
+    //   旧逻辑 20 张卡全判为非当前 → 当前集反而没按钮；现只有非当前集才显示「▶ 切到此集播放」。
+    const curPlaying = (typeof window.__hmdao_curAwemeId === 'string') ? window.__hmdao_curAwemeId : '';
+    const needDouyinSwitch = isDouyinVideo && a.awemeId && (a.notPlayed === true || (curPlaying && String(curPlaying) !== String(a.awemeId)));
+    // ★2026-09-11：B站合集对等逻辑——非当前播放的 B站批量卡显示「切到该集播放」。
+    const isBiliVideo = a.type === 'video' && a.source === 'bilibili-batch' && a.url;
+    const needBiliSwitch = isBiliVideo && a.url && !biliSameEpisode(a.url, window.__sourcePageUrl || '');
+    const needSwitch = needDouyinSwitch || needBiliSwitch;
     switchBtn.style.display = needSwitch ? 'inline-block' : 'none';
-    if (needSwitch) {
+    if (needDouyinSwitch) {
+      switchBtn.textContent = '▶ 切到此集播放';
       switchBtn.onclick = () => switchDouyinEpisodeTo(a.awemeId);
+      const pi = document.getElementById('previewInfo');
+      if (pi) {
+        pi.innerHTML = `<span>⚠ 该集未在浏览器播放过，直链未缓存</span><br>` +
+          `<span>点「▶ 切到此集播放」让源页跳到该集并捕获真实直链后，再双击预览即可正常播放</span>`;
+      }
+    } else if (needBiliSwitch) {
+      switchBtn.textContent = '▶ 切到该集播放';
+      switchBtn.onclick = () => switchBiliEpisodeTo(a);
+      const pi = document.getElementById('previewInfo');
+      if (pi) {
+        pi.innerHTML = `<span>⚠ 该集未在源页播放</span><br>` +
+          `<span>点「▶ 切到该集播放」让 B站源页跳到该集并捕获直链后，再双击预览即可正常播放</span>`;
+      }
     }
   }
   // ★2026-08-23 「在源页播放」按钮默认隐藏，仅抖音分支播放失败时由 showSourcePlayButton 显示
@@ -1872,15 +2079,33 @@ function openPreview(idx) {
 }
 // escapeAttr / truncate 定义见 ui-utils.js（全局单一来源）
 
+// ★2026-09-10 防御：网络层捕获的 video URL 经常 path 末段是「get-url / asset / undefined / 空」
+//   （同一视频的多条 CDN 引用、抓取 endpoint、占位 URL 等）。这些不该被当作「同视频的不同
+//   分辨率」参与匹配——它们是去重失败的产物而非真实分辨率变体。
+const PLACEHOLDER_FILE_NAME_RE = /^(asset|get-url|undefined|null|video|index|blob|untitled|\?.*)$/i;
+function isPlaceholderFileName(name) {
+  return PLACEHOLDER_FILE_NAME_RE.test(String(name || '').trim());
+}
+
 // ===== 视频备选分辨率：显示当前页面同一视频的其他 source URL =====
 function buildVideoAltResolutions(current) {
   const altDiv = document.getElementById('pvAltResolutions');
   if (!altDiv) return;
-  // 找同一页面中的其他视频 URL（不同链接），并尝试从文件名中提取分辨率标记
-  const related = assets.filter(av =>
-    av.type === 'video' && av.url !== current.url &&
-    (av.source === 'video>source' || current.source === 'video>source' || fileName(av.url) === fileName(current.url))
-  );
+  // ★2026-09-10 修复（"备选分辨率显示 get-url/get-url..."根因）：
+  //   旧逻辑用 fileName(av.url) === fileName(current.url) 匹配同视频多分辨率——但网络层累积的
+  //   同视频多条 CDN 引用 path 末段都是「get-url」/「asset」/「undefined」等占位符，全被匹配进去，
+  //   显示 N 个堆叠重复的同名按钮。修复：① current 占位 → 整段不显示；② related 占位 → 剔除；
+  //   ③ 限制最多 6 个（既防止堆叠也避免无关变体挤爆 UI）；④ 改用 stripResolutionTag 比较基础名，
+  //   即使 fileName 不同但去掉 _1080p 后基名一致才算"同一视频"。
+  const curBase = stripResolutionTag(fileName(current.url));
+  if (isPlaceholderFileName(curBase)) { altDiv.style.display = 'none'; return; }
+  const related = assets.filter((av) => {
+    if (av.type !== 'video' || av.url === current.url) return false;
+    if (!(av.source === 'video>source' || current.source === 'video>source')) return false;
+    const fn = stripResolutionTag(fileName(av.url));
+    if (isPlaceholderFileName(fn)) return false; // 排除占位 URL
+    return fn === curBase;
+  }).slice(0, 6);
   if (!related.length) { altDiv.style.display = 'none'; return; }
 
   const buttons = related.map(r => {
@@ -1897,6 +2122,24 @@ function buildVideoAltResolutions(current) {
 function extractResolutionHint(url) {
   const m = url.match(/[_-](\d{3,4}p)\b/i) || url.match(/(\d{3,4}x\d{3,4})/i) || url.match(/\b(hd|fhd|uhd|4k|2k|8k)\b/i);
   return m ? m[1].toUpperCase() : null;
+}
+
+// ★2026-09-02：yt-dlp 抖音 URL 归一化（jingxuan?modal_id=xxx → /video/<aweme_id>）。
+//   后端 /api/platform/ytdlp 底层调 yt-dlp，而其抖音 extractor【不支持】精选列表页 + modal 锚点形式，
+//   实测报错：ERROR: Unsupported URL: https://www.douyin.com/jingxuan?modal_id=7678346515106106634
+//   换成 https://www.douyin.com/video/<id> 后即可被识别（实测报错转为 "Fresh cookies are needed"，
+//   说明 URL 已正确解析，cookie 由 &cookies_file= 提供，buildDouyinCookiesFile() 负责）。
+//   项目内多处把页面 URL 直接喂给后端（本文件 3629/3904/3906 与 download.js 的 action=download），
+//   故统一在此归一化，避免只修一处、其余调用点仍 500。
+function normalizeYtdlpDouyinUrl(u) {
+  try {
+    const pu = new URL(String(u || ''));
+    if (/douyin\.com$/i.test(pu.hostname) && !/\/video\//i.test(pu.pathname)) {
+      const mid = pu.searchParams.get('modal_id') || pu.searchParams.get('aweme_id');
+      if (mid && /^\d+$/.test(mid)) return 'https://www.douyin.com/video/' + mid;
+    }
+  } catch (_) {}
+  return String(u || '');
 }
 
 // 把分辨率标记/格式注记转成人话标签：1080P / 720P / 4K / 原画质 等
@@ -1944,11 +2187,16 @@ function humanizeResLabel(raw, opts) {
 // 返回 [{ label, downloadUrl }]，不含 current 自身。无相关源时返回 []。
 function collectAltResolutionUrls(current) {
   if (!current || !current.url || !Array.isArray(assets)) return [];
-  // 用「去分辨率标记后的基础名」匹配，使 house_1080p.mp4 / house_720p.mp4 视为同一视频
+  // ★2026-09-10：与 buildVideoAltResolutions 一致——current 占位、related 占位都剔除；
+  //   限制最多 6 个备选，防止下载面板堆叠重复（同视频的多条 CDN 引用导致的「get-url」按钮堆）。
   const base = stripResolutionTag(fileName(current.url));
-  const related = assets.filter(av =>
-    av.type === 'video' && av.url !== current.url && stripResolutionTag(fileName(av.url)) === base
-  );
+  if (isPlaceholderFileName(base)) return [];
+  const related = assets.filter((av) => {
+    if (av.type !== 'video' || av.url === current.url) return false;
+    const fn = stripResolutionTag(fileName(av.url));
+    if (isPlaceholderFileName(fn)) return false;
+    return fn === base;
+  }).slice(0, 6);
   return related.map(r => {
     const resTag = extractResolutionHint(r.url) || r.quality || '';
     return { label: (resTag ? resTag + ' · ' : '') + fileName(r.url), downloadUrl: r.url };
@@ -2043,6 +2291,12 @@ async function openDownloadPanel(a) {
   if (!panel || !list || !a) return;
   // 网盘资产统一走 downloadSingle，不弹视频分辨率面板（避免把网盘分享页当视频直链）。
   if (a.type === 'netdisk' || a.type === 'archive' || a.isNetdiskFile) {
+    downloadSingle(a);
+    return;
+  }
+  // ★豆包朗读（WS 流式音频，伪 URL 无直链）：不弹分辨率面板、不请求 yt-dlp formats
+  //   （此前会因 isEmbedPlatform 判定去解析豆包会话页 → 后端 500 + 弹出"选择分辨率"）。
+  if (a.wsAudio || (a.type === 'audio' && !/^https?:/i.test(a.url || ''))) {
     downloadSingle(a);
     return;
   }
@@ -2146,7 +2400,11 @@ async function populateDownloadResolutions(a) {
             const [res] = await Promise.race([
               chrome.scripting.executeScript({
                 target: { tabId: tid }, world: 'MAIN',
+                // ★2026-09-02：读取前先调一次 SSR 补扫，避免「扫描时填充 / 下载时已被重置」导致空读。
+                //   实测：注入脚本在 SPA 路由变化时 delete __hmdao_captures 并重建（约 inject-main.js:93），
+                //   扫一次管一阵，下一次面板打开时可能又被冲掉。补扫函数本身幂等且同步，立即重建索引。
                 func: (id) => {
+                  try { if (typeof window.__hmdaoScanDyRenderData === 'function') window.__hmdaoScanDyRenderData(); } catch (_) {}
                   try {
                     const c = window.__hmdao_captures || {};
                     const m = c.dyFormatsByAweme || {};
@@ -2352,8 +2610,11 @@ async function fetchBufferChunked(url, referer, stageLabel) {
   } catch (_) {}
   if (!total || total <= CHUNK) {
     const r = await fetchViaBackground(url, { referer });
-    if (!r || !r.ok || !r.arrayBuffer) throw new Error(`${stageLabel || '轨道'}拉取失败：` + ((r && (r.error || r.status)) || 'unknown'));
-    return r.arrayBuffer;
+    // ★2026-09-10：sendMessage 会丢弃 ArrayBuffer，优先用 b64 还原（fetchUrl 现已回传 b64）。
+    let buf = r && r.arrayBuffer;
+    if (!buf && r && r.b64) { try { buf = b64ToBytes(r.b64); } catch (_) { buf = null; } }
+    if (!r || !r.ok || !buf) throw new Error(`${stageLabel || '轨道'}拉取失败：` + ((r && (r.error || r.status)) || 'unknown'));
+    return buf;
   }
   const chunks = [];
   let offset = 0, guard = 0;
@@ -2362,8 +2623,11 @@ async function fetchBufferChunked(url, referer, stageLabel) {
     guard++;
     const end = Math.min(offset + CHUNK - 1, total - 1);
     const r = await fetchViaBackground(url, { referer, headers: { Range: `bytes=${offset}-${end}` } });
-    if (!r || !r.ok || !r.arrayBuffer) throw new Error(`${stageLabel || '轨道'}分块失败 @${offset}：` + ((r && (r.error || r.status)) || 'unknown'));
-    chunks.push(new Uint8Array(r.arrayBuffer));
+    // ★2026-09-10：sendMessage 丢弃 ArrayBuffer，用 b64 还原分块。
+    let buf = r && r.arrayBuffer;
+    if (!buf && r && r.b64) { try { buf = b64ToBytes(r.b64); } catch (_) { buf = null; } }
+    if (!r || !r.ok || !buf) throw new Error(`${stageLabel || '轨道'}分块失败 @${offset}：` + ((r && (r.error || r.status)) || 'unknown'));
+    chunks.push(new Uint8Array(buf));
     offset = end + 1;
     const pct = Math.floor((offset / total) * 100);
     if (pct !== lastPct && pct % 10 === 0) {
@@ -2549,9 +2813,22 @@ async function confirmDownload() {
           }
         }
       }
-        closeDownloadPanel();
-      }
+    }
+    // ★2026-09-03 修复（真机问题：面板选分辨率下载卡“下载中” + 没实际下载）：
+    //   抖音等嵌入平台资产在面板里选了具体分辨率直链（sel.downloadUrl）时，
+    //   必须把该 URL 传给 downloadSingle。否则确认下载只走默认 a.url / window.__dySelectedFormat，
+    //   既可能忽略用户选的 1080P，又可能命中旧 mergeDashViaBackend 路径导致 UI 卡住且无失败提示。
+    if (sel.downloadUrl) {
+      console.log('[HMDAO][dl] 面板选中分辨率下载：label=', sel.label, 'url=', sel.downloadUrl.slice(0, 120));
+      downloadSingle(a, { downloadUrl: sel.downloadUrl })
+        .catch((e) => {
+          console.error('[HMDAO][dl] 面板选中分辨率下载失败：', e);
+          setStatus('⚠ 下载失败：' + (e && e.message || e), true);
+        })
+        .finally(restore);
+      closeDownloadPanel();
       return;
+    }
     if (sel.formatId) {
       downloadViaYtDlp(a, window.__sourcePageUrl || '', sel.formatId).finally(restore);
     } else {
@@ -2677,6 +2954,10 @@ if (!window.__hmdaodlWatcher) {
 function closeDownloadPanel() {
   const panel = document.getElementById('downloadPanel');
   if (panel) panel.classList.remove('open');
+  // ★2026-09-03 修复：用户点「取消」或关闭面板时，必须重置「下载中…」按钮状态，
+  //   否则下载异常挂起后再打开面板，确认按钮仍显示「下载中…」且不可用。
+  const btn = document.getElementById('dlConfirm');
+  if (btn) { btn.disabled = false; btn.textContent = btn.dataset.old || '下载'; }
 }
 
 document.getElementById('closeDownloadPanel').onclick = closeDownloadPanel;
@@ -3491,7 +3772,15 @@ let __douyinCookiesFile = null; // 缓存，避免每次扫描重读
 async function buildDouyinCookiesFile() {
   if (__douyinCookiesFile) return __douyinCookiesFile;
   try {
-    const list = await chrome.cookies.getAll({ domain: 'douyin.com' });
+    // ★2026-09-02 修正（上一版用 domains 是错的，勿改回）：
+    //   1) Chrome 的 cookies.getAll 【不支持 domains 属性】——实测直接抛
+    //      "Unexpected property: 'domains'"，异常被本函数 catch 吞掉后返回 null，
+    //      cookie 文件恒为空 → 后端 yt-dlp 报 "Fresh cookies are needed" → 500。
+    //   2) 而 { domain:'douyin.com' } 是【精确匹配】，取不到 www.douyin.com 子域下的关键 cookie
+    //      （ttwid / sessionid 等实际都设在 www 域）。两个写法都不行。
+    //   正确做法：getAll({}) 取全部 cookie 再按域名后缀过滤，自然覆盖 douyin.com 及所有子域。
+    const allCookies = await chrome.cookies.getAll({});
+    const list = (allCookies || []).filter((c) => /douyin\.com$/i.test(String((c && c.domain) || '')));
     if (!list || !list.length) return null;
     const lines = [
       '# Netscape HTTP Cookie File',
@@ -3622,7 +3911,7 @@ async function fetchPlatformFormats(a) {
   }
   try {
     const apiBase = await getCloudApiBase();
-    const r = await fetch(apiBase + '/api/platform/ytdlp?action=formats&url=' + encodeURIComponent(videoPageUrl) + cookieArg, { credentials: 'omit' });
+    const r = await fetch(apiBase + '/api/platform/ytdlp?action=formats&url=' + encodeURIComponent(normalizeYtdlpDouyinUrl(videoPageUrl)) + cookieArg, { credentials: 'omit' });
     const d = await r.json().catch(() => null);
     if (d && d.formats && d.formats.length) {
       window.__ytFormats = d.formats;
@@ -3633,6 +3922,11 @@ async function fetchPlatformFormats(a) {
         const defaultFmt = (d.formats.find(f => f.has_video && f.has_audio) || d.formats.find(f => f.has_video)) || d.formats[0];
         window.__ytSelectedFormat = defaultFmt ? defaultFmt.format_id : '';
       }
+    } else if (d && d.error) {
+      // ★2026-09-10：后端 yt-dlp 解析失败（站点不支持 / 证书无效 / 需登录 / 加密流等）。
+      //   此前非 YouTube 站点走到这里什么都不做 → 用户点卡片「没反应」，只有 Console 里能看到 500，
+      //   被误判成扩展坏了。现在把后端返回的原因直接显示到侧栏状态条。
+      try { setStatus('⚠ 解析失败：' + String(d.error).slice(0, 120), true); } catch (_) {}
     } else if (a && /youtube\.com|youtu\.be/i.test(derivePlatformVideoPageUrl(a) || window.__sourcePageUrl || '')) {
       // ★2026-08-23 P4：yt-dlp 后端未返回（未安装/失效）→ 源页 ytInitialPlayerResponse 直链兜底，
       // 保证 Youtube 仍能选分辨率并直接下载真实直链（无需后端、不影响播放）。
@@ -3664,6 +3958,23 @@ async function fetchPlatformFormats(a) {
 // closePreview 仍留在本文件（共享 teardown）。
 
 function closePreview() {
+  // ★2026-09-06：关闭预览必须立即停掉【侧栏自己的】音频（豆包朗读等走 previewAudio 播放）。
+  //   否则关了卡片声音还在响（用户明确要求：不要有残留音效流出）。
+  try {
+    const au = document.getElementById('previewAudio');
+    if (au) { au.pause(); try { au.removeAttribute('src'); au.load(); } catch (_) {} }
+  } catch (_) {}
+  try { if (typeof playToken !== 'undefined') playToken++; } catch (_) {}
+  try { if (typeof window.stopHoverAudio === 'function') window.stopHoverAudio(); } catch (_) {}
+  // ★2026-09-05 修复（"关闭视频卡后还有声音流出、没随卡片一起关闭"）：
+  //   声音来自【源页】——openPreview 的抖音分支会调 playInSourceTab 让源页继续播。
+  //   此前关闭预览只清理侧栏元素，从不暂停源页 → 用户听到"关了还在响"。
+  //   现对称处理：仅当本次预览【确实触发过源页播放】才暂停源页（避免误停用户自己开的视频）。
+  if (window.__hmdaoPreviewStartedPlayback != null) {
+    const __pauseTab = window.__hmdaoPreviewStartedPlayback;
+    window.__hmdaoPreviewStartedPlayback = null;
+    try { pauseInSourceTab(__pauseTab); } catch (_) {}
+  }
   document.getElementById('previewOverlay').classList.remove('open');
   const v = document.getElementById('previewVideo'); v.pause(); v.removeAttribute('src');
   try { v.load(); } catch (_) {} // ★2026-08-22 修复（"关闭预览有缓存声音"）：removeAttribute('src') 后必须 load() 才释放解码器，否则部分浏览器仍残留音轨
@@ -3708,8 +4019,140 @@ function closePreview() {
   const pvImgEl = document.getElementById('previewImg');
   if (pvImgEl) pvImgEl.style.display = 'none';
   if (window.__mergedDashBlobUrl) { try { URL.revokeObjectURL(window.__mergedDashBlobUrl); } catch (_) {} window.__mergedDashBlobUrl = null; }
+  // ★2026-09-04 兜底（用户实测「点卡后只有声音没画面，关闭后声音仍不停」）：
+  //   声音可能来自动态创建的媒体元素（DASH 合并 blob、音频轨直链、临时 video），
+  //   逐个枚举容易漏 —— 这里统一杀掉侧栏文档里的全部 video/audio。
+  try {
+    document.querySelectorAll('video, audio').forEach((m) => {
+      try { m.pause(); } catch (_) {}
+      try { m.removeAttribute('src'); } catch (_) {}
+      try { m.load(); } catch (_) {}
+    });
+  } catch (_) {}
   window.__previewAsset = null;
 }
+
+// =====================================================================
+// ★2026-09-05 侧栏健康自检 + 媒体泄漏监视器（用户可在侧栏 DevTools 控制台直接使用）
+//   window.__hmdaoHealth()          → 一键输出健康报告（资产/媒体元素/缓存/内存/定时器）
+//   window.__hmdaoWatchMedia(true)  → 监视 video/audio 的创建/播放/移除（定位"关卡后仍有声音"）
+//   window.__hmdaoWatchMedia(false) → 关闭监视
+// =====================================================================
+window.__hmdaoHealth = function () {
+  const rep = { ts: new Date().toISOString() };
+  try {
+    // 1) 资产规模
+    rep.assets = Array.isArray(window.assets) ? window.assets.length : -1;
+    rep.batchAssets = (typeof batchAssets !== 'undefined' && Array.isArray(batchAssets)) ? batchAssets.length : -1;
+    rep.selected = (window.selected && window.selected.size) || 0;
+    rep.batchSelection = (window.batchSelection && window.batchSelection.size) || 0;
+    rep.lastScanSig = window.__hmdaoLastScanSig ? String(window.__hmdaoLastScanSig).slice(0, 40) : null;
+    // 2) DOM 内媒体元素（声音残留的直接证据）
+    const media = Array.from(document.querySelectorAll('video, audio'));
+    rep.mediaInDom = media.length;
+    rep.mediaPlaying = media.filter((m) => !m.paused && !m.ended).map((m) => ({
+      tag: m.tagName.toLowerCase(),
+      src: String(m.currentSrc || m.src || m.srcObject || '').slice(0, 80),
+      muted: m.muted, volume: m.volume,
+      inDom: m.isConnected,
+      cls: (m.className || '').toString().slice(0, 40),
+    }));
+    rep.mediaWithSrc = media.filter((m) => m.currentSrc || m.src).length;
+    rep.mediaDetached = media.filter((m) => !m.isConnected).length;
+    // 3) 缓存/队列状态（缩略图治理）
+    rep.coverCache = (typeof HMDAO_COVER_CACHE !== 'undefined') ? HMDAO_COVER_CACHE.size : -1;
+    rep.coverQueue = (typeof HMDAO_COVER_QUEUE !== 'undefined') ? HMDAO_COVER_QUEUE.length : -1;
+    rep.coverActive = (typeof HMDAO_COVER_ACTIVE !== 'undefined') ? HMDAO_COVER_ACTIVE : -1;
+    rep.frameBudget = (typeof HMDAO_FRAME_BUDGET !== 'undefined') ? HMDAO_FRAME_BUDGET : -1;
+    rep.imgDimensions = (typeof imgDimensions !== 'undefined' && imgDimensions) ? Object.keys(imgDimensions).length : -1;
+    // 4) 渲染状态
+    rep.domCards = document.querySelectorAll('#list .card').length;
+    rep.lastRenderSig = (typeof __lastRenderSig !== 'undefined' && __lastRenderSig) ? String(__lastRenderSig).length : 0;
+    rep.hoverVideoAlive = (typeof hoverVideoEl !== 'undefined' && !!hoverVideoEl);
+    // 5) 内存（Chrome 专属，精度粗但足够看趋势）
+    if (performance.memory) {
+      rep.heapMB = Math.round((performance.memory.usedJSHeapSize / 1048576) * 10) / 10;
+      rep.heapLimitMB = Math.round(performance.memory.jsHeapSizeLimit / 1048576);
+    }
+  } catch (e) { rep.error = String(e && e.message || e); }
+  console.log('%c[HMDAO 健康报告]', 'color:#1ea7fd;font-weight:bold', rep);
+  return rep;
+};
+
+let __hmdaoMediaObserver = null;
+
+// ★2026-09-05：一键停止全部媒体（侧栏 + 源页）。
+//   场景：① 关卡片后源页仍在响 ② 悬停音频卡触发的试听停不下来 ③ 抖音自动连播。
+//   调用方式：侧栏控制台 window.__hmdaoStopAllMedia()，或按 Esc（预览弹层打开时 Esc 仍走关闭逻辑）。
+window.__hmdaoStopAllMedia = function () {
+  try { if (typeof stopHoverAudio === 'function') stopHoverAudio(); } catch (_) {}
+  try { if (typeof stopDouyinFrameStream === 'function') stopDouyinFrameStream(); } catch (_) {}
+  try {
+    document.querySelectorAll('video, audio').forEach((m) => { try { m.pause(); } catch (_) {} });
+  } catch (_) {}
+  try {
+    if (window.__playingPageIdx != null) {
+      chrome.runtime.sendMessage({ type: 'HMDAO_STOP_PAGE_AUDIO', audioIdx: window.__playingPageIdx }).catch(() => {});
+      window.__playingPageIdx = null;
+    }
+  } catch (_) {}
+  try { chrome.runtime.sendMessage({ type: 'HMDAO_STOP_AUDIO_IN_PAGE', audioId: 'hover' }).catch(() => {}); } catch (_) {}
+  // 源页主播放器（若本次预览触发过播放）
+  if (window.__hmdaoPreviewStartedPlayback != null) {
+    const t = window.__hmdaoPreviewStartedPlayback;
+    window.__hmdaoPreviewStartedPlayback = null;
+    try { pauseInSourceTab(t); } catch (_) {}
+  }
+  return '已停止侧栏与源页的全部媒体播放';
+};
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  try {
+    const ov = document.getElementById('previewOverlay');
+    if (ov && ov.classList.contains('open')) return; // 弹层打开时 Esc 走既有的关闭逻辑（内部会同步暂停源页）
+    window.__hmdaoStopAllMedia();
+    console.log('[HMDAO] Esc → 已停止全部媒体播放');
+  } catch (_) {}
+});
+
+window.__hmdaoWatchMedia = function (on) {
+  try {
+    if (__hmdaoMediaObserver) { __hmdaoMediaObserver.disconnect(); __hmdaoMediaObserver = null; }
+    if (!on) { console.log('[HMDAO] 媒体监视器已关闭'); return; }
+    // 拦截 play 事件（捕获阶段，覆盖未来创建的元素）——"关卡后仍有声音"的直接证据源
+    const onPlay = (e) => {
+      const m = e.target;
+      if (m && (m.tagName === 'VIDEO' || m.tagName === 'AUDIO')) {
+        console.warn('[HMDAO][media-watch] ▶ 播放:', m.tagName.toLowerCase(),
+          'src=' + String(m.currentSrc || m.src || m.srcObject || '').slice(0, 90),
+          'inDom=' + m.isConnected, 'muted=' + m.muted);
+      }
+    };
+    document.addEventListener('play', onPlay, true);
+    // 监视 DOM 增删（卡片重建/媒体元素挂载与卸载）
+    __hmdaoMediaObserver = new MutationObserver((muts) => {
+      for (const mu of muts) {
+        for (const n of mu.addedNodes) {
+          if (n.nodeType === 1 && (n.tagName === 'VIDEO' || n.tagName === 'AUDIO' || n.querySelector && n.querySelector('video,audio'))) {
+            console.log('[HMDAO][media-watch] + 挂载:', n.tagName.toLowerCase(), (n.className || '').toString().slice(0, 40));
+          }
+        }
+        for (const n of mu.removedNodes) {
+          const medias = (n.tagName === 'VIDEO' || n.tagName === 'AUDIO') ? [n]
+            : (n.querySelectorAll ? Array.from(n.querySelectorAll('video,audio')) : []);
+          for (const m of medias) {
+            if (!m.paused) {
+              console.warn('[HMDAO][media-watch] ⚠ 移除了仍在播放的媒体元素（这就是声音残留）:',
+                m.tagName.toLowerCase(), 'src=' + String(m.currentSrc || m.src || '').slice(0, 90));
+            }
+          }
+        }
+      }
+    });
+    __hmdaoMediaObserver.observe(document.getElementById('list') || document.body, { childList: true, subtree: true });
+    console.log('[HMDAO] 媒体监视器已开启：滚动/点击卡片，观察 play 与"移除仍在播放的媒体"告警');
+  } catch (e) { console.warn('[HMDAO][media-watch] 启动失败:', e && e.message); }
+};
 
 // ===== DASH 1080p+ 音视频合并为单文件 MP4（纯 JS：mp4box.js 解封装 + mp4-muxer 封装）=====
 function startDashPreview(a, vid, dash) {
@@ -3737,9 +4180,58 @@ function startDashPreview(a, vid, dash) {
   }
 }
 
+// 把 DASH 的视频轨 + 音频轨交后端 ffmpeg 合成为含音画单文件，再拉回侧栏（返回 Blob）
+// 与下载链路同源（/api/media/merge-dash），产物经后端 ffprobe 自检保证含音画。
+async function mergeDashForPreview(a) {
+  const apiBase = (window.DdayupConfig && typeof window.DdayupConfig.getApiBaseSync === 'function')
+    ? window.DdayupConfig.getApiBaseSync()
+    : 'http://127.0.0.1:3000';
+  // ★平台判定优先用 a.platform（权威字段），URL 关键字仅作兜底：
+  //   仅看 URL 会漏判（例如本地/代理域、或 CDN 域名不含平台关键字的情况），
+  //   一旦漏判就带错 Referer → 防盗链 CDN 403 → 合并失败。
+  const isDy = /douyin|tiktok|bytedance/i.test(a.platform || '')
+    || /douyin|bytedance|tiktok|douyinvod|iesdouyin|v26-web/i.test(a.url || '');
+  const referer = isDy ? 'https://www.douyin.com/' : deriveMediaReferer(a.url, window.__sourcePageUrl || '');
+  const resp = await fetch(apiBase + '/api/media/merge-dash', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      videoUrl: a.downloadAddr || a.url,
+      audioUrl: a.dashAudio,
+      referer,
+      filename: (a.title || deriveFilename(a) || 'video'),
+    }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || !data.ok) throw new Error((data && data.error) || ('HTTP ' + resp.status));
+  const fileResp = await fetch(apiBase + data.fileUrl);
+  if (!fileResp.ok) throw new Error('拉取合并产物失败 HTTP ' + fileResp.status);
+  return await fileResp.blob();
+}
+
 // 后台带 Referer 拉取媒体字节 → 本地 blob → <video> 播放（绕过侧栏元素的签名/Referer 限制）
 async function fallbackCdnFetch(a, vid) {
   const sourcePage = window.__sourcePageUrl || '';
+  // ★2026-09-02 修复（真机冒烟"只有画面没声音"根因）：
+  //   抖音是 DASH 分离轨 —— a.url 是【视频轨（无音）】，a.dashAudio 是配对的音频轨。
+  //   此前预览只拉 a.url 播 → 必然有画面、没声音。
+  //   修复：资产带 dashAudio 时，交后端 ffmpeg 合成含音画单文件再播放
+  //   （字节不经过浏览器做合并，且产物经后端 ffprobe 自检，已 6/6 验证）。
+  //   后端不可用 → 回退下方原逻辑（仅视频轨、无声），并给出明确提示，绝不静默。
+  if (a && a.type === 'video' && a.dashAudio && /^https?:/i.test(a.dashAudio)) {
+    try {
+      setStatus('⏳ 正在合成含音画单文件（后端 ffmpeg）…');
+      const blob = await mergeDashForPreview(a);
+      const url = URL.createObjectURL(blob);
+      cacheDragBlob(a, blob, 'video/mp4');
+      window.__previewAsset = { ...a, url, __mergedDash: true };
+      vid.src = url; vid.load(); vid.play().catch(() => {});
+      setStatus('✅ 已合成含音画单文件（' + Math.round((blob.size || 0) / 1024) + 'KB），可直接播放/下载');
+      return;
+    } catch (e) {
+      setStatus('⚠ 音视频合并失败（' + ((e && e.message) || '未知') + '），先播放视频轨（无声音）', true);
+    }
+  }
   // ★2026-08-24 修复：优先用 a.downloadAddr（抖音 REFRESH_FROM_PAGE 返回的新鲜直链），
   //   否则抖音 a.url（stale 扫描直链）拉字节 403 → blob 是错误页 → <video> 不播。
   const effectiveUrl = a.downloadAddr || a.url;
@@ -3797,14 +4289,27 @@ async function fallbackCdnFetch(a, vid) {
       // ★2026-08-24 修复（实测「点卡片不播放」根因）：HMDAO_REFRESH_FROM_PAGE 返回字段是 r.url（非 downloadAddr），
       //   原代码写 r.downloadAddr → 永远 undefined → 侧栏 trySidePanelPlay 拿空 url → 直接 return false 不播。
       //   改用 r.url（新鲜直链）覆盖 a.downloadAddr，侧栏才能 fallbackCdnRefetch 预览。
-      if (r && r.ok && r.url) a.downloadAddr = r.url; // 新鲜直链，优先侧栏播放
+      // ★2026-09-03 修复（合集多集数）：只有「本卡片 awemeId 与源页返回的一致」时才覆盖 downloadAddr，
+      //   否则保留本卡片专属直链，避免自动播放的下一集把 downloadAddr 改成别的集 → 预览对不上。
+      const refAweme = (r && r.awemeId) ? String(r.awemeId).replace(/[^\w]/g, '') : '';
+      const cardAweme = (a.awemeId) ? String(a.awemeId).replace(/[^\w]/g, '') : '';
+      if (r && r.ok && r.url && (!cardAweme || !refAweme || cardAweme === refAweme)) {
+        a.downloadAddr = r.url; // 新鲜直链，优先侧栏播放
+      }
+      // 本集标题也按 awemeId 对齐写入，确保下载文件名带当前集而不是统一合集名
+      if (r && r.ok && r.desc && !a.title) a.title = r.desc;
 
       // ★2026-08-23 核心诉求落地：抖音视频「在源页继续播放」
       //   1) 立即让源页继续播：源页 video 本来就在播，play() 零风险，绝不 tabs.update 跳页/重载
       //      —— 直接满足用户核心需求，且源视频绝不会被侧栏任何操作暂停/中断。
       //   2) 侧栏后台试播预览（best-effort）：若防盗链放行则从字节预览，否则静默失败不影响源页。
       //   两项并行：源页播放是主保障，侧栏预览是附加。彻底消除"点击卡片导致源视频暂停"的旧 bug。
-      getSourceTabId().then((tabId) => { if (tabId) playInSourceTab(tabId); });
+      // ★2026-09-05：记录"本次预览触发了源页播放"，供 closePreview 对称暂停（消除"关卡还有声音"）
+      getSourceTabId().then((tabId) => {
+        if (!tabId) return;
+        playInSourceTab(tabId);
+        window.__hmdaoPreviewStartedPlayback = tabId;
+      });
 
       const trySidePanelPlay = (url) => {
         if (!url) return false;
@@ -3819,7 +4324,11 @@ async function fallbackCdnFetch(a, vid) {
       }
     }).catch(() => {
       // 解析失败也不跳页：源页继续播 + 侧栏退到后台拉取
-      getSourceTabId().then((tabId) => { if (tabId) playInSourceTab(tabId); });
+      getSourceTabId().then((tabId) => {
+        if (!tabId) return;
+        playInSourceTab(tabId);
+        window.__hmdaoPreviewStartedPlayback = tabId;
+      });
       try { fallbackCdnRefetch(a, vid, referer); }
       catch (_) { setStatus('✅ 源页继续播放中'); }
     });
@@ -3848,9 +4357,9 @@ async function fallbackCdnFetch(a, vid) {
       if (cf) dyCookie = '&cookies_file=' + encodeURIComponent(cf);
     }
     // 同时拉取格式列表（用于分辨率选择）
-    const fmtP = fetch(apiBase + '/api/platform/ytdlp?action=formats&url=' + encodeURIComponent(videoPageUrl) + dyCookie, { credentials: 'omit' })
+    const fmtP = fetch(apiBase + '/api/platform/ytdlp?action=formats&url=' + encodeURIComponent(normalizeYtdlpDouyinUrl(videoPageUrl)) + dyCookie, { credentials: 'omit' })
       .then(r => r.json()).catch(() => null);
-    const urlP = fetch(apiBase + '/api/platform/ytdlp?action=extract&url=' + encodeURIComponent(videoPageUrl) + dyCookie, { credentials: 'omit' })
+    const urlP = fetch(apiBase + '/api/platform/ytdlp?action=extract&url=' + encodeURIComponent(normalizeYtdlpDouyinUrl(videoPageUrl)) + dyCookie, { credentials: 'omit' })
       .then(r => r.json()).catch(() => null);
 
     Promise.all([urlP, fmtP]).then(([ytData, fmtData]) => {
@@ -4112,6 +4621,48 @@ async function switchDouyinEpisodeTo(assetOrId) {
   }
 }
 
+// ★2026-09-11：B站合集「切到该集播放」流程（与抖音 switchDouyinEpisodeTo 对等）。
+//   点击合集里非当前播放的 B站卡片后，让源 tab 跳到该卡片独立的 /video/<bvid>?p=<page>，
+//   等 1.5s 让 inject-main 捕获新直链，自动触发重扫刷新侧栏。点哪张开哪张，绝不错配。
+function biliEpisodeKey(u) {
+  try {
+    const p = new URL(u || '', 'https://www.bilibili.com');
+    const m = (p.pathname + p.search).match(/\/video\/(BV\w+)/);
+    if (!m) return '';
+    const bv = m[1];
+    const pm = p.searchParams.get('p');
+    // ★2026-09-11：page 缺省也归一为 #p1，保证 p=1 卡片与源页 p=1 稳定匹配（避免漏判当前集）
+    return bv + '#p' + (pm || '1');
+  } catch (_) { return ''; }
+}
+function biliSameEpisode(a, b) {
+  const ka = biliEpisodeKey(a || ''), kb = biliEpisodeKey(b || '');
+  return !!ka && ka === kb;
+}
+async function switchBiliEpisodeTo(asset) {
+  // ★边界：目标 == 当前源页正在播放的集 → 绝不跳页，只在当前源页 play()。
+  let targetUrl = (asset && (asset.url || asset.biliPageUrl || asset.playerUrl)) || null;
+  if (!targetUrl) { setStatus('⚠ 该集没有可用源页地址'); return; }
+  const sourceTabId = await getSourceTabId();
+  if (!sourceTabId) { setStatus('⚠ 没有源页面，请先在 B站页面扫描后再切换', true); return; }
+  try {
+    const tab = await chrome.tabs.get(sourceTabId);
+    const cur = (tab && tab.url) || '';
+    if (biliSameEpisode(cur, targetUrl)) {
+      setStatus('✅ 就是当前播放的这集，正在源页继续播放…');
+      await playInSourceTab(sourceTabId);
+      return;
+    }
+    setStatus('▶ 已在 B站源页打开该集…');
+    await chrome.tabs.update(sourceTabId, { url: targetUrl });
+    setTimeout(async () => {
+      try { await playInSourceTab(sourceTabId); } catch (_) {}
+      try { chrome.runtime.sendMessage({ type: 'HMDAO_RESCAN_TAB', tabId: sourceTabId }); } catch (_) {}
+      setStatus('已打开，等待源页重新扫描…');
+    }, 1500);
+  } catch (_) { setStatus('⚠ 切换源页面失败', true); }
+}
+
 // 在当前源页文档内触发 <video> 播放（滚动到可视区 + play），绕过 Chrome 自动播放策略。
 // ★2026-08-23 修复（问题1「源页突然暂停/静音被改」）：
 //   旧逻辑 document.querySelector('video') 会选中抖音 jingxuan 页【第一个】video（常是推荐位
@@ -4141,6 +4692,30 @@ async function playInSourceTab(tabId) {
           const p = v.play();
           if (p && p.catch) p.catch(() => {});
         }
+      },
+    });
+  } catch (_) {}
+}
+
+// ★2026-09-05：「关闭视频卡后仍有声音流出」的根因修复配套。
+//   实测健康报告 playing=[]（侧栏本身没有泄漏的播放元素），声音来自【源页】——
+//   openPreview 的抖音分支会显式调 playInSourceTab 让源页视频继续播（这是产品行为：
+//   侧栏直链被防盗链拦截时只能在源页看）。但关闭预览时没有任何地方暂停源页，
+//   于是"关了卡片声音还在"。此处提供对称的 pauseInSourceTab，由 closePreview 在
+//   「本次预览确实触发过源页播放」时调用（用 __hmdaoPreviewStartedPlayback 标记，
+//   避免误停用户本来就在看的视频）。
+async function pauseInSourceTab(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const vs = Array.from(document.querySelectorAll('video'));
+        if (!vs.length) return;
+        // 只暂停【正在播放且未静音】的主播放器（与 playInSourceTab 同一选取规则），
+        // 不改动 muted 等用户设置，也不碰推荐位的静音小卡片。
+        const playing = vs.filter((x) => !x.paused && !x.ended && !x.muted);
+        const pool = playing.length ? playing : vs.filter((x) => !x.paused && !x.ended);
+        for (const v of pool) { try { v.pause(); } catch (_) {} }
       },
     });
   } catch (_) {}
@@ -4296,10 +4871,67 @@ function isEmbedPlatformAsset(a) {
   return false;
 }
 
+// ★2026-09-11 悬停抽帧改造：自增序号 + 闸门 + 字节上限。
+//   ① 序号：鼠标移开/切卡后自增，回调先比对序号，不匹配直接丢弃（在途字节不再上屏，等价 abort）。
+//   ② 闸门：悬停抽帧仅作为「该卡没有有效封面」时的兜底（旧闸门 assets.length>20 会把多视频页
+//      整体静默禁用，imini 这类站点一张帧都抽不到）。
+//   ③ 字节上限：只拉前 2MB（对齐 card-render.js 的抽帧写法），避免整文件拉完 + base64 回传打满 SW。
+let hoverVideoSeq = 0;
+const HOVER_FRAME_MAX_BYTES = 2 * 1024 * 1024;
+
+// 判断该卡片是否需要「悬停抽帧」兜底：无封面 / 封面被判为统一占位图 / 封面加载失败 才需要。
+function hmdaoCardNeedsHoverFrame(a, card) {
+  try {
+    if (!a || !card) return false;
+    // 已抽过帧（含本次会话内 hover 过）→ 不必再抽
+    if (a.__hoverCoverBlob) return false;
+    const cover = Array.isArray(a.cover) ? (a.cover[0] || '') : (a.cover || '');
+    // 封面已被判为「CDN 统一占位图」→ 需要抽真帧
+    let ph = false;
+    try {
+      if (cover && typeof window.__hmdaoIsPlaceholderCover === 'function') ph = !!window.__hmdaoIsPlaceholderCover(cover);
+    } catch (_) { ph = false; }
+    const tag = card.querySelector ? card.querySelector('.tag') : null;
+    const st = tag ? (tag.dataset.coverState || '') : '';
+    const coverBroken = (st === 'error' || st === 'empty' || st === 'none');
+    if (cover && !ph && !coverBroken) return false; // 已有有效封面 → 不抽帧（悬停仅作兜底）
+    // 视口内【视频卡】过多时不抽帧（避免侧栏卡顿）：轻量 getBoundingClientRect 判定，不新建 observer
+    // （renderNow 只给视频卡挂 .url-row，据此区分视频卡与图片卡，避免图片多的页面被误判超阈值）
+    let visibleCards = 0;
+    try {
+      const cards = document.querySelectorAll('#list .card') || [];
+      for (let i = 0; i < cards.length; i++) {
+        const r = cards[i].getBoundingClientRect();
+        if (r.bottom > -200 && r.top < (window.innerHeight + 200)) {
+          if (cards[i].querySelector && cards[i].querySelector('.url-row')) visibleCards++;
+        }
+        if (visibleCards > 12) break;
+      }
+    } catch (_) { visibleCards = 0; }
+    if (visibleCards > 12) return false;
+    return true;
+  } catch (_) { return false; }
+}
+
+// 该封面 <img> 当前是否显示着「已被判死的统一占位图」——用卡片上记录的原始 cover URL 反查
+// （封面走 relay 后 im.src 是 blob: URL，无法直接按 src 判定，故回溯 card.dataset.cover）。
+function hmdaoCoverIsPlaceholderOf(im) {
+  try {
+    if (!im || typeof window.__hmdaoIsPlaceholderCover !== 'function') return false;
+    const card = (im.closest && im.closest('.card')) || null;
+    const raw = card ? (card.dataset.cover || '') : '';
+    if (!raw) return false;
+    return !!window.__hmdaoIsPlaceholderCover(raw);
+  } catch (_) { return false; }
+}
+
 async function hoverVideoFrame(a, card) {
   if (!a || (a.type !== 'video' && !a.dynamic)) return;
   // 动图（webp/gif 动画）直接显示封面动图即可，不需要创建 <video> 抽帧（避免无意义媒体实例开销）
   if (a.dynamic && a.type !== 'video') return;
+  // ★2026-09-11 替换旧闸门（原 `assets.length > 20` 静默禁用整个多视频页的悬停抽帧）：
+  //   新闸门 = 该卡没有有效封面 && 视口内视频卡 ≤ 12。
+  try { if (!hmdaoCardNeedsHoverFrame(a, card)) return; } catch (_) { return; }
   const tag = card.querySelector('.tag');
   if (!tag) return;
   const v = ensureHoverVideo();
@@ -4339,22 +4971,27 @@ async function hoverVideoFrame(a, card) {
     return;
   }
   const referer = deriveMediaReferer(a.url, window.__sourcePageUrl || '');
-  fetchMediaViaBackground(a.url, referer).then((res) => {
-    paintHoverFrame(v, res);
-  }).catch(() => {
-    // 后台拉取失败（大文件超时/防盗链/跨域 ACAO 拒绝读取字节）→ 降级：
-    // ★之前回退到 v.src=a.url（直连第三方 CDN）会触发「Third-party cookie will be blocked」警告
-    // 且 <video> 加载跨域防盗链媒体往往 ACAO opaque 失败黑屏。
-    // 现改为：彻底不挂 video.src，保留底层封面图作为预览（用户可双击调 yt-dlp 或 openPreview）。
-    try { v.style.display = 'none'; } catch (_) {}
-  });
+  // ★2026-09-11：序号快照 —— 鼠标移开/切卡后 stopHoverVideoFrame 会 hoverVideoSeq++，
+  //   此处捕获的 seq 随即失效，回调里比对不上就直接丢弃在途字节（等价 abort，不再上屏）。
+  const mySeq = ++hoverVideoSeq;
+  let res = null;
+  try {
+    // maxBytes：只拉前 2MB（只要首帧），否则整文件拉完 + base64 回传会打满 SW 通道
+    res = await fetchMediaViaBackground(a.url, referer, { maxBytes: HOVER_FRAME_MAX_BYTES });
+  } catch (_) { res = null; }
+  if (mySeq !== hoverVideoSeq) return;      // 已移开/切卡 → 丢弃
+  if (!res) { try { v.style.display = 'none'; } catch (_) {} return; }
+  paintHoverFrame(v, res, mySeq);
 }
 
 // 把后台返回的字节画成悬停首帧（失败则保持封面图，不报错）
 // 2026-08-24 增强：成功时把首帧 canvas 截成 png blob 缓存到 a.__hoverCoverBlob，
 // 供 card-render 在 relay 封面 404 时回退（hover 过的视频移开鼠标也显示首帧），解决"hover 才显示"问题。
-function paintHoverFrame(v, res) {
+// ★2026-09-11：新增 seq 参数（丢弃在途结果）与「写回封面缓存」（悬停过的卡变成常驻封面）。
+function paintHoverFrame(v, res, seq) {
   if (!res || !res.ok || !res.b64) return;
+  // 上屏前再比对一次序号：字节回来时鼠标可能已经移开
+  if (typeof seq === 'number' && seq !== hoverVideoSeq) return;
   try {
     const blob = new Blob([b64ToBytes(res.b64)], { type: res.mime || 'video/mp4' });
     const url = URL.createObjectURL(blob);
@@ -4392,11 +5029,17 @@ function paintHoverFrame(v, res) {
               }
               snapBlobUrl = URL.createObjectURL(pb);
               a.__hoverCoverBlob = snapBlobUrl;
+              // ★2026-09-11（与"无封面卡抽帧"方案合流）：把抽到的首帧【写回封面缓存】，
+              //   让悬停过的卡变成常驻封面 —— 后续重渲/滚动不再重复抽帧，
+              //   同时覆盖掉此前可能已被缓存的占位图（占位图识别已把 URL 判死并从缓存撤销）。
+              try { if (typeof hmdaoCacheHoverCover === 'function') hmdaoCacheHoverCover(a, snapBlobUrl); } catch (_) {}
               // 刷新同 URL 资产的所有视频卡的 coverImg（包括当前卡，移开鼠标也保留画面）
               try {
                 const esc = (window.CSS && CSS.escape) ? CSS.escape(a.url) : String(a.url).replace(/"/g, '\\"');
                 document.querySelectorAll('.card[data-asset-url="' + esc + '"] .cover-img').forEach((im) => {
-                  if (!im.src || im.dataset.coverState !== 'ok') {
+                  // ★2026-09-11 补全：占位图/破图/失败态也要被真帧替换（旧逻辑只跳过 'ok' 态，
+                  //   而占位图命中时卡面停留在 🎬/空态，此处统一刷新）
+                  if (!im.src || im.dataset.coverState !== 'ok' || hmdaoCoverIsPlaceholderOf(im)) {
                     im.src = snapBlobUrl;
                     im.dataset.coverState = 'hover';
                     const tag = im.parentElement;
@@ -4419,6 +5062,10 @@ function paintHoverFrame(v, res) {
 }
 
 function stopHoverVideoFrame(card) {
+  // ★2026-09-11：鼠标一移开就【立即让在途请求失效】（hoverVideoSeq++ 后，hoverVideoFrame /
+  //   paintHoverFrame 的回调会因序号不匹配直接丢弃结果，等价 abort，不再等网络）。
+  //   800ms 只用于已上屏画面的淡出，不再等字节。
+  try { hoverVideoSeq++; } catch (_) {}
   // 仅当单例 video 确实在该卡片时才移除（避免误清其它卡片的悬停）
   if (hoverVideoEl && hoverVideoEl.parentElement === card) {
     // 销毁悬停的 hls 实例（优酷 m3u8 流用 hls.js 挂载，避免累积）
@@ -4466,6 +5113,11 @@ async function downloadVideoViaBackground(a) {
       const blob = new Blob([b64ToBytes(yt.b64)], { type: 'video/mp4' });
       const url = URL.createObjectURL(blob);
       cacheDragBlob(a, blob, 'video/mp4');
+      // ★2026-09-10：用户为该类型设置了目录 → 写用户目录，否则回退默认路径
+      if (await writeBlobToUserDir(a.type, deriveFilename(a), blob)) {
+        setStatus('✅ 已保存到设置的目录：' + deriveFilename(a));
+        finish(true); return;
+      }
       downloadBlobUrl(url, 'Ddayup/videos/' + deriveFilename(a));
       setTimeout(() => URL.revokeObjectURL(url), 120000);
       setStatus('✅ 已用播放器真实字节下载（itag ' + (yt.itag || '?') + '，' + Math.round(yt.size / 1024) + 'KB）');
@@ -4492,6 +5144,11 @@ async function downloadVideoViaBackground(a) {
       const blob = new Blob([b64ToBytes(res.b64)], { type: res.mime || 'video/mp4' });
       const url = URL.createObjectURL(blob);
       cacheDragBlob(a, blob, res.mime || 'video/mp4'); // 缓存真实字节 → 可拖到桌面/文件夹
+      // ★2026-09-10：用户为该类型设置了目录 → 写用户目录（FileSystemAccess 可写任意路径）
+      if (await writeBlobToUserDir(a.type, deriveFilename(a), blob)) {
+        setStatus('✅ 已保存到设置的目录：' + deriveFilename(a));
+        finish(true); return;
+      }
       downloadBlobUrl(url, 'Ddayup/videos/' + deriveFilename(a));
       setTimeout(() => URL.revokeObjectURL(url), 120000);
       const usedSec = Math.floor((Date.now() - t0) / 1000);
@@ -4536,9 +5193,14 @@ document.addEventListener('keydown', (e) => {
 document.getElementById('pvDownload').onclick = () => {
   const a = getPreviewAsset();
   if (!a) return;
-  // 网盘资产统一走 downloadSingle：有 direct 直接下载；无 direct/未解析则提示并自动触发深度解析。
-  // 避免为网盘资产弹出视频分辨率面板（原画质/平台直链），那是给视频素材用的。
-  if (a.type === 'netdisk' || a.type === 'archive' || a.isNetdiskFile) {
+  // ★2026-09-10 修复（"图片从预览下载后落在 Ddayup/videos，右键下载却在 Ddayup/images"）：
+  //   openDownloadPanel 是【视频分辨率面板】，其内部保存路径硬编码 'Ddayup/videos/'。
+  //   此前任何非网盘/非归档资产（含图片）都走它 → 图片被存进 videos 目录，与右键菜单
+  //   （走 downloadSingle → typeDirs[a.type] → images）不一致。
+  //   现在只有【视频 / 动图】才需要分辨率面板；其余类型一律走 downloadSingle，
+  //   由 typeDirs 决定子目录（image→images / audio→audio / model→models ...），全链路统一。
+  const isVideoLike = a.type === 'video' || a.dynamic;
+  if (a.type === 'netdisk' || a.type === 'archive' || a.isNetdiskFile || !isVideoLike) {
     downloadSingle(a);
     return;
   }
@@ -4574,6 +5236,35 @@ document.getElementById('pvOpenTab').onclick = () => {
 };
 document.getElementById('pvNetResolve').onclick = () => { const a = getPreviewAsset(); if (a) netdiskResolve(a); };
 document.getElementById('pvSimilar').onclick = () => { const a = getPreviewAsset(); if (a) doFindSimilar(a); };
+// ★2026-09-05：「🔄 源页刷新」成功后同步侧栏卡片 + 触发源页重扫。
+//   1) 用刷新到的直链/元数据就地更新 window.assets 里对应的卡（按 awemeId 优先、其次 url）；
+//   2) renderNow() 让卡片立刻反映新直链（并清掉「📍 未在源页播放过」标记）；
+//   3) 发 HMDAO_RESCAN_TAB 让 background 深度重扫该 tab —— SCRAN_RESULT 回来后
+//      侧栏的集数/标题/封面与源页当前播放内容一致。
+async function syncAssetAfterRefresh(a, r) {
+  try {
+    const list = Array.isArray(window.assets) ? window.assets : [];
+    let hit = null;
+    for (const x of list) {
+      if (!x) continue;
+      if (a && a.awemeId && x.awemeId && String(x.awemeId) === String(a.awemeId)) { hit = x; break; }
+      if (a && a.url && x.url === a.url) { hit = x; break; }
+    }
+    if (hit) {
+      if (r && r.url && typeof r.url === 'string') hit.url = r.url;
+      if (r && r.title) hit.title = r.title;
+      if (r && r.cover) hit.cover = r.cover;
+      if (r && r.awemeId) hit.awemeId = r.awemeId;
+      hit.notPlayed = false; // 已在源页播放过 → 撤掉「📍 未播放」徽标
+      try { renderNow(); } catch (_) {}
+    }
+  } catch (_) {}
+  try {
+    const tid = (window.__hmdao_sourceTabId != null) ? window.__hmdao_sourceTabId : null;
+    if (tid != null) await chrome.runtime.sendMessage({ type: 'HMDAO_RESCAN_TAB', tabId: tid });
+  } catch (_) {}
+}
+
 document.getElementById('pvRefresh').onclick = async () => {
   const a = getPreviewAsset();
   if (!a) return;
@@ -4603,13 +5294,19 @@ document.getElementById('pvRefresh').onclick = async () => {
     const isBlob = typeof r.url === 'string' && r.url.startsWith('blob:');
     if (isBlob) { setStatus('⚠ 仅捕获到 MSE blob URL，没有直接下载链接。请用 B站原生右键→「视频另存为」', true); return; }
     // 更新预览对象 + 重设预览源
-    window.__previewAsset = { ...a, url: r.url };
+    const freshUrl = r.url;
+    window.__previewAsset = { ...a, url: freshUrl };
     const vid = document.getElementById('previewVideo');
     if (a.type === 'video' && vid) {
-      vid.src = r.url; vid.load(); vid.play().catch(() => {});
+      vid.src = freshUrl; vid.load(); vid.play().catch(() => {});
     }
-    document.getElementById('previewInfo').innerHTML = `<span>${typeLabel(a.type)} · ${fileName(a.url)}（已刷新）</span><br><a href="${escapeAttr(r.url)}" target="_blank" title="${escapeAttr(r.url)}">${truncate(r.url, 60)}</a>`;
-    setStatus('✅ 已刷新 URL，可点「下载」');
+    document.getElementById('previewInfo').innerHTML = `<span>${typeLabel(a.type)} · ${fileName(freshUrl)}（已刷新）</span><br><a href="${escapeAttr(freshUrl)}" target="_blank" title="${escapeAttr(freshUrl)}">${truncate(freshUrl, 60)}</a>`;
+    setStatus('✅ 已刷新 URL，正在同步侧栏…');
+    // ★2026-09-05：源页刷新成功后同步侧栏 —— 把该卡的直链换成源页当前播放的那条，
+    //   再触发源页重扫，让侧栏卡片集数/标题/封面与【当前源播放内容】对齐。
+    //   此前只更新预览对象，侧栏卡片仍是旧直链 → 用户遇到"刷新能播，但卡片还是历史内容"。
+    try { await syncAssetAfterRefresh(a, r); } catch (_) {}
+    setStatus('✅ 已刷新 URL 并同步侧栏，可点「下载」');
   } else {
     setStatus('⚠ 未捕获到 fresh URL，请保持在源页+点击视频让它播一下', true);
   }
@@ -4651,7 +5348,41 @@ try {
 } catch (_) {}
 // 向 background 上报本组件 build，汇总到统一入口 HMDAO_GET_BUILDS（一眼分辨新旧）
 chrome.runtime.sendMessage({ type: 'HMDAO_REPORT_BUILD', component: 'sidepanel', build: HMDAO_SIDEPANEL_BUILD }).catch(() => {});
-chrome.runtime.sendMessage({ type: 'HMDAO_SCAN_REQUEST', batchMode: batchCollectEnabled }).catch(() => {});
+
+// ★2026-09-10 关键链路：把 background 广播的 HMDAO_DOWNLOAD_PROGRESS 接到侧栏进度卡上。
+//   这条消息是 chrome.downloads.onChanged 的实时回流（每个 tick 都可能触发）。
+//   - state='in_progress' | 'in_paused' → progressByDownloadId 更新字节
+//   - state='complete' → completeByDownloadId 转完成态（不再卡"开始下载"）
+//   - state='interrupted' → failByDownloadId 转失败态（带 reason）
+//   注意：chrome.downloads.onChanged 触发非常频繁（每次有变化都触发，含字节变化），
+//   所以这里只做参数透传给 progress.js（内部有 dirty 防抖 + DOM 节流渲染）。
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.type !== 'HMDAO_DOWNLOAD_PROGRESS') return;
+  if (msg.downloadId == null) return;
+  const HP = window.HmdaoProgress;
+  if (!HP) return;
+  if (msg.state === 'complete') {
+    const base = String(msg.filename || '').split(/[\\/]/).pop() || '已下载';
+    HP.completeByDownloadId(msg.downloadId, '已下载完成：' + base);
+  } else if (msg.state === 'interrupted') {
+    HP.failByDownloadId(msg.downloadId, (msg.error && (msg.error.message || String(msg.error))) || '下载中断');
+  } else {
+    // in_progress / in_paused / downloading / paused：实时进度
+    HP.progressByDownloadId(msg.downloadId, msg.bytesReceived || 0, msg.totalBytes || 0);
+  }
+});
+
+// onCreated：把刚创建的 downloadId 绑到当前未绑的最近进行中任务卡。
+// progressByDownloadId 自身有 fallback，这里只是抢在第一时间绑定，让侧栏首屏字节能命中。
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.type !== 'HMDAO_DOWNLOAD_CREATED') return;
+  if (msg.downloadId == null) return;
+  const HP = window.HmdaoProgress;
+  if (HP && HP.bindLatestPending) {
+    try { HP.bindLatestPending(msg.downloadId); } catch (_) {}
+  }
+});
+chrome.runtime.sendMessage({ type: 'HMDAO_SCAN_REQUEST', batchMode: batchCollectEnabled, force: true }).catch(() => {});
 loadPagePreview();
 // 侧栏是单例面板，切换标签时不会自动重载；必须监听 onActivated 重新获取当前页信息并扫描新标签。
 // 这样从云桥等平台标签切到 B站时，侧栏顶部「当前页」和素材列表会同步刷新，而不是滞留旧标签。
@@ -4673,7 +5404,54 @@ if (chrome.tabs && chrome.tabs.onActivated) {
       }
     } catch (_) {}
     loadPagePreview();
-    chrome.runtime.sendMessage({ type: 'HMDAO_SCAN_REQUEST', tabId: activeInfo.tabId, batchMode: batchCollectEnabled }).catch(() => {});
+    // ★2026-09-11 修复（列表恒空主因）：onActivated 会在 5315 行清空 window.assets 后请求扫描，
+    //   此前不带 force → 若本次扫描内容与上次广播相同被 bcastSig 静默吞掉 → 列表永远填不回来。
+    //   tab 切换是显式用户行为且已清空，必须强制广播以重新填充。
+    chrome.runtime.sendMessage({ type: 'HMDAO_SCAN_REQUEST', tabId: activeInfo.tabId, batchMode: batchCollectEnabled, force: true }).catch(() => {});
+  });
+}
+// ★2026-09-11：离开/切换即清 + 重进重扫（覆盖"源页关闭 / 同标签内跳转别的链接或平台"）。
+//   onActivated 已处理"切到别的标签"；这里补 onRemoved（源页关闭）与 onUpdated（同标签导航换链/换平台）。
+//   语义与 onActivated 一致：清空当前扫描卡历史（保留批量下载），更新 currentSourceUrl，重进时由 onActivated/SCAN_REQUEST 重扫。
+if (chrome.tabs && chrome.tabs.onRemoved) {
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    try {
+      if (window.__hmdao_sourceTabId != null && tabId === window.__hmdao_sourceTabId) {
+        // 源页关闭：清空扫描历史（保留批量），清 lastScan 避免下次打开恢复死卡
+        window.assets = (batchAssets || []).slice();
+        window.selected = new Set();
+        try { batchSelection && batchSelection.clear(); } catch (_) {}
+        window.__hmdaoAssets = window.assets.slice();
+        currentSourceUrl = '';
+        window.__hmdao_sourceTabId = null;
+        try { chrome.storage.local.remove('lastScan'); } catch (_) {}
+        try { renderNow(); } catch (_) {}
+        try { if (typeof updateScanStatus === 'function') updateScanStatus(window.assets, 'idle'); } catch (_) {}
+        try { if (typeof setStatus === 'function') setStatus('源页已关闭，已清空扫描历史。重新打开源页可再次扫描。', false); } catch (_) {}
+      }
+    } catch (_) {}
+  });
+}
+if (chrome.tabs && chrome.tabs.onUpdated) {
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    try {
+      // 仅关心"地址真正变化"（换链接/换平台），忽略同页刷新与仅 title 变化
+      if (!changeInfo || !changeInfo.url) return;
+      if (window.__hmdao_sourceTabId != null && tabId !== window.__hmdao_sourceTabId) return;
+      const nu = String(changeInfo.url || '').split('#')[0];
+      const old = String(currentSourceUrl || '').split('#')[0];
+      if (nu === old) return; // 同页锚点/刷新不处理
+      // 同标签内跳转到别的链接/平台：清空当前扫描卡，更新源页地址，触发重扫
+      window.assets = (batchAssets || []).slice();
+      window.selected = new Set();
+      try { batchSelection && batchSelection.clear(); } catch (_) {}
+      window.__hmdaoAssets = window.assets.slice();
+      currentSourceUrl = changeInfo.url;
+      try { renderNow(); } catch (_) {}
+      try { if (typeof updateScanStatus === 'function') updateScanStatus(window.assets, 'scanning'); } catch (_) {}
+      try { if (typeof setStatus === 'function') setStatus('已切换到新链接/平台，清空旧扫描历史，正在重新扫描…', false); } catch (_) {}
+      chrome.runtime.sendMessage({ type: 'HMDAO_SCAN_REQUEST', tabId, batchMode: batchCollectEnabled, force: true }).catch(() => {});
+    } catch (_) {}
   });
 }
 // 初始化阶段【不】主动探测第三方 Cookie：chrome.contentSettings.get 会在扩展加载时
@@ -4762,9 +5540,24 @@ window.__hmdaoLazyCheck3pCookies = function lazyCheck3pCookies() {
     chrome.storage.local.get('lastScan', (s) => {
       try {
         const ls = (s && s.lastScan) || null;
-        if (ls && Array.isArray(ls.assets) && ls.assets.length) {
+        if (!ls || !Array.isArray(ls.assets) || !ls.assets.length) return;
+        // ★2026-09-11 守卫（离开/切换/新窗口即清根因）：仅当 lastScan 记录的源页仍是当前激活页且 URL 一致才恢复，
+        //   否则视为"切换到别的链接/平台/新对话窗口"的残留 → 清空并交由下方 SCAN_REQUEST 重扫，杜绝错页死卡。
+        const restoreIfSame = () => {
           if (!Array.isArray(window.assets)) window.assets = [];
           for (const a of ls.assets) {
+            // ★豆包朗读的伪 URL 卡（doubao-ws-audio://）是上一轮内存里的 blob 指针，
+            //   侧栏重启后已失效、永远点不动 → 恢复时直接丢弃，避免"历史残留幽灵卡"。
+            if (a && /^doubao-ws-audio:/i.test(String(a.url || ''))) continue;
+            // ★2026-09-11 修复（liblib 等 MSE 站点 lastScan 残留"假卡"根因）：
+            //   视频/音频资产若 URL 是 blob:/data:，在侧栏重启/重开后已跨上下文失效，
+            //   既不能预览也不能下载，且会触发控制台 ERR_FILE_NOT_FOUND。恢复时直接丢弃。
+            if (a && (a.type === 'video' || a.type === 'audio')) {
+              try {
+                const u = String(a.url || '');
+                if (/^blob:/i.test(u) || /^data:/i.test(u)) continue;
+              } catch (_) {}
+            }
             if (a && a.__batch) {
               if (!batchAssets.some(x => x.url === a.url)) batchAssets.push(a);
             } else {
@@ -4779,14 +5572,87 @@ window.__hmdaoLazyCheck3pCookies = function lazyCheck3pCookies() {
           window.__hmdaoAssets = window.assets.slice();
           try { renderNow(); } catch (_) {}
           try { updateScanStatus(window.assets, 'done'); } catch (_) {}
-        }
+        };
+        const lsUrl = String(ls.url || '').split('#')[0];
+        const verify = (cb) => {
+          if (!chrome.tabs || !chrome.tabs.query || !lsUrl) return cb(false);
+          chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+            const t = (tabs && tabs[0]) || null;
+            const aUrl = t ? String(t.url || '').split('#')[0] : '';
+            const sameUrl = !!aUrl && aUrl === lsUrl;
+            // tabId 未知时（旧数据）仅按 URL 对齐，避免误清刷新恢复
+            const sameTab = ls.tabId == null || (t && t.id === ls.tabId);
+            cb(sameUrl && sameTab);
+          });
+        };
+        verify((ok) => {
+          if (!ok) { try { chrome.storage.local.remove('lastScan'); } catch (_) {} return; }
+          restoreIfSame();
+        });
       } catch (_) {}
     });
   } catch (_) {}
 
+  // ★豆包朗读（WS 流式音频）实体化：源页只留字节元数据，这里把字节取回、在侧栏转成真实 blob: URL。
+  //   转完之后它就是一张普通音频卡 —— 悬停试听、下载、停止全部走既有通用路径，
+  //   不再有伪 URL（doubao-ws-audio://）泄漏到任何后续逻辑（杜绝 scheme 报错与走错通道）。
+  async function hydrateDoubaoWsAudios() {
+    try {
+      const list = (window.assets || []).filter((a) => a && !a.__wsBlob
+        && (a.wsAudio || /^doubao-ws-audio:\/\//i.test(String(a.url || ''))));
+      if (!list.length) return;
+      let changed = false;
+      // 每段朗读一张卡（源页最多保留 5 段 + 当前段），逐个取字节实体化
+      for (const a of list.slice(0, 6)) {
+        // 伪 URL 里带时间戳（doubao-ws-audio://<ts>），元数据丢失时也能反解出是哪一段
+        let ts = Number(a.wsTs) || 0;
+        if (!ts) {
+          const m = /doubao-ws-audio:\/\/(\d+)/i.exec(String(a.url || ''));
+          if (m) ts = Number(m[1]) || 0;
+        }
+        let res = null;
+        try {
+          res = await chrome.runtime.sendMessage({ type: 'HMDAO_GET_DOUBAO_WS_AUDIO', ts });
+        } catch (_) { res = null; }
+        if (!res || !res.ok || !res.b64) {
+          try { console.log('[HMDAO][doubao] 实体化跳过：' + ((res && res.error) || 'no-data')); } catch (_) {}
+          continue;
+        }
+        const bytes = b64ToBytes(res.b64);
+        const mime = (res.mime && /^audio\//.test(res.mime)) ? res.mime : 'audio/ogg';
+        const blob = new Blob([bytes], { type: mime });
+        const blobUrl = URL.createObjectURL(blob);
+        a.url = blobUrl;
+        a.__wsBlob = blobUrl;
+        a.wsAudio = true;
+        a.wsTs = a.wsTs || ts;
+        a.mime = mime;
+        a.size = Number(res.size) || bytes.length;
+        changed = true;
+      }
+      // ★实体化失败的（拿不到字节、仍是伪 URL）一律剔除：
+      //   剔除判据【只看 URL】——wsAudio 标记在链路中可能丢失（scanPage 重建只留 url/type/source），
+      //   靠标记判断会漏掉这些卡 → 留下"点不动还刷错误日志"的幽灵卡（实测复现）。
+      try {
+        const before = (window.assets || []).length;
+        window.assets = (window.assets || []).filter((x) => !(
+          x && (x.wsAudio || /^doubao-ws-audio:/i.test(String(x.url || ''))) && !x.__wsBlob
+        ));
+        if ((window.assets || []).length !== before) changed = true;
+      } catch (_) {}
+      if (changed) {
+        try { window.__hmdaoAssets = window.assets.slice(); } catch (_) {}
+        try { renderNow(); } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
   // 接收扫描结果广播，更新状态
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === 'HMDAO_SCAN_RESULT' && Array.isArray(msg.assets)) {
+      console.log('[HMDAO][sidepanel] SCAN_RESULT 收到 assets=' + msg.assets.length + ' url=' + (msg.url || ''));
+      // ★2026-09-03：记录「本次扫描时的当前集」与「上次」对比，用于切集时实时刷新高亮/徽标（不等全量重建）。
+      const prevCurAweme = (typeof window.__hmdao_curAwemeId === 'string') ? window.__hmdao_curAwemeId : '';
       // ★2026-09-01 修复（封面 403 无回退 / 预览·下载拿不到源页真凶）：
       //   window.__hmdao_sourceTabId 【从未被赋值】（全仓搜索 `window.__hmdao_sourceTabId =` 零命中）
       //   → media-fetch.js:107 第二层「源页 MAIN 世界带会话 Cookie 的 IN_TAB fetch」永远不执行
@@ -4795,18 +5661,118 @@ window.__hmdaoLazyCheck3pCookies = function lazyCheck3pCookies() {
       //   同理 download.js:402/663 的 HMDAO_DOWNLOAD_IN_TAB 也拿不到 tabId。
       //   修复：SCAN_RESULT 广播本就带 tabId（scan.js:1149），在此落地。
       try { if (typeof msg.tabId === 'number') window.__hmdao_sourceTabId = msg.tabId; } catch (_) {}
+      // ★2026-09-03：记录「当前正在播放的集」awemeId，供侧栏精确高亮 + 打 📍 未播放 徽标（切集实时跟随源页）。
+      try { window.__hmdao_curAwemeId = (msg.curAwemeId || '') ? String(msg.curAwemeId) : ''; } catch (_) {}
+      // 切集时允许当前卡自动滚入可视区（card-render 的 _hmdaoScrolled 防止重复滚动）。
+      try { window.__hmdao_autoScrollCurrent = (prevCurAweme !== (msg.curAwemeId || '')); } catch (_) {}
       // ★2026-09-01 修复（切站残留根因）：每次扫描结果带来源页 url；若与当前页不同，
       //   说明已切到其他网站/视频 → 清空普通资产（保留批量资产），再增量合并，避免历史残留。
       //   （SPA 同 tab 内导航不会触发 onActivated，旧逻辑只靠 onActivated 清空，故残留；此处用 url 兜底。）
+      // ★2026-09-04 修复：从【整 URL】改为【站点 host】判定切站——合集页内切集 modal_id 变化属同站，
+      //   不再清卡（否则数量"一会多一会少"）。仅真正切到不同站点(b站/YouTube 等)才清。
       try {
+        // ★2026-09-07 建议2（防御性兜底/双保险）：与「当前展示页」(window.__sourcePageUrl，auto 导航会同步) 比对，
+        //   而非 currentSourceUrl（auto 轻量同步路径不会更新它，易滞后 → 漏清）。一旦 SCAN_RESULT 的来源页与当前
+        //   展示页文档身份不同（跨 path / 跨站 / hash 路由开启时跨 hash），直接清空旧资产再增量合并，
+        //   即便 auto 分支的清空因竞态/事件丢失被跳过，此处也能兜住，彻底杜绝不同链接记录混显。
         const incomingUrl = (msg.url || '').toString();
-        if (incomingUrl && currentSourceUrl && incomingUrl !== currentSourceUrl) {
-          window.assets = (typeof batchAssets !== 'undefined' && Array.isArray(batchAssets)) ? batchAssets.slice() : [];
+        // ★2026-09-08 关键修正（imini 显示 runninghub 历史素材、重扫也不清的根因）：
+        //   __sourcePageUrl 在【切标签那一刻】就被别处(:1116)更新成新站了 —— 等扫描结果回来，
+        //   displayedUrl 与 incomingUrl 已相等 → idChanged 恒 false → 永不清残留。
+        //   改为比对「当前展示资产所属页身份」(__hmdaoDisplayedPageKey)：它在每次合并后被记录，
+        //   只随资产走，不随标签切换走 —— 切站后第一次 SCAN_RESULT 必然 idChanged → 正确清空。
+        const displayedUrl = (window.__hmdaoDisplayedPageKey
+          ? '__k__' + window.__hmdaoDisplayedPageKey
+          : (window.__sourcePageUrl || '')).toString();
+        const idChanged = hmdaoSourceIdentityKey(incomingUrl) !== hmdaoSourceIdentityKey(displayedUrl);
+        // ★2026-09-08 更正（撤回上一版「0 条不清空」闸门）：
+        //   该闸门会让「身份变更但本次扫描为空」的情况【跳过清理】；而 __sourcePageUrl
+        //   会在切标签/导航时被别处（:1116）同步更新 → 下一轮 idChanged 变成 false
+        //   → 永远不再触发清理 → 实测「即梦 ⇄ runninghub 切换后两站卡片混在一起」。
+        //   混显是功能性错误，远比"清成空白"严重，故恢复【换页必清】。
+        //   （"闪一下就消失"改由增量合并只加不删 + 换页后轮询快速回填来缓解。）
+        if (incomingUrl && displayedUrl && idChanged) {
+          // 切站：释放旧卡封面 blob URL，防止快速切源页时 blob 堆积导致内存膨胀/崩溃
+          try {
+            (window.assets || []).forEach((a) => {
+              if (a && a.__hoverCoverBlob && /^blob:/.test(a.__hoverCoverBlob)) { try { URL.revokeObjectURL(a.__hoverCoverBlob); } catch (_) {} }
+            });
+          } catch (_) {}
+          // ★保留「正在下载的普通资产」+「全部批量资产」(批量永清)，其余普通资产随换页丢弃（与 auto 清空同语义）。
+          clearAssetsForNewPage();
           if (window.selected && window.selected.clear) window.selected.clear();
           if (typeof batchSelection !== 'undefined' && batchSelection && batchSelection.clear) batchSelection.clear();
           try { renderNow(); } catch (_) {}
         }
+        // ★2026-09-10 B（同路径 SPA 切换内容 → 旧卡残留 / 封面错配）：
+        //   切站清空的判定基于「文档身份」(origin+pathname)。但 imini / 即梦 / runninghub 这类
+        //   多视频画廊站是【同路径 SPA 换内容】（列表刷新、切分类、切到另一个视频），
+        //   pathname 不变 → idChanged 恒 false → 上一批视频卡与新一批混在一起，
+        //   表现为「封面与卡对不上 / 越扫越多 / 显示上一个站的素材」。
+        //   补一条内容层面的判定：本次扫描的视频 URL 与已有视频 URL【完全无交集】
+        //   → 视为整批内容被替换，清空旧卡后再增量合并。
+        //   例外：抖音 / B站 / YouTube 依赖源页累积（dyUrls 增量合并），清空会导致采不到，一律跳过。
+        try {
+          const hostOf = (u) => { try { return new URL(String(u || ''), 'https://x/').hostname; } catch (_) { return ''; } };
+          const isIncremental = /(^|\.)(douyin|iesdouyin|tiktok|bilibili|youtube)\.(com|cn|tv|be)$/i.test(hostOf(incomingUrl));
+          if (!isIncremental) {
+            const keyOf = (a) => String((a && a.url) || '').split('?')[0];
+            const incV = (Array.isArray(msg.assets) ? msg.assets : []).filter((a) => a && a.type === 'video').map(keyOf).filter(Boolean);
+            const prevV = (window.assets || []).filter((a) => a && a.type === 'video').map(keyOf).filter(Boolean);
+            if (incV.length && prevV.length && !incV.some((u) => prevV.indexOf(u) >= 0)) {
+              clearAssetsForNewPage();
+              if (window.selected && window.selected.clear) window.selected.clear();
+              try { renderNow(); } catch (_) {}
+            }
+          }
+        } catch (_) {}
+        // ★豆包：会话切换（/chat/<id> 变化）时，必须移除上个会话的朗读音频卡。
+        //   自动扫描走「增量合并、只加不删」，旧卡会带着旧标题一直留在列表 —— 表现为
+        //   "新建任务后标题没刷新/没和源项目同步"。切会话即清音频卡，与源会话保持一致。
+        try {
+          const cid = (u) => { const m = /\/chat\/(\d+)/.exec(String(u || '')); return m ? m[1] : ''; };
+          const cNew = cid(incomingUrl);
+          const cOld = cid(currentSourceUrl);
+          if (cNew && cOld && cNew !== cOld) {
+            // 移除时同步释放 blob URL —— 否则来回切会话会不断泄漏音频字节内存
+            window.assets = (window.assets || []).filter((x) => {
+              if (x && x.wsAudio) {
+                try {
+                  if (x.__wsBlob && /^blob:/i.test(x.__wsBlob)) URL.revokeObjectURL(x.__wsBlob);
+                } catch (_) {}
+                return false;
+              }
+              return true;
+            });
+            window.__hmdaoAssets = window.assets.slice();
+          }
+        } catch (_) {}
         if (incomingUrl) currentSourceUrl = incomingUrl;
+      } catch (_) {}
+      // ★2026-09-05 关键修复：切换不同抖音合集（mixId 变化）时，旧批量资产必须清空，
+      //   否则侧栏会残留上一合集的集数卡（用户看到的"第6集/第14集/第40集"幽灵卡）。
+      //   同合集内切集 mixId 不变，批量资产保留。
+      try {
+        const incomingMixId = (msg.mixId || '').toString();
+        const mixChanged = !!(incomingMixId || currentMixId) && incomingMixId !== currentMixId;
+        if (mixChanged) {
+          // ★2026-09-05 二次修复（"开启批量采集后卡数还是时多时少"）：
+          //   信息流批量采集场景下，用户一滚动就会切到下一个视频/合集 → mixId 不停变化。
+          //   此前无条件清空 batchAssets → 已采集到的卡被反复抹掉再重采 → 数量忽多忽少，
+          //   与"扫描多少是多少、绝不丢"的批量语义直接冲突。
+          //   改为：批量采集开启时【保留批量容器】（累积是批量的核心价值），
+          //   只在【未开启批量】时按合集切换清理。
+          if (!batchCollectEnabled && Array.isArray(batchAssets)) batchAssets.length = 0;
+          // ★2026-09-05 补漏：此前只清 __batch 资产，普通资产里的【抖音视频卡】属于上一合集，
+          //   不清就会留在列表里 → 切合集后标题/封面仍是旧合集的（"没和切换后的状态同步对齐"）。
+          window.assets = (window.assets || []).filter((a) => !(a && a.__batch)
+            && !(a && a.platform === 'douyin' && a.type === 'video'));
+          window.__hmdaoLastScanSig = null; // 允许下一轮重新持久化（内容已变）
+          if (window.selected && window.selected.clear) window.selected.clear();
+          if (typeof batchSelection !== 'undefined' && batchSelection && batchSelection.clear) batchSelection.clear();
+          console.log('[HMDAO][sidepanel] 合集切换：mixId %s → %s，清空批量资产', currentMixId || '(空)', incomingMixId || '(空)');
+        }
+        if (incomingMixId) currentMixId = incomingMixId;
       } catch (_) {}
       // ★2026-08-23 修复（问题3 断裂A）：扫描结果必须回填到 window.assets 才能显示卡片。
       //   旧逻辑只写 __hmdaoAssets（仅计数），导致 SCAN_RESULT 永不进卡片列表 → 刷新/扫描后无素材。
@@ -4818,12 +5784,29 @@ window.__hmdaoLazyCheck3pCookies = function lazyCheck3pCookies() {
         // 显式 __batch 标记的（BATCH_COLLECT 按钮采集的）无条件入 batchAssets。
         const scanBatchMode = !!msg.batchMode;
         const incoming = msg.assets || [];
+        // ★2026-09-11 诊断（侧栏 0 卡片定位）：打印入站资产真实形态，确认是否缺 url / 被误判批量。
+        try {
+          console.log('[HMDAO_DIAG][merge] 入站 assets=' + incoming.length
+            + ' batchMode=' + !!msg.batchMode + ' batchCollectEnabled=' + !!batchCollectEnabled
+            + ' 明细=' + JSON.stringify(incoming.map((a) => ({ t: a && a.type, hasUrl: !!(a && a.url), url0: ((a && a.url) || '').slice(0, 48), platform: a && a.platform, aid: a && a.awemeId, batch: !!(a && a.__batch) }))));
+        } catch (_) {}
         const incoming_normal = []; // 本次扫描产出的普通（非批量）资产暂存
+        // ★2026-09-04 修复（批量合集封面/标题"切集后不刷新"真凶）：
+        //   此前批量资产只"追加不更新"——首次合成批量卡时若封面/标题尚为空(详情 API 未补齐)，
+        //   之后 dyCoverByAweme/dyTitlesByAweme 补齐了也永远写不进 batchAssets → 卡片封面/标题恒为空/旧值。
+        //   现改为：按 awemeId(优先) 或 url 找到已存在批量卡则就地更新元数据；找不到才新增。
+        const BATCH_META_KEYS = ['cover', 'title', 'episodeNo', 'modalId', 'playerUrl', 'dashAudio', 'awemeId', 'dyFormats'];
+        const applyBatchMeta = (tgt, src) => {
+          for (const k of BATCH_META_KEYS) { const nv = src[k]; if (nv == null || nv === '') continue; tgt[k] = nv; }
+          if (src.notPlayed !== undefined) tgt.notPlayed = src.notPlayed;
+        };
         for (const a of incoming) {
           if (!a) continue;
           const isBatchItem = a.__batch || (scanBatchMode && a.type === 'video');
           if (isBatchItem) {
-            if (!batchAssets.some(x => x.url === a.url)) batchAssets.push(Object.assign({}, a, { __batch: true }));
+            const ex = batchAssets.find(x => (a.awemeId && x.awemeId === a.awemeId) || x.url === a.url);
+            if (ex) applyBatchMeta(ex, a);
+            else if (!batchAssets.some(x => x.url === a.url)) batchAssets.push(Object.assign({}, a, { __batch: true }));
           } else {
             // 普通资产暂存（稍后与批量合并进 window.assets）
             if (!incoming_normal.some(x => x.url === a.url)) incoming_normal.push(a);
@@ -4838,25 +5821,102 @@ window.__hmdaoLazyCheck3pCookies = function lazyCheck3pCookies() {
         //   改为【增量合并】：保留已采集到的资产，只追加本次新增（按 url 去重），从不删除。
         //   切 tab / 换页的"残留清除"已由 onActivated / doRescan 的显式清空保证，此处不再重复丢弃。
         const existingNormal = (window.assets || []).filter(a => !(a && a.__batch));
+        // ★2026-09-04 修复（用户要求"单卡跟随源页当前视频整体替换"）：非批量模式下，侧栏只保留
+        //   【与源页当前视频同 awemeId】的那一张卡，上一集(different awemeId)直接丢弃 → 始终一张卡跟随源页，
+        //   标题/封面随源页当前视频刷新，绝不与源视频不一致。批量模式(合集)不受影响（保留全部集数卡）。
+        if (!batchCollectEnabled) {
+          let curAid = null;
+          for (const a of incoming_normal) { if (a && a.platform === 'douyin' && a.type === 'video' && a.awemeId) { curAid = String(a.awemeId); break; } }
+          if (!curAid && incoming_normal[0] && incoming_normal[0].awemeId) curAid = String(incoming_normal[0].awemeId);
+          if (curAid) {
+            for (let i = existingNormal.length - 1; i >= 0; i--) {
+              const x = existingNormal[i];
+              if (x && x.platform === 'douyin' && x.type === 'video' && x.awemeId && String(x.awemeId) !== curAid) existingNormal.splice(i, 1);
+            }
+          }
+        }
         // ★2026-08-30 修复（用户要求"判断有没有新素材，有新才刷新"）：
         //   先算出【真正的新增项】（url 不在已有集合中）。若【无新增】→ 直接 return，
         //   不更新 window.assets、不刷新扫描状态、不触发渲染 → 彻底消除"无变化也闪烁"。
         //   轮询（10s/12s）因此变成"增量感知"而非"无条件全量刷新"。
         const existingUrls = new Set(existingNormal.map(a => a && a.url).filter(Boolean));
-        const addedNormal = incoming_normal.filter(a => a && a.url && !existingUrls.has(a.url));
+        // ★2026-09-03 修复（标题 / 封面 / 集数不跟随源页刷新的真凶）：
+        //   增量合并此前只认「新 URL」，同 url 或 同 awemeId 的资产一律跳过 →
+        //   首次抓到某集时标题/封面/集数常还是空的，之后详情 API 补齐了元数据，
+        //   却因「不是新 URL」永远补不进去 → 侧栏标题/封面/集数不跟随源页切换刷新。
+        //   现分三种情况处理：
+        //     ① 同 awemeId 且同 url → 就地更新元数据（补全标题/封面/集数）；
+        //     ② 同 awemeId 但 url 变了（切集后捕获到新签名直链）→ 用新卡替换旧卡（旧直链已过期，留着就是"只有声音"废卡）；
+        //     ③ 同 url → 就地更新元数据。
+        const META_KEYS = ['cover', 'title', 'episodeNo', 'modalId', 'playerUrl', 'dashAudio', 'awemeId', 'dyFormats'];
+        const metaOf = (x) => { try { return JSON.stringify(x); } catch (_) { return String(x); } };
+        let metaChanged = false;
+        const applyMeta = (tgt, src) => {
+          for (const k of META_KEYS) {
+            const nv = src[k];
+            if (nv == null || nv === '') continue;
+            if (metaOf(tgt[k]) === metaOf(nv)) continue;
+            tgt[k] = nv;
+            metaChanged = true;
+          }
+          // notPlayed 是布尔，false 也要能写回（旧卡从"未播放"变"当前播放"）
+          if (src.notPlayed !== undefined && tgt.notPlayed !== src.notPlayed) { tgt.notPlayed = src.notPlayed; metaChanged = true; }
+        };
+        const addedNormal = [];
+        for (const a of incoming_normal) {
+          if (!a || !a.url) continue;
+          const isDy = (a.platform === 'douyin' && a.type === 'video' && !!a.awemeId);
+          let idx = isDy
+            ? existingNormal.findIndex(x => x && x.platform === 'douyin' && x.type === 'video' && String(x.awemeId) === String(a.awemeId))
+            : -1;
+          if (idx >= 0) {
+            if (existingNormal[idx].url === a.url) { applyMeta(existingNormal[idx], a); continue; }
+            // ★2026-09-04 修复（批量合集 57 卡侧栏闪烁/卡死真凶）：
+            //   抖音 play_addr 是带签名、会过期的直链，每次扫描都会换一个新 url。
+            //   旧逻辑 ② 把旧卡整张丢弃、再 push 新卡 → 触发 full re-render →
+            //   57 张卡每轮轮询全部重建、封面图重新加载 → 卡片"一会多一会少/封面闪烁"、侧栏卡死。
+            //   但 url 轮换对【视觉】无任何变化（同一集、同一封面/标题），无需重建 DOM。
+            //   现改为【原地更新 url 字段】：卡片 DOM 不变、封面不重载，仅底层直链悄然刷新。
+            //   除非封面/标题等真正视觉字段也变了，否则不触发 metaChanged → 不重渲染。
+            existingNormal[idx].url = a.url;
+            applyMeta(existingNormal[idx], a); // cover/title/episodeNo 等真变了才置 metaChanged
+            continue;
+          }
+          idx = existingNormal.findIndex(x => x && x.url === a.url);
+          if (idx >= 0) { applyMeta(existingNormal[idx], a); continue; } // ③
+          addedNormal.push(a);
+        }
         const addedBatch = batchAssets.filter(b => b && b.url && !existingUrls.has(b.url));
         if (addedNormal.length === 0 && addedBatch.length === 0) {
-          // 无新素材 → 静默跳过（不重建 DOM、不重载图片）
+          // 无新素材 → 若元数据有更新 或 「当前集」变化，仍刷新一次（让标题/封面/集数/高亮跟随源页）；
+          // 否则静默跳过（不重建 DOM、不重载图片），消除无变化也闪烁。
+          if (metaChanged || (prevCurAweme && prevCurAweme !== (msg.curAwemeId || ''))) {
+            try { renderNow(); } catch (_) {}
+          }
           return;
         }
         // 有新增 → 增量合并（保留已有 + 追加新增），从不删除
         const normalMerged = existingNormal.concat(addedNormal);
         const batchMerged = batchAssets.concat((window.assets || []).filter(a => a && a.__batch).filter(a => !batchAssets.some(b => b.url === a.url)));
         window.assets = batchCollectEnabled ? normalMerged.concat(batchMerged) : normalMerged;
+        // ★2026-09-11 诊断：合并后 window.assets 实际条数与类型构成。
+        try {
+          console.log('[HMDAO_DIAG][merge] 合并后 window.assets=' + (window.assets || []).length
+            + ' 明细=' + JSON.stringify((window.assets || []).map((a) => ({ t: a && a.type, hasUrl: !!(a && a.url), url0: ((a && a.url) || '').slice(0, 48), platform: a && a.platform }))));
+        } catch (_) {}
         // 合并展示列表（普通 + 批量），更新计数与渲染
         const combined = window.assets.slice();
         window.__hmdaoAssets = combined.slice();
-      } catch (_) {}
+        // ★2026-09-08：记录「当前展示资产所属页身份」，供下一次 SCAN_RESULT 判定换站清残留
+        //（不随标签切换漂移，只随资产走 —— 修复 imini 显示 runninghub 历史素材的根因）
+        try { window.__hmdaoDisplayedPageKey = hmdaoSourceIdentityKey(incomingUrl || window.__sourcePageUrl || ''); } catch (_) {}
+      } catch (e) { console.warn('[HMDAO][sidepanel] SCAN_RESULT 合并异常:', e, '\nassets示例=', JSON.stringify((msg.assets || []).slice(0, 3))); }
+      // ★2026-09-06 豆包朗读：把 WS 流式音频「实体化」为侧栏 blob URL。
+      //   根因：scanPage 的 push(url,type,source) 会重建资产对象、丢掉 wsAudio/wsTs/platform/title，
+      //   卡片退化成「伪 URL 的普通音频」→ 试听/下载全部走错通道（实测 source 被写成 'network'）。
+      //   改为在侧栏把字节取回、转成真实 blob: URL 写回 a.url —— 之后它就是一张普通音频卡，
+      //   悬停试听/下载/停止全部复用现有通用路径，不再有任何伪 URL 泄漏到后续逻辑。
+      try { hydrateDoubaoWsAudios(); } catch (_) {}
       // ★2026-08-23 修复（问题3 根因：刷新/重启侧栏后视频卡全丢）：
       //   旧逻辑只有 addXunleiFiles(1218) 写 lastScan，SCAN_RESULT 处理器从不持久化，
       //   导致普通扫描的视频资产重启即丢 → 用户报"刷新后 URL 全部丢失，扫描无法加载出视频"。
@@ -4867,12 +5927,34 @@ window.__hmdaoLazyCheck3pCookies = function lazyCheck3pCookies() {
           const allAssets = window.assets.slice();
           const persistedUrls = new Set();
           const persistList = [];
+          // ★2026-09-09：图片上限放宽到 200 条后，全量持久化体积骤增。
+          //   资产里可能挂着封面 dataURL / base64 预览（单条可达数 MB），整表入库会撑爆
+          //   storage.local 配额 → set 静默失败 → 刷新后一条都恢复不了。
+          //   这里只剔除「超长字符串字段」（>4096，实际只可能是 dataURL/b64），其余字段原样保留；
+          //   封面等可视化字段运行时照常存在，恢复后由卡片懒加载重新生成，功能不降级。
+          const slimAsset = (a) => {
+            const o = {};
+            for (const k of Object.keys(a)) {
+              const v = a[k];
+              o[k] = (typeof v === 'string' && v.length > 4096) ? '' : v;
+            }
+            return o;
+          };
+          const PERSIST_MAX = 500;
           for (const a of allAssets) {
             if (!a || !a.url || persistedUrls.has(a.url)) continue;
+            if (persistList.length >= PERSIST_MAX) break;
             persistedUrls.add(a.url);
-            persistList.push(a);
+            persistList.push(slimAsset(a));
           }
-          if (persistList.length) {
+          // ★2026-09-05 节流：此前「每次 SCAN_RESULT」都写 lastScan —— 上百条资产的 JSON 序列化
+          //   + storage 写入 + storage.onChanged 触发重渲染，是侧栏卡顿的一环。
+          //   改为：内容签名未变不写；即便变了也最多 3 秒一次（下一轮扫描会补上）。
+          const __sig = persistList.length + '|' + persistList.map((a) => a.awemeId || a.url || '').join('|').length;
+          const __now = Date.now();
+          if (persistList.length && __sig !== window.__hmdaoLastScanSig && __now - (window.__hmdaoLastScanTs || 0) > 3000) {
+            window.__hmdaoLastScanSig = __sig;
+            window.__hmdaoLastScanTs = __now;
             chrome.storage.local.get('lastScan', (s) => {
               const ls = (s && s.lastScan) || {};
               if (currentSourceUrl) ls.url = currentSourceUrl;
@@ -4975,7 +6057,51 @@ window.__hmdaoLazyCheck3pCookies = function lazyCheck3pCookies() {
       }
     } catch (e) { page = { error: String(e && e.message || e) }; }
 
-    const report = { sidepanel, lastScan: lastScan ? { count: (lastScan.assets || []).length, url: lastScan.url || '', ts: lastScan.ts } : null, page };
+    // ===== 2026-09-02 扩展：抖音下载链路专项自检（playApi 连通性 + dNR 规则）=====
+    //   目的：用户无需手动拼接/复制 playApi，执行 __hmdaoRunFullDiag() 即可自动完成探测。
+    let dy = null;
+    try {
+      const [tab2] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab2 && tab2.id != null && /douyin\.com/i.test(tab2.url || '')) {
+        const [r2] = await chrome.scripting.executeScript({
+          target: { tabId: tab2.id }, world: 'MAIN',
+          func: async () => {
+            try {
+              if (typeof window.__hmdaoScanDyRenderData === 'function') window.__hmdaoScanDyRenderData();
+              const c = window.__hmdao_captures || {};
+              const aid = c.curAwemeId || (new URL(location.href).searchParams.get('modal_id')) || '';
+              const f = (c.dyFormatsByAweme || {})[aid] || [];
+              const mixed = f.find((x) => /含音画/.test(x.label || '')) || f.find((x) => x.is_default);
+              const out = { aid, formatCount: f.length, hasMixed: !!mixed, labels: f.slice(0, 6).map((x) => x.label) };
+              if (mixed && mixed.url) {
+                out.playApiHead = String(mixed.url).slice(0, 80);
+                try {
+                  const resp = await fetch(mixed.url, { credentials: 'include' });
+                  const b = await resp.blob();
+                  out.probe = { status: resp.status, size: b.size, type: b.type, isVideo: /video|mp4|octet/i.test(b.type) };
+                } catch (e) { out.probe = { err: String((e && e.message) || e) }; }
+              }
+              return out;
+            } catch (e) { return { err: String((e && e.message) || e) }; }
+          },
+        });
+        dy = (r2 && r2.result) || null;
+      }
+    } catch (e) { dy = { err: String((e && e.message) || e) }; }
+
+    let dnr = null;
+    try {
+      const rules = await chrome.declarativeNetRequest.getSessionRules();
+      dnr = {
+        sessionRules: rules.length,
+        douyinvodRules: rules.filter((r) => {
+          const d = (r.condition && r.condition.domains) || (r.condition && r.condition.requestDomains) || [];
+          return d.some((x) => x && x.includes('douyinvod'));
+        }).length,
+      };
+    } catch (e) { dnr = { err: String((e && e.message) || e) }; }
+
+    const report = { sidepanel, lastScan: lastScan ? { count: (lastScan.assets || []).length, url: lastScan.url || '', ts: lastScan.ts } : null, page, dy, dnr };
     console.log('%c[HMDAO 全量诊断]', 'color:#1ea7fd;font-weight:bold', report);
     // 逐项结论
     const L = (ok, name, good, bad) => console.log((ok ? '%c[✓] ' : '%c[✗] ') + name + (ok ? good : bad), ok ? 'color:#52c41a' : 'color:#ff4d4f');
@@ -4995,9 +6121,128 @@ window.__hmdaoLazyCheck3pCookies = function lazyCheck3pCookies() {
     } else if (page && page.error) {
       console.warn('%c[⚠] 源页读取失败：' + page.error, 'color:#ffb020');
     }
+    // 抖音下载链路结论（2026-09-02）
+    if (dy && !dy.err) {
+      console.log('%c[抖音·playApi 探测]', 'color:#722ed1', dy);
+      L(!!(dy.probe && dy.probe.isVideo), '抖音·playApi 连通性',
+        '有效 status=' + (dy.probe && dy.probe.status) + ' size=' + (dy.probe && dy.probe.size) + ' type=' + (dy.probe && dy.probe.type),
+        '失效 → ' + JSON.stringify(dy.probe || {}) + '（playApi 过期或被 CDN 拒）');
+    } else if (dy && dy.err) {
+      console.warn('%c[⚠] playApi 探测异常：' + dy.err, 'color:#ffb020');
+    }
+    if (dnr && !dnr.err) {
+      L(dnr.douyinvodRules > 0, '抖音·dNR session 规则',
+        'douyinvod 规则=' + dnr.douyinvodRules + '（session 池共 ' + dnr.sessionRules + ' 条）',
+        'session 池中无 douyinvod 规则（注意：须用 getSessionRules，不是 getDynamicRules）');
+    }
     return report;
   };
+  // ★2026-09-02 一键自动化测试：抖音下载全链路。自动跑完
+  //   「定位源页 → 取 playApi → 依次尝试 4 种下载方式 → 回查 chrome.downloads 任务最终状态」，
+  //   每步输出成败与原因，一次执行即可定位断裂层。用法：侧栏 Console 运行 __hmdaoTestDyDownload()
+  window.__hmdaoTestDyDownload = async function () {
+    const log = [];
+    const T = (name, r) => { const item = { step: name, ...(r || {}) }; log.push(item); console.log('[DY-TEST] ' + name, r); };
+    try {
+      // 1) 定位抖音源页
+      const tabs = await chrome.tabs.query({});
+      const dyTab = (tabs || []).find((t) => /douyin\.com/i.test(t.url || ''));
+      T('1.定位源页', { ok: !!dyTab, url: dyTab ? String(dyTab.url).slice(0, 70) : '(未找到)' });
+      if (!dyTab) return log;
+
+      // 2) 取 playApi（先触发 SSR 补扫，保证索引最新）
+      const [r0] = await chrome.scripting.executeScript({
+        target: { tabId: dyTab.id }, world: 'MAIN',
+        func: () => {
+          try {
+            if (typeof window.__hmdaoScanDyRenderData === 'function') window.__hmdaoScanDyRenderData();
+            const c = window.__hmdao_captures || {};
+            const aid = c.curAwemeId || (new URL(location.href).searchParams.get('modal_id')) || '';
+            const f = (c.dyFormatsByAweme || {})[aid] || [];
+            const mixed = f.find((x) => /含音画/.test(x.label || '')) || f.find((x) => x.is_default);
+            return { ok: !!mixed, aid, formatCount: f.length, playApi: mixed ? String(mixed.url) : '' };
+          } catch (e) { return { ok: false, err: String((e && e.message) || e) }; }
+        },
+      });
+      const s0 = (r0 && r0.result) || {};
+      T('2.取 playApi', { ok: s0.ok, aid: s0.aid, formatCount: s0.formatCount, head: String(s0.playApi || '').slice(0, 70) });
+      if (!s0.playApi) return log;
+      const playApi = s0.playApi;
+
+      // 3A) 源页 fetch（预期：若 302 到跨域 CDN 则 CORS 失败）
+      const [rA] = await chrome.scripting.executeScript({
+        target: { tabId: dyTab.id }, world: 'MAIN',
+        func: async (u) => {
+          try {
+            const r = await fetch(u, { credentials: 'include' });
+            const b = await r.blob();
+            return { ok: true, status: r.status, size: b.size, type: b.type };
+          } catch (e) { return { ok: false, err: String((e && e.message) || e) }; }
+        },
+        args: [playApi],
+      });
+      T('3A.源页 fetch', (rA && rA.result) || {});
+
+      // 3B) fetch(redirect:manual)：确认是否 302，以及重定向到哪个域
+      const [rB] = await chrome.scripting.executeScript({
+        target: { tabId: dyTab.id }, world: 'MAIN',
+        func: async (u) => {
+          try {
+            const r = await fetch(u, { redirect: 'manual', credentials: 'include' });
+            return { ok: true, status: r.status, type: r.type, location: r.headers ? r.headers.get('location') : null };
+          } catch (e) { return { ok: false, err: String((e && e.message) || e) }; }
+        },
+        args: [playApi],
+      });
+      const sB = (rB && rB.result) || {};
+      if (sB.location) { try { sB.locationHost = new URL(sB.location).hostname; } catch (_) {} sB.location = String(sB.location).slice(0, 70); }
+      T('3B.fetch(redirect:manual)', sB);
+
+      // 3C) 同源 <a download>（当前采用的方案）
+      const [rC] = await chrome.scripting.executeScript({
+        target: { tabId: dyTab.id }, world: 'MAIN',
+        func: (u) => {
+          try {
+            const a = document.createElement('a');
+            a.href = u; a.download = 'hmdao_test_C.mp4'; a.rel = 'noopener';
+            document.body.appendChild(a); a.click();
+            setTimeout(() => { try { a.remove(); } catch (_) {} }, 3000);
+            return { ok: true, method: 'anchor-download', host: new URL(u).hostname };
+          } catch (e) { return { ok: false, err: String((e && e.message) || e) }; }
+        },
+        args: [playApi],
+      });
+      T('3C.同源 <a download>', (rC && rC.result) || {});
+
+      // 3D) chrome.downloads 直连（预期 403 / SERVER_FORBIDDEN，用于对照）
+      const d = await new Promise((resolve) => {
+        try {
+          chrome.downloads.download({ url: playApi, filename: 'Ddayup/videos/hmdao_test_D.mp4', saveAs: false }, (id) => {
+            if (chrome.runtime.lastError) resolve({ ok: false, err: chrome.runtime.lastError.message });
+            else resolve({ ok: true, id });
+          });
+        } catch (e) { resolve({ ok: false, err: String((e && e.message) || e) }); }
+      });
+      T('3D.chrome.downloads 直连', d);
+      if (d && d.id != null) {
+        await new Promise((r) => setTimeout(r, 3500));
+        const st = await new Promise((resolve) => {
+          try { chrome.downloads.search({ id: d.id }, (items) => resolve(items && items[0])); }
+          catch (_) { resolve(null); }
+        });
+        T('3D-2.任务最终状态', st ? {
+          state: st.state, bytesReceived: st.bytesReceived, totalBytes: st.totalBytes,
+          error: st.error, finalUrl: String(st.finalUrl || '').slice(0, 70),
+        } : {});
+      }
+    } catch (e) {
+      T('FATAL', { err: String((e && e.message) || e) });
+    }
+    console.log('%c[DY-TEST 汇总]', 'color:#1ea7fd;font-weight:bold', log);
+    return log;
+  };
   console.log('%c[HMDAO] 真机诊断已就绪：侧栏 Console 运行 __hmdaoRunFullDiag() （或 __hmdaoRunFullDiag({rescan:true}) 先扫描）', 'color:#1ea7fd');
+  console.log('%c[HMDAO] 抖音下载链路自动测试：侧栏 Console 运行 __hmdaoTestDyDownload()', 'color:#1ea7fd');
 
   // 「全屏」：聊天框覆盖整个侧栏显示（再次点击还原）
   const fullBtn = document.getElementById('aiBotFull');
@@ -5080,6 +6325,32 @@ window.__hmdaoLazyCheck3pCookies = function lazyCheck3pCookies() {
   //   修复：先调 loadPagePreview 刷新顶部当前页（与实际 tab 同步），再 doRescan 重扫。
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === 'HMDAO_RESCAN_TAB') {
+      // ★2026-09-05 修复（抖音卡顿根因，见 background.js notifySidepanelRescan 注释）：
+      //   auto 事件（切 tab / 抖音 SPA pushState）此前走 doRescan —— 它会【清空全部卡片 +
+      //   唤醒后端 + runDiagnose 页面诊断注入 + 深度重扫 + 重建上百张卡】，抖音上每 1.5s 来一次，
+      //   侧栏被彻底占死。改为轻量同步：只刷新顶部当前页 + 发一次【轻量】扫描请求（不清空、
+      //   不诊断、不深解析），素材卡片由 SCAN_RESULT 增量合并。
+      //   用户手动点「↻ 重新扫描」仍走 doRescan 全量路径。
+      if (msg && msg.auto) {
+        // ★2026-09-07 修复（"切源页/前进后退残留旧记录"根因）：
+        //   旧 auto 路径只发轻量扫描、从不清空 window.assets → SCAN_RESULT 增量合并把上一页素材滞留，
+        //   不同链接记录混在一起。改为：若本次导航到的页面「文档身份」(origin+pathname) 与当前展示页不同
+        //   （真正换页 / 前进后退到不同文档 / 切到别的标签页），先清空旧资产再扫描；仅同文档 SPA 切集
+        //   (如抖音 ?modal_id 变化) 才走纯增量合并，避免抖音卡顿回归。
+        const newUrl = (msg.url || '').toString();
+        const oldUrl = (window.__sourcePageUrl || '').toString();
+        const docChanged = !!(newUrl && oldUrl && pageDocKey(newUrl) !== pageDocKey(oldUrl));
+        if (docChanged) {
+          clearAssetsForNewPage();
+          try { if (typeof currentSourceUrl !== 'undefined') currentSourceUrl = newUrl; } catch (_) {}
+        }
+        setTimeout(() => {
+          try { loadPagePreview(); } catch (_) {} // 同步顶部当前页（更新 window.__sourcePageUrl）
+          try { updateScanStatus(window.__hmdaoAssets || [], 'scanning'); } catch (_) {}
+          chrome.runtime.sendMessage({ type: 'HMDAO_SCAN_REQUEST', batchMode: batchCollectEnabled, deep: false, force: true }).catch(() => {});
+        }, 0);
+        return;
+      }
       setTimeout(() => {
         try { loadPagePreview(); } catch (_) {}
         try { doRescan(); } catch (_) {}

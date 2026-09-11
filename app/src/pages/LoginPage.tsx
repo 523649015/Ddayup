@@ -6,6 +6,7 @@ import { Eye, EyeOff, LogIn, Loader2 } from 'lucide-react';
 import { usePublicUILanguage } from '@/i18n/publicUi';
 import { emailLoginSchema, type EmailLoginInput } from '@/schemas/authSchemas';
 import { signInWithEmail } from '@/services/authService';
+import { useAuthStore } from '@/store/useAuthStore';
 import { ComplianceNotice } from '@/components/ComplianceNotice';
 import { ElfLogo } from '@/components/ElfLogo';
 import { Button } from '@/components/ui/button';
@@ -16,6 +17,18 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 export default function LoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
+  // ★2026-08-22 修复（侧栏本地记忆）：已登录用户访问 /login 自动跳到 from/首页，
+  //   避免刷新或被引导到 /login 时误以为"需要重新登录"。
+  //   等 useAuthStore.persist 完成水化(hasHydrated)后判断 session 是否有效。
+  const hasHydrated = useAuthStore((s) => s.hasHydrated);
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+  useEffect(() => {
+    if (!hasHydrated) return;
+    if (isAuthenticated()) {
+      const from = (location.state as { from?: string } | null)?.from || '/?skipLaunch=1';
+      navigate(from, { replace: true });
+    }
+  }, [hasHydrated, isAuthenticated, location.state, navigate]);
   const [searchParams] = useSearchParams();
   const { language, setLanguage, t } = usePublicUILanguage();
   const [showPassword, setShowPassword] = useState(false);
@@ -33,18 +46,13 @@ export default function LoginPage() {
     return '';
   }, [searchParams, t]);
 
-  // 从注册页跳转而来（邮箱已注册）时预填邮箱并提示直接登录
+  // 预填邮箱：仅从注册页跳转（邮箱已注册）带 email 时填入，但不显示「已注册」提示。
+  // ★2026-08-21 修复：蓝色「该邮箱已注册」提示严格只出现在注册页（注册 409 时），
+  //   登录页只显示登录相关错误（如密码错误），避免两条提示同时出现。
   const presetEmail = useMemo(() => {
-    const state = location.state as { email?: string; reason?: string } | null;
-    return state?.reason === 'already_registered' ? (state.email || '') : '';
+    const state = location.state as { email?: string } | null;
+    return state?.email || '';
   }, [location.state]);
-
-  const alreadyRegisteredHint = useMemo(() => {
-    const state = location.state as { reason?: string } | null;
-    return state?.reason === 'already_registered'
-      ? t('该邮箱已注册，请直接登录。', 'This email is already registered. Please sign in directly.')
-      : '';
-  }, [location.state, t]);
 
   const {
     register,
@@ -128,12 +136,6 @@ export default function LoginPage() {
               {successMessage ? (
                 <div className='rounded-md border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-300'>
                   {successMessage}
-                </div>
-              ) : null}
-
-              {alreadyRegisteredHint ? (
-                <div className='rounded-md border border-blue-500/30 bg-blue-500/10 px-4 py-3 text-sm text-blue-300'>
-                  {alreadyRegisteredHint}
                 </div>
               ) : null}
 

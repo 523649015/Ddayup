@@ -12,6 +12,19 @@ dist
 dist-ssr
 *.local
 
+# 环境变量 / 支付凭证（含私钥，严禁提交）
+.env
+.env.local
+.env.*.local
+.env.alipay
+alipay-sandbox/*.pem
+alipay-sandbox/server.log
+sandbox.log
+preview.log
+alipay-sandbox/server.log
+sandbox.log
+preview.log
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

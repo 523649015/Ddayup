@@ -1,0 +1,12 @@
+[eval]:1
+const fs=require('fs');const f='f:/Work/HMDAODAO/app/dist/assets/index-T_7PnG1W.js';const c=fs.readFileSync(f,'utf8');const i=c.indexOf('preferredTypes.includes');console.log('includes found at',i);if(i,i+120));
+                                                                                                                                                                                                                 ^
+Expression expected
+
+SyntaxError: Unexpected token ')'
+    at makeContextifyScript (node:internal/vm:194:14)
+    at compileScript (node:internal/process/execution:388:10)
+    at evalTypeScript (node:internal/process/execution:260:22)
+    at node:internal/main/eval_string:71:3
+
+Node.js v24.15.0

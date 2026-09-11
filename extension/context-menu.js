@@ -36,7 +36,15 @@ document.querySelectorAll('#ctxMenu button[data-action]').forEach((btn) => {
     switch (action) {
       case 'preview': openPreview(ctxAssetIdx); break;
       case 'play': if (a.type === 'audio') playAudioInPage(a, { visual: true }); break;
-      case 'download': downloadSingle(a); break;
+      case 'download':
+        // ★2026-08-31 修正（上轮强制走 downloadVideoViaBackground 是错的）：
+        //   HMDAO_FETCH_MEDIA 对 bilivideo CDN 不成熟（SW fetch 必 403 + pickDouyinLikeTab 找不到 B站 tab 兜底），
+        //   导致 B站右键 fetch 失败 → 卡永远 pending。
+        //   而 downloadSingle 内部已对 B站 video 走成熟链路（line 244-256 + 716-721：WBI refresh 拿 durl → dlViaChrome 100% 成功），
+        //   对抖音/视频号走 downloadVideoViaBackground、对 yt-dlp 平台走后端合并。
+        //   因此右键统一走 downloadSingle，让它按平台智能选路（不强制覆盖）。
+        downloadSingle(a);
+        break;
       case 'save': saveSingleToLocal(a); break;
         case 'copy':
           navigator.clipboard.writeText(a.url).then(() => setStatus('已复制链接')).catch(() => setStatus('复制失败', true));

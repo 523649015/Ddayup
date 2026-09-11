@@ -10,6 +10,9 @@
 // deriveFilename / fileName / errStr / dbg / cacheDragBlob / downloadBlobUrl / typeDirs。
 // 故在 sidepanel.js 之后加载（共享全局作用域，无 TDZ 风险）。
 let hoverAudioInPage = false;
+// 播放会话令牌：每次进入 playAudioViaBlob 自增，用于区分「被后续暂停合法打断」
+// 与「本次会话真正失败」，避免悬停快速进出时的 AbortError 误报为播放故障。
+let playToken = 0;
 
 // ===== 自动播放解锁 =====
 // 浏览器自动播放策略要求 play() 必须在「用户手势」内调用；而悬停(onmouseenter)不是手势，
@@ -32,6 +35,22 @@ function unlockAudioOnGesture() {
 }
 document.addEventListener('pointerdown', unlockAudioOnGesture);
 
+// ★P2（2026-08-01）：悬停补全捕获后，把新鲜直链回写到主资产库，避免下次悬停再次回退触发。
+function maybeUpdateAssetUrl(a, url) {
+  try {
+    const list = (typeof window !== 'undefined' && window.assets) || [];
+    const key = (x) => x && (x.url || x.href || '');
+    let target = null;
+    if (a && a.name) target = list.find((x) => x && x.name === a.name && x.type === 'audio');
+    if (!target && a) {
+      const ap = (() => { try { return new URL(key(a)).pathname; } catch (_) { return ''; } })();
+      if (ap) target = list.find((x) => x && (() => { try { return new URL(key(x)).pathname; } catch (_) { return ''; } })() === ap);
+    }
+    if (!target && a) target = a;
+    if (target && url) { target.url = url; target.fresh = true; }
+  } catch (_) {}
+}
+
 // 以【源页身份】fetch 音频字节（带 Cookie + Referer），返回 { ok, b64, mime, size }。
 // overrideUrl 用于「直链过期后回源页取到的新鲜直链」重试。
 async function fetchAudioBytesInPage(a, overrideUrl) {
@@ -45,6 +64,22 @@ async function fetchAudioBytesInPage(a, overrideUrl) {
     });
     console.log('[HMDAO][audio] fetch 字节结果 ' + dbg({ url, referer, res: res && { ok: res.ok, status: res.status, mime: res.mime, size: res.size, error: res.error } }));
     if (res && res.ok && res.b64) return res;
+    // ★抖音等需会话 Cookie 的防盗链流（sf*-cdn-tos.douyinstatic.com / ies-music/*.mp3）：
+    // SW fetch(include 仍被 Privacy Sandbox 拦截) 与 ISOLATED world fetch 都拿不到，
+    // 必须改用【源页 MAIN 世界 credentials:include】拉（继承 ttwid/SESSDATA）。
+    // 复用 HMDAO_FETCH_MEDIA_IN_TAB + fetchMediaInTabWithCookie（与视频预览同源兜底）。
+    const isDouyin = /douyin|bytedance|tiktok|douyinvod|iesdouyin/i.test(url || '');
+    if (isDouyin) {
+      const tabId = (typeof window.__hmdao_sourceTabId === 'number') ? window.__hmdao_sourceTabId : null;
+      if (tabId != null) {
+        console.log('[HMDAO][audio] 抖音音频回落 MAIN 世界带 Cookie 拉取 ' + dbg({ url, tabId }));
+        const t = await chrome.runtime.sendMessage({
+          type: 'HMDAO_FETCH_MEDIA_IN_TAB', tabId, url, referer: referer || '', usePageCookie: true,
+        });
+        if (t && t.ok && t.b64) return { ok: true, mime: t.mime || 'audio/mpeg', b64: t.b64, size: t.size };
+        console.warn('[HMDAO][audio] MAIN 世界拉取也失败 ' + dbg({ url, err: t && (t.error || t.status) }));
+      }
+    }
     return { ok: false, status: res && res.status, error: (res && (res.error || res.status)) || 'unknown', _res: res };
   } catch (e) {
     console.error('[HMDAO][audio] fetch 字节异常', e);
@@ -100,7 +135,9 @@ async function playAudioViaBlob(a, { visual = false, url: overrideUrl } = {}) {
     // MIME 补正：非 audio/* 会让 <audio> 直接拒绝 blob
     if (!/^audio\//.test(mime)) {
       const ext = ((a.url || '').split('?')[0].match(/\.([a-z0-9]+)$/i) || [])[1] || '';
-      const map = { mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', oga: 'audio/ogg', m4a: 'audio/mp4', aac: 'audio/aac', flac: 'audio/flac', opus: 'audio/ogg', weba: 'audio/webm' };
+      // ★mp4：豆包技能音乐是 .mp4 容器装 AAC 音频（由 <audio> 播放），必须映射成 audio/mp4，
+      //   否则 blob MIME 是 video/mp4 / audio/mpeg → <audio> 解码失败（NotSupportedError）。
+      const map = { mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', oga: 'audio/ogg', m4a: 'audio/mp4', aac: 'audio/aac', flac: 'audio/flac', opus: 'audio/ogg', weba: 'audio/webm', mp4: 'audio/mp4' };
       mime = map[ext.toLowerCase()] || (isAudioMagic ? 'audio/mpeg' : mime || 'audio/mpeg');
     }
     const blob = new Blob([bytes], { type: mime });
@@ -110,15 +147,25 @@ async function playAudioViaBlob(a, { visual = false, url: overrideUrl } = {}) {
     const au = document.getElementById('previewAudio');
     if (!au) return false;
     if (visual) au.style.display = '';
+    // ★播放会话令牌：悬停快速进出/切换时，上一个 play() 仍是挂起的异步 Promise，
+    // 新会话会先 pause() 再 play()，从而打断前一个 play() → 抛 AbortError。
+    // 用令牌区分「被合法打断」（忽略）与「本次会话真正失败」（报错），避免误报。
+    const myToken = ++playToken;
     au.pause();
     au.src = url;
     au.load();
     try {
       await au.play();
+      if (myToken !== playToken) return true; // 已被新会话合法接管/中断，静默退出
       hoverAudioInPage = true;
       setStatus('🎵 正在播放：' + fileName(a.url));
       return true;
     } catch (e) {
+      // AbortError = 「play() 被随后的 pause() 打断」，属正常竞态，非故障，忽略。
+      if (e && e.name === 'AbortError') {
+        console.log('[HMDAO][audio] play() 被后续暂停合法打断(AbortError)，忽略');
+        return true;
+      }
       const isNotAllowed = (e && (e.name === 'NotAllowedError' || /notallowed|user didn't interact|gesture/i.test(e.message || '')));
       console.error('[HMDAO][audio] au.play() 失败(带手势尝试) ' + dbg({ name: e && e.name, msg: e && e.message, blobType: blob.type, blobSize: blob.size }));
       // 兜底：浏览器允许【静音】自动播放（无需用户手势）。先静音起播，再尝试取消静音。
@@ -126,13 +173,18 @@ async function playAudioViaBlob(a, { visual = false, url: overrideUrl } = {}) {
       try {
         au.muted = true;
         await au.play();
+        if (myToken !== playToken) { try { au.muted = false; } catch (_) {} return true; } // 被接管
         try { au.muted = false; } catch (_) {}
         hoverAudioInPage = true;
         setStatus('🎵 正在播放：' + fileName(a.url));
         return true;
       } catch (e2) {
+        if (e2 && e2.name === 'AbortError') {
+          console.log('[HMDAO][audio] 静音兜底 play() 被合法打断(AbortError)，忽略');
+          return true;
+        }
         au.muted = false;
-        console.error('[HMDAO][audio] 静音兜底播放也失败 ' + dbg({ name: e2 && e2.name, msg: e2 && e2.message }));
+        console.error('[HMDAO][audio] 静音兜底播放也失败 ' + dbg({ name: e2 && e2.name, msg: e2 && e.message }));
         a.__lastErr = isNotAllowed ? '浏览器自动播放策略拒绝（缺少用户手势）' : ('au.play 失败：' + errStr(e));
         setStatus(isNotAllowed
           ? '⚠ 浏览器拦截了自动播放（无手势）。先点一下卡片/本面板任意位置即可解锁试听'
@@ -196,7 +248,7 @@ async function downloadViaBrowser(a) {
     }
   } catch (_) {}
   setStatus('正在下载：' + fileName(a.url));
-  chrome.downloads.download({
+  dlViaChrome({
     url: a.url,
     filename: 'Ddayup/' + (typeDirs[a.type] || 'other') + '/' + deriveFilename(a),
     saveAs: false,
@@ -253,6 +305,13 @@ async function playAudioWithRealUrl(a) {
     const codeMap = { 1: '已中止', 2: '网络错误', 3: '解码错误', 4: '格式/源不受支持' };
     mediaErrText = me ? ('媒体错误 code=' + me.code + '(' + (codeMap[me.code] || '未知') + ') ' + (me.message || '')) : '媒体加载错误';
     a.__lastErr = '直链 <audio> 加载失败：' + mediaErrText;
+    // ★2026-08-31 修复（open.maic.chat 等代理站点）：proxy-media 返回非音频 → code=4 格式不受支持。
+    //   此时重试（resolveFreshAudioUrl / playAudioViaBlob）必然再次失败且刷屏。标记 __fmtUnsupported，
+    //   明确提示"在源页播放"，catch 分支据此跳过重试。
+    if (me && me.code === 4) {
+      a.__fmtUnsupported = true;
+      setStatus('⚠ 该音频直链格式无法在侧栏播放（站点代理可能返回非音频），请在源页播放', true);
+    }
     console.warn('[HMDAO][audio] 直链加载失败 ' + dbg({ url: a.url, referer, code: me && me.code, message: me && me.message }));
   };
   au.addEventListener('error', onErr, { once: true });
@@ -272,6 +331,12 @@ async function playAudioWithRealUrl(a) {
     setStatus('🎵 正在播放：' + fileName(a.url));
     return true;
   } catch (e) {
+    // ★2026-08-31：格式不受支持（code=4，如站点代理返回非音频）→ 不进回源重试（必败且刷屏），直接返回。
+    //   兼容 AbortError 先于 error 事件触发的乱序：直接判 au.error.code 兜底。
+    if (a.__fmtUnsupported || (au.error && au.error.code === 4)) {
+      console.warn('[HMDAO][audio] 直链格式不受支持，已提示在源页播放，跳过重试');
+      return false;
+    }
     const reason = loadFailed ? mediaErrText : errStr(e);
     console.warn('[HMDAO][audio] 直链播放被拒 ' + dbg({ url: a.url, referer, reason }));
     // 回源页取新鲜直链（签名过期场景）后用最稳的「源页 fetch→blob」路径重试一次
@@ -286,6 +351,98 @@ async function playAudioWithRealUrl(a) {
   }
 }
 
+// ★豆包朗读（WS 流式 ogg_opus）试听：资产无 HTTP 直链（伪 URL doubao-ws-audio://ts），
+//   先从源页取回 doubao-audio-capture.js 旁路收集到的原始字节，再走与爱给相同的 blob 播放路径。
+// 在【源页内】播放豆包朗读（字节不出页面）：不受回传大小限制，悬停与点击都能用。
+// silent=true 时失败完全静默（悬停场景不刷红字，违反不报错边界的提示一律不打）。
+async function playDoubaoWsAudioInPage(a, { silent = false } = {}) {
+  let res = null;
+  try {
+    res = await chrome.runtime.sendMessage({ type: 'HMDAO_PLAY_DOUBAO_WS_AUDIO', ts: Number(a.wsTs) || 0 });
+  } catch (_) { res = null; }
+  if (!res || !res.ok) {
+    if (silent) {
+      try { console.log('[HMDAO][doubao] 悬停试听静默跳过：' + ((res && res.error) || 'unknown')); } catch (_) {}
+    } else {
+      setStatus('⚠ 未取到朗读音频（请先在源页点一次「朗读」并播放完）', true);
+    }
+    return false;
+  }
+  window.__hmdaoPlayingDoubaoWs = true;
+  if (!silent) setStatus('🎵 正在播放：' + (a.title || '豆包朗读'));
+  return true;
+}
+
+async function playDoubaoWsAudio(a, { visual = false, silent = false } = {}) {
+  if (!silent) setStatus('正在从源页取回朗读音频…');
+  let res = null;
+  try {
+    res = await chrome.runtime.sendMessage({ type: 'HMDAO_GET_DOUBAO_WS_AUDIO', ts: Number(a.wsTs) || 0 });
+  } catch (_) { res = null; }
+  // no-result 多为瞬时注入失败（SW 忙/页面正重渲染），重试一次即可，不给用户假失败
+  if (!res || (!res.ok && res.error === 'no-result')) {
+    await new Promise((r) => setTimeout(r, 400));
+    try {
+      res = await chrome.runtime.sendMessage({ type: 'HMDAO_GET_DOUBAO_WS_AUDIO', ts: Number(a.wsTs) || 0 });
+    } catch (_) { res = null; }
+  }
+  if (!res || !res.ok || !res.b64) {
+    // 回退：在源页内直接播放（字节不出页面，不受回传限制）
+    return playDoubaoWsAudioInPage(a, { silent });
+  }
+  try {
+    const bytes = b64ToBytes(res.b64);
+    const mime = (res.mime && /^audio\//.test(res.mime)) ? res.mime : 'audio/ogg';
+    const blob = new Blob([bytes], { type: mime });
+    const url = URL.createObjectURL(blob);
+    cacheDragBlob(a, blob, mime); // 缓存真实字节 → 可复制/拖到桌面
+    const au = document.getElementById('previewAudio');
+    if (!au) return false;
+    if (visual) au.style.display = '';
+    const myToken = ++playToken;
+    au.pause();
+    au.src = url;
+    au.load();
+    try {
+      await au.play();
+      if (myToken !== playToken) return true; // 被新会话合法接管
+      hoverAudioInPage = true;
+      setStatus('🎵 正在播放：' + (a.title || fileName(a.url)));
+      return true;
+    } catch (e) {
+      if (e && e.name === 'AbortError') return true; // play() 被后续 pause() 合法打断
+      setStatus('⚠ 播放失败：' + errStr(e), true);
+      return false;
+    }
+  } catch (e) {
+    setStatus('⚠ 播放失败：' + errStr(e), true);
+    return false;
+  }
+}
+
+// 播放侧栏内已存在的音频 blob（豆包朗读实体化后的 URL）。
+// 复用侧栏 <audio id="previewAudio">：移开/关闭时 pause 它即可立即静音，不会有残留音。
+async function playPanelBlobAudio(a, visual = false) {
+  try {
+    const au = document.getElementById('previewAudio');
+    if (!au || !a || !a.url) return false;
+    if (visual) au.style.display = '';
+    const myToken = ++playToken;
+    au.pause();
+    au.src = a.url;
+    au.load();
+    try {
+      await au.play();
+    } catch (e) {
+      if (e && e.name === 'AbortError') return true;
+      try { console.log('[HMDAO][doubao] blob 播放失败 ' + ((e && e.name) || '')); } catch (_) {}
+      return false;
+    }
+    if (myToken !== playToken) return true; // 已被新会话合法接管
+    return true;
+  } catch (_) { return false; }
+}
+
 async function playAudioInPage(a, { visual = false, useHover = false } = {}) {
   console.log('[HMDAO][audio] playAudioInPage 开始 ' + dbg({
     url: a.url, type: a.type, audioIdx: a.audioIdx, source: a.source,
@@ -293,6 +450,14 @@ async function playAudioInPage(a, { visual = false, useHover = false } = {}) {
     referer: pageReferer(a),
     sourcePageUrl: window.__sourcePageUrl || '(空)',
   }));
+  // ★防御：仍未实体化的伪 URL（实体化失败的残留）→ 静默返回。
+  //   不进后续任何播放路径，避免刷「全部路径失败」错误日志（用户明确要求不产生错误噪音）。
+  if (a && /^doubao-ws-audio:/i.test(String(a.url || ''))) return false;
+  // ★侧栏内已实体化的音频（豆包朗读 blob:）：直接用侧栏 <audio> 播放。
+  //   鼠标移开/关卡片 → stopHoverAudio 直接 pause 这个元素 → 立即静音、零残留。
+  if (a && a.type === 'audio' && /^blob:/i.test(String(a.url || ''))) return playPanelBlobAudio(a, visual);
+  // ★豆包朗读（WS 流式 ogg_opus）：伪 URL 不可 fetch，走「取回字节 → blob 播放」专用路径
+  if (a.wsAudio) return playDoubaoWsAudio(a, { visual });
   // 主路径（最稳）：在【源页 MAIN world】以 fetch + referrerPolicy 自动带 Referer 拉字节 → blob 播放。
   // 爱给 CDN 强制校验 Referer，且 dNR 无法可靠注入 referer（白名单不含 referer），
   // 只有「源页上下文里的 fetch 用 unsafe-url referrerPolicy」能让浏览器自动带上正确 Referer。
@@ -326,8 +491,29 @@ async function playAudioInPage(a, { visual = false, useHover = false } = {}) {
       console.log('[HMDAO][audio] 悬停试听被自动播放策略拦截（无手势），静默跳过，待用户点击解锁');
       return false;
     }
-    // 兜底：直链 <audio src> 直接播（部分站点 dNR referer 生效或无需 referer 时可用）
-    if (await playAudioWithRealUrl(a)) return;
+    // ★爱给等「签名 CDN 音频」(s8.aigei.com / alicdn / OSS) 绝不走裸 <audio src> 兜底：
+    // 这类直链带 e=时间戳+token 签名，且 CDN 校验【源站登录 Cookie + Referer】。
+    // 侧栏裸 <audio> 加载既无登录 Cookie、Referer 也常被 CSP 拦，必 403 → 控制台刷一排红色
+    // GET ... 403 噪声，且毫无播放希望。这里直接跳过该兜底，给出一次友好提示即可。
+    // 注意：本改动只影响 Ddayup 侧栏自身的播放逻辑，绝不注入/改写任何页面或全局请求头，
+    // 因此【不会影响浏览器功能或网页运行】。
+    // 抖音/字节系（sf*-cdn-tos.douyinstatic.com / ies-music/*.mp3 等）是需会话 Cookie 的签名防盗链流，
+    // 裸 <audio src> 直连既无登录态、又触发「Third-party cookie will be blocked」告警，必败。
+    // 这类与 aigei/alicdn 同属「跳过裸直连」范围（已优先走 MAIN 世界带 Cookie 的源页拉取）。
+    const isSignedCdn = /(^|\.)aigei\.com$|s8\.aigei\.com|alicdn\.com|aliyuncs\.com|aliyun\.com|oss-/.test(a.url || '');
+    const isCookieCdn = /douyin|bytedance|tiktok|douyinvod|iesdouyin|sf[0-9]*-cdn-tos\.douyinstatic\.com/i.test(a.url || '');
+    if (!isSignedCdn && !isCookieCdn && await playAudioWithRealUrl(a)) return;
+    if (isSignedCdn || isCookieCdn) {
+      a.__lastErr = isCookieCdn
+        ? '抖音音频需登录态会话 Cookie，已尝试源页带 Cookie 拉取，若仍失败请确认源页已登录抖音'
+        : '源站签名校验未通过（需登录/会员或直链已失效）';
+      console.warn('[HMDAO][audio] 跳过裸 <audio> 直连（' + (isCookieCdn ? '抖音防盗链需会话 Cookie' : '签名 CDN 必 403') + '，避免控制台噪声）: ' + dbg({ url: (a.url || '').slice(0, 80) }));
+      // ★2026-08-23 数据驱动修复：抖音原声(ies-music)连源页带 Cookie 拉取都失败（实测 lastErr 已确认），
+      //   再走 playAudioFromPage / console.error 只会刷噪声且无意义。直接优雅降级：提示用户去源页试听，
+      //   不打「全部路径失败」，也不阻塞视频播放（音视频独立）。
+      setStatus('⚠ 该音频为抖音原声/签名音频，需源页登录态才能播放，请到源页试听', false);
+      return;
+    }
   }
   // 最后兜底：仅有 MSE <audio> 元素（空 URL）→ 直接驱动源页该元素播放
   if (a.audioIdx != null) {
@@ -345,12 +531,55 @@ async function playAudioInPage(a, { visual = false, useHover = false } = {}) {
 
 async function hoverPlayAudio(a) {
   hoverAudioInPage = false;
+  // ★豆包朗读（WS 流式，无直链）：悬停走【源页内播放】（字节不出页面），
+  //   失败一律静默 —— 既不刷红色提示，又保留悬停试听体验。
+  if (a && a.wsAudio) return playDoubaoWsAudioInPage(a, { silent: true });
+  // ★P2（2026-08-01）：爱给等「游离 Audio 播放器」音效站，若 a.url 为空（扫描时序未跑到
+  // forceAudioPlayCapture / 签名 URL 未捕获），悬停时先在源页自动触发试听补全捕获，
+  // 按 pathname 匹配回填 a.url，确保悬停一定有得播。
+  if (!a.url && a.tabId) {
+    try {
+      const isAigei = /(^|\.)aigei\.com$/i.test(new URL(a.pageUrl || '').hostname);
+      if (isAigei) {
+        const res = await chrome.runtime.sendMessage({ type: 'HMDAO_CAPTURE_AUDIO_NOW', tabId: a.tabId });
+        if (res && res.ok && Array.isArray(res.audioPlays)) {
+          // audioPlays 每条为 { url, path(origin+pathname), how, ts }；按 path 精确匹配
+          const wantPath = (() => { try { return new URL(a.url || a.href || '').origin + new URL(a.url || a.href || '').pathname; } catch (_) { return ''; } })();
+          let match = null;
+          if (wantPath) match = res.audioPlays.find((p) => p.path && p.path === wantPath);
+          if (!match && res.audioPlays.length) match = res.audioPlays[0];
+          if (match && match.url) {
+            a.url = match.url;
+            a.fresh = true;
+            // 同步写回全局素材库，避免下次悬停再次回退
+            maybeUpdateAssetUrl(a, match.url);
+          }
+        }
+      }
+    } catch (_) {}
+  }
   await playAudioInPage(a, { visual: false, useHover: true });
 }
 
 function stopHoverAudio() {
   const overlayOpen = document.getElementById('previewOverlay').classList.contains('open');
   if (overlayOpen) return;
+  // ★豆包朗读：悬停走的是【源页内播放】，移开时必须同步停源页那个游离 <audio>
+  if (window.__hmdaoPlayingDoubaoWs) {
+    window.__hmdaoPlayingDoubaoWs = false;
+    try { chrome.runtime.sendMessage({ type: 'HMDAO_STOP_DOUBAO_WS_AUDIO' }).catch(() => {}); } catch (_) {}
+  }
+  // ★关键修复（2026-08-01）：hoverPlayAudio 走 playAudioInPage → playAudioViaBlob，
+  // 实际是给侧栏自身 <audio id="previewAudio"> 喂 blob 播放。鼠标离开时必须 pause 这个
+  // 元素，否则音频会持续播放（之前 stopHoverAudio 只发 HMDAO_STOP_AUDIO_IN_PAGE 给源页
+  // 的游离 Audio，未暂停侧栏 <audio> → 用户报告"移开还在播放"）。
+  try {
+    const au = document.getElementById('previewAudio');
+    // ★推进播放令牌：使任何仍在挂起的 playAudioViaBlob.play() 落入「被合法接管」分支，
+    // 不再把 pause() 打断它的 AbortError 误报为播放故障。
+    playToken++;
+    if (au) { try { au.pause(); } catch (_) {} try { au.removeAttribute('src'); au.load(); } catch (_) {} }
+  } catch (_) {}
   if (hoverAudioInPage) {
     chrome.runtime.sendMessage({ type: 'HMDAO_STOP_AUDIO_IN_PAGE', audioId: 'hover' });
     hoverAudioInPage = false;
@@ -360,4 +589,28 @@ function stopHoverAudio() {
     chrome.runtime.sendMessage({ type: 'HMDAO_STOP_PAGE_AUDIO', audioIdx: window.__playingPageIdx }).catch(() => {});
     window.__playingPageIdx = null;
   }
+  setStatus('');
+}
+
+// ★兜底：鼠标离开整个侧栏资产列表或侧栏失去焦点时，强制停止 hover 试听。
+// 单独卡片 mouseleave 在快速移出侧栏、iframe 边界或焦点丢失时可能漏发，
+// 这里用容器级 mouseleave + window blur 作为最后一道保险。
+function installSidepanelAudioLeaveGuard() {
+  try {
+    const listEl = document.getElementById('list');
+    if (listEl) {
+      listEl.addEventListener('mouseleave', (e) => {
+        stopHoverAudio();
+      });
+    }
+    // 侧栏失去焦点（用户切到别的窗口/标签）也停止
+    window.addEventListener('blur', () => {
+      stopHoverAudio();
+    });
+  } catch (_) {}
+}
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', installSidepanelAudioLeaveGuard);
+} else {
+  installSidepanelAudioLeaveGuard();
 }

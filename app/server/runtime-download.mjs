@@ -37,7 +37,29 @@ async function pumpResponse(response, fileHandle, startOffset, totalBytes, onPro
  * @param {boolean} [options.allowResume=true] 是否允许断点续传
  * @returns {Promise<{receivedBytes:number,totalBytes:number,resumed:boolean}>}
  */
-export async function downloadFileWithProgress(url, targetPath, onProgress, headers = {}, options = {}) {
+/**
+ * GitHub Releases 在国内经常超时/被限速，会让「一键安装」直接失败。
+ * 允许用 HMDAO_GITHUB_MIRROR 配置镜像前缀兜底（多个用逗号/分号/空格分隔），
+ * 镜像的用法是「前缀 + 原始 URL」，例如：
+ *   https://gh-proxy.com/https://github.com/yt-dlp/yt-dlp/releases/download/...
+ * 只对 GitHub 系域名套用，避免把前缀误加到自建源 / OSS 地址上。
+ */
+function buildMirrorCandidates(url) {
+  const candidates = [url];
+  const raw = String(process.env.HMDAO_GITHUB_MIRROR || '').trim();
+  if (!raw) return candidates;
+  const isGithubAsset = /^https?:\/\/(?:www\.)?github\.com\//i.test(url)
+    || /^https?:\/\/objects\.githubusercontent\.com\//i.test(url);
+  if (!isGithubAsset) return candidates;
+  for (const prefix of raw.split(/[,;\s]+/).filter(Boolean)) {
+    const candidate = `${prefix.replace(/\/+$/, '')}/${url}`;
+    if (!candidates.includes(candidate)) candidates.push(candidate);
+  }
+  return candidates;
+}
+
+/** 单一源的下载实现（断点续传等原行为保持不变）。 */
+async function downloadOnce(url, targetPath, onProgress, headers = {}, options = {}) {
   const allowResume = options?.allowResume !== false;
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
 
@@ -75,6 +97,29 @@ export async function downloadFileWithProgress(url, targetPath, onProgress, head
   } finally {
     await fileHandle.close().catch(() => {});
   }
+}
+
+/**
+ * 对外入口：先走原始地址，失败后依次尝试 HMDAO_GITHUB_MIRROR 配置的镜像。
+ * 签名与返回值保持不变，调用方无感知。
+ */
+export async function downloadFileWithProgress(url, targetPath, onProgress, headers = {}, options = {}) {
+  const candidates = buildMirrorCandidates(url);
+  let lastError = null;
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    try {
+      // 换源后不能沿用上一个源的断点（分片边界与校验可能不兼容），仅首个源允许续传。
+      return await downloadOnce(candidates[index], targetPath, onProgress, headers, {
+        ...options,
+        allowResume: index === 0 ? options?.allowResume !== false : false,
+      });
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('download-failed:unknown');
 }
 
 export { USER_AGENT };

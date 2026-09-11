@@ -26,9 +26,20 @@
     REFRESH_FROM_PAGE: 'HMDAO_REFRESH_FROM_PAGE',
     REFRESH_ASSETS: 'HMDAO_REFRESH_ASSETS',
     FIND_SIMILAR: 'HMDAO_FIND_SIMILAR',
+    // 信息流批量采集（独立于 REFRESH_FROM_PAGE，避免与单视频源页解析串扰）
+    // body: { mode: 'collection' | 'currentPage' | 'custom', awemeIds?: string[], tabId? }
+    // 处理前注入 window.__hmdao_batchMode=true 到源页，强制 tryDouyinWeixin 走 aweme_list 多视频分支；
+    // 处理完清除该信号，恢复单视频默认行为。
+    BATCH_COLLECT: 'HMDAO_BATCH_COLLECT',
 
     // --- 网盘 / 预设 ---
     NETDISK_RESOLVE: 'HMDAO_NETDISK_RESOLVE',
+    // 在已打开的网盘页中递归解析文件树（自动填码 + 展开子目录 + 捕获每个文件的下载直链）
+    // 返回结构化 { tree: [{name, size, isDir, url?, children?}], names: [...] }
+    NETDISK_TREE: 'HMDAO_NETDISK_TREE',
+    // 在网盘页内自动勾选指定文件并触发下载按钮，通过浏览器下载事件捕获真实直链
+    // body: { url, name?, fileId? }  返回 { ok, url?, name? }
+    NETDISK_DOWNLOAD: 'HMDAO_NETDISK_DOWNLOAD',
     OPEN_PRESET: 'HMDAO_OPEN_PRESET',
 
     // --- 下载 / 导入 ---
@@ -48,6 +59,22 @@
     STOP_AUDIO_IN_PAGE: 'HMDAO_STOP_AUDIO_IN_PAGE',
     RESOLVE_FRESH_AUDIO: 'HMDAO_RESOLVE_FRESH_AUDIO',
     INSTALL_REFERER_RULE: 'HMDAO_INSTALL_REFERER_RULE',
+    INSTALL_YOUKU_REFERER: 'HMDAO_INSTALL_YOUKU_REFERER', // 优酷 CDN 一次性注入 Referer，供 hls.js 拉 m3u8/.ts
+
+    // --- B站多分辨率枚举（纯前端 WBI，不依赖后端 yt-dlp）---
+    // 在源页 MAIN 世界用 WBI 签名调 /x/player/playurl?fnval=16（DASH），
+    // 一次返回 dash.video[]（含所有分辨率轨）+ support_formats（清晰度名称），
+    // 让侧栏下载面板能列出 4K/1080P/720P/480P… 供用户自选，无需后端。
+    // body: { tabId }   返回 { ok, formats: [{quality,label,width,height,url,codecs,isDash}], audioUrl, title }
+    BILI_LIST_QUALITIES: 'HMDAO_BILI_LIST_QUALITIES',
+    // ★2026-08-31：DASH 音视频【后台线程合并】（大视频也要合并成含音画单文件）。
+    //   侧栏主线程做 mp4box 解封装会冻结 UI，故放到 Service Worker 线程执行：
+    //     in : { videoUrl, audioUrl, referer, filename }
+    //     out: 先发若干 HMDAO_MERGE_CHUNK（每块 ≤50MB，不触及 ~64MB 消息上限），最后发 HMDAO_MERGE_DONE
+    MERGE_DASH: 'HMDAO_MERGE_DASH',
+    MERGE_CHUNK: 'HMDAO_MERGE_CHUNK',
+    MERGE_DONE: 'HMDAO_MERGE_DONE',
+    MERGE_PROGRESS: 'HMDAO_MERGE_PROGRESS',
 
     // --- 智能机器人 ---
     AI_CHAT: 'HMDAO_AI_CHAT',
@@ -58,6 +85,22 @@
     AI_BOT_REMOVE: 'HMDAO_AI_BOT_REMOVE',
     AGENT_UPLOAD: 'HMDAO_AGENT_UPLOAD',
     RUN_AGENT_WORKFLOW: 'HMDAO_RUN_AGENT_WORKFLOW',
+
+    // --- 截图识文（可插拔特性，features/screenshot-ocr*）---
+    // sidepanel → background：请求截当前视口(png 高保真) / 长截图
+    //   payload: { tabId?, format? }
+    // background → sidepanel：sendResponse({ ok, dataUrl, restricted, isLong, width, height })
+    SCREENSHOT_CAPTURE: 'HMDAO_SCREENSHOT_CAPTURE',
+    SCREENSHOT_CAPTURE_LONG: 'HMDAO_SCREENSHOT_CAPTURE_LONG',
+    // 注入页 → sidepanel：用户框选完区域后回传矩形
+    //   payload: { x, y, w, h, dpr, scrollX, scrollY, vw, vh }
+    SCREENSHOT_REGION_READY: 'HMDAO_SCREENSHOT_REGION_READY',
+    // 注入页 → sidepanel：用户取消框选
+    SCREENSHOT_CANCEL: 'HMDAO_SCREENSHOT_CANCEL',
+    // sidepanel → background：把截图发后端做 OCR / 翻译（不传画布）
+    //   payload: { image: dataURL, task: 'ocr' | 'translate', lang? }
+    // background → sidepanel：sendResponse({ ok, text, error })
+    SCREENSHOT_OCR: 'HMDAO_SCREENSHOT_OCR',
 
     // --- 扩展心跳 / build ---
     EXT_PING: 'HMDAO_EXT_PING',

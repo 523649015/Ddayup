@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { Link, useNavigate } from 'react-router-dom';
@@ -6,6 +6,7 @@ import { Eye, EyeOff, UserPlus, Loader2, Check, X } from 'lucide-react';
 import { usePublicUILanguage } from '@/i18n/publicUi';
 import { emailRegisterSchema, getPasswordStrength, type EmailRegisterInput } from '@/schemas/authSchemas';
 import { signUpWithEmail } from '@/services/authService';
+import { useAuthStore } from '@/store/useAuthStore';
 import { ComplianceNotice } from '@/components/ComplianceNotice';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -15,9 +16,18 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 export default function RegisterPage() {
   const navigate = useNavigate();
   const { language, setLanguage, t } = usePublicUILanguage();
+  // ★2026-08-22 修复（侧栏本地记忆）：已登录用户访问 /register 自动跳到首页,
+  //   避免重复提示"该邮箱已注册"。
+  const hasHydratedR = useAuthStore((s) => s.hasHydrated);
+  const isAuthenticatedR = useAuthStore((s) => s.isAuthenticated);
+  useEffect(() => {
+    if (!hasHydratedR) return;
+    if (isAuthenticatedR()) navigate('/?skipLaunch=1', { replace: true });
+  }, [hasHydratedR, isAuthenticatedR, navigate]);
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [alreadyRegistered, setAlreadyRegistered] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const {
@@ -57,6 +67,7 @@ export default function RegisterPage() {
 
   const onSubmit = async (data: EmailRegisterInput) => {
     setError(null);
+    setAlreadyRegistered(null);
     setIsSubmitting(true);
 
     try {
@@ -65,9 +76,11 @@ export default function RegisterPage() {
         navigate('/login?registered=true', { replace: true });
         return;
       }
-      // 邮箱已注册：直接带邮箱跳转到登录页，避免用户误以为未注册而重复创建账号
+      // 邮箱已注册：★2026-08-21 修复——蓝色「该邮箱已注册」提示严格只显示在注册页，
+      //   不再跳转到登录页带 reason=already_registered（否则会与登录页的密码错误提示同时出现）。
+      //   本地显示提示并提供「去登录」链接，避免用户误以为未注册而重复创建账号。
       if (result.code === 'user_already_exists') {
-        navigate('/login', { state: { email: data.email, reason: 'already_registered' }, replace: true });
+        setAlreadyRegistered(data.email);
         return;
       }
       setError(result.error || t('注册失败，请重试。', 'Sign up failed. Please try again.'));
@@ -106,6 +119,15 @@ export default function RegisterPage() {
 
           <CardContent>
             <form onSubmit={handleSubmit(onSubmit)} className='space-y-4'>
+              {alreadyRegistered ? (
+                <div className='rounded-md border border-blue-500/30 bg-blue-500/10 px-4 py-3 text-sm text-blue-300'>
+                  {t('该邮箱已注册，请直接登录。', 'This email is already registered. Please sign in directly.')}{' '}
+                  <Link to='/login' state={{ email: alreadyRegistered }} className='font-medium text-blue-200 underline hover:text-blue-100'>
+                    {t('去登录', 'Go to sign in')}
+                  </Link>
+                </div>
+              ) : null}
+
               {error ? (
                 <div className='rounded-md border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-400'>
                   {error}

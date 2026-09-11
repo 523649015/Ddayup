@@ -27,6 +27,20 @@ export function LaunchCanvasPage() {
   const [exiting, setExiting] = useState(false);
   const [showLaunchScreen, setShowLaunchScreen] = useState(() => !shouldBypassLaunchScreen());
 
+  // 全局快捷键：Ctrl/Cmd + Shift + W 打开工作流模板面板（导入/导出 JSON 在该面板内）
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'W' || e.key === 'w')) {
+        e.preventDefault();
+        import('@/store/useCanvasStore').then((m) => {
+          m.useCanvasStore.getState().openImportWorkflow();
+        }).catch(() => {});
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
   const launchCopy = useMemo(() => ({
     title: 'DDUp',
     subtitle: '遇见更多志同道合的人',

@@ -25,6 +25,8 @@ export function buildLocalPostBackendsSnapshot(deps) {
     resolveLocalPostUpscaleBackend,
     resolveLocalPostYtDlpBackend,
     resolveLocalPostFlorence2Backend,
+    resolveLocalPostAria2Backend,
+    resolveLocalPostFfmpegBackend,
     buildLocalPostBackendStatus,
   } = deps;
 
@@ -41,6 +43,10 @@ export function buildLocalPostBackendsSnapshot(deps) {
     gmic: buildLocalPostBackendStatus('gmic', gmicBackend, 'gmic.exe'),
     ytdlp: buildLocalPostBackendStatus('ytdlp', resolveLocalPostYtDlpBackend(), 'yt-dlp.exe'),
     florence2: buildLocalPostBackendStatus('florence2', resolveLocalPostFlorence2Backend(), path.resolve(APP_DIR, 'server', 'local_image_example_florence2.py')),
+    // Step 2/3/5: aria2 + ffmpeg 是网盘/视频素材下载引擎组，此前漏装在 localPostBackends 快照里，
+    // 导致面板读 localPostBackends?.aria2 永远为空、卡片状态缺失（消息不对称）。
+    aria2: buildLocalPostBackendStatus('aria2', resolveLocalPostAria2Backend(), 'aria2c.exe'),
+    ffmpeg: buildLocalPostBackendStatus('ffmpeg', resolveLocalPostFfmpegBackend(), 'ffmpeg.exe'),
     upscale: {
       'fsr-preview': buildLocalPostBackendStatus('fsr-preview', fsrBackend, path.resolve(APP_DIR, 'server', 'local_post_example_fsr.py')),
       realbasicvsr: buildLocalPostBackendStatus('realbasicvsr', realbasicvsrBackend, path.resolve(APP_DIR, 'server', 'local_post_example_realbasicvsr.py')),
@@ -58,6 +64,19 @@ function rejectUnsupportedRuntime(deps, res, runtimeKey) {
     error: { message: `unsupported-runtime:${runtimeKey || 'unknown'}` },
   });
   return true;
+}
+
+// 写操作鉴权：仅当部署时设置了 HMDAO_API_KEY 才强制校验（本地开发不设则不校验）。
+// 防止云端部署后匿名用户滥用服务器算力跑 yt-dlp 等运行时安装。
+function requireApiKey(deps, req, res) {
+  const expect = String(process.env.HMDAO_API_KEY || '').trim();
+  if (!expect) return true; // 未配置密钥：放行（本地开发 / 内网）
+  const auth = req.headers && (req.headers.authorization || req.headers.Authorization);
+  const fromHeader = auth && auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const fromQuery = req.url && new URL(req.url, 'http://x').searchParams.get('apiKey') || '';
+  if (fromHeader === expect || fromQuery === expect) return true;
+  deps.send(res, 401, { success: false, error: { code: 'UNAUTHORIZED', message: '缺少或无效的 API Key' } });
+  return false;
 }
 
 function failure(deps, res, status, error, extra = {}) {
@@ -183,6 +202,7 @@ export function registerHealthRoutes(router, deps) {
   });
 
   router.register('POST', '/api/health/local-post/runtime/install', async (req, res) => {
+    if (!requireApiKey(deps, req, res)) return undefined;
     const body = await readJson(req).catch(() => ({}));
     const runtimeKey = String(body?.runtimeKey || '').trim();
     if (rejectUnsupportedRuntime(deps, res, runtimeKey)) return undefined;
@@ -194,6 +214,7 @@ export function registerHealthRoutes(router, deps) {
   });
 
   router.register('POST', '/api/health/local-post/runtime/uninstall', async (req, res) => {
+    if (!requireApiKey(deps, req, res)) return undefined;
     const body = await readJson(req).catch(() => ({}));
     const runtimeKey = String(body?.runtimeKey || '').trim();
     if (rejectUnsupportedRuntime(deps, res, runtimeKey)) return undefined;
@@ -219,6 +240,7 @@ export function registerHealthRoutes(router, deps) {
 
   // P3-9：回滚到指定（或最新）备份点
   router.register('POST', '/api/health/local-post/runtime/rollback', async (req, res) => {
+    if (!requireApiKey(deps, req, res)) return undefined;
     const body = await readJson(req).catch(() => ({}));
     const runtimeKey = String(body?.runtimeKey || '').trim();
     const backupId = body?.backupId != null ? String(body.backupId) : null;
@@ -233,6 +255,7 @@ export function registerHealthRoutes(router, deps) {
 
   // P3-3：清理旧版本残留的临时产物（staging / 下载缓存，可选清理备份）
   router.register('POST', '/api/health/local-post/runtime/cleanup', async (req, res) => {
+    if (!requireApiKey(deps, req, res)) return undefined;
     const body = await readJson(req).catch(() => ({}));
     const runtimeKey = String(body?.runtimeKey || '').trim();
     const removeBackups = Boolean(body?.removeBackups);
@@ -246,6 +269,7 @@ export function registerHealthRoutes(router, deps) {
   });
 
   router.registerPrefix('GET', '/api/health/local-post/runtime/install/', (req, res, url) => {
+    if (!requireApiKey(deps, req, res)) return undefined;
     const jobId = decodeURIComponent(url.pathname.slice('/api/health/local-post/runtime/install/'.length));
     const job = deps.getRuntimeInstallJob(jobId);
     if (!job) {

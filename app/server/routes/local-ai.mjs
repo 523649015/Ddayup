@@ -27,6 +27,7 @@ export function registerLocalAiRoutes(router, deps) {
     sanitizeLocalAssetId,
     send,
     sendLocalFileStream,
+    getUserFromRequest,
   } = deps;
 
   router.registerPrefix(['GET', 'HEAD'], '/api/dcc/local-artifacts/', async (req, res, url) => {
@@ -51,7 +52,8 @@ export function registerLocalAiRoutes(router, deps) {
     const body = contentType.includes('multipart/form-data')
       ? await readLocalImageAnalyzeMultipart(req)
       : await readJson(req);
-    const analysis = await processLocalImageAnalyzeRequest(body);
+    const userId = getUserFromRequest(req);
+    const analysis = await processLocalImageAnalyzeRequest(body, userId);
     return send(res, 200, { success: true, analysis });
   });
 

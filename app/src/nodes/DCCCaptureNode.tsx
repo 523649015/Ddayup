@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import {
   Box,
@@ -886,7 +886,7 @@ export function DCCCaptureNode({ selected, data, id }: NodeProps) {
   }
   async function ensureRealHostReady() {
     try {
-      const statusParams = new URLSearchParams({ engine });
+      const statusParams = new URLSearchParams({ engine, force: '1' });
       const response = await dccGatewayFetch(`/api/dcc/status?${statusParams.toString()}`);
       if (!response.ok) {
         throw new Error('HMDao DCC status service is unavailable. Please confirm the local 8792 service is running.');
@@ -945,7 +945,28 @@ export function DCCCaptureNode({ selected, data, id }: NodeProps) {
         if (unrealStatus?.integration?.recommendedMode === 'official-sequencer-capture' && unrealStatus?.official?.capturePrerequisitesReady) {
           throw new Error('The current Unreal project already satisfies the compatibility-mode offline export prerequisites, but DCC node live preview and shot-animation capture still require HMDao Unreal Capture direct bridge to be enabled in this project. Enable the plugin, restart Unreal, and then click Connect again.');
         }
-        throw new Error('HMDao Unreal Capture has been copied, but it is not enabled in the current Unreal project yet. Enable it in Plugins and restart Unreal before reconnecting.');
+        // 插件已复制但未在工程启用：自动触发一次 repair，后端会（即使 Unreal 正在运行）
+        // 把 HMDao Unreal Capture 写入 .uproject 的启用列表，避免“装了却连不上”的死循环。
+        try {
+          await runDccPluginManagerAction({
+            engine: 'unreal',
+            action: 'repair',
+            projectPath: typeof unrealStatus?.projectPath === 'string' ? unrealStatus.projectPath : undefined,
+          });
+        } catch (repairError) {
+          // repair 失败时退回原提示，引导用户手动启用。
+          throw new Error('HMDao Unreal Capture has been copied, but it is not enabled in the current Unreal project yet. Go to the DCC environment panel and run Quick Check / Repair (or enable it in the Unreal Plugins window), then restart Unreal and reconnect.');
+        }
+        // 自动 repair 已写入启用项；强制重新拉取最新状态（绕过前端缓存），
+        // 若 Unreal 已在运行并加载了插件则直接继续真正的连接，不再强制抛“请重启”。
+        const refreshed = await dccGatewayFetch('/api/dcc/status?engine=unreal&force=1')
+          .then((r) => (r.ok ? r.json() : null))
+          .catch(() => null) as { engines?: { unreal?: { pluginEnabledInProject?: boolean } } } | null;
+        if (refreshed?.engines?.unreal?.pluginEnabledInProject) {
+          unrealStatus.pluginEnabledInProject = true;
+        } else {
+          throw new Error('HMDao Unreal Capture has been enabled in the project descriptor by auto-repair. Restart Unreal Editor once, then click Connect again to bring the direct bridge online.');
+        }
       }
       if (!unrealStatus?.hostProcessRunning) {
         throw new Error('Unreal Editor is not running. Open the target project from Epic Games Launcher, wait for the visible main window, then reconnect from HMDao.');
@@ -2286,7 +2307,7 @@ function FrameInput({
   );
 }
 
-function ToolbarButton({ title, testId, disabled, onClick, children }: { title: string; testId?: string; disabled?: boolean; onClick?: () => void; children: import('react').ReactNode }) {
+function ToolbarButton({ title, testId, disabled, onClick, children }: { title: string; testId?: string; disabled?: boolean; onClick?: () => void; children: ReactNode }) {
   return (
     <button
       type="button"

@@ -3,6 +3,8 @@
 import path from 'node:path';
 import { getManagedRuntimeManifestEntry } from './local-post-processing.mjs';
 import { spawn } from 'node:child_process';
+import { APP_DIR } from './server-paths.mjs';
+import { LOCAL_POST_SELF_CHECK_TIMEOUT_MS } from './local-post-constants.mjs';
 
 export function trimDiagnosticText(value, maxLength = 220) {
   const normalized = String(value || '').replace(/\s+/g, ' ').trim();

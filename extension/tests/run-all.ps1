@@ -11,7 +11,8 @@ $tests = @(
   'phase9-diag-logic',
   'phase10-scantab-tdz-order',
   'phase11-source-play-isolation',
-  'phase12-active-tab-capture'
+  'phase12-active-tab-capture',
+  'phase14-virtualization'
 )
 $totalFail = 0
 foreach ($f in $tests) {

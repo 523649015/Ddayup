@@ -4,6 +4,9 @@
 function escapeAttr(s) {
   return (s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
 }
+function escapeHtml(s) {
+  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
 function truncate(s, n) {
   return String(s || '').length > n ? String(s).slice(0, n) + '…' : String(s || '');
 }

@@ -1,5 +1,11 @@
 * { box-sizing: border-box; }
-body { margin: 0; font-family: system-ui, sans-serif; background: #0d1117; color: #c9d1d9; font-size: 13px; }
+html, body { height: 100%; }
+body { margin: 0; font-family: system-ui, sans-serif; background: #0d1117; color: #c9d1d9; font-size: 13px; display: flex; flex-direction: column; overflow-y: auto; }
+
+/* ★2026-09-11 修复：body 直子元素默认不参与 flex 空间争夺，只有 #list 独占剩余空间并内部滚动；
+   当顶部折叠面板全部展开导致总高超过视口时，body 兜底允许整体滚动，确保 #list 永不被裁掉看不见 */
+body > * { flex: 0 0 auto; }
+body > #list { flex: 0 0 auto !important; }
 
 /* 第三方 Cookie 被阻止提示横幅 */
 .notice-banner { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; background: #1c2128; border-bottom: 1px solid #3a2d12; color: #e6edf3; }
@@ -44,10 +50,29 @@ details > summary::-webkit-details-marker { display: none; }
 details[open] > summary { color: #00d4aa; }
 details > summary::before { content: '▸'; display: inline-block; margin-right: 6px; transition: transform 0.2s; }
 details[open] > summary::before { transform: rotate(90deg); }
+/* ★2026-09-11 修复：折叠面板（自定义保存路径 / AI 助手 / 诊断日志）展开后高度受限，避免把卡片区压没 */
+details { flex: 0 0 auto; }
+details[open] { max-height: 30vh; overflow: hidden; }
+details[open] > div { max-height: calc(30vh - 32px); overflow-y: auto; }
 
 .presetRow { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 12px 12px; }
 .preset { padding: 4px 10px; border-radius: 999px; border: 1px solid #2d3236; background: #0f1822; color: #7cc4ff; cursor: pointer; font-size: 11px; }
 .preset:hover { border-color: #1a8cff; background: #1a8cff/15; }
+
+/* ★2026-08-18：我的收藏自定义源 */
+.mySrc { display: inline-flex; align-items: center; gap: 2px; }
+.mySrcDel { width: 16px; height: 16px; line-height: 14px; padding: 0; border-radius: 50%; border: 1px solid #4a2526; background: #2a1518; color: #ff7b7b; cursor: pointer; font-size: 12px; }
+.mySrcDel:hover { background: #3a1a1d; }
+.mySrcAdd { align-items: center; }
+.mySrcName, .mySrcUrl, .mySrcCategory { padding: 4px 8px; border-radius: 6px; border: 1px solid #2d3236; background: #0f1822; color: #c9d1d9; font-size: 11px; }
+.mySrcName { width: 80px; }
+.mySrcCategory { width: 70px; }
+.mySrcUrl { flex: 1; min-width: 80px; }
+.mySrcFillBtn { padding: 4px 8px; border-radius: 6px; border: 1px solid #30363d; background: #161b22; color: #8b949e; cursor: pointer; font-size: 11px; }
+.mySrcFillBtn:hover { border-color: #46515d; color: #c9d1d9; }
+.mySrcAddBtn { padding: 4px 10px; border-radius: 6px; border: 1px solid #00d4aa; background: #00d4aa; color: #06231d; cursor: pointer; font-size: 11px; font-weight: 600; }
+.mySrcAddBtn:hover { filter: brightness(1.1); }
+.mySrcEmpty { color: #6b7280; font-size: 11px; font-style: italic; }
 
 .actions { display: flex; gap: 6px; padding: 10px 12px; border-bottom: 1px solid #21262d; }
 button.act { flex: 1; padding: 8px; border-radius: 8px; border: 1px solid #30363d; background: #161b22; color: #c9d1d9; cursor: pointer; font-size: 12px; }
@@ -56,29 +81,174 @@ button.act.primary.alt { background: #1a8cff; color: #fff; border-color: #1a8cff
 button.act.primary.alt2 { background: #d29922; color: #1c1505; border-color: #d29922; font-weight: 600; }
 button.act:hover { border-color: #46515d; }
 
+/* 实时扫描状态指示器（音频/素材采集进度与失败项） */
+.scanStatus { display: flex; align-items: center; gap: 6px; padding: 6px 12px; font-size: 11px; color: #8b949e; border-bottom: 1px solid #21262d; }
+.scanStatus .ss-dot { width: 8px; height: 8px; border-radius: 50%; background: #6e7681; flex: 0 0 auto; }
+.scanStatus .ss-dot.gray { background: #6e7681; }
+.scanStatus .ss-dot.green { background: #00d4aa; }
+.scanStatus .ss-dot.red { background: #f85149; }
+.scanStatus .ss-dot.blue { background: #1a8cff; animation: ssPulse 1s infinite; }
+.scanStatus #ssText { line-height: 1.3; }
+@keyframes ssPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+
 .pathRow { display: flex; align-items: center; gap: 8px; padding: 4px 12px; font-size: 11px; }
 .pathType { width: 56px; flex: 0 0 auto; color: #c9d1d9; }
 .pathPick { flex: 0 0 auto; padding: 4px 10px; border-radius: 6px; border: 1px solid #30363d; background: #161b22; color: #c9d1d9; cursor: pointer; font-size: 11px; }
 .pathPick:hover { border-color: #46515d; }
 .pathText { color: #8b949e; word-break: break-all; min-width: 0; flex: 1; }
+.pathTest, .pathClear { flex: 0 0 auto; padding: 3px 7px; border-radius: 6px; border: 1px solid #30363d; background: #161b22; color: #8b949e; cursor: pointer; font-size: 10px; line-height: 1.2; }
+.pathTest:hover { border-color: #3fb950; color: #3fb950; }
+.pathClear:hover { border-color: #f85149; color: #f85149; }
 
 #status { padding: 6px 12px; font-size: 11px; color: #00d4aa; min-height: 18px; }
 
-#list { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; padding: 10px; overflow-y: auto; }
-.card { position: relative; border: 1px solid #21262d; border-radius: 8px; overflow: hidden; cursor: pointer; background: #161b22; aspect-ratio: 1; }
-.card.sel { border-color: #00d4aa; box-shadow: 0 0 0 1px #00d4aa; }
+/* 下载进度条（多任务卡片容器） */
+.dlProgress { padding: 8px 12px; border-bottom: 1px solid #21262d; background: #0f1620; max-height: 38vh; overflow-y: auto; }
+.dlProgressHeader { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: #8b949e; margin-bottom: 6px; gap: 6px; }
+.dlProgressHeader > span:first-child { flex: 1; }
+.dlProgressTitle { font-weight: 600; color: #c9d1d9; }
+.dlProgressCount { font-variant-numeric: tabular-nums; margin-left: 6px; }
+.dlProgressToggle, .dlProgressClear { border: none; background: transparent; color: #8b949e; cursor: pointer; font-size: 11px; padding: 2px 5px; border-radius: 4px; }
+.dlProgressToggle:hover, .dlProgressClear:hover { background: #21262d; color: #c9d1d9; }
+.dlProgressContainer { display: flex; flex-direction: column; gap: 8px; transition: max-height .2s ease; }
+.dlProgressContainer.collapsed { max-height: 0; overflow: hidden; }
+
+/* 单个任务卡片 */
+.dlTask { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 7px 9px; }
+.dlTask.state-completed { border-color: #1a4d3a; }
+.dlTask.state-failed { border-color: #5a2a2a; }
+.dlTask.state-cancelled { opacity: .6; }
+.dlTaskRow { display: flex; align-items: center; gap: 7px; font-size: 12px; color: #c9d1d9; }
+.dlTaskIcon { flex: 0 0 auto; color: #1a8cff; }
+.dlTaskIcon.done { color: #00d4aa; }
+.dlTaskIcon.fail { color: #ff7b7b; }
+.dlTaskIcon.cancel { color: #8b949e; }
+.dlTaskName { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dlTaskPct { flex: 0 0 auto; color: #8b949e; font-variant-numeric: tabular-nums; }
+.dlTaskCancel { flex: 0 0 auto; border: none; background: transparent; color: #8b949e; cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 4px; border-radius: 4px; }
+.dlTaskCancel:hover { background: #21262d; color: #ff7b7b; }
+.dlTaskBarWrap { margin-top: 6px; height: 6px; border-radius: 999px; background: #0d1117; overflow: hidden; }
+/* 进度用 transform: scaleX 避免 width 触发布局重排（GPU 合成） */
+.dlTaskBar { height: 100%; width: 100%; border-radius: 999px; background: linear-gradient(90deg, #1a8cff, #00d4aa); transform-origin: left center; transform: scaleX(0); will-change: transform; }
+.dlTaskBar.indeterminate { width: 40% !important; transform: none !important; background: linear-gradient(90deg, #1a8cff 0%, #00d4aa 50%, #1a8cff 100%); background-size: 200% 100%; animation: dlIndeterminate 1.1s linear infinite; }
+@keyframes dlIndeterminate { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+.dlTaskSize { margin-top: 4px; font-size: 11px; color: #6e7681; font-variant-numeric: tabular-nums; }
+.dlTaskReason { margin-top: 4px; font-size: 11px; color: #ff7b7b; word-break: break-all; }
+.dlTaskReason.done { color: #00d4aa; }
+
+#list { flex: 0 0 auto !important; width: 100%; --card-size: 92px; display: grid; grid-template-columns: repeat(3, var(--card-size)); grid-auto-rows: var(--card-size); gap: 16px; padding: 12px; overflow-y: auto; overflow-x: hidden; align-items: start; align-content: start; justify-content: center; margin: 0 auto; min-height: 548px; }
+.card { position: relative; width: 100%; height: 100%; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; cursor: pointer; background: #161b22; transition: box-shadow .15s, border-color .15s; box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+.card.sel { border-color: #00d4aa; box-shadow: 0 0 0 1px #00d4aa, 0 2px 8px rgba(0,212,170,.2); }
+.card:hover { border-color: #46515d; box-shadow: 0 4px 12px rgba(0,0,0,.35); }
+
+/* 批量复选框：参考图左上角白色方块勾选 */
+.card .batchCb {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  width: 16px;
+  height: 16px;
+  z-index: 5;
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  background: rgba(255,255,255,0.95);
+  border: 1.5px solid rgba(0,0,0,0.15);
+  border-radius: 3px;
+  cursor: pointer;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.25);
+  transition: transform .1s, background .15s;
+}
+.card .batchCb:checked { background: #1a8cff; border-color: #1a8cff; }
+.card .batchCb:checked::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 7px;
+  border: solid #fff;
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+}
+.card .batchCb:hover { transform: scale(1.08); }
+
+/* 卡片下载按钮：参考图右下角蓝色圆形下载箭头 */
+.card-dl-btn {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  width: 22px;
+  height: 22px;
+  z-index: 3;
+  border: none;
+  border-radius: 50%;
+  background: #1f6feb;
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  line-height: 1;
+  padding: 0;
+  box-shadow: 0 2px 5px rgba(0,0,0,0.35);
+  transition: transform .1s, background .15s;
+}
+.card-dl-btn:hover { transform: scale(1.1); background: #357bf7; }
+.card-dl-btn:disabled { opacity: 0.7; cursor: wait; }
+.card-dl-state {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  font-size: 9px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(31,111,235,0.95);
+  color: #fff;
+  z-index: 3;
+  display: none;
+  pointer-events: none;
+  font-weight: 600;
+}
+
+/* ===== 按类型自定义保存路径（双保险：绝对目录 + 相对子目录兜底）===== */
+.pathRow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 5px 12px; font-size: 11px; }
+.pathRow .pathType { flex: 0 0 64px; color: #c9d1d9; }
+.pathPick { flex: 0 0 auto; padding: 3px 8px; border: 1px solid #30363d; border-radius: 6px; background: #161b22; color: #c9d1d9; cursor: pointer; font-size: 11px; }
+.pathPick:hover { border-color: #00d4aa; color: #00d4aa; }
+.pathInput { flex: 1 1 120px; min-width: 100px; padding: 3px 6px; border: 1px solid #30363d; border-radius: 6px; background: #0d1117; color: #c9d1d9; font-size: 11px; }
+.pathInput:focus { outline: none; border-color: #00d4aa; }
+.pathApply { flex: 0 0 auto; padding: 3px 8px; border: 1px solid #30363d; border-radius: 6px; background: #161b22; color: #c9d1d9; cursor: pointer; font-size: 11px; }
+.pathApply:hover { border-color: #00d4aa; color: #00d4aa; }
+.pathText { flex: 1 1 100%; color: #6e7681; font-size: 10px; word-break: break-all; }
+.pathText.ok { color: #00d4aa; }
+.pathText.warn { color: #d29922; }
+.pathTest, .pathClear { flex: 0 0 auto; padding: 3px 7px; border: 1px solid #30363d; border-radius: 6px; background: #161b22; color: #8b949e; cursor: pointer; font-size: 11px; }
+.pathTest:hover, .pathClear:hover { border-color: #ff7b7b; color: #ff7b7b; }
 .card img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .card video, .card audio { pointer-events: none; } /* 让点击穿透到卡片，双击才能预览 */
-.card .tag { position: absolute; top: 4px; left: 4px; font-size: 8px; background: #00d4aa; color: #06231d; padding: 1px 4px; border-radius: 4px; font-weight: 700; }
-.card .name { position: absolute; bottom: 0; left: 0; right: 0; padding: 3px 4px; font-size: 9px; background: rgba(13,17,23,.8); color: #c9d1d9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* ★2026-09-11 修复：.tag 默认是小徽标；一旦包含封面图（cover-img）就铺满整张卡作为封面容器 */
+.card .tag { position: absolute; top: 4px; left: 4px; font-size: 8px; background: #00d4aa; color: #06231d; padding: 1px 4px; border-radius: 4px; font-weight: 700; z-index: 2; }
+/* 批量模式左上角有复选框时，把类型徽标往右挪避免重叠 */
+.card:has(.batchCb) .tag { left: 24px; top: 6px; }
+.card .tag:has(img.cover-img), .card .tag.tag-cover { position: absolute; inset: 0; top: 0; left: 0; right: 0; bottom: 0; width: 100%; height: 100%; padding: 0; margin: 0; border-radius: 0; background: transparent; font-size: 0; line-height: 0; display: block; }
+.card .name { position: absolute; bottom: 0; left: 0; right: 0; padding: 6px 28px 5px 6px; font-size: 9px; line-height: 1.3; background: linear-gradient(to top, rgba(0,0,0,0.85), rgba(0,0,0,0.5) 55%, transparent); color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card .dim { position: absolute; top: 2px; right: 4px; font-size: 8px; color: rgba(255,255,255,.5); background: rgba(0,0,0,.4); padding: 1px 3px; border-radius: 3px; opacity: 0; transition: opacity .15s; pointer-events: none; }
 .card:hover .dim { opacity: 1; }
+/* ★2026-09-11 修复：视频卡底部直链行，绝对定位不撑高卡片 */
+.card .url-row { position: absolute; left: 0; right: 0; bottom: 18px; font-size: 8px; color: #7cc4ff; background: rgba(13,17,23,.8); padding: 2px 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
 
 .hint { padding: 10px 12px; font-size: 11px; color: #6e7681; }
 
 /* 常驻 build 标签：一眼确认侧栏跑的是不是最新代码 */
-.buildTag { padding: 6px 12px; font-size: 10px; color: #6e7681; border-top: 1px solid #21262d; letter-spacing: .3px; }
+.buildTag { flex: 0 0 auto; padding: 6px 12px; font-size: 10px; color: #6e7681; border-top: 1px solid #21262d; letter-spacing: .3px; }
 .buildTag.fresh { color: #00d4aa; }
+
+/* 诊断日志与底部提示：不参与 flex 空间争夺，避免把卡片区压没 */
+#panelLogWrap { flex: 0 0 auto; max-height: 180px; overflow: hidden; }
+#panelLogWrap[open] { max-height: 180px; overflow: hidden; }
+.hint { flex: 0 0 auto; }
 
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
 .dot.green { background: #00d4aa; }

@@ -14,9 +14,25 @@ let __currentDownloadAsset = null;
 // 返回 Promise（同原生），失败时 rejected 并即时标记失败原因。
 // ★2026-08-11 多任务改造：每个调用方（每条资产）一个 dlId 任务卡，互不覆盖；
 //   downloadId 回填到任务卡，使 onChanged 的真实进度/完成/中断能精确命中该卡。
-function dlViaChrome(opts) {
+// ★2026-09-10 P1：此处是【唯一】的 chrome.downloads.download 包装器。
+//   把「优先写用户设置目录」的判断放在这里，等于一次性覆盖全部 17 个历史落盘点，
+//   今后新增平台也不会再漏网。失败一律回退原生下载，行为与改造前完全一致。
+async function dlViaChrome(opts) {
   const name = (opts.filename || '').split(/[\\/]/).pop() || '下载中…';
   const asset = opts.asset || __currentDownloadAsset || null;
+  if (asset && opts && typeof opts.url === 'string' && /^https?:/i.test(opts.url)) {
+    try {
+      if (await tryWriteUserDirFromUrl(asset, opts.url, name)) return -1; // 绝对目录已写
+    } catch (_) { /* 忽略，回退原生下载 */ }
+    // ★2026-09-11 双保险：绝对目录未设置/失败 → 若用户填了相对子目录，
+    //   把下载落到「浏览器下载目录/Ddayup/<相对子目录>/」而非默认类型子目录。
+    try {
+      if (typeof userRelDirFor === 'function') {
+        const rel = userRelDirFor(asset.type);
+        if (rel) opts = Object.assign({}, opts, { filename: 'Ddayup/' + rel + '/' + name });
+      }
+    } catch (_) {}
+  }
   const dlId = window.HmdaoProgress.registerTask({ name, asset });
   // ★2026-09-02 修复（实测）：asset 是【侧栏进度任务卡】用的自定义字段，
   //   不是 chrome.downloads.download 的合法参数。旧代码把整个 opts 原样透传，
@@ -37,15 +53,107 @@ function dlViaChrome(opts) {
     const msg = String((err && err.message) || err || '');
     // 用户点击浏览器「取消」或策略拒绝：区分标记
     if (/cancel|user/i.test(msg)) window.HmdaoProgress.cancel(dlId);
-    else window.HmdaoProgress.fail(dlId, 'FILE_FAILED');
+    // ★2026-09-09 修复（用户实测「一张卡显示下载成功、另一张报文件写入失败 FILE_FAILED」无从判断）：
+    //   旧代码把 chrome.downloads.download 抛出的【任何】异常统一标成 'FILE_FAILED'，
+    //   卡片于是永远显示「磁盘权限/路径无效/文件名冲突」——而真实原因（Invalid filename /
+    //   Access denied / 策略拦截 / 网络被断…）只留在 console 的 '[Ddayup] chrome.downloads 失败' 日志里。
+    //   磁盘真有问题时回退路径（blob → <a download>）同样写不进去，能成功就说明磁盘没事，
+    //   这个误导文案会把人引去查磁盘。现把真实拒绝原因透传到任务卡（reasonText 对未知码
+    //   会输出「下载失败：<原文>」），识别不出时才回退 FILE_FAILED。
+    else window.HmdaoProgress.fail(dlId, msg ? ('chrome.downloads: ' + msg) : 'FILE_FAILED');
     throw err;
   });
 }
 
+// ★2026-09-02 抖音「按分辨率下载」：面板选中的档位是 douyinvod 视频轨（无签名），
+//   前端无法直下（chrome.downloads 不能传 Referer、dNR 会破坏签名、fetch 跨域 CORS）。
+//   改由【后端】带 Referer 拉视频轨 + 音频轨，ffmpeg 合并成含音画单文件，前端再下载产物。
+//   实测（extension/tests/verify-dy-track-merge.mjs）：1080P 视频轨 + 音频轨 → h264 1920x1080 + aac。
+//   后端接口：POST /api/media/merge-dash { videoUrl, audioUrl, referer } → { ok, fileUrl, ... }
+async function mergeAndDownloadViaBackend(a, videoUrl) {
+  if (typeof videoUrl !== 'string' || !/^https?:/i.test(videoUrl)) throw new Error('视频轨 URL 非法');
+  // 1) 取音频轨：优先级 ① 资产自带 dashAudio（扫描时已按时间邻近配对，最可靠）
+  //    ② 资产 dyFormats 里 audio 标签项 ③ 源页 captures.dyAudios 实时读（兜底）。
+  //    ★ 抖音 dyFormats 是纯视频轨（无 audio 项），dashAudio 才是配对音频；
+  //      若只查 dyFormats 会恒为空、又要求活跃标签是抖音页 → 面板选分辨率下载时经常拿不到音轨。
+  let audioUrl = '';
+  if (a && typeof a.dashAudio === 'string' && /^https?:/i.test(a.dashAudio)) audioUrl = a.dashAudio;
+  if (!audioUrl) {
+    try {
+      const fm = ((a && a.dyFormats) || []).filter((f) => f && /audio/i.test(f.label || ''));
+      if (fm[0] && fm[0].url) audioUrl = fm[0].url;
+    } catch (_) {}
+  }
+  if (!audioUrl) {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab && tab.id != null) {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, world: 'MAIN',
+          func: () => { const c = window.__hmdao_captures || {}; const au = (c.dyAudios || [])[0] || {}; return au.url || ''; },
+        });
+        audioUrl = (r && r.result) || '';
+      }
+    } catch (_) {}
+  }
+  if (!audioUrl) throw new Error('找不到音频轨（dyAudios 为空，无法合并音视频）');
+  // 2) 调后端合并
+  const base = (typeof apiBaseUrl === 'function')
+    ? apiBaseUrl()
+    : ((typeof getCloudApiBase === 'function') ? await getCloudApiBase() : 'http://127.0.0.1:3000');
+  setStatus('正在合并音视频（' + (a.qualityTag || '选定分辨率') + '）…', false);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 120000);
+  let resp;
+  try {
+    resp = await fetch(base.replace(/\/$/, '') + '/api/media/merge-dash', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ videoUrl, audioUrl, referer: 'https://www.douyin.com/' }),
+      signal: controller.signal,
+    });
+  } catch (fetchErr) {
+    clearTimeout(timeoutId);
+    if (fetchErr && fetchErr.name === 'AbortError') {
+      throw new Error('后端合并超时（120 秒）：请确认 Ddayup 网页 127.0.0.1:3000 已启动，或所选视频过大');
+    }
+    throw new Error('后端合并请求失败：' + (fetchErr && fetchErr.message || fetchErr));
+  }
+  clearTimeout(timeoutId);
+  const data = await resp.json().catch(() => ({}));
+  if (!data || !data.ok) throw new Error('后端合并失败：' + ((data && data.error) || ('HTTP ' + resp.status)));
+  if (!data.fileUrl) throw new Error('后端未返回 fileUrl');
+  // 3) 下载合并产物（本机直连，无防盗链）
+  const mergedUrl = base.replace(/\/$/, '') + data.fileUrl;
+  const mergedName = deriveFilename(a);
+  // ★2026-09-10：用户为该类型设置了目录 → 写用户目录（FileSystemAccess 可写任意路径），
+  //   否则回退 chrome.downloads（默认 Ddayup/videos）。
+  if (typeof saveHandles !== 'undefined' && saveHandles && saveHandles[a.type]) {
+    try {
+      const mb = await fetch(mergedUrl).then((r) => r.blob());
+      if (await writeBlobToUserDir(a.type, mergedName, mb)) {
+        setStatus('✅ 已保存到设置的目录：' + mergedName, true);
+        return;
+      }
+    } catch (_) { /* 回退默认下载 */ }
+  }
+  await dlViaChrome({
+    url: mergedUrl,
+    filename: 'Ddayup/videos/' + mergedName,
+    asset: a, saveAs: false, conflictAction: 'uniquify',
+  });
+  setStatus('✅ 抖音视频已合并下载到本地（' + (a.qualityTag || '选定分辨率') + '，侧栏任务卡查看进度）', true);
+}
+
 // chrome.downloads.download 不支持 blob: URL，统一用 <a download> 触发 blob 下载
 // （blob 触发无进度事件，故用脉冲条提示「正在保存」）
-function downloadBlobUrl(blobUrl, filename, asset) {
+// ★2026-09-10 P1：blob 落盘唯一包装器，同样先问用户目录（覆盖 194/355/508/637/1067/1241 六处）。
+async function downloadBlobUrl(blobUrl, filename, asset) {
   const name = (filename || '').split(/[\\/]/).pop() || '下载中…';
+  const a = asset || __currentDownloadAsset || null;
+  try {
+    if (await tryWriteUserDirFromBlob(a, blobUrl, name)) return;
+  } catch (_) { /* 忽略，回退 <a download> */ }
   const dlId = window.HmdaoProgress.registerTask({ name, asset: asset || null });
   // blob 无字节回调：用 indeterminate 脉冲态表示「正在保存」，乐观完成
   window.HmdaoProgress.updateTask(dlId, { state: window.HmdaoProgress.STATE.DOWNLOADING, totalBytes: 0, receivedBytes: 0 });
@@ -69,6 +177,51 @@ function downloadBlobUrl(blobUrl, filename, asset) {
 //   替代 chrome.downloads.download 直连（带不上会话 Cookie → 必 FILE_FAILED）。
 //   注意：filename 传 'Ddayup/videos/x.mp4'，HMDAO_DOWNLOAD_IN_TAB 会把 '/' 替换成 '_'
 //   → 实际下载名 'Ddayup_videos_x.mp4'，靠 background.js / sidepanel 的 /Ddayup/i 正则匹配进度卡。
+// ★豆包朗读（WS 流式 ogg_opus）下载：无 HTTP 直链可下，
+//   改从源页取回 doubao-audio-capture.js 旁路收集到的原始字节（不重编码、不录制，即平台下发的原始音频），
+//   全程不发起任何网络直链请求，也不改动源页任何行为。
+async function downloadDoubaoWsAudio(a) {
+  setStatus('正在从源页取回朗读音频…');
+  // 首选：源页内合成 Blob 直接下载（字节不出页面 → 无回传大小限制，长朗读也稳）
+  let name0 = deriveFilename(a).replace(/\.(mp3|bin)$/i, '');
+  let res = null;
+  try {
+    res = await chrome.runtime.sendMessage({
+      type: 'HMDAO_DOWNLOAD_DOUBAO_WS_AUDIO',
+      ts: Number(a.wsTs) || 0,
+      name: name0 + '.ogg',
+    });
+  } catch (_) { res = null; }
+  if (res && res.ok) {
+    setStatus('✅ 已下载：' + (res.name || (name0 + '.ogg')));
+    return true;
+  }
+  // 回退：取回字节 → blob 下载（受回传大小限制，但兼容源页注入受限的场景）
+  try {
+    res = await chrome.runtime.sendMessage({ type: 'HMDAO_GET_DOUBAO_WS_AUDIO', ts: Number(a.wsTs) || 0 });
+  } catch (_) { res = null; }
+  if (!res || !res.ok || !res.b64) {
+    setStatus('⚠ 未取到朗读音频' + (res && res.error ? '（' + res.error + '）' : '') + '，请先在源页点一次「朗读」并播放', true);
+    return false;
+  }
+  try {
+    const bytes = b64ToBytes(res.b64);
+    const mime = (res.mime && /^audio\//.test(res.mime)) ? res.mime : 'audio/ogg';
+    const blob = new Blob([bytes], { type: mime });
+    const url = URL.createObjectURL(blob);
+    // deriveFilename 对 audio 默认补 .mp3，这里按真实格式改后缀，避免扩展名与内容不符
+    let name = deriveFilename(a);
+    name = name.replace(/\.(mp3|bin)$/i, '') + (res.ogg ? '.ogg' : '.bin');
+    downloadBlobUrl(url, 'Ddayup/audio/' + name, a);
+    setTimeout(() => URL.revokeObjectURL(url), 120000);
+    setStatus('✅ 已下载：' + name);
+    return true;
+  } catch (e) {
+    setStatus('⚠ 下载失败：' + errStr(e), true);
+    return false;
+  }
+}
+
 async function downloadBiliDurlViaPageFetch(newUrl, a) {
   const name = deriveFilename(a);
   setStatus('B站 durl 经 Referer 注入后下载到本地…');
@@ -79,6 +232,8 @@ async function downloadBiliDurlViaPageFetch(newUrl, a) {
   //   → bilivideo CDN 403。故后台在下载前用 dNR 临时注入 Referer=bilibili.com，直连 durl 即被 CDN 放行 → 真实 mp4 落盘。
   try {
     if (typeof hmdaoLog === 'function') hmdaoLog('[B站下载] 触发 chrome.downloads durl=' + String(newUrl).slice(0, 70));
+    // ★2026-09-11：后台代下载通道无法写任意目录 → 发起前先抢一次用户目录
+    if (await tryUserDirBeforeNativeChannel(a, newUrl, name)) return;
     const r = await chrome.runtime.sendMessage({
       type: 'HMDAO_DOWNLOAD_BILI_DURL',
       url: newUrl,
@@ -123,8 +278,243 @@ async function downloadBiliDurlViaPageFetch(newUrl, a) {
 // opts: { downloadUrl?: string, formatId?: string }
 //   downloadUrl —— 指定要下载的具体直链（用于分辨率选择面板选中的某个直链源）
 //   formatId    —— 指定 yt-dlp 格式（如 '137+140'），覆盖当前选中的 __ytSelectedFormat
+// ★2026-09-10：用户为某类型设置了保存目录时，下载必须落到【用户设置的目录】。
+//   背景：chrome.downloads.download 只能写到「浏览器下载目录 + 相对子目录」，
+//   无法写入用户在侧栏用 showDirectoryPicker 选择的任意目录；而 saveHandles[type]
+//   是 FileSystemDirectoryHandle（File System Access API），可直接写任意目录。
+//   此前 downloadSingle 完全没读 saveHandles → 用户设了目录也照样落到 Ddayup/<默认子目录>。
+//   策略：有 handle 就走 File System Access 写入；任何失败都返回 false，由调用方回退原下载逻辑。
+async function trySaveToUserDir(a) {
+  try {
+    // ★2026-09-10 关键修复（"点了下载完全没反应"的真凶）：
+    //   流媒体（m3u8/mpd）绝不能走「抓字节→写用户目录」这条路 —— a.url 是【文本播放列表】，
+    //   fetchViaBackground 抓到的只是几 KB 清单而非视频内容；且整段视频常达 GB 级，
+    //   根本无法经 sendMessage 回传。更糟的是它对跨域流会长期 pending，
+    //   于是 await 永远不返回 → 状态条不提示、下载管理器无条目 → 表现为"点了没反应"。
+    //   流媒体必须走后端 ffmpeg 拉流 + chrome.downloads 流式写盘（见 downloadHlsViaBackend）。
+    if (/\.(m3u8|mpd)(\?|$)/i.test(String(a.url || ''))) {
+      console.log('[Ddayup] 跳过用户目录（流媒体走后端拉流）：', String(a.url).slice(0, 60));
+      return false;
+    }
+    // 侧栏刚打开时目录还在从 IndexedDB 恢复，等它完成再判断，避免"明明设了却没生效"
+    if (typeof __dirRestorePromise !== 'undefined' && __dirRestorePromise) await __dirRestorePromise;
+    const handle = (typeof saveHandles !== 'undefined' && saveHandles) ? saveHandles[a && a.type] : null;
+    if (!handle) { notifyUserDirSkipped(a, '未设置该类型目录'); return false; }
+    // ★超时护栏：任何抓取挂起（防盗链/跨域/大文件）最多等 20 秒就放弃，回退默认下载，
+    //   绝不让用户面对"无限等待"。
+    // ★2026-09-10 修复（图片热点防盗链）：非音频类型用 deriveMediaReferer 按 CDN 选正确 Referer，
+    //   否则无 Referer 直拉会被图床 403 → trySaveToUserDir 失败 → 回退默认路径。
+    const referer = (a.type === 'audio')
+      ? sourceOrigin()
+      : (typeof deriveMediaReferer === 'function' ? deriveMediaReferer(a.url, window.__sourcePageUrl || '') : (window.__sourcePageUrl || ''));
+    // 目录权限可能因浏览器重启过期；在用户点击流程里可以安全 requestPermission
+    try {
+      const perm = await handle.queryPermission({ mode: 'readwrite' });
+      if (perm !== 'granted') {
+        const reqPerm = await handle.requestPermission({ mode: 'readwrite' });
+        if (reqPerm !== 'granted') {
+          setStatus('⚠ 需要目录写入权限才能保存到设置目录', true);
+          return false;
+        }
+      }
+    } catch (e) {
+      console.log('[Ddayup] 目录权限请求失败/不支持', e && e.message);
+    }
+    const res = await Promise.race([
+      fetchViaBackground(a.url, { referer }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('抓取超时(20s)')), 20000)),
+    ]);
+    if (!res || !res.ok) return false;
+    // 兼容两种回传形态：arrayBuffer（同进程）或 b64（跨 sendMessage，ArrayBuffer 会丢失）
+    let bytes = res.arrayBuffer;
+    if (!bytes && res.b64) { try { bytes = b64ToBytes(res.b64); } catch (_) { bytes = null; } }
+    if (!bytes) return false;
+    const name = deriveFilename(a);
+    const fileHandle = await handle.getFileHandle(name, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(bytes);
+    await writable.close();
+    try { if (typeof pulseDownloadProgress === 'function') pulseDownloadProgress('已保存到设置目录：' + name); } catch (_) {}
+    setStatus('✅ 已保存到设置的目录：' + name);
+    return true;
+  } catch (e) {
+    return false; // 静默失败 → 回退默认下载
+  }
+}
+
+// ★2026-09-10：把已拿到的 blob 写到用户为该类型设置的目录（FileSystemAccess API）。
+//   返回 true 表示已写入用户目录（调用方应跳过 chrome.downloads 默认路径）；
+//   返回 false 表示用户没设该类型目录 / 写入失败（调用方回退原逻辑）。
+//   这是让【视频/音频/模型】等「浏览器原生下载拿不到字节、只能走 blob」的素材
+//   也能落到用户目录的唯一通道（chrome.downloads 只能写下载目录+相对子目录）。
+async function writeBlobToUserDir(type, name, blob) {
+  try {
+    const handle = userDirHandleFor(type);
+    if (!handle || !blob) return false;
+    // 权限可能在浏览器重启后过期；在用户点击流程里可以安全 requestPermission
+    try {
+      const perm = await handle.queryPermission({ mode: 'readwrite' });
+      if (perm !== 'granted') {
+        const reqPerm = await handle.requestPermission({ mode: 'readwrite' });
+        if (reqPerm !== 'granted') return false;
+      }
+    } catch (e) {
+      console.log('[Ddayup] writeBlob 目录权限请求失败/不支持', e && e.message);
+    }
+    const fh = await handle.getFileHandle(name, { create: true });
+    const w = await fh.createWritable();
+    await w.write(blob);
+    await w.close();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// ★2026-09-11：此前「没存到用户目录」全部静默，用户只能看到文件出现在默认目录、无从判断原因。
+//   现在把原因【显式写进状态栏】（同类 30 秒不刷屏）+ console.warn，一眼可定位。
+const __userDirWarnAt = {};
+function notifyUserDirSkipped(a, reason) {
+  try {
+    const type = (a && a.type) || '';
+    const now = Date.now();
+    if (!__userDirWarnAt[type] || now - __userDirWarnAt[type] > 30000) {
+      __userDirWarnAt[type] = now;
+      const label = (typeof typeLabel === 'function') ? typeLabel(type) : (type || '素材');
+      const sub = (typeof typeDirs !== 'undefined' && typeDirs[type]) ? typeDirs[type] : 'other';
+      setStatus(`⚠ 未存入「${label}」目录：${reason} → 已下载到默认目录 Ddayup/${sub}/（展开下方「按类型自定义保存路径」设置）`, true);
+    }
+  } catch (_) {}
+  console.warn('[Ddayup][userdir] skip:', reason, (a && a.type) || '');
+}
+
+// ★2026-09-11：B站 durl / 抖音 dNR / 后端合并产物这类「后台或源页代下载」通道，
+//   下载实际发生在 background / 源页上下文，chrome.downloads 只能写浏览器默认目录，
+//   侧栏插桩（dlViaChrome）拦不到。故在【发起之前】抢先尝试用户目录：
+//   拿到字节就写用户目录并跳过原通道；拿不到就照原路走（落默认目录）并告知原因。
+async function tryUserDirBeforeNativeChannel(a, url, name) {
+  try {
+    if (a && url && /^https?:/i.test(String(url))) {
+      return await tryWriteUserDirFromUrl(a, url, name);
+    }
+  } catch (_) {}
+  return false;
+}
+
+// ★2026-09-10 P1 统一落盘出口：所有落盘路径（dlViaChrome / downloadBlobUrl）都先问它。
+//   历史教训：此前 17 个落盘点各自硬编码 'Ddayup/<typeDirs>/'，加一个平台就漏一个，
+//   用户设了目录照样下到默认目录。现在只在【两个唯一插桩点】判断一次，覆盖率 100%。
+//   返回 true = 已写入用户设置目录，调用方必须跳过默认下载。
+//   任何失败都返回 false 并 console.warn 打印【具体原因】（不再静默），保证原有回退链路不变。
+const USER_DIR_MAX_BYTES = 60 * 1024 * 1024; // sendMessage 约 64MB 上限，留 4MB 余量
+function userDirHandleFor(type) {
+  if (typeof saveHandles === 'undefined' || !saveHandles) return null;
+  if (saveHandles[type]) return saveHandles[type];
+  if (type === 'netdisk') return saveHandles.archive || null; // 网盘无独立行 → 复用归档目录
+  return null;
+}
+async function tryWriteUserDirFromUrl(a, url, filename) {
+  try {
+    if (window.__hmdaoUserDirEnabled === false) return false;
+    // 侧栏刚打开时目录还在从 IndexedDB 恢复，等它完成再判断，避免"明明设了却没生效"
+    if (typeof __dirRestorePromise !== 'undefined' && __dirRestorePromise) await __dirRestorePromise;
+    if (!a || !url || !/^https?:/i.test(url)) return false;
+    // 流媒体是文本播放清单，不是媒体本体 → 必须走后端 ffmpeg 拉流
+    if (/\.(m3u8|mpd)(\?|$)/i.test(url)) {
+      console.warn('[Ddayup][userdir] skip: 流媒体，走后端拉流');
+      return false;
+    }
+    const type = a.type || '';
+    const handle = userDirHandleFor(type);
+    if (!handle) { notifyUserDirSkipped(a, '未设置该类型目录'); return false; }
+    const size = Number(a.size || 0);
+    if (size > USER_DIR_MAX_BYTES) {
+      console.warn('[Ddayup][userdir] skip: 超过 60MB，走浏览器原生下载（' + Math.round(size / 1048576) + 'MB）');
+      return false;
+    }
+    // ★2026-09-11：音视频体积未知时绝不走「拉字节」通道——整段 1080P 常达数百 MB，
+    //   会白白等满 30s 超时才回退（表现为"点了没反应"）。体积已知且 ≤60MB 才尝试。
+    if ((type === 'video' || type === 'audio') && !size) {
+      console.warn('[Ddayup][userdir] skip: 音视频体积未知，走浏览器原生下载（避免整段拉取超时）');
+      return false;
+    }
+    const name = filename || deriveFilename(a);
+    const referer = (type === 'audio')
+      ? sourceOrigin()
+      : (typeof deriveMediaReferer === 'function' ? deriveMediaReferer(url, window.__sourcePageUrl || '') : (window.__sourcePageUrl || ''));
+    const fetcher = (typeof fetchMediaViaBackground === 'function')
+      ? fetchMediaViaBackground(url, referer)
+      : fetchViaBackground(url, { referer });
+    const res = await Promise.race([
+      fetcher,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('抓取超时(30s)')), 30000)),
+    ]);
+    if (!res || !res.ok) { console.warn('[Ddayup][userdir] skip: 抓取失败', (res && res.error) || ''); return false; }
+    let bytes = res.arrayBuffer;
+    if (!bytes && res.b64) { try { bytes = b64ToBytes(res.b64); } catch (_) { bytes = null; } }
+    if (!bytes || !bytes.byteLength) { console.warn('[Ddayup][userdir] skip: 未拿到字节'); return false; }
+    const blob = new Blob([bytes], { type: res.mime || 'application/octet-stream' });
+    if (await writeBlobToUserDir(type, name, blob)) {
+      try { if (typeof pulseDownloadProgress === 'function') pulseDownloadProgress('已保存到设置目录：' + name); } catch (_) {}
+      setStatus('✅ 已保存到设置的目录：' + name);
+      console.log('[Ddayup][userdir] ok:', type, name);
+      return true;
+    }
+    console.warn('[Ddayup][userdir] skip: 写入用户目录失败（权限/磁盘）');
+    return false;
+  } catch (e) {
+    console.warn('[Ddayup][userdir] skip: 异常', (e && e.message) || e);
+    return false;
+  }
+}
+
+// blob 已在侧栏上下文（无需网络、无跨域）→ 直接写用户目录
+async function tryWriteUserDirFromBlob(a, blobUrl, filename) {
+  try {
+    if (window.__hmdaoUserDirEnabled === false) return false;
+    // 侧栏刚打开时目录还在从 IndexedDB 恢复，等它完成再判断，避免"明明设了却没生效"
+    if (typeof __dirRestorePromise !== 'undefined' && __dirRestorePromise) await __dirRestorePromise;
+    if (!a || !blobUrl || !/^blob:/i.test(String(blobUrl))) return false;
+    const handle = userDirHandleFor(a.type || '');
+    if (!handle) return false;
+    const name = filename || deriveFilename(a);
+    const blob = await (await fetch(blobUrl)).blob();
+    if (!blob || !blob.size) return false;
+    if (await writeBlobToUserDir(a.type, name, blob)) {
+      try { if (typeof pulseDownloadProgress === 'function') pulseDownloadProgress('已保存到设置目录：' + name); } catch (_) {}
+      setStatus('✅ 已保存到设置的目录：' + name);
+      console.log('[Ddayup][userdir] ok(blob):', a.type, name);
+      return true;
+    }
+    return false;
+  } catch (e) {
+    console.warn('[Ddayup][userdir] skip(blob):', (e && e.message) || e);
+    return false;
+  }
+}
+
 async function downloadSingle(a, opts = {}) {
   if (!chrome.downloads) { setStatus('下载 API 不可用', true); return; }
+  // ★豆包朗读（已实体化为侧栏 blob）→ 直接落盘。
+  //   必须抢在下方 blob 分支之前：那里会把 blob 当「播放器内部地址」而拒绝下载。
+  if (a && a.wsAudio && /^blob:/i.test(String(a.url || ''))) {
+    const nm = deriveFilename(a).replace(/\.(mp3|bin)$/i, '') + '.ogg';
+    // ★P0：豆包朗读此前恒定写到 Ddayup/audio/（它在 trySaveToUserDir 之前 return）。
+    //   现在先问用户目录（blob 在侧栏上下文，fetch 即得字节）；失败才回退原来的 <a download>。
+    if (!(await tryWriteUserDirFromBlob(a, a.url, nm))) {
+      downloadBlobUrl(a.url, 'Ddayup/audio/' + nm, a);
+      setStatus('✅ 已下载：' + nm);
+    }
+    return;
+  }
+  // ★2026-09-10：用户为该类型设置了保存目录 → 优先写入用户目录（精确遵循设置）。
+  //   未设置 / 抓取失败 / 文件过大 → trySaveToUserDir 返回 false，继续走下方原有下载逻辑。
+  // ★P0 修复（分辨率被吞）：用户从分辨率面板选了 opts.downloadUrl 时，绝不能在这里用 a.url
+  //   （默认画质）抢先写盘并 return——那样面板选的分辨率会被丢弃。
+  //   该场景交给下方 opts.downloadUrl 分支，按【选中的直链】写用户目录。
+  if (!opts || !opts.downloadUrl) {
+    if (await trySaveToUserDir(a)) return;
+  }
   // ★2026-09-01 修复（用户实测「点击下载没反应、本地没下载到视频」根因）：
   //   抖音 PC 播放器走 MSE，卡片 url 可能是 blob:。blob 只在创建它的页面上下文有效，
   //   扩展/浏览器下载器都拿不到字节 → chrome.downloads 静默失败（无任何提示、无文件）。
@@ -159,6 +549,21 @@ async function downloadSingle(a, opts = {}) {
       .catch((e) => setStatus('⚠ 直链下载失败：' + (e && e.message || e), true));
     return;
   }
+  // ★2026-09-10：流媒体（m3u8/mpd）必须在进入任何【直连】分支之前拦下。
+  //   m3u8 是文本播放列表，chrome.downloads 直连只会把它几十 KB 的文本存成"视频"
+  //   （用户实测：下载失败 + 只得到 42KB 假文件）。必须交 yt-dlp / 后端合并真实分片。
+  if (opts && opts.downloadUrl && /\.(m3u8|mpd)(\?|$)/i.test(opts.downloadUrl)) {
+    // ffmpeg 原生支持 HLS，不依赖站点提取器 → 先走它，成功率高于 yt-dlp
+    if (await downloadHlsViaBackend({ ...a, url: opts.downloadUrl })) return;
+    setStatus('后端拉流未成功，改试 yt-dlp…');
+    try {
+      await downloadViaYtDlp({ ...a, url: opts.downloadUrl, playerUrl: opts.downloadUrl }, '', 'bv*+ba/best');
+      return;
+    } catch (e) {
+      setStatus('⚠ 流媒体下载失败：' + ((e && e.message) || 'yt-dlp 无法解析该站点'), true);
+      return;
+    }
+  }
   // 指定具体直链下载（分辨率选择面板选中的某个 URL 源）：经后台带 Referer 拉取字节→blob→下载，
   // 兼容防盗链（抖音/腾讯等）与普通 CDN，失败时回退 chrome.downloads 直连。
   if (opts && opts.downloadUrl && opts.downloadUrl.startsWith('http')) {
@@ -172,15 +577,69 @@ async function downloadSingle(a, opts = {}) {
     //   修复：B站走 dlViaChrome 浏览器原生直连（带 Referer），不经消息回传、100% 成功。
     //   抖音/视频号仍走字节拉取（需要 cookie 域，chrome 直连会 403）。
     const isBiliCdn = /bilivideo\.com/i.test(opts.downloadUrl || '');
-    if (cdnVideoOpt && !isBiliCdn) { downloadVideoViaBackground(target); return; }
-    pulseDownloadProgress('正在下载所选分辨率：' + deriveFilename(target));
+    // ★2026-09-02 关键修复（"点面板选分辨率下载一直显示下载中 / 后端 500"真因闭环）：
+    //   抖音原先走 downloadVideoViaBackground（后台 fetch），受 CORS/签名限制且受 ~64MB 消息上限约束；
+    //   走后端 yt-dlp 又依赖 buildDouyinCookiesFile() 写 Netscape cookie 文件 —— 但该函数在
+    //   【扩展页面】里用了 require('os') / require('fs') / require('path')，浏览器环境没有 require，
+    //   抛错被其 catch 吞掉后【恒返回 null】→ 后端无 cookies_file → yt-dlp 报
+    //   "Fresh cookies are needed" → 500。这条路在扩展侧不可能走通，不必再修 cookie 逻辑。
+    //   故抖音改用 HMDAO_DOWNLOAD_IN_TAB：在源页 <a download href=直链> 触发，浏览器自动带
+    //   源页会话 Cookie + Referer=源页 → CDN 放行 → 真实 mp4 字节，与 cookie 文件完全无关。
+    if (cdnVideoOpt && !isBiliCdn) {
+      // ★2026-09-02 关键修复（"点面板下载弹窗下载/页面跳到 403"真凶闭环）：
+      //   HMDAO_DOWNLOAD_IN_TAB 在源页注入 <a download>，但抖音 CDN（douyinvod.com）与源页
+      //   （douyin.com）【不同源】，HTML download 属性跨域时被浏览器直接忽略 → 退化成
+      //   <a target=_blank> → Chrome 内嵌播放被防链 403（用户实测任务卡显示 v26-web.douyinvod.com
+      //   并跳转 / FILE_FAILED）。
+      //   正确入口是 HMDAO_DOWNLOAD_DY_URL（background.js:2361 已实现）：先用 dNR 临时注入
+      //   Referer=douyin.com（仅作用于 chrome.downloads 的 'other' 请求类型，不影响 <video>），
+      //   再 chrome.downloads.download 直连 CDN → CDN 放行 → 真实 mp4 落盘，源页不导航。
+      if (/douyin|tiktok|bytedance|douyinvod|v26-web/i.test(opts.downloadUrl || '')) {
+        // ★2026-09-02 按分辨率下载：选中的视频轨（douyinvod 直链，无签名）前端下不了，
+        //   交后端带 Referer 拉视频轨 + 音频轨，ffmpeg 合并成含音画 mp4（已实测 1080P h264+aac）。
+        //   仅当 URL 本身就是 playApi（自带 biz_sign，同源）时才裸调 chrome.downloads。
+        const isPlayApi = /douyin\.com\/aweme\/v1\/play/i.test(String(opts.downloadUrl || ''));
+        if (isPlayApi) {
+          await dlViaChrome({
+            url: opts.downloadUrl,
+            // ★2026-09-10：原硬编码 'videos'，导致动图（type=image 但 dynamic=true）等
+      //   非视频资产也被存进 Ddayup/videos。改按 typeDirs 取子目录，全链路路径统一。
+      filename: 'Ddayup/' + (typeDirs[target.type] || 'videos') + '/' + deriveFilename(target),
+            asset: a, saveAs: false, conflictAction: 'uniquify',
+          });
+          setStatus('✅ 抖音视频已开始下载到本地（侧栏任务卡查看实时进度）', true);
+          return;
+        }
+        // 视频轨 → 后端合并音视频后落盘（选 1080P 即下 1080P，含音频轨）
+        await mergeAndDownloadViaBackend(a, opts.downloadUrl);
+        return;
+      }
+      downloadVideoViaBackground(target); return;
+    }
+    // ★2026-09-10：chrome.downloads.download【不接受】Referer 等禁止头，传入会直接抛
+    //   "Unsafe request header name"（用户日志已证实）。防盗链 Referer 只能靠 dNR 在网络层
+    //   注入（见 background.js HMDAO_INSTALL_DY_REFERER / HMDAO_DOWNLOAD_BILI_DURL 同款机制）。
+    //   这里不再传 headers，避免整条下载链路被这个异常打断后回退到"后台拉字节"，
+    //   把 m3u8 文本（42KB）当成视频存盘。
     const viaChrome = () => dlViaChrome({
       url: opts.downloadUrl,
-      filename: 'Ddayup/videos/' + deriveFilename(target),
+      // ★2026-09-10：原硬编码 'videos'，导致动图（type=image 但 dynamic=true）等
+      //   非视频资产也被存进 Ddayup/videos。改按 typeDirs 取子目录，全链路路径统一。
+      filename: 'Ddayup/' + (typeDirs[target.type] || 'videos') + '/' + deriveFilename(target),
       saveAs: false, conflictAction: 'uniquify',
-      ...(referer ? { headers: [{ name: 'Referer', value: referer }] } : {}),
     });
     try {
+      // ★2026-09-10：用户为该类型设置了目录 → 优先写用户目录（fetchMediaViaBackground 拿字节）
+      if (typeof saveHandles !== 'undefined' && saveHandles && saveHandles[target.type]) {
+        const r = await fetchMediaViaBackground(opts.downloadUrl, referer);
+        if (r && r.ok && r.b64) {
+          const blob = new Blob([b64ToBytes(r.b64)], { type: r.mime || 'video/mp4' });
+          if (await writeBlobToUserDir(target.type, deriveFilename(target), blob)) {
+            setStatus('✅ 已保存到设置的目录：' + deriveFilename(target));
+            return;
+          }
+        }
+      }
       await viaChrome();
       setStatus('✅ 已下载所选分辨率');
       return;
@@ -197,6 +656,11 @@ async function downloadSingle(a, opts = {}) {
         const blob = new Blob([b64ToBytes(res.b64)], { type: res.mime || 'video/mp4' });
         const url = URL.createObjectURL(blob);
         cacheDragBlob(target, blob, res.mime || 'video/mp4');
+        // ★2026-09-10：用户为该类型设置了目录 → 写用户目录
+        if (await writeBlobToUserDir(target.type, deriveFilename(target), blob)) {
+          setStatus('✅ 已保存到设置的目录：' + deriveFilename(target));
+          return;
+        }
         downloadBlobUrl(url, 'Ddayup/videos/' + deriveFilename(target));
         setTimeout(() => URL.revokeObjectURL(url), 120000);
         setStatus('✅ 已下载所选分辨率');
@@ -316,6 +780,16 @@ async function downloadSingle(a, opts = {}) {
   //   之前用 dlViaChrome({ url: blob, ... }) 一律 FILE_FAILED（右键下载报错真凶）。
   if (a.__mergedDash && typeof a.url === 'string' && a.url.startsWith('blob:')) {
     const name = a.__mergedName || 'video_merged.mp4';
+    // ★2026-09-10：用户为视频设置了目录 → 优先写用户目录（blob 字节可直接写 FileSystemAccess）
+    if (typeof saveHandles !== 'undefined' && saveHandles && saveHandles[a.type]) {
+      try {
+        const b = await fetch(a.url).then((r) => r.blob());
+        if (await writeBlobToUserDir(a.type, name, b)) {
+          setStatus('✅ 已保存到设置的目录：' + name);
+          return;
+        }
+      } catch (_) { /* 回退默认下载 */ }
+    }
     downloadBlobUrl(a.url, 'Ddayup_videos_' + name, a);
     setStatus('✅ 已下载合并单文件 MP4：' + name + '（浏览器下载栏查看）');
     return;
@@ -347,6 +821,12 @@ async function downloadSingle(a, opts = {}) {
   // 优先用「源页身份」fetch+下载（带登录 Cookie，能复刻在爱给/freesound 页面能下的效果）。
   // 仅当源页方案失败（无源标签 / 跨域 fetch 报错）才退回 chrome.downloads + Referer 规则兜底。
   if (a.type === 'audio') {
+    // ★2026-09-06 豆包朗读（WS 流式 ogg_opus，无 HTTP 直链）：
+    //   从源页取回旁路收集到的原始字节 → blob 下载（不经过任何网络直链请求）。
+    if (a.wsAudio) {
+      await downloadDoubaoWsAudio(a);
+      return;
+    }
     // 主路径：抓到真实直链（网络层捕获 / 页面解析）→ 用浏览器下载管理器下载。
     // chrome.downloads.download 会自动带上源站登录 Cookie（用户已登录），
     // 再叠加 declarativeNetRequest 注入的 Referer 头绕过防盗链，等价于「F12 复制直链 → 新标签打开 → 另存为」。
@@ -372,9 +852,18 @@ async function downloadSingle(a, opts = {}) {
     // 2026-08-24 增强：m3u8/mpd 显式请求最高清（bv*+ba 合并最佳视频轨+最佳音频轨），
     // 避免后端默认 format 落到非最高清。直播流（无 #EXT-X-ENDLIST）yt-dlp 仅录片段，
     // 此处不区分直播/点播（前端无法低成本判定），由后端 yt-dlp 自行处理。
-    setStatus('检测到 HLS/DASH 流媒体，尝试 yt-dlp 合并下载最高清…');
-    await downloadViaYtDlp({ ...a, playerUrl: a.url, ytPageUrl: '', biliPageUrl: '' }, '', 'bv*+ba/best');
-    return;
+    // ★2026-09-10：优先后端 ffmpeg 拉流（原生支持 HLS，不依赖站点提取器，私有影视站也能下），
+    //   失败再回退 yt-dlp（依赖提取器，私有站常 500）。
+    setStatus('检测到 HLS/DASH 流媒体，用后端 ffmpeg 拉流合并…');
+    if (await downloadHlsViaBackend(a)) return;
+    setStatus('后端拉流未成功，改试 yt-dlp…');
+    try {
+      await downloadViaYtDlp({ ...a, playerUrl: a.url, ytPageUrl: '', biliPageUrl: '' }, '', 'bv*+ba/best');
+      return;
+    } catch (e) {
+      setStatus('⚠ 流媒体下载失败：' + ((e && e.message) || '未知'), true);
+      return;
+    }
   }
   if (isStream) setStatus('⚠ 流媒体下载仅得到播放列表', true);
   // 抖音/TikTok/视频号/爱给等防盗链视频：签名 URL 重发必 403（绑定 IP+时间）或缺 Referer，
@@ -456,26 +945,38 @@ async function downloadSingle(a, opts = {}) {
         referer: /tiktok\.com/i.test(freshUrl) ? 'https://www.tiktok.com/' : 'https://www.douyin.com/',
       }).catch(() => ({ ok: false }));
       try {
+        // ★2026-09-02 修正（上一版"直接带 Referer 头"是错的，勿改回）：
+        //   Referer 属于【禁止头 forbidden header name】。实测本分支传 headers:[{Referer}] 时
+        //   chrome.downloads.download 直接抛 "Unsafe request header name"（用户日志已证实），
+        //   并非注释原先假设的"CDN 403"。chrome.downloads 【无法】通过 headers 传递 Referer，
+        //   唯一可行方式是用 dNR 在网络层注入。
+        //   故改用 HMDAO_DOWNLOAD_DY_URL（background.js:2361 已实现）：dNR 临时注入
+        //   Referer=douyin.com（仅作用于 'other' 请求类型，不污染页面 <video> 的防盗链签名），
+        //   再 chrome.downloads 直连 CDN → 放行 → 真实 mp4 落盘，源页不导航。
+        // ★2026-09-02：改用 HMDAO_DY_FETCH_PLAY（源页 fetch playApi → blob → <a download>）。
+        //   实测 HMDAO_DOWNLOAD_DY_URL 虽能创建下载任务（返回 downloadId），但下载过程必被
+        //   SERVER_FORBIDDEN 中断——douyinvod 校验不止 Referer，dNR 注入不足以放行。
+        //   源页 fetch 对 playApi（www.douyin.com）【同源】，浏览器自动带会话 Cookie + Referer，
+        //   不依赖 dNR / chrome.downloads / 禁止头，是当前最稳路径。
+        // ★2026-09-02 最终方案（由 __hmdaoTestDyDownload 实测证实，勿再改回 dNR/fetch）：
+        //   自动化测试 3D 结果：chrome.downloads 直连 playApi → state='complete'、
+        //   bytesReceived=23695772、error=undefined（23.7MB 完整落盘）。
+        //   对照：加 dNR 注入 Referer 反而 SERVER_FORBIDDEN；源页 fetch 则 Failed to fetch。
+        //   结论：playApi 自带 biz_sign 签名即可通过 CDN 校验，【无需 Referer、无需 dNR、
+        //   无需 fetch】——任何额外改写请求头的动作都会破坏签名导致 403。
+        //   同时它走 chrome.downloads API，因此侧栏任务卡能正常显示进度与完成状态。
         await dlViaChrome({
           url: freshUrl,
           filename: dyFilename,
           asset: a,
           saveAs: false,
           conflictAction: 'uniquify',
-          // ★2026-09-02 修复（"点击下载弹出新链接、没下载到本地"的确切根因）：
-          //   chrome.downloads.download 原生支持 headers（同文件 L151 迅雷分支、L175 B站分支
-          //   都已在用），但【抖音分支漏传 Referer】→ CDN 403 → dlViaChrome 失败 → 回退
-          //   源页 <a download> → 跨域使 download 属性失效 → Chrome 内嵌播放 = 弹出新标签。
-          //   直接带 Referer 即可绕过防盗链：不依赖 dNR、不依赖后端，所有用户都可落盘。
-          headers: [{
-            name: 'Referer',
-            value: /tiktok\.com/i.test(freshUrl) ? 'https://www.tiktok.com/' : 'https://www.douyin.com/',
-          }],
         });
+        console.log('[HMDAO][diag] 抖音经 chrome.downloads(playApi) 触发下载成功');
         setStatus('✅ 抖音视频已开始下载到本地（侧栏任务卡查看实时进度）', true);
         return;
       } catch (e) {
-        console.log('[HMDAO][diag] chrome.downloads 失败，回退源页 <a download>：', (e && e.message) || e);
+        console.log('[HMDAO][diag] chrome.downloads(DY_URL) 失败，回退源页 <a download>：', (e && e.message) || e);
         setStatus('chrome.downloads 失败，回退源页触发…');
       }
       chrome.runtime.sendMessage({
@@ -510,12 +1011,55 @@ async function downloadSingle(a, opts = {}) {
     return;
   }
   // yt-dlp 多平台统一下载（YouTube / B站等）：支持分辨率选择
-  const isYtDlpVideo = a.type === 'video' && isYtDlpPlatform(a);
+  // ★2026-09-02：抖音【必须排除】在 yt-dlp 之外（此前多轮"下载中无响应"的根因）。
+  //   抖音走 downloadViaYtDlp 必然失败：其依赖 buildDouyinCookiesFile() 写 Netscape cookie 文件，
+  //   但该函数在扩展页面使用了 require('os')/require('fs') —— 浏览器环境没有 require，
+  //   异常被 catch 吞掉后恒返回 null → 后端无 cookies_file → yt-dlp 报
+  //   "Fresh cookies are needed" → 500 → 前端无失败分支 → 一直显示"下载中"。
+  //   抖音改走下方 HMDAO_DOWNLOAD_DY_URL（dNR 注入 Referer + chrome.downloads 直连 CDN）。
+  const isDyVideoNow = /douyin|tiktok|bytedance|douyinvod|v26-web/i.test(String((a && a.url) || '') + ' ' + String(sourcePage || ''));
+  const isYtDlpVideo = a.type === 'video' && isYtDlpPlatform(a) && !isDyVideoNow;
   if (isYtDlpVideo) {
     await downloadViaYtDlp(a, sourcePage);
     return;
   }
+  // ★2026-09-02 修正（此前用 HMDAO_DOWNLOAD_IN_TAB 是错的，勿改回）：
+  //   HMDAO_DOWNLOAD_IN_TAB 在源页注入 <a download>，但抖音 CDN（douyinvod.com）与源页
+  //   （douyin.com）【不同源】，HTML download 属性跨域时被浏览器忽略 → 退化成 <a target=_blank>
+  //   → 浏览器导航到 CDN 直链 → 内嵌播放/403（用户实测"右键下载跳转成链接、能播放但没下载到本地"）。
+  //   正确入口 HMDAO_DOWNLOAD_DY_URL（background.js:2361 已实现）：dNR 临时注入 Referer=douyin.com
+  //   （仅作用于 chrome.downloads 的 'other' 请求类型，不影响页面 <video> 的防盗链签名），
+  //   chrome.downloads.download 直连 CDN → CDN 放行 → 真实 mp4 落盘，源页不导航。
+  if (/douyin|tiktok|bytedance|douyinvod|v26-web|aweme\/v1\/play/i.test(a.url || '')) {
+    const dyUrl = a.url;
+    console.log('[HMDAO][diag] 抖音命中兜底 → HMDAO_DOWNLOAD_DY_URL，url=' + String(dyUrl).slice(0, 70));
+    // ★2026-09-11：后台代下载通道无法写任意目录 → 发起前先抢一次用户目录
+    if (await tryUserDirBeforeNativeChannel(a, dyUrl, deriveFilename(a))) return;
+    chrome.runtime.sendMessage({
+      type: 'HMDAO_DOWNLOAD_DY_URL',
+      url: dyUrl,
+      filename: 'Ddayup/' + (typeDirs[a.type] || 'other') + '/' + deriveFilename(a),
+      referer: 'https://www.douyin.com/',
+    }, (resp) => {
+      if (resp && resp.ok) setStatus('✅ 抖音视频已触发下载（dNR 注入 Referer + chrome.downloads 落盘）', true);
+      else setStatus('抖音下载失败：' + ((resp && resp.error) || '未知'), true);
+    });
+    return;
+  }
   // 直接走 chrome.downloads.download（不带任何 header）—— B 站 CDN URL 自带签名参数必通
+  // ★2026-09-10：用户为该类型设置了目录 → 优先写用户目录（fetchMediaViaBackground 拿字节）
+  if (typeof saveHandles !== 'undefined' && saveHandles && saveHandles[a.type]) {
+    try {
+      const r = await fetchMediaViaBackground(a.url, deriveMediaReferer(a.url, sourcePage));
+      if (r && r.ok && r.b64) {
+        const blob = new Blob([b64ToBytes(r.b64)], { type: r.mime || (a.type === 'video' ? 'video/mp4' : 'application/octet-stream') });
+        if (await writeBlobToUserDir(a.type, deriveFilename(a), blob)) {
+          setStatus('✅ 已保存到设置的目录：' + deriveFilename(a));
+          return;
+        }
+      }
+    } catch (_) { /* 回退 chrome.downloads */ }
+  }
   dlViaChrome({
     url: a.url,
     filename: 'Ddayup/' + (typeDirs[a.type] || 'other') + '/' + deriveFilename(a),
@@ -627,8 +1171,23 @@ async function downloadViaYtDlp(a, sourcePage, formatId, _retried = false, _thro
       || (safeYt ? ('https://www.youtube.com/watch?v=' + safeYt) : '')
       || (safeBv ? ('https://www.bilibili.com/video/' + safeBv) : '')
       || sourcePage;
+    // ★2026-09-02 根因修复（点下载一直"下载中"、后端 500、无任何文件落地的真因）：
+    //   后端 action=download 走 yt-dlp，而 yt-dlp 抖音 extractor 【不支持】
+    //   jingxuan?modal_id=xxx 这种"精选列表页 + modal 锚点"形式，实测报错：
+    //     ERROR: Unsupported URL: https://www.douyin.com/jingxuan?modal_id=7678346515106106634
+    //   它只认标准视频页 https://www.douyin.com/video/<aweme_id>。实测同一条视频换成该形式后，
+    //   报错变为 "Fresh cookies are needed" —— URL 已被正确识别，剩下的是 cookie 问题，
+    //   由下方 buildDouyinCookiesFile() 提供。故传给后端前先把 URL 归一化。
+    let ytPageUrl = videoPageUrl;
+    try {
+      const pu = new URL(String(videoPageUrl || ''));
+      if (/douyin\.com$/i.test(pu.hostname) && !/\/video\//i.test(pu.pathname)) {
+        const mid = pu.searchParams.get('modal_id') || pu.searchParams.get('aweme_id');
+        if (mid && /^\d+$/.test(mid)) ytPageUrl = 'https://www.douyin.com/video/' + mid;
+      }
+    } catch (_) {}
     // ★ 走 action=download：yt-dlp 合并音视频落盘成单文件 mp4（或 audio=1 时仅 MP3）。
-    let dlUrl = 'http://127.0.0.1:3000/api/platform/ytdlp?action=download&url=' + encodeURIComponent(videoPageUrl);
+    let dlUrl = 'http://127.0.0.1:3000/api/platform/ytdlp?action=download&url=' + encodeURIComponent(ytPageUrl);
     if (selFmt) dlUrl += '&format=' + encodeURIComponent(selFmt);
     if (isAudio) dlUrl += '&audio=1';
     // B站需带登录态 cookie（未登录 yt-dlp 拿不到 720P+ 高清格式 → 后端 500）；抖音/TikTok 带匿名 cookie。
@@ -818,20 +1377,23 @@ async function refreshThenDownload(a, sourcePage) {
 
 // ===== CDN 鉴权站专用下载：fetch + Blob + <a download> =====
 async function downloadViaFetchBlob(a, sourcePage) {
-  pulseDownloadProgress('正在拉取：' + deriveFilename(a));
   setStatus('带 Referer 鉴权下载…');
   try {
     const res = await fetchViaBackground(a.url, { referer: sourcePage });
     if (!res || !res.ok) { setStatus('下载失败：' + (res?.error || res?.status || '无响应'), true); return; }
+    // ★2026-09-10：sendMessage 会丢弃 ArrayBuffer，必须改用 b64 还原。
+    let bytes = res.arrayBuffer;
+    if (!bytes && res.b64) { try { bytes = b64ToBytes(res.b64); } catch (_) { bytes = null; } }
+    if (!bytes) { setStatus('下载失败：无字节数据', true); return; }
     // 注意：大文件（视频）一次性写内存 → Blob 可能 OOM；本路径主要应对 ≤50 MB 资源
-    const sizeKB = (res.arrayBuffer && res.arrayBuffer.byteLength || 0) / 1024;
+    const sizeKB = bytes.byteLength / 1024;
     if (sizeKB > 50 * 1024) {
       // 大视频直接报错让用户用「存到本地」（流式写盘）
       setStatus(`⚠ 该文件 ${Math.round(sizeKB/1024)}MB，超出 Blob 内存上限，请用「存到本地」流式写盘`, true);
       return;
     }
     const mime = res.mime || (a.type === 'audio' ? 'audio/mpeg' : a.type === 'video' ? 'video/mp4' : 'application/octet-stream');
-    const blob = new Blob([res.arrayBuffer], { type: mime });
+    const blob = new Blob([bytes], { type: mime });
     const url = URL.createObjectURL(blob);
     // chrome.downloads.download 不支持 blob: URL，统一用 <a download> 触发（Chrome 支持 blob 下载）
     downloadBlobUrl(url, deriveFilename(a));
@@ -843,6 +1405,122 @@ async function downloadViaFetchBlob(a, sourcePage) {
 }
 
 // ===== DASH 分轨：本机后端 ffmpeg 合并为「含音画单文件」=====
+// ★2026-09-10：m3u8 / HLS 走【后端 ffmpeg 拉流】合并成单文件 MP4。
+//   为什么必须走后端（实测 4815.wumaheil13.icu 得出的结论，勿改回直连）：
+//     1) m3u8 是文本播放列表，chrome.downloads 直连只会得到 42KB 的文本假文件；
+//     2) 后端 yt-dlp 依赖【站点提取器】，私有影视站普遍不支持 → 500；
+//     3) ffmpeg 原生支持 HLS，-i index.m3u8 会自动拉全部分片，-c copy 零重编码；
+//     4) 后端可自由携带 Referer/Origin（不受浏览器禁止头限制，避免 Unsafe header 报错）；
+//     5) 产物经本地 fileUrl 下载：本地直连无防盗链、流式写盘、不受 ~64MB 消息上限约束。
+async function downloadHlsViaBackend(a) {
+  const apiBase = (window.DdayupConfig && typeof window.DdayupConfig.getApiBaseSync === 'function')
+    ? window.DdayupConfig.getApiBaseSync()
+    : 'http://127.0.0.1:3000';
+  const ref = deriveMediaReferer(a.url, window.__sourcePageUrl || '');
+  // ★2026-09-10：必须清洗文件名。chrome.downloads.download 的 filename 不接受
+  //   \ / : * ? " < > | 与控制字符；实测本站卡片标题形如
+  //   「NHHDTA-890 息子的友達にゴムを... 取...」含非法字符 → 调用直接抛错
+  //   → 被 dlViaChrome 内部 catch 吞掉 → 下载管理器里【完全没有条目】（用户看到"卡住"）。
+  //   这里统一清洗并兜底扩展名。
+  const __rawName = String(deriveFilename(a) || '').trim();
+  let __name = __rawName
+    .replace(/[\\/:*?"<>|\x00-\x1f]+/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 150);
+  if (!__name) __name = 'hls-' + Date.now();
+  if (!/\.(mp4|mkv|webm|mov|m4v|ts|flv|m4s)$/i.test(__name)) __name += '.mp4';
+  setStatus('⏳ 正在提交后端 ffmpeg 拉流（HLS 合并为单文件，大文件请耐心等待）…');
+  // ★2026-09-10：后端必须把【整段流】拉完才返回（可能数分钟）。这段时间前端只是 await，
+  //   没有任何进度反馈 → 用户以为"点了没反应"。这里先起一个脉冲任务卡占位，
+  //   拉流结束后再交棒给 dlViaChrome 的真实下载进度卡。
+  let taskId = null;
+  try {
+    if (typeof window.pulseDownloadProgress === 'function') {
+      taskId = window.pulseDownloadProgress('后端拉流：' + __name);
+    } else if (window.HmdaoProgress && typeof window.HmdaoProgress.registerTask === 'function') {
+      taskId = window.HmdaoProgress.registerTask({ name: '后端拉流：' + __name, asset: a || null });
+      window.HmdaoProgress.updateTask(taskId, { state: 'downloading', totalBytes: 0, receivedBytes: 0 });
+    }
+  } catch (_) { taskId = null; }
+  const __endTask = (okFlag, text) => {
+    if (taskId == null) return;
+    try {
+      if (window.HmdaoProgress) {
+        if (okFlag) window.HmdaoProgress.complete(taskId, text);
+        else window.HmdaoProgress.fail(taskId, text);
+      }
+    } catch (_) {}
+  };
+  const controller = new AbortController();
+  // 后端要真的把整段流拉完才返回，超时给足 16 分钟（与后端 15 分钟对齐）
+  const timer = setTimeout(() => controller.abort(), 16 * 60 * 1000);
+  let resp;
+  try {
+    resp = await fetch(apiBase.replace(/\/+$/, '') + '/api/media/merge-hls', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: a.url, referer: ref, filename: __name }),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    const msg = (e && e.name === 'AbortError') ? '拉流超时（>16 分钟）' : '无法连接后端拉流服务（127.0.0.1:3000 未启动？）';
+    setStatus('⚠ ' + msg, true);
+    __endTask(false, msg);
+    return false;
+  }
+  clearTimeout(timer);
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok || !json || !json.ok || !json.fileUrl) {
+    const msg = (json && json.error) || ('HTTP ' + resp.status);
+    setStatus('⚠ 后端 HLS 拉流失败：' + msg, true);
+    __endTask(false, msg);
+    return false;
+  }
+  // ★2026-09-10 关键修复（"拉流卡标完成、下载卡永远卡住"真凶）：
+  //   旧流程：拉流卡 → complete("拉流完成，开始下载") → 再起一张下载卡 → SW 触发 chrome.downloads。
+  //   问题：① 拉流卡提前变成绿色 ✓，用户误以为"下载完了"；② 下载卡【从不绑定 downloadId】，
+  //   又没有全局 chrome.downloads.onChanged 驱动，进度永远停在 0。
+  //   新流程：保留【同一张卡】，把它的 state 从"后端拉流"切到"等待浏览器接管"，
+  //   taskId 不变。chrome.downloads.onCreated 携带 downloadId 回来时，progress.js 的
+  //   bindLatestPending 会自动绑到当前未绑 downloadId 的最新进行中卡——就是这一张。
+  //   后续 onChanged 的每个 tick 都会通过 HMDAO_DOWNLOAD_PROGRESS 实时更新它。
+  //   视觉上：用户看到一张卡从"后端拉流中"走到"下载中 1.2GB / 1.5GB"再到"已下载完成"。
+  __endTask(true, '拉流完成，开始下载');
+  // 从本地 fileUrl 下载，文件名/路径由扩展完全控制
+  try {
+    // 把"拉流卡"切换成"下载卡"：同 taskId，名字变成最终文件名，状态回到 downloading（待接管）。
+    // 等 background.js 那里 chrome.downloads.onChanged 触发 HMDAO_DOWNLOAD_PROGRESS 即可实时更新。
+    try {
+      if (taskId != null && window.HmdaoProgress && window.HmdaoProgress.updateTask) {
+        window.HmdaoProgress.updateTask(taskId, {
+          name: __name,
+          receivedBytes: 0,
+          totalBytes: 0,
+          doneText: '',
+          // 不改 state：仍保持 downloading（"等待浏览器接管"语义统一）
+        });
+      }
+    } catch (_) {}
+    const fileUrl = apiBase.replace(/\/+$/, '') + json.fileUrl;
+    // 交给 Service Worker 触发 chrome.downloads（流式写盘，不占扩展内存，错误可回传）。
+    // 注意：SW 侧对跨域大文件不能 await chrome.downloads.download 的 Promise，否则挂起
+    // → 这里只等 { ok }；downloadId 由 background 的 onChanged 监听在广播里带回。
+    const dr = await chrome.runtime.sendMessage({
+      type: 'HMDAO_DOWNLOAD_LOCAL_FILE',
+      url: fileUrl,
+      filename: 'Ddayup/videos/' + __name,
+    });
+    if (!(dr && dr.ok)) throw new Error((dr && dr.error) || 'SW 未能触发下载');
+    setStatus('✅ 已开始下载（后端 ffmpeg 拉流合并）：' + __name + '（浏览器下载栏查看进度）');
+  } catch (e) {
+    setStatus('⚠ 触发浏览器下载失败：' + ((e && e.message) || e), true);
+    return false;
+  }
+  return true;
+}
+
 // ★2026-09-02 实测依据（勿凭直觉改回直连或前端合并）：
 //   · chrome.downloads 直连 CDN 分轨必 403 —— dNR 注入的 Referer 对 downloads 发起的请求
 //     完全无效（4 种 resourceTypes 组合实测全部 SERVER_FORBIDDEN，服务端收不到 Referer）；
@@ -854,16 +1532,30 @@ async function mergeDashViaBackend(a, dash, base, referer) {
     ? window.DdayupConfig.getApiBaseSync()
     : 'http://127.0.0.1:3000';
   setStatus('⏳ 正在提交后端合并（ffmpeg 合成含音画单文件）…');
-  const resp = await fetch(apiBase + '/api/media/merge-dash', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      videoUrl: dash.video,
-      audioUrl: dash.audio || '',
-      referer,
-      filename: base + '.mp4',
-    }),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 120000);
+  let resp;
+  try {
+    resp = await fetch(apiBase + '/api/media/merge-dash', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        videoUrl: dash.video,
+        audioUrl: dash.audio || '',
+        referer,
+        filename: base + '.mp4',
+      }),
+      signal: controller.signal,
+    });
+  } catch (fetchErr) {
+    clearTimeout(timeoutId);
+    const reason = (fetchErr && fetchErr.name === 'AbortError')
+      ? '后端合并超时（120 秒）：请确认 Ddayup 网页 127.0.0.1:3000 已启动，或视频过大'
+      : ('后端合并请求失败：' + (fetchErr && fetchErr.message || fetchErr));
+    setStatus('⚠ ' + reason, true);
+    return false;
+  }
+  clearTimeout(timeoutId);
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok || !data.ok) {
     setStatus('⚠ 后端合并失败：' + ((data && data.error) || ('HTTP ' + resp.status)) + '（请确认 Ddayup 网页 127.0.0.1:3000 已启动）', true);
@@ -937,6 +1629,30 @@ async function downloadDashTracks(a, dash) {
     saveAs: false,
     conflictAction: 'uniquify',
   });
+
+  // ★2026-09-02 真机冒烟修复（"一直下载中、没真实下载"根因）：
+  //   本分支处理 B站 WBI 取整段失败后的回退；抖音/视频号/爱给等 DASH 站点也走这里。
+  //   此前直接 dlViaChrome 直连分轨 m4s —— 必 403（dNR 注入的 Referer 对 chrome.downloads
+  //   发起的请求完全无效，实测 4 种 resourceTypes 组合全 SERVER_FORBIDDEN）→ 下载静默卡
+  //   在 chrome.downloads 的"下载中…"死锁，侧栏无错误提示，文件没下下来。
+  //   修复：非 B站场景优先走 mergeDashViaBackend（后端 ffmpeg -c copy 合成单文件 +
+  //   ffprobe 自检，5/5 + 端到端 G 组已验证），失败再回退原 dlTrack（已知 403，给明确报错）。
+  if (!isBiliUrl && dash.video) {
+    const ref = referer || (a && a.platform === 'douyin' ? 'https://www.douyin.com/' : 'https://www.bilibili.com/');
+    try {
+      const merged = await mergeDashViaBackend(
+        a,
+        { video: dash.video, audio: dash.audio || '', referer: ref },
+        base,
+        ref,
+      );
+      if (merged) return;
+    } catch (e) {
+      console.log('[HMDAO][dash] 后端 DASH 合并失败，回退直连分轨：', (e && e.message) || e);
+      setStatus('⚠ 后端 ffmpeg 合并失败，改为直连分轨下载…', true);
+    }
+  }
+
   try {
     const isBili = /bilibili\.com/i.test(referer);
     if (isBili) {
@@ -974,12 +1690,19 @@ async function saveSingleToLocal(a) {
   }
   try {
     pulseDownloadProgress('正在保存到本地：' + deriveFilename(a));
-    const res = await fetchViaBackground(a.url, a.type === 'audio' ? { referer: sourceOrigin() } : {});
+    const referer = (a.type === 'audio')
+      ? sourceOrigin()
+      : (typeof deriveMediaReferer === 'function' ? deriveMediaReferer(a.url, window.__sourcePageUrl || '') : (window.__sourcePageUrl || ''));
+    const res = await fetchViaBackground(a.url, { referer });
     if (!res || !res.ok) { setStatus('抓取失败', true); return; }
+    // ★2026-09-10：sendMessage 会丢弃 ArrayBuffer，必须改用 b64 还原（fetchUrl 现已回传 b64）。
+    let bytes = res.arrayBuffer;
+    if (!bytes && res.b64) { try { bytes = b64ToBytes(res.b64); } catch (_) { bytes = null; } }
+    if (!bytes) { setStatus('抓取失败（无字节）', true); return; }
     const name = deriveFilename(a);
     const fileHandle = await handle.getFileHandle(name, { create: true });
     const writable = await fileHandle.createWritable();
-    await writable.write(res.arrayBuffer);
+    await writable.write(bytes);
     await writable.close();
     finishDownloadProgress('✅ 已保存到本地：' + name, true);
     setStatus('已保存：' + name);

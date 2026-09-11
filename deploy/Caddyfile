@@ -1,0 +1,59 @@
+# =============================================================================
+# Ddayup 生产环境 Caddy 反向代理（TLS 终止 + 强制 HTTPS + 仅暴露 443）
+#
+# 部署拓扑（安全加固后）：
+#   浏览器 --HTTPS(443)--> Caddy --http(本机)--> 3000(ui-static-proxy)
+#                                                 3000 --http(127.0.0.1)--> 8792(hmdao-api)
+#
+# - 8792 仅监听 127.0.0.1（由 ecosystem.config.cjs 的 HMDAO_API_HOST 控制），
+#   公网不可直达；所有流量必须经 Caddy(443) 进入。
+# - Caddy 自动申请/续期 Let's Encrypt 证书，并自动将 http://80 重定向到 https://443。
+# - HSTS 头确保浏览器只走 HTTPS。
+#
+# 用法：
+#   caddy run --config deploy/Caddyfile --adapter caddyfile
+#   或  caddy start --config deploy/Caddyfile --adapter caddyfile
+#
+# 前置要求：
+#   - 将域名 A 记录指向本机公网 IP（Caddy 需 80 端口完成 ACME 验证）。
+#   - 若用 IP 而非域名：无法自动签发证书，请用 deploy/Caddyfile.selfsigned 或自备证书，
+#     否则暂时只能本地自签（仅测试，浏览器会告警）。
+# =============================================================================
+
+{
+	# 全局：不在 stdout 刷大量访问日志（生产按需开启）
+	admin off
+	log {
+		output stderr
+		level INFO
+	}
+}
+
+# 主站点（已备案域名）
+mingmingchuangyi.cn {
+
+	# 强制 HSTS：浏览器在 max-age 内只许 HTTPS 访问
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# 反代到本机 3000（ui-static-proxy：静态托管 + 反代 /api、/ws 到 8792）
+	reverse_proxy 127.0.0.1:3000 {
+		# 透传真实来源，便于后端审计（后端 CORS 仍按白名单校验）
+		header_up Host {host}
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	# WebSocket 升级（/ws/workflow、/ws/catalog、/ws/dcc）需保持长连接
+	reverse_proxy /ws/* 127.0.0.1:3000 {
+		header_up Host {host}
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+}

@@ -1,4 +1,5 @@
 ﻿import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type DragEvent as ReactDragEvent } from 'react';
+import { createPortal } from 'react-dom';
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -89,6 +90,9 @@ interface FlowCanvasProps {
   onConnect: (connection: Connection) => void;
   onNodeClick: (event: React.MouseEvent, node: Node) => void;
   onPaneClick: () => void;
+  onNodeContextMenu?: (event: React.MouseEvent, node: Node) => void;
+  onConnectStart?: (event: any, payload: { nodeId: string; handleId: string | null; handleType: string }) => void;
+  onConnectEnd?: (event: MouseEvent | TouchEvent) => void;
   onSelectionChange: (params?: { nodes?: Node[] | null }) => void;
   onMove: () => void;
   syncDraggedNodeGroups: (node: Node) => void;
@@ -247,6 +251,9 @@ function FlowCanvasImpl(props: FlowCanvasProps) {
       onConnect={props.onConnect}
       onNodeClick={props.onNodeClick}
       onPaneClick={props.onPaneClick}
+      onNodeContextMenu={props.onNodeContextMenu}
+      onConnectStart={props.onConnectStart}
+      onConnectEnd={props.onConnectEnd}
       onNodeDragStop={onNodeDragStopEnhanced}
       onNodeDragStart={onNodeDragStart}
       onSelectionChange={props.onSelectionChange}
@@ -620,6 +627,65 @@ function CanvasFlow() {
     blurActiveEditableElement();
     safeDeselectAll();
   }, [safeDeselectAll]);
+
+  // === 右键节点菜单（删除/复制/重命名） ===
+  const [nodeMenu, setNodeMenu] = useState<{ x: number; y: number; nodeId: string } | null>(null);
+  const onNodeContextMenu = useCallback((event: React.MouseEvent, node: Node) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setNodeMenu({ x: event.clientX, y: event.clientY, nodeId: node.id });
+  }, []);
+
+  // === 拖连接器到空白：弹"选一个兼容节点"面板 ===
+  const [connectMenu, setConnectMenu] = useState<{
+    x: number; y: number; sourceNodeId: string; sourceType: string;
+    dropX: number; dropY: number;
+  } | null>(null);
+  const onConnectEnd = useCallback((event: MouseEvent | TouchEvent) => {
+    // ReactFlow 在没拖到有效 handle 时不会触发 onConnect；onConnectEnd 给我们最后一次拖放位置。
+    // 我们无法直接判断是否落在有效 handle 上（ReactFlow 不传 connection），
+    // 因此统一弹出候选面板：用户取消则相当于放弃，挑选则继续。
+    const target = event.target as HTMLElement | null;
+    if (!target) return;
+    // 落在 handle 上 ReactFlow 会自己处理连线，此处仅处理"空白处松手"
+    if (target.closest('.react-flow__handle')) return;
+    if (target.closest('.react-flow__node')) return; // 也排除节点上
+    // 找当前正在拖动的 source：从 window.__hmdao_pendingSource 读取（拖动开始时写入）
+    const src = (window as any).__hmdao_pendingSource as
+      | { nodeId: string; type: string; handle: string | null } | undefined;
+    if (!src) return;
+    const cx = 'clientX' in event ? event.clientX : (event as TouchEvent).changedTouches?.[0]?.clientX ?? 0;
+    const cy = 'clientY' in event ? event.clientY : (event as TouchEvent).changedTouches?.[0]?.clientY ?? 0;
+    // 边界钳制：保证候选面板完整落在视口内（菜单宽 240、预估高 ~220）
+    const MENU_W = 240, MENU_H = 230;
+    const x = Math.min(Math.max(cx, 8), window.innerWidth - MENU_W - 8);
+    const y = Math.min(Math.max(cy, 8), window.innerHeight - MENU_H - 8);
+    setConnectMenu({ x, y, sourceNodeId: src.nodeId, sourceType: src.type, dropX: cx, dropY: cy });
+  }, []);
+
+  // 记录拖动开始的 source（让 onConnectEnd 知道从哪个 handle 出发）
+  const onConnectStart = useCallback((_event: any, payload: { nodeId: string; handleId: string | null; handleType: string }) => {
+    if (payload.handleType !== 'source') return;
+    const node = canvas?.nodes.find((n) => n.id === payload.nodeId);
+    (window as any).__hmdao_pendingSource = {
+      nodeId: payload.nodeId,
+      type: node?.type || 'unknown',
+      handle: payload.handleId,
+    };
+  }, [canvas?.nodes]);
+
+  // 全局点击/滚动/ESC 关闭菜单
+  useEffect(() => {
+    if (!nodeMenu && !connectMenu) return;
+    const onDocClick = () => { setNodeMenu(null); setConnectMenu(null); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { setNodeMenu(null); setConnectMenu(null); } };
+    document.addEventListener('mousedown', onDocClick);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDocClick);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [nodeMenu, connectMenu]);
 
   const importMediaFile = useCallback(async (file: File, position?: { x: number; y: number }) => {
     const nodeType = getMediaNodeType(file);
@@ -2817,6 +2883,9 @@ function CanvasFlow() {
         onConnect={onConnect}
         onNodeClick={onNodeClick}
         onPaneClick={onPaneClick}
+        onNodeContextMenu={onNodeContextMenu}
+        onConnectStart={onConnectStart}
+        onConnectEnd={onConnectEnd}
         onSelectionChange={onSelectionChange}
         onMove={scheduleViewportSync}
         syncDraggedNodeGroups={syncDraggedNodeGroups}
@@ -2906,6 +2975,102 @@ function CanvasFlow() {
       <div className="absolute bottom-2 left-1/2 -translate-x-1/2 z-10">
         <ComplianceNotice mode="footer" minimal />
       </div>
+      {/* === 右键节点菜单 === */}
+      {nodeMenu && createPortal(
+        <div
+          className="fixed z-[9999] min-w-[160px] rounded-lg border border-[#30363d] bg-[#161b22]/95 shadow-2xl backdrop-blur-sm py-1 text-sm"
+          style={{ left: nodeMenu.x, top: nodeMenu.y }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="block w-full px-3 py-1.5 text-left text-[#e6edf3] hover:bg-[#21262d]"
+            onClick={() => {
+              navigator.clipboard?.writeText?.(nodeMenu.nodeId).catch(() => {});
+              setNodeMenu(null);
+            }}
+          >复制节点 ID</button>
+          <button
+            type="button"
+            className="block w-full px-3 py-1.5 text-left text-[#e6edf3] hover:bg-[#21262d]"
+            onClick={() => {
+              removeNodes([nodeMenu.nodeId]);
+              setNodeMenu(null);
+            }}
+          >删除节点</button>
+          <button
+            type="button"
+            className="block w-full px-3 py-1.5 text-left text-[#e6edf3] hover:bg-[#21262d]"
+            onClick={() => { setNodeMenu(null); }}
+          >取消</button>
+        </div>,
+        document.body,
+      )}
+      {/* === 连线拖到空白：弹兼容节点面板 === */}
+      {connectMenu && createPortal(
+        <div
+          className="fixed z-[9999] w-[240px] rounded-lg border border-[#30363d] bg-[#161b22]/95 shadow-2xl backdrop-blur-sm p-2"
+          style={{ left: connectMenu.x, top: connectMenu.y }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          {(() => {
+            const META: Record<string, { icon: string; label: string }> = {
+              video: { icon: '🎬', label: '视频' },
+              image: { icon: '🖼️', label: '图片' },
+              audio: { icon: '🔊', label: '音频' },
+              text:  { icon: '📝', label: '文本' },
+            };
+            // 常见下游推荐：把最匹配的排在前面并标记
+            const RECOMMEND: Record<string, string> = {
+              video: 'image',
+              image: 'text',
+              audio: 'text',
+              text:  'image',
+            };
+            const rec = RECOMMEND[connectMenu.sourceType];
+            const list = (['video','image','audio','text'] as const)
+              .filter((t) => t !== connectMenu.sourceType)
+              .sort((a, b) => (a === rec ? -1 : b === rec ? 1 : 0));
+            return (
+              <>
+                <div className="px-2 py-1 text-xs text-[#6e7681]">连接到</div>
+                {list.map((t) => {
+                  return (
+                    <button
+                      key={t}
+                      type="button"
+                      className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[#e6edf3] hover:bg-[#21262d] ${t === rec ? 'bg-[#1f2d3d]' : ''}`}
+                      onClick={() => {
+                        const src = canvas?.nodes.find((n) => n.id === connectMenu.sourceNodeId);
+                        if (!src) { setConnectMenu(null); return; }
+                        // 新节点落在松手处（避免固定偏移跑到屏幕外）
+                        const p = screenToFlowPosition({ x: connectMenu.dropX, y: connectMenu.dropY });
+                        const id = addNode(t, { x: p.x + 60, y: p.y - 20 });
+                        setConnectMenu(null);
+                        if (id && t) {
+                          setTimeout(() => {
+                            addEdge(connectMenu.sourceNodeId, id, { sourceHandle: 'media-output', targetHandle: `${t}-main` });
+                          }, 0);
+                        }
+                      }}
+                    >
+                      <span className="text-base">{META[t].icon}</span>
+                      <span className="flex-1">新建 {META[t].label} 节点</span>
+                      {t === rec && <span className="rounded bg-[#1f6feb] px-1 text-[10px] text-white">推荐</span>}
+                    </button>
+                  );
+                })}
+                <button
+                  type="button"
+                  className="mt-1 block w-full rounded-md px-2 py-1.5 text-left text-[#8b949e] hover:bg-[#21262d]"
+                  onClick={() => { setConnectMenu(null); (window as any).__hmdao_pendingSource = null; }}
+                >取消</button>
+              </>
+            );
+          })()}
+        </div>,
+        document.body,
+      )}
     </>
   );
 }

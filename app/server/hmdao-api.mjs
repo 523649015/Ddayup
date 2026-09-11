@@ -25,6 +25,7 @@ import {
   selectPypiWheelPlatformRegex,
 } from './platform-utils.mjs';
 import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
 import Busboy from 'busboy';
 import { createDccEnvironmentManager } from './dcc-plugin-manager.mjs';
 import { createUnrealPixelStreamingLegacyModule } from './dcc/unreal-pixel-streaming-legacy.mjs';
@@ -130,6 +131,8 @@ import { registerModelsRoutes } from './routes/models.mjs';
 import { registerAssetsRoutes } from './routes/assets.mjs';
 import { registerDccRoutes } from './routes/dcc.mjs';
 import { registerMediaRoutes } from './routes/media.mjs';
+// 音频格式转码（ogg→mp3），独立可插拔路由
+import { registerAudioTranscodeRoutes } from './routes/audio-transcode.mjs';
 import { registerCobuildRoutes } from './routes/cobuild.mjs';
 import { registerSearchRoutes } from './routes/search.mjs';
 import { registerLocalAiRoutes } from './routes/local-ai.mjs';
@@ -835,41 +838,106 @@ async function proxyRemoteMediaAsset(req, res, mediaUrl, kind = '', referer = ''
   if (origin) upstreamHeaders.Origin = sanitizeForwardHeaderValue(origin);
 
   try {
-    const upstream = await requestRemoteBinaryAsset(targetUrl, {
+    // ★2026-09-04 修复（预览 3~4 分钟才播放 / 侧栏卡顿 根因）：
+    //   旧逻辑 requestRemoteBinaryAsset + sendRaw(body) 会把整个视频 Buffer.from(arrayBuffer()) 缓冲完才整体发送，
+    //   浏览器必须等【整段下载完成】才起播 → 大文件要等数分钟、且侧栏持有巨大 blob 卡顿。
+    //   现改为【流式转发】：直接用 fetch 取 web ReadableStream，逐块 pipe 给 res，Chrome 边收边播
+    //   （配合上游 Accept-Ranges，可无缝拖拽/起播）；Range 原样透传，上游回 206 我们也原样转 206。
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(new Error('media-proxy-timeout')), 45000);
+    const upstream = await fetch(targetUrl, {
       method: req.method === 'HEAD' ? 'HEAD' : 'GET',
       headers: upstreamHeaders,
-      timeoutMs: 45000,
+      redirect: 'follow',
+      signal: controller.signal,
     });
-    const upstreamIssue = detectRemoteMediaUpstreamIssue(targetUrl, upstream);
-    if (upstreamIssue) {
+    // 轻量上游体检：仅看状态码 + content-type（不读 body），避免把登录页 HTML / JSON 当媒体透传。
+    const ctype = readHeaderValue(upstream.headers, 'content-type').toLowerCase();
+    const isMedia = /^(video|audio|image)\//.test(ctype)
+      || /mp4|webm|mp3|ogg|m4a|m4v|mov|mkv|flv|avi|quicktime|octet-stream|x-matroska|mp2t|mpegurl|mpd|dash\+xml|audio\//i.test(ctype);
+    if (!isMedia) {
+      clearTimeout(timeout);
       return sendMediaProxyError(
-        res,
-        upstreamIssue.status,
-        upstreamIssue.category,
-        upstreamIssue.provider,
-        upstreamIssue.message,
+        res, 422, 'remote-asset-not-media', '',
+        `上游返回的内容类型非媒体（${ctype || 'unknown'}），疑似防盗链/需登录，已拒绝透传。`,
       );
     }
-    const body = upstream.body;
-    const contentType = inferMediaContentType(targetUrl, readHeaderValue(upstream.headers, 'content-type'), kind);
+    const upstreamIssue = detectRemoteMediaUpstreamIssue(targetUrl, { status: upstream.status, headers: upstream.headers });
+    if (upstreamIssue) {
+      clearTimeout(timeout);
+      return sendMediaProxyError(res, upstreamIssue.status, upstreamIssue.category, upstreamIssue.provider, upstreamIssue.message);
+    }
+    const contentType = inferMediaContentType(targetUrl, ctype, kind);
     const contentDisposition = sanitizeForwardHeaderValue(readHeaderValue(upstream.headers, 'content-disposition'));
     const contentLengthHeader = readHeaderValue(upstream.headers, 'content-length');
-    const responseContentLength = req.method === 'HEAD'
-      ? String(Number(contentLengthHeader || 0))
-      : String(body.length);
+    const contentRangeHeader = readHeaderValue(upstream.headers, 'content-range');
+    const etagHeader = readHeaderValue(upstream.headers, 'etag');
+    const lastModHeader = readHeaderValue(upstream.headers, 'last-modified');
+    const origin = res._hmdaoOrigin || '';
+    const corsHeaders = origin
+      ? { 'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Credentials': 'true' }
+      : {};
     const headers = {
       'Content-Type': contentType,
-      'Content-Length': responseContentLength,
+      // ★2026-09-05 修复（预览"加载不出来"、浏览器报 net::ERR_CONTENT_LENGTH_MISMATCH 的根因）：
+      //   只要声明了 Content-Length，浏览器就要求【字节数完全一致】；一旦上游提前断开
+      //   （抖音 CDN 限速/签名到期/网络抖动/我们主动 abort），实际发出的字节少于声明值 →
+      //   Chrome 直接抛 ERR_CONTENT_LENGTH_MISMATCH，整段视频判死、一帧都播不了。
+      //   策略：① 206（Range 分段，长度天然受限）② 小文件（≤8MB，图片/短音频）
+      //   —— 这两种才透传 Content-Length（保住进度条拖拽）；大文件全量流改为分块传输，
+      //      提前断开最多表现为"播到某一刻停止"，不会整体失败。
+      ...(contentLengthHeader && (upstream.status === 206 || Number(contentLengthHeader) <= 8 * 1024 * 1024)
+        ? { 'Content-Length': String(contentLengthHeader) } : {}),
       'Cache-Control': 'private, max-age=300',
       'Accept-Ranges': readHeaderValue(upstream.headers, 'accept-ranges') || 'bytes',
       'Cross-Origin-Resource-Policy': 'cross-origin',
-      // CORS 由 sendRaw() 统一处理，不再硬编码 *
-      ...(readHeaderValue(upstream.headers, 'content-range') ? { 'Content-Range': readHeaderValue(upstream.headers, 'content-range') } : {}),
-      ...(readHeaderValue(upstream.headers, 'etag') ? { ETag: readHeaderValue(upstream.headers, 'etag') } : {}),
-      ...(readHeaderValue(upstream.headers, 'last-modified') ? { 'Last-Modified': readHeaderValue(upstream.headers, 'last-modified') } : {}),
+      ...(contentRangeHeader ? { 'Content-Range': contentRangeHeader } : {}),
+      ...(etagHeader ? { ETag: etagHeader } : {}),
+      ...(lastModHeader ? { 'Last-Modified': lastModHeader } : {}),
       ...(contentDisposition ? { 'Content-Disposition': contentDisposition.replace(/attachment/ig, 'inline') } : {}),
+      ...corsHeaders,
+      'Access-Control-Allow-Headers': 'content-type, authorization, range',
+      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+      'Access-Control-Expose-Headers': 'Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag, Last-Modified, X-HMDAO-Media-Error, X-HMDAO-Media-Provider',
     };
-    return sendRaw(res, upstream.status, body, headers);
+    if (req.method === 'HEAD' || !upstream.body) {
+      res.writeHead(upstream.status, headers);
+      res.end();
+      clearTimeout(timeout);
+      return;
+    }
+    // 逐块 pipe：浏览器边收边播，不再整段缓冲。
+    res.writeHead(upstream.status, headers);
+    // ★2026-09-05 修复（预览播不了的第二根因）：45s 定时器此前覆盖【整个 body 下载】，
+    //   长视频/限速链路下载超过 45s 就被 abort —— 而响应头里已声明了 Content-Length，
+    //   于是必然触发 ERR_CONTENT_LENGTH_MISMATCH。定时器只应守卫「建连 + 拿到响应头」，
+    //   拿到 headers 后立即清除；传输期间改用【空闲看门狗】（60s 无任何数据才判定链路死掉）。
+    clearTimeout(timeout);
+    const nodeStream = Readable.fromWeb(upstream.body);
+    let cleaned = false;
+    let idleTimer = null;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      clearTimeout(timeout);
+      if (idleTimer) clearTimeout(idleTimer);
+      try { controller.abort(); } catch (_) {}
+      try { nodeStream.destroy(); } catch (_) {}
+    };
+    const bumpIdle = () => {
+      if (cleaned) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        try { controller.abort(new Error('media-proxy-idle-timeout')); } catch (_) {}
+      }, 60000);
+    };
+    bumpIdle();
+    nodeStream.on('data', bumpIdle);
+    req.on('close', cleanup);
+    res.on('close', cleanup);
+    nodeStream.on('error', () => { try { res.destroy(); } catch (_) {} cleanup(); });
+    nodeStream.pipe(res);
+    return;
   } catch (error) {
     return send(res, 502, {
       success: false,
@@ -11652,6 +11720,13 @@ registerDccRoutes(apiRouter, {
 // ComfyUI 网关前缀组：整组早已收敛为 handleComfyUiApi，此处仅把分发点
 // 从 route() 手写 if 迁入路由表（前缀命中在精确路径之后，无遮蔽风险）。
 apiRouter.registerPrefix('*', '/api/comfyui/', handleComfyUiApi);
+
+registerAudioTranscodeRoutes(apiRouter, {
+  readJson,
+  runCommand,
+  resolveLocalPostFfmpegBackend,
+  send,
+});
 
 registerMediaRoutes(apiRouter, {
   execFileAsync,

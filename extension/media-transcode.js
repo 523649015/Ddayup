@@ -147,8 +147,11 @@ async function fetchTrackChunked(url, referer, onProgress) {
   // 小文件或拿不到大小 → 一次性拉取（不超限）
   if (!total || total <= DASH_CHUNK) {
     const r = await fetchViaBackground(url, { referer });
-    if (!r || !r.ok || !r.arrayBuffer) throw new Error('拉取失败：' + ((r && (r.error || r.status)) || 'unknown'));
-    return new Uint8Array(r.arrayBuffer);
+    // ★2026-09-10：sendMessage 丢弃 ArrayBuffer，用 b64 还原。
+    let buf = r && r.arrayBuffer;
+    if (!buf && r && r.b64) { try { buf = b64ToBytes(r.b64); } catch (_) { buf = null; } }
+    if (!r || !r.ok || !buf) throw new Error('拉取失败：' + ((r && (r.error || r.status)) || 'unknown'));
+    return new Uint8Array(buf);
   }
   // 分块拉取
   const chunks = [];
@@ -161,10 +164,13 @@ async function fetchTrackChunked(url, referer, onProgress) {
       referer,
       headers: { Range: `bytes=${offset}-${end}` },
     });
-    if (!r || !r.ok || !r.arrayBuffer) {
+    // ★2026-09-10：sendMessage 丢弃 ArrayBuffer，用 b64 还原分块。
+    let buf = r && r.arrayBuffer;
+    if (!buf && r && r.b64) { try { buf = b64ToBytes(r.b64); } catch (_) { buf = null; } }
+    if (!r || !r.ok || !buf) {
       throw new Error(`分块拉取失败 @${offset}-${end}：` + ((r && (r.error || r.status)) || 'unknown'));
     }
-    chunks.push(new Uint8Array(r.arrayBuffer));
+    chunks.push(new Uint8Array(buf));
     offset = end + 1;
     if (typeof onProgress === 'function') onProgress(offset, total);
   }

@@ -1049,7 +1049,7 @@ export async function updateUnrealProjectPluginState(projectPath, enabled) {
 export function deriveUnrealStateSummary({ project, pluginInstalled, pluginEnabled, buildArtifactsPresent, directBridgeOnline, cameraCount }) {
   if (!project) return { level: 'warning', summary: 'No Unreal project was detected yet. Open or select a .uproject first.' };
   if (!pluginInstalled) return { level: 'warning', summary: 'An Unreal project was detected, but HMDao Unreal Capture is not installed yet.' };
-  if (!pluginEnabled) return { level: 'warning', summary: 'HMDao Unreal Capture files are installed, but the current project has not enabled the plugin yet.' };
+  if (!pluginEnabled) return { level: 'warning', summary: 'HMDao Unreal Capture files are installed, but the current project has not enabled the plugin yet. Enable it in the Unreal Plugins window (or close Unreal and reconnect so HMDao can enable it automatically), then restart Unreal once for it to take effect.' };
   if (!buildArtifactsPresent) return { level: 'warning', summary: 'The plugin is enabled, but Unreal build artifacts for the current project were not detected yet.' };
   if (!directBridgeOnline) return { level: 'warning', summary: 'The plugin is ready, but Unreal has not bridged the editor back to HMDao yet.' };
   if (cameraCount <= 0) return { level: 'warning', summary: 'The plugin is connected, but no camera or viewport source has been enumerated yet.' };
@@ -1086,7 +1086,7 @@ export function deriveUnrealEnvironmentSummary({
     };
   }
   if (!pluginInstalled) return { level: 'warning', summary: 'HMDao custom Unreal plugin files are not installed yet.' };
-  if (!pluginEnabled) return { level: 'warning', summary: 'HMDao custom Unreal plugin files exist, but the current project has not enabled the plugin yet.' };
+  if (!pluginEnabled) return { level: 'warning', summary: 'HMDao custom Unreal plugin files exist, but the current project has not enabled the plugin yet. Enable it in the Unreal Plugins window (or close Unreal and reconnect so HMDao can enable it automatically), then restart Unreal once for it to take effect.' };
   if (!buildArtifactsPresent) return { level: 'warning', summary: 'HMDao custom Unreal plugin is enabled, but no plugin build artifacts were detected for the current project yet.' };
   if (!directBridgeOnline) return { level: 'warning', summary: 'HMDao custom Unreal plugin is installed, but Unreal has not bridged the editor back to HMDao yet.' };
   if (cameraCount <= 0) return { level: 'warning', summary: 'HMDao custom Unreal plugin is connected, but no camera or viewport source has been enumerated yet.' };

@@ -1,0 +1,44 @@
+{
+  "id": "1787634885636-unreal-reinstall",
+  "createdAt": "2026-08-25T05:14:45.637Z",
+  "engine": "unreal",
+  "action": "reinstall",
+  "projectPath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject",
+  "restoreEntries": [
+    {
+      "type": "directory",
+      "sourcePath": "F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture",
+      "targetPath": "F:\\练习\\ue5\\5.7\\cc\\Plugins\\HMDaoUnrealCapture",
+      "existed": true,
+      "backupPath": "restore\\plugin"
+    },
+    {
+      "type": "file",
+      "sourcePath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject",
+      "targetPath": "F:\\练习\\ue5\\5.7\\cc\\cc.uproject",
+      "existed": true,
+      "backupPath": "restore\\cc.uproject"
+    },
+    {
+      "type": "directory",
+      "sourcePath": "F:\\Unreal Engine\\UE_5.7\\Engine\\Plugins\\HMDaoUnrealCapture",
+      "targetPath": "F:\\Unreal Engine\\UE_5.7\\Engine\\Plugins\\HMDaoUnrealCapture",
+      "existed": false,
+      "backupPath": "restore\\engine-plugin-0"
+    },
+    {
+      "type": "directory",
+      "sourcePath": "F:\\Unreal Engine\\UE_5.7\\Engine\\Plugins\\Marketplace\\HMDaoUnrealCapture",
+      "targetPath": "F:\\Unreal Engine\\UE_5.7\\Engine\\Plugins\\Marketplace\\HMDaoUnrealCapture",
+      "existed": true,
+      "backupPath": "restore\\engine-plugin-1"
+    },
+    {
+      "type": "directory",
+      "sourcePath": "F:\\Unreal Engine\\UE_5.7\\Engine\\Plugins\\VirtualProduction\\HMDaoUnrealCapture",
+      "targetPath": "F:\\Unreal Engine\\UE_5.7\\Engine\\Plugins\\VirtualProduction\\HMDaoUnrealCapture",
+      "existed": false,
+      "backupPath": "restore\\engine-plugin-2"
+    }
+  ]
+}

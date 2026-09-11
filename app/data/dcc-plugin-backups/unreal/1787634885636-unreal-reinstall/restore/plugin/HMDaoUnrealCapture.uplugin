@@ -1,0 +1,40 @@
+﻿{
+    "FileVersion":  3,
+    "Version":  2,
+    "VersionName":  "0.3.1",
+    "FriendlyName":  "HMDao Unreal Capture",
+    "Description":  "Direct editor capture bridge for HMDao DCC nodes.",
+    "Category":  "HMDao",
+    "CreatedBy":  "HMDao",
+    "CreatedByURL":  "",
+    "DocsURL":  "",
+    "MarketplaceURL":  "",
+    "SupportURL":  "",
+    "EngineVersion":  "5.7.0",
+    "CanContainContent":  false,
+    "Modules":  [
+                    {
+                        "Name":  "HMDaoUnrealCaptureBootstrap",
+                        "Type":  "RuntimeNoCommandlet",
+                        "LoadingPhase":  "PreDefault",
+                        "PlatformAllowList":  [
+                                                  "Win64"
+                                              ],
+                        "TargetAllowList":  [
+                                                "Editor"
+                                            ]
+                    },
+                    {
+                        "Name":  "HMDaoUnrealCapture",
+                        "Type":  "Editor",
+                        "LoadingPhase":  "PostEngineInit",
+                        "PlatformAllowList":  [
+                                                  "Win64"
+                                              ],
+                        "TargetAllowList":  [
+                                                "Editor"
+                                            ]
+                    }
+                ],
+    "Installed":  true
+}

@@ -21,7 +21,7 @@
  */
 
 export function registerAssetsRoutes(router, deps) {
-  const { send, readJson } = deps;
+  const { send, readJson, getUserFromRequest } = deps;
 
   // ---- 设置 ----
   router.register('GET', '/api/settings/dispatch', async (req, res) => {
@@ -88,19 +88,32 @@ export function registerAssetsRoutes(router, deps) {
     });
   });
 
-  // ---- 素材库 ----
+  // ---- 素材库（按用户硬隔离：所有操作须携带有效登录态，未登录返回 401）----
+  const requireUserId = (req, res) => {
+    const userId = getUserFromRequest(req);
+    if (!userId) {
+      send(res, 401, { success: false, error: { code: 'UNAUTHENTICATED', message: '请先登录' } });
+      return null;
+    }
+    return userId;
+  };
+
   router.register('GET', '/api/assets/library', async (req, res) => {
-    const items = await deps.readAssetLibraryCatalog();
+    const userId = requireUserId(req, res);
+    if (!userId) return undefined;
+    const items = await deps.readAssetLibraryCatalog(userId);
     return send(res, 200, { success: true, items });
   });
 
   router.register('GET', '/api/assets/duplicates', async (req, res) => {
-    const items = await deps.readAssetLibraryCatalog();
+    const userId = requireUserId(req, res);
+    if (!userId) return undefined;
+    const items = await deps.readAssetLibraryCatalog(userId);
     const groups = deps.buildAssetLibraryDuplicateGroups(items);
     const duplicateIds = groups.flatMap((group) => group.duplicateIds);
     // 持久化：把本次计算结果写入缓存文件，供「去重看板常驻视图」直接读取，
     // 避免每次打开都重算，也使结果在多次会话间稳定可见。
-    await deps.writeAssetLibraryDuplicates(groups).catch(() => undefined);
+    await deps.writeAssetLibraryDuplicates(userId, groups).catch(() => undefined);
     return send(res, 200, {
       success: true,
       groups,
@@ -110,7 +123,9 @@ export function registerAssetsRoutes(router, deps) {
   });
 
   router.register('GET', '/api/assets/duplicates/persisted', async (req, res) => {
-    const groups = await deps.readAssetLibraryDuplicates().catch(() => []);
+    const userId = requireUserId(req, res);
+    if (!userId) return undefined;
+    const groups = await deps.readAssetLibraryDuplicates(userId).catch(() => []);
     const duplicateIds = groups.flatMap((group) => group.duplicateIds);
     return send(res, 200, {
       success: true,
@@ -121,28 +136,36 @@ export function registerAssetsRoutes(router, deps) {
   });
 
   router.register('POST', '/api/assets/delete', async (req, res) => {
+    const userId = requireUserId(req, res);
+    if (!userId) return undefined;
     const body = await readJson(req);
     const assetIds = Array.isArray(body?.assetIds) ? body.assetIds : [];
-    const deletedIds = await deps.deleteAssetLibraryItems(assetIds);
+    const deletedIds = await deps.deleteAssetLibraryItems(userId, assetIds);
     return send(res, 200, { success: true, deletedIds });
   });
 
   router.register('POST', '/api/assets/prune-missing', async (req, res) => {
-    const result = await deps.pruneMissingAssetLibraryItems();
+    const userId = requireUserId(req, res);
+    if (!userId) return undefined;
+    const result = await deps.pruneMissingAssetLibraryItems(userId);
     return send(res, 200, { success: true, ...result });
   });
 
   router.register('POST', '/api/assets/restore', async (req, res) => {
+    const userId = requireUserId(req, res);
+    if (!userId) return undefined;
     const body = await readJson(req);
     const inputItems = Array.isArray(body?.items) ? body.items : [];
-    const restoredIds = await deps.restoreAssetLibraryItems(inputItems);
+    const restoredIds = await deps.restoreAssetLibraryItems(userId, inputItems);
     return send(res, 200, { success: true, restoredIds });
   });
 
   router.register('POST', '/api/assets/validate', async (req, res) => {
+    const userId = requireUserId(req, res);
+    if (!userId) return undefined;
     const body = await readJson(req);
     const assetId = String(body?.assetId || '').trim();
-    const item = await deps.findAssetLibraryItem(assetId);
+    const item = await deps.findAssetLibraryItem(userId, assetId);
     if (!item) return send(res, 404, { success: false, error: { message: 'asset-not-found' } });
     if (String(item.storageLabel || '').trim().toLowerCase() === 'reference') {
       return send(res, 200, { success: true, state: 'reference', canTranscode: false, type: item.type });
@@ -158,9 +181,11 @@ export function registerAssetsRoutes(router, deps) {
   });
 
   router.register('POST', '/api/assets/repair', async (req, res) => {
+    const userId = requireUserId(req, res);
+    if (!userId) return undefined;
     const body = await readJson(req);
     const assetId = String(body?.assetId || '').trim();
-    const items = await deps.readAssetLibraryCatalog();
+    const items = await deps.readAssetLibraryCatalog(userId);
     const item = items.find((entry) => String(entry.id || '') === assetId || String(entry.backendAssetId || '') === assetId);
     if (!item) return send(res, 404, { success: false, error: { message: 'asset-not-found' } });
     if (String(item.storageLabel || '').trim().toLowerCase() === 'reference') {
@@ -179,7 +204,7 @@ export function registerAssetsRoutes(router, deps) {
       }
       return entry;
     });
-    await deps.writeAssetLibraryCatalog(updatedItems);
+    await deps.writeAssetLibraryCatalog(userId, updatedItems);
     return send(res, 200, {
       success: true,
       url: deps.buildAssetLibraryContentUrl(assetId),
@@ -189,11 +214,13 @@ export function registerAssetsRoutes(router, deps) {
   });
 
   router.register('POST', '/api/assets/import', async (req, res) => {
+    const userId = requireUserId(req, res);
+    if (!userId) return undefined;
     const contentType = String(req.headers['content-type'] || '').toLowerCase();
     const body = contentType.includes('multipart/form-data')
       ? await deps.readAssetLibraryImportMultipart(req)
       : await readJson(req);
-    const result = await deps.processAssetLibraryImportRequest(body);
+    const result = await deps.processAssetLibraryImportRequest(userId, body);
     return send(res, 200, {
       success: true,
       item: result.item,
@@ -203,8 +230,10 @@ export function registerAssetsRoutes(router, deps) {
   });
 
   router.register('POST', '/api/assets/import-directory', async (req, res) => {
+    const userId = requireUserId(req, res);
+    if (!userId) return undefined;
     const body = await readJson(req);
-    const result = await deps.processAssetLibraryImportDirectory(body);
+    const result = await deps.processAssetLibraryImportDirectory(userId, body);
     return send(res, 200, {
       success: true,
       canceled: result.canceled,
@@ -217,11 +246,13 @@ export function registerAssetsRoutes(router, deps) {
   // 素材字节流。注意：必须是前缀路由，且仅 GET/HEAD，
   // 与上方 /api/assets/* 精确路径不冲突（精确表优先于前缀表命中）。
   router.registerPrefix(['GET', 'HEAD'], '/api/assets/content/', async (req, res, url) => {
+    const userId = requireUserId(req, res);
+    if (!userId) return undefined;
     const assetId = deps.sanitizeLocalAssetId(url.pathname.slice('/api/assets/content/'.length));
     if (!assetId) {
       return send(res, 400, { success: false, error: { message: 'invalid-asset-id' } });
     }
-    const item = await deps.findAssetLibraryItem(assetId);
+    const item = await deps.findAssetLibraryItem(userId, assetId);
     if (!item?.filePath) {
       return send(res, 404, { success: false, error: { message: 'asset-not-found' } });
     }

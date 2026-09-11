@@ -36,6 +36,8 @@ export interface ConnectedReferenceInput extends MediaInput {
   enabled: boolean;
   roleOptions: ReferenceRoleOption[];
   isManualBinding?: boolean;
+  /** 文本类输入（如 text 节点上游）承载的纯文本内容，用于注入提示词。 */
+  text?: string;
 }
 
 export interface ReferenceBindingCandidate {
@@ -158,11 +160,21 @@ function findNodeAsset(node: CanvasNode, preferredTypes: Array<MediaInput['type'
       };
     }
   }
+  // text 节点的核心产物是纯文本（提示词/指令），无媒体 url，作为文本输入返回。
+  // 注意：循环变量 type 在上面的 for 结束后已超出作用域，这里应判断 preferredTypes 是否包含 'text'。
+  if (preferredTypes.includes('text')) {
+    const text = (node.data as any)?.prompt ?? (node.data as any)?.text ?? '';
+    if (text) return { type: 'text', text: String(text) };
+  }
   return null;
 }
 
 function allowedMediaTypes(targetNodeType: NodeType, targetHandle: string | undefined): Array<MediaInput['type']> {
-  if (targetNodeType === 'image') return ['image'];
+  if (targetNodeType === 'image') {
+    // 主输入端口除图片参考外，也接受上游文本节点作为提示词指令。
+    if (matchesHandle(targetHandle, 'image-main')) return ['image', 'text'];
+    return ['image'];
+  }
   if (targetNodeType === 'video') {
     if (matchesHandle(targetHandle, 'video-image-reference')) return ['image'];
     if (matchesHandle(targetHandle, 'video-video-reference')) return ['video'];
@@ -285,7 +297,10 @@ export function collectConnectedReferenceInputs(
     if (!sourceNode) continue;
     const mediaTypes = allowedMediaTypes(targetNodeType, edge.targetHandle);
     const asset = findNodeAsset(sourceNode, mediaTypes);
-    if (!asset?.url) continue;
+    // 媒体输入需要 url；文本输入（如 text 节点）允许只有 text 内容。
+    // 注意：findNodeAsset 可能返回 null/undefined（节点无对应媒体资产），
+    // 必须先判空再使用 'text' in asset，否则 'text' in null 会抛 TypeError。
+    if (!asset?.url && !(asset && 'text' in asset && (asset as any).text)) continue;
 
     const channel = inferReferenceChannel(targetNodeType, edge.targetHandle);
     const handleId = String(edge.targetHandle || '');
@@ -331,6 +346,7 @@ export function collectConnectedReferenceInputs(
       weight: clampWeight(setting.weight ?? manualInput?.weight, defaultWeightForRole(channel, role)),
       enabled: setting.enabled === undefined ? (manualInput?.enabled === undefined ? true : Boolean(manualInput.enabled)) : Boolean(setting.enabled),
       roleOptions,
+      ...('text' in asset && (asset as any).text ? { text: String((asset as any).text) } : {}),
     });
     seenSettings.add(`${sourceNode.id}:${handleId}:${asset.type}:${channel}`);
     seenIdentities.add(identityKey);

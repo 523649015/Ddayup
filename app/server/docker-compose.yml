@@ -1,0 +1,27 @@
+# DDayup 云端后端部署（前端由 CloudBase 静态托管，不在此容器）
+# 用法：
+#   docker compose up -d
+# 数据持久化：/data 卷存 users.json / activated-providers.json / 工作流元数据
+# 前端 dist/ 应单独上传到 CloudBase 静态网站托管，其 /api 反代到本服务的 8792 端口
+services:
+  ddup-api:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: ddup-api:latest
+    container_name: ddup-api
+    restart: unless-stopped
+    ports:
+      - "8792:8792"
+    environment:
+      - HMDAO_API_HOST=0.0.0.0
+      - HMDAO_API_PORT=8792
+      - HMDAO_DATA_DIR=/data
+      # 模型网关 Key 应通过密钥管理注入，勿硬编码：
+      # - ACTIVATED_PROVIDERS_JSON=<base64 or mounted file>
+    volumes:
+      - ddup-data:/data
+
+volumes:
+  ddup-data:
+    driver: local

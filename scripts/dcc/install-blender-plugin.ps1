@@ -51,6 +51,26 @@ foreach ($version in $targets) {
     Remove-Item -LiteralPath $cache -Recurse -Force
   }
   Write-Host "Installed HMDao Blender Capture for Blender $($version.Name): $dest"
+
+  # 安装即启用：复制后自动启用 add-on，避免"装了却连不上"的手动步骤
+  # （与 Unreal 的"安装即写入 .uproject 启用项"对齐）。
+  $blenderExe = $null
+  try { $blenderExe = (Get-Command blender -ErrorAction SilentlyContinue).Source } catch {}
+  if (-not $blenderExe) {
+    $cand = Get-ChildItem "C:\Program Files\Blender Foundation" -Recurse -Filter blender.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cand) { $blenderExe = $cand.FullName }
+  }
+  if ($blenderExe) {
+    $enablePy = 'import bpy; bpy.ops.preferences.addon_enable(module="hmdao_blender_capture"); bpy.ops.wm.save_userpref()'
+    try {
+      & $blenderExe -b --python-expr $enablePy 2>&1 | Out-Null
+      Write-Host "Auto-enabled HMDao Blender Capture add-on for Blender $($version.Name)."
+    } catch {
+      Write-Host "Could not auto-enable the add-on (Blender may be running). Enable it manually in Preferences > Add-ons."
+    }
+  } else {
+    Write-Host "Blender executable not found; enable HMDao Blender Capture manually in Preferences > Add-ons."
+  }
 }
 
 Write-Host ""

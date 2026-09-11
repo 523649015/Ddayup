@@ -288,6 +288,8 @@ export default defineConfig({
       'use-sync-external-store/shim/with-selector.js',
       // Transformers.js 本地翻译（浏览器端 ONNX Runtime）
       '@xenova/transformers',
+      // 二维码生成（CJS→ESM 预打包，否则浏览器端拿不到具名导出）
+      'qrcode',
     ],
     // 关键：onnxruntime-web 在 /public/ort-wasm/ 下用 wasmPaths 加载 WASM
     // Vite 不允许从 /public 目录 import；交给浏览器运行时直接拉取

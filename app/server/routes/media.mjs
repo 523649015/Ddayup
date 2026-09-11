@@ -354,7 +354,15 @@ export function registerMediaRoutes(router, deps) {
         });
     }
     } catch (e) {
-      return send(res, 500, { error: 'yt-dlp 调用失败：' + (e.message || e) });
+      // ★2026-09-10：yt-dlp 的真实失败原因在【stderr】（如 "Unsupported URL"、
+      //   "ERROR: unable to download"、"Sign in to confirm"）。原先只返回 Node 层的
+      //   e.message（多半是 "Command failed"），排障时完全看不出站点为何解析不了。
+      //   这里把 stderr 尾部一并返回，供前端提示与日志定位。
+      const detail = String((e && e.stderr) || (e && e.stdErr) || '').slice(-500);
+      return send(res, 500, {
+        error: 'yt-dlp 调用失败：' + ((e && e.message) || e),
+        detail: detail || undefined,
+      });
     }
   });
 
@@ -510,6 +518,89 @@ export function registerMediaRoutes(router, deps) {
       for (const p of [vPath, aPath]) {
         try { fs.rmSync(p, { force: true }); } catch (_) { /* 忽略 */ }
       }
+    }
+  });
+
+  // ==================================================================
+  // HLS / m3u8 拉流合并（ffmpeg 直接拉 m3u8 → 单文件 MP4）
+  // ------------------------------------------------------------------
+  // 为什么必须单独开这条链路（2026-09-10）：
+  //   1) m3u8 是【文本播放列表】。chrome.downloads 直连只会把几十 KB 文本存成"视频"
+  //      —— 实测 4815.wumaheil13.icu：下载得到 42KB 假文件。
+  //   2) 后端 yt-dlp 依赖【站点提取器】；私有影视站（index.php/vod/play/...）普遍不支持
+  //      → /api/platform/ytdlp 直接 500，整条下载链路断掉。
+  //   3) ffmpeg 原生支持 HLS（-i index.m3u8 即自动拉全部分片并拼接），
+  //      与站点提取器无关，是这类站唯一可靠的下发方式；-c copy 零重编码。
+  //   4) 防盗链：后端可用 -headers 自由携带 Referer / Origin（不受浏览器禁止头限制）。
+  //   5) 产物走既有 /api/media/merge-file 下发（本地直连无防盗链，且默认不输出
+  //      Content-Disposition → 保存路径与文件名仍由扩展完全控制）。
+  // ==================================================================
+  router.register('POST', '/api/media/merge-hls', async (req, res) => {
+    let body = {};
+    try { body = (await readJson(req)) || {}; } catch (_) { body = {}; }
+    const streamUrl = String(body.url || body.videoUrl || '').trim();
+    const referer = String(body.referer || '').trim();
+    const ua = String(body.userAgent || '').trim()
+      || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+    if (!/^https?:\/\//i.test(streamUrl)) {
+      return send(res, 400, { ok: false, error: '缺少有效的 m3u8/mpd 地址' });
+    }
+
+    const ticket = crypto.randomBytes(12).toString('hex');
+    const outPath = dashMergePath(ticket, '.mp4');
+    cleanupStaleDashMerges();
+    const bins = resolveFfmpegBins();
+    try {
+      const args = ['-y'];
+      // HLS 必须放宽协议白名单：m3u8 内部会引用 http/https 的 ts 分片与 crypto 分片
+      args.push('-protocol_whitelist', 'file,http,https,tcp,tls,crypto');
+      const headers = [];
+      if (referer) headers.push('Referer: ' + referer);
+      headers.push('User-Agent: ' + ua);
+      if (referer) {
+        try { headers.push('Origin: ' + new URL(referer).origin); } catch (_) { /* 忽略非法 referer */ }
+      }
+      if (headers.length) args.push('-headers', headers.join('\r\n') + '\r\n');
+      args.push('-i', streamUrl, '-c', 'copy', '-movflags', '+faststart', outPath);
+
+      // 拉流可能很长（整部影视），给足 15 分钟；超时由 execFileAsync 直接 kill
+      await execFileAsync(bins.ffmpeg, args, {
+        timeout: 15 * 60 * 1000,
+        maxBuffer: 20 * 1024 * 1024,
+        windowsHide: true,
+      });
+      if (!fs.existsSync(outPath)) throw new Error('ffmpeg 未产出文件');
+
+      // ★自检：与 merge-dash 同款 ffprobe 校验，避免把坏文件当成成功交付
+      let types = [];
+      try {
+        const { stdout } = await runCommand(bins.ffprobe, ['-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', outPath]);
+        types = String(stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      } catch (_) { types = []; }
+      if (!types.includes('video')) {
+        try { fs.rmSync(outPath, { force: true }); } catch (_) { /* 忽略 */ }
+        return send(res, 500, {
+          ok: false,
+          error: '产物无视频流，已丢弃',
+          detail: '可能是加密分片（EXT-X-KEY）或分片拉取被防盗链拦截',
+        });
+      }
+
+      const filename = sanitizeDashMergeName(body.filename, `hls-${ticket}.mp4`);
+      return send(res, 200, {
+        ok: true,
+        ticket,
+        fileUrl: `/api/media/merge-file?ticket=${ticket}`,
+        filename,
+        size: fs.statSync(outPath).size,
+        hasVideo: types.includes('video'),
+        hasAudio: types.includes('audio'),
+        engine: 'ffmpeg-hls-copy',
+      });
+    } catch (e) {
+      try { fs.rmSync(outPath, { force: true }); } catch (_) { /* 忽略 */ }
+      const message = String((e && e.message) || e);
+      return send(res, 500, { ok: false, error: 'HLS 拉流失败：' + message.slice(0, 300) });
     }
   });
 

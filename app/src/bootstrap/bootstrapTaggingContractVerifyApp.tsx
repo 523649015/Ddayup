@@ -2,9 +2,9 @@ import { StrictMode } from 'react';
 import * as ReactDOMClient from 'react-dom/client';
 import { TaggingContractVerifyCanvas } from '@/components/TaggingContractVerifyCanvas';
 import { setDebugBridgeBootstrapState } from '@/services/debugBridge';
+import { useApiKeyStore, isUnusableProviderKeyStatus } from '@/store/useApiKeyStore';
 
 async function bootstrapLocalDemoApiKeys() {
-  const { useApiKeyStore, isUnusableProviderKeyStatus } = await import('@/store/useApiKeyStore');
   const apiKeyStore = useApiKeyStore.getState();
   const hasImageAccess = Object.values(apiKeyStore.keys).some((entry) => (
     entry

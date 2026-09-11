@@ -3,7 +3,13 @@
   <head>
     <meta charset="utf-8" />
     <title>Ddayup网页素材采集扩展</title>
-    <link rel="stylesheet" href="sidepanel.css" />
+    <link rel="stylesheet" href="sidepanel.css?v=20260911c" />
+    <style>
+      .lic-badge{display:inline-block;font-size:11px;font-weight:600;padding:1px 7px;border-radius:10px;vertical-align:middle;margin-left:4px}
+      .lic-badge.trial{background:rgba(125,223,100,.18);color:#7ddf64}
+      .lic-badge.paid{background:rgba(47,129,247,.18);color:#58a6ff}
+      .lic-badge.expired{background:rgba(248,81,73,.18);color:#ff7b72}
+    </style>
   </head>
   <body>
     <!-- 第三方 Cookie 被阻止时的友好提示（默认隐藏，由 sidepanel.js 检测后显示） -->
@@ -37,7 +43,7 @@
             <circle id="pupilRight" cx="62" cy="50" r="3.6" fill="#06231d"/>
           </g>
         </svg>
-        Ddayup 素材采集 <span id="statusDot" class="dot gray"></span>
+        Ddayup 素材采集 <span id="statusDot" class="dot gray"></span> <span id="trialBadge" class="lic-badge"></span>
       </h1>
       <div class="sub" id="pageInfo">初始化中…</div>
     </header>
@@ -56,10 +62,14 @@
       <button class="chip" data-type="video">视频 <b id="cntVid">0</b></button>
       <button class="chip" data-type="audio">音频 <b id="cntAud">0</b></button>
       <button class="chip" data-type="model">3D 模型 <b id="cntMod">0</b></button>
+      <button class="chip" data-type="document">📄 文档 <b id="cntDoc">0</b></button>
       <button class="chip" data-type="archive">📦 归档 <b id="cntArc">0</b></button>
       <button class="chip" data-type="netdisk">🔗 网盘 <b id="cntNet">0</b></button>
       <button class="refresh" id="revealBtn" style="margin-left:6px" title="自动点击「下载/获取」按钮触发动态注入的链接">▶ 自动点击揭示</button>
       <button class="refresh" id="rescan" title="重新扫描">↻ 重新扫描</button>
+      <label class="hint" title="开启后：纯 hash 路由站点(如 example.com/#/page2)切换内容也清空旧素材；默认关闭以避免误清同页 SPA" style="margin-left:6px;white-space:nowrap">
+        <input type="checkbox" id="hashClearOnRoute" /> hash 路由也清卡
+      </label>
     </div>
 
     <!-- 尺寸/低质量筛选 -->
@@ -68,47 +78,38 @@
       <label><input type="checkbox" id="excludeIcons" /> 小图标(≤64×64)</label>
       <label>宽≥<input type="number" id="minWidth" placeholder="0" /></label>
       <label>高≥<input type="number" id="minHeight" placeholder="0" /></label>
+      <label title="屏蔽已知带平台水印的图床（小红书/微博/公众号/快手等），只留无水印素材源">
+        <input type="checkbox" id="blockWatermark" checked /> 水印来源
+      </label>
       <button id="applyFilter">应用</button>
       <button id="clearFilter">清空</button>
     </div>
+    <!-- 水印来源自定义屏蔽（默认名单见 sidepanel.js WATERMARK_HOSTS_DEFAULT，可增删） -->
+    <div class="filters wmBlock" id="wmBlockRow" style="display:none;flex-wrap:wrap;gap:4px;align-items:center;">
+      <button class="hint">屏蔽域名（逗号分隔）：</button>
+      <input type="text" id="wmHosts" style="flex:1;min-width:120px;padding:3px 6px;border-radius:6px;border:1px solid #2d3236;background:#0f1822;color:#c9d1d9;font-size:11px;" placeholder="如 xhscdn.com,sinaimg.cn" />
+      <button id="wmHostsSave">保存</button>
+    </div>
 
-    <details open>
-      <summary>📸 专业图片源</summary>
-      <div class="presetRow">
-        <button class="preset" data-url="https://unsplash.com">Unsplash</button>
-        <button class="preset" data-url="https://www.pexels.com/zh-cn/">Pexels</button>
-        <button class="preset" data-url="https://pixabay.com/zh/images/">Pixabay</button>
-        <button class="preset" data-url="https://stocksnap.io">StockSnap</button>
-        <button class="preset" data-url="https://splitshire.com">SplitShire</button>
-      </div>
-    </details>
-    <details>
-      <summary>🎬 专业视频源</summary>
-      <div class="presetRow">
-        <button class="preset" data-url="https://www.pexels.com/zh-cn/videos/">Pexels Videos</button>
-        <button class="preset" data-url="https://coverr.co">Coverr</button>
-        <button class="preset" data-url="https://mixkit.co/free-stock-video/">Mixkit 视频</button>
-        <button class="preset" data-url="https://pixabay.com/zh/videos/">Pixabay 视频</button>
-      </div>
-    </details>
-    <details>
-      <summary>🎵 音效 / 音乐源</summary>
-      <div class="presetRow">
-        <button class="preset" data-url="https://freesound.org">Freesound</button>
-        <button class="preset" data-url="https://mixkit.co/free-stock-music/">Mixkit Music</button>
-        <button class="preset" data-url="https://pixabay.com/zh/music/">Pixabay Music</button>
-        <button class="preset" data-url="https://soundbible.com">SoundBible</button>
-      </div>
-    </details>
-    <details>
-      <summary>🧊 3D 模型源</summary>
-      <div class="presetRow">
-        <button class="preset" data-url="https://sketchfab.com">Sketchfab</button>
-        <button class="preset" data-url="https://poly.pizza">Poly Pizza</button>
-        <button class="preset" data-url="https://quaternius.com">Quaternius</button>
-        <button class="preset" data-url="https://kenney.nl">Kenney</button>
-      </div>
-    </details>
+    <!-- ★2026-08-22 信息流批量采集开关：默认关；侧栏【始终】显示此条（含开关），让用户随时可发现入口。
+         仅「模式选择 + 批量采集按钮」在开启后才可见（由 sidepanel.js applyBatchUI 切换）。 -->
+    <div class="filters batchCollectBar" id="batchCollectBar" style="flex-wrap:wrap;gap:8px;align-items:center;display:flex;">
+      <label title="开启后可在抖音/视频号信息流页批量勾选并采集多个视频，不影响单视频采集">
+        <input type="checkbox" id="batchCollectEnabled" /> 信息流批量采集
+      </label>
+      <span id="batchCollectModeGroup" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;">
+        <select id="batchCollectMode" title="采集范围">
+          <option value="currentPage">当前页所有视频</option>
+          <option value="collection">合集视频</option>
+          <option value="custom">自定义（勾选卡片）</option>
+        </select>
+        <button class="accent" id="batchCollectBtn" style="display:none">批量采集选中</button>
+      </span>
+      <span id="batchCollectHint" style="color:#888;font-size:12px;">（开启后可批量勾选卡片采集）</span>
+    </div>
+
+    <!-- ===== 预设素材源（数据驱动渲染，见 bulk-actions.js 的 PRESET_SOURCES）===== -->
+    <div id="presetSources"></div>
     <details>
       <summary>🤖 AI 助手（Ddayup 智能机器人）</summary>
       <div class="presetRow" style="flex-direction:column;align-items:stretch;gap:8px">
@@ -125,22 +126,79 @@
 
     <details>
       <summary>按类型自定义保存路径（支持中文）</summary>
-      <div class="pathRow"><span class="pathType">📸 图片</span><button class="pathPick" data-type="image">选择目录</button><span class="pathText" data-type="image">未设置</span></div>
-      <div class="pathRow"><span class="pathType">🎬 视频</span><button class="pathPick" data-type="video">选择目录</button><span class="pathText" data-type="video">未设置</span></div>
-      <div class="pathRow"><span class="pathType">🎵 音频</span><button class="pathPick" data-type="audio">选择目录</button><span class="pathText" data-type="audio">未设置</span></div>
-      <div class="pathRow"><span class="pathType">🧊 3D模型</span><button class="pathPick" data-type="model">选择目录</button><span class="pathText" data-type="model">未设置</span></div>
-      <div class="pathRow"><span class="pathType">📦 归档</span><button class="pathPick" data-type="archive">选择目录</button><span class="pathText" data-type="archive">未设置</span></div>
+      <div class="pathRow" data-type="image"><span class="pathType">📸 图片</span><button class="pathPick" data-type="image" title="点此弹出系统目录选择框，选中任意绝对目录（如 D:\素材\图片）。需 Chrome 桌面版支持「文件系统访问 API」。">选择目录</button><input class="pathInput" data-type="image" type="text" placeholder="或填相对子目录，如 浏览器下载素材/图片" title="若浏览器不支持选目录，可在此填相对子目录名（用 / 或 \ 分隔），下载会存到「浏览器下载目录\Ddayup\<你填的>\」。注意：扩展无法写入任意绝对盘符路径（如 D:\...），要指定绝对路径请用上方「选择目录」按钮。" /><button class="pathApply" data-type="image" title="应用上方文本框输入的子目录">应用</button><span class="pathText" data-type="image">未设置</span><button class="pathTest" data-type="image" title="写入一个测试文件，验证该目录可写">测试</button><button class="pathClear" data-type="image" title="清除该类型的目录设置（含相对子目录）">✕</button></div>
+      <div class="pathRow" data-type="video"><span class="pathType">🎬 视频</span><button class="pathPick" data-type="video" title="点此弹出系统目录选择框，选中任意绝对目录（如 D:\素材\视频）。需 Chrome 桌面版支持「文件系统访问 API」。">选择目录</button><input class="pathInput" data-type="video" type="text" placeholder="或填相对子目录，如 浏览器下载素材/视频" title="若浏览器不支持选目录，可在此填相对子目录名（用 / 或 \ 分隔），下载会存到「浏览器下载目录\Ddayup\<你填的>\」。注意：扩展无法写入任意绝对盘符路径（如 D:\...），要指定绝对路径请用上方「选择目录」按钮。" /><button class="pathApply" data-type="video" title="应用上方文本框输入的子目录">应用</button><span class="pathText" data-type="video">未设置</span><button class="pathTest" data-type="video" title="写入一个测试文件，验证该目录可写">测试</button><button class="pathClear" data-type="video" title="清除该类型的目录设置（含相对子目录）">✕</button></div>
+      <div class="pathRow" data-type="audio"><span class="pathType">🎵 音频</span><button class="pathPick" data-type="audio" title="点此弹出系统目录选择框，选中任意绝对目录（如 D:\素材\音频）。需 Chrome 桌面版支持「文件系统访问 API」。">选择目录</button><input class="pathInput" data-type="audio" type="text" placeholder="或填相对子目录，如 浏览器下载素材/音频" title="若浏览器不支持选目录，可在此填相对子目录名（用 / 或 \ 分隔），下载会存到「浏览器下载目录\Ddayup\<你填的>\」。注意：扩展无法写入任意绝对盘符路径（如 D:\...），要指定绝对路径请用上方「选择目录」按钮。" /><button class="pathApply" data-type="audio" title="应用上方文本框输入的子目录">应用</button><span class="pathText" data-type="audio">未设置</span><button class="pathTest" data-type="audio" title="写入一个测试文件，验证该目录可写">测试</button><button class="pathClear" data-type="audio" title="清除该类型的目录设置（含相对子目录）">✕</button></div>
+      <div class="pathRow" data-type="model"><span class="pathType">🧊 3D模型</span><button class="pathPick" data-type="model" title="点此弹出系统目录选择框，选中任意绝对目录（如 D:\素材\模型）。需 Chrome 桌面版支持「文件系统访问 API」。">选择目录</button><input class="pathInput" data-type="model" type="text" placeholder="或填相对子目录，如 浏览器下载素材/模型" title="若浏览器不支持选目录，可在此填相对子目录名（用 / 或 \ 分隔），下载会存到「浏览器下载目录\Ddayup\<你填的>\」。注意：扩展无法写入任意绝对盘符路径（如 D:\...），要指定绝对路径请用上方「选择目录」按钮。" /><button class="pathApply" data-type="model" title="应用上方文本框输入的子目录">应用</button><span class="pathText" data-type="model">未设置</span><button class="pathTest" data-type="model" title="写入一个测试文件，验证该目录可写">测试</button><button class="pathClear" data-type="model" title="清除该类型的目录设置（含相对子目录）">✕</button></div>
+      <div class="pathRow" data-type="archive"><span class="pathType">📦 归档</span><button class="pathPick" data-type="archive" title="点此弹出系统目录选择框，选中任意绝对目录（如 D:\素材\归档）。需 Chrome 桌面版支持「文件系统访问 API」。">选择目录</button><input class="pathInput" data-type="archive" type="text" placeholder="或填相对子目录，如 浏览器下载素材/归档" title="若浏览器不支持选目录，可在此填相对子目录名（用 / 或 \ 分隔），下载会存到「浏览器下载目录\Ddayup\<你填的>\」。注意：扩展无法写入任意绝对盘符路径（如 D:\...），要指定绝对路径请用上方「选择目录」按钮。" /><button class="pathApply" data-type="archive" title="应用上方文本框输入的子目录">应用</button><span class="pathText" data-type="archive">未设置</span><button class="pathTest" data-type="archive" title="写入一个测试文件，验证该目录可写">测试</button><button class="pathClear" data-type="archive" title="清除该类型的目录设置（含相对子目录）">✕</button></div>
+      <div class="pathRow" data-type="netdisk"><span class="pathType">☁ 网盘</span><button class="pathPick" data-type="netdisk" title="点此弹出系统目录选择框，选中任意绝对目录。需 Chrome 桌面版支持「文件系统访问 API」。未单独设则复用「归档」目录。">选择目录</button><input class="pathInput" data-type="netdisk" type="text" placeholder="或填相对子目录，如 浏览器下载素材/网盘" title="若浏览器不支持选目录，可在此填相对子目录名（用 / 或 \ 分隔），下载会存到「浏览器下载目录\Ddayup\<你填的>\」。注意：扩展无法写入任意绝对盘符路径（如 D:\...），要指定绝对路径请用上方「选择目录」按钮。" /><button class="pathApply" data-type="netdisk" title="应用上方文本框输入的子目录">应用</button><span class="pathText" data-type="netdisk">未设置</span><button class="pathTest" data-type="netdisk" title="写入一个测试文件，验证该目录可写">测试</button><button class="pathClear" data-type="netdisk" title="清除该类型的目录设置（含相对子目录）">✕</button></div>
+      <div class="pathDiagRow" style="display:flex;align-items:center;gap:8px;padding:8px 12px 4px"><button id="pathDiagnose" style="flex:0 0 auto;padding:4px 10px;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9;cursor:pointer;font-size:11px">🔍 诊断保存目录</button><span style="color:#6e7681;font-size:10px">点一下，把下方结果截图发我即可定位</span></div>
     </details>
 
+    <div id="dlProgress" class="dlProgress" style="display:none">
+      <!-- 多任务进度卡片由 progress.js 动态渲染：标题 + #dlProgressContainer（每个任务一张 .dlTask 卡片） -->
+    </div>
+    <div id="scanStatus" class="scanStatus" title="实时扫描状态：已扫描素材数 / 进度 / 失败项">
+      <span class="ss-dot gray" id="ssDot"></span>
+      <span id="ssText">待扫描</span>
+    </div>
     <div id="status"></div>
-    <div id="ytDlpNotice" style="display:none;margin:10px;padding:10px 12px;border:1px solid #e0b341;border-radius:8px;background:rgba(224,179,65,0.12);font-size:12px;line-height:1.5;color:#caa12e;">
-      <div style="font-weight:600;margin-bottom:4px;">⚠ 需要 yt-dlp 才能解析视频直链</div>
-      <div>浏览器扩展已安装，但后端 <b>yt-dlp</b> 未就绪。YouTube / B站 等视频的清晰度选择与下载需先在 Ddayup Web App 安装 yt-dlp。</div>
-      <button class="install-btn" style="margin-top:8px;padding:5px 12px;border:0;border-radius:6px;background:#3b82f6;color:#fff;cursor:pointer;font-size:12px;">前往「模型下载」安装 yt-dlp</button>
+    <div id="ytDlpNotice" style="display:none;margin:10px;padding:12px 14px;border:1px solid #30363d;border-radius:10px;background:#161b22;font-size:12px;line-height:1.55;color:#c9d1d9;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <span class="yd-dot" id="ydDot" style="width:8px;height:8px;border-radius:50%;background:#8b949e;flex:0 0 auto;"></span>
+        <span id="ydTitle" style="font-weight:600;color:#e6edf3;font-size:13px;">yt-dlp / 后端状态检测中…</span>
+      </div>
+      <div id="ydDesc" style="color:#8b949e;margin-bottom:10px;">正在检查本机 yt-dlp 与 Ddayup Web 后端（127.0.0.1:3000）。</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+        <button class="install-btn" id="ydStartBackendBtn" style="display:none;padding:6px 14px;border:0;border-radius:7px;background:#238636;color:#fff;cursor:pointer;font-size:12px;font-weight:600;">▶ 启动 Ddayup 后端</button>
+        <button class="install-btn" id="ydConnectBtn" style="padding:6px 14px;border:0;border-radius:7px;background:#3b82f6;color:#fff;cursor:pointer;font-size:12px;font-weight:600;">⚡ 一键连接 yt-dlp（本地）</button>
+        <button class="yd-link" id="ydWebBtn" style="padding:6px 10px;border:1px solid #30363d;border-radius:7px;background:transparent;color:#58a6ff;cursor:pointer;font-size:12px;">或前往 Web 模型面板</button>
+        <span id="ydSpinner" style="display:none;color:#8b949e;font-size:12px;">⏳ 正在安装 / 连接…</span>
+        <span id="ydDismiss" style="margin-left:auto;color:#6e7681;cursor:pointer;font-size:11px;user-select:none;" title="不再提示（本机永久隐藏）">不再提示 ✕</span>
+      </div>
+    </div>
+    <div id="cloudConfigHint" style="display:none;margin:10px;padding:10px 14px;border:1px solid #30363d;border-radius:10px;background:#161b22;font-size:12px;line-height:1.5;color:#c9d1d9;">
+      ⚙ 未配置云端地址：默认连本机。点扩展「选项」可填写云端服务器地址。
     </div>
     <div id="list"></div>
     <div id="buildTag" class="buildTag">build …（加载中）</div>
+    <details id="panelLogWrap" style="margin:10px 12px 6px;color:#8b949e;font-size:11px;">
+      <summary style="cursor:pointer;user-select:none;">诊断日志（点击展开）</summary>
+      <pre id="panelLog" style="margin-top:6px;max-height:160px;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;font-size:10px;line-height:1.5;white-space:pre-wrap;word-break:break-all;"></pre>
+    </details>
     <div class="hint">双击预览原图/视频/音频 · 右键保存/下载/找相似 · 直接拖拽卡片仅可到<b>桌面/文件夹</b>（Chrome 限制，拖到微信/PS 无效）· 图片请点预览里的「📋 复制图片」再在微信按 Ctrl+V · 顶部筛选栏可排除小图标与低分辨率</div>
+    <div class="hint" style="color:#6e7681;border-top:1px solid #21262d;padding-top:8px;margin-top:2px;">⚠️ 温馨提示：本面板采集的素材仅供个人<b>自用与学习参考</b>，请勿用于商业用途或二次分发；使用前请遵守各素材源平台的版权与许可协议。</div>
+
+    <!-- ===== 授权 / 付费墙（试用过期或需激活时显示）===== -->
+    <div class="overlay" id="licensePaywall" style="display:none;z-index:1000">
+      <div class="overlayContent" style="max-width:460px">
+        <button class="closeBtn" id="lpClose">&times;</button>
+        <div class="pname" style="margin-bottom:10px">🔐 Ddayup 素材采集 · 授权</div>
+        <div id="lpInfo" style="font-size:13px;color:#c9d1d9;line-height:1.6;margin-bottom:14px"></div>
+
+        <!-- 登录 / 注册（后端自动开通 7 天试用）-->
+        <div style="font-size:12px;color:#8b949e;margin-bottom:6px">登录或注册账号（自动开通 7 天免费试用）</div>
+        <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px">
+          <input id="lpEmail" type="email" placeholder="邮箱" style="padding:8px 10px;border-radius:6px;border:1px solid #30363d;background:#0d1117;color:#e6edf3" />
+          <input id="lpPassword" type="password" placeholder="密码（至少 6 位）" style="padding:8px 10px;border-radius:6px;border:1px solid #30363d;background:#0d1117;color:#e6edf3" />
+          <button id="lpLogin" class="accent" style="padding:8px 0">登录</button>
+          <button id="lpRegister" class="accent" style="padding:8px 0;background:#238636">注册并开通试用</button>
+        </div>
+
+        <!-- 付费订阅：仅跳转官网网页（Edge 禁止扩展内嵌支付 UI）-->
+        <div style="font-size:12px;color:#8b949e;margin:6px 0">7 天试用结束后需付费订阅才能继续使用采集功能</div>
+        <button id="lpUpgrade" class="accent" style="width:100%;padding:10px 0;background:#2f81f7;font-size:14px;margin-bottom:10px">💳 去官网订阅（微信 / 国际卡）</button>
+
+        <!-- 激活码（兼容离线购买渠道）-->
+        <div style="font-size:12px;color:#8b949e;margin-bottom:6px">或输入付费激活码</div>
+        <div style="display:flex;gap:8px;margin-bottom:12px">
+          <input id="lpKey" type="text" placeholder="DDAYUP-XXXXXXXX" style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid #30363d;background:#0d1117;color:#e6edf3;text-transform:uppercase" />
+          <button id="lpActivate" class="accent" style="padding:8px 14px">激活</button>
+        </div>
+        <div id="lpStatus" style="font-size:12px;color:#58a6ff;min-height:16px"></div>
+        <div style="font-size:11px;color:#6e7681;margin-top:10px;line-height:1.5">支付在 Ddayup 官网网页完成，本扩展不内置支付。订阅支持 7 天无理由退款，详见官网退款政策。</div>
+      </div>
+    </div>
 
     <!-- 预览模态窗 -->
     <div class="overlay" id="previewOverlay">
@@ -155,7 +213,7 @@
         <div class="previewCard" id="previewModel" style="display:none">
           <!-- 可渲染格式(glb/gltf/obj/stl/ply/fbx/dae/3ds)：Three.js 交互视口；专有格式(c4d/blend/max…)：信息卡 -->
           <div id="pvModelViewport" style="display:none;width:100%;max-width:480px;height:280px;margin:0 auto;border-radius:8px;overflow:hidden;background:#14171d;position:relative"></div>
-          <iframe id="pvModelFrame" sandbox="allow-scripts allow-same-origin" style="display:none;width:100%;max-width:480px;height:280px;border:none;border-radius:8px;background:#14171d"></iframe>
+          <iframe id="pvModelFrame" sandbox="allow-scripts" style="display:none;width:100%;max-width:480px;height:280px;border:none;border-radius:8px;background:#14171d"></iframe>
           <div id="pvModelStatus" style="display:none;font-size:11px;color:#8b949e;margin:6px 0"></div>
           <button id="pvModelOpenApp" style="display:none;margin:4px auto 0;padding:5px 12px;border:none;border-radius:6px;background:#2f81f7;color:#fff;font-size:12px;cursor:pointer">在 Ddayup 中预览 3D</button>
           <div class="icon" id="pvModelIcon">🧊</div>
@@ -168,17 +226,33 @@
           <div class="purl" id="previewArchiveUrl"></div>
           <div id="pvArchiveEntries" style="display:none;text-align:left;max-height:160px;overflow:auto;font-size:11px;color:#8b949e;background:#14171d;border-radius:8px;padding:8px 10px;margin-top:8px;white-space:pre-wrap"></div>
         </div>
+        <div class="previewCard" id="previewNetdisk" style="display:none">
+          <div class="icon">☁️</div>
+          <div class="pname" id="previewNetdiskName"></div>
+          <div class="purl" id="previewNetdiskUrl"></div>
+          <div id="pvNetdiskTree" style="display:none;text-align:left;max-height:280px;overflow:auto;font-size:12px;background:#14171d;border-radius:8px;padding:6px 8px;margin-top:10px"></div>
+        </div>
+        <div class="previewCard" id="previewDocument" style="display:none">
+          <div class="icon">📄</div>
+          <div class="pname" id="previewDocumentName"></div>
+          <div class="purl" id="previewDocumentUrl"></div>
+          <button id="previewDocumentOpen" style="margin-top:10px;padding:6px 14px;border-radius:8px;border:1px solid #1a8cff;background:#1a8cff;color:#fff;cursor:pointer;font-size:12px">🔗 新窗口打开</button>
+        </div>
         <div class="previewInfo" id="previewInfo"></div>
         <div class="previewAltRes" id="pvAltResolutions" style="display:none"></div>
         <div class="previewActions" id="previewActions">
           <button class="accent" id="pvRefresh" title="在源页重新捕获视频 URL，解决 B站 blob / 签名过期">🔄 源页刷新</button>
           <button class="accent" id="pvPlay" style="display:none">▶ 试听</button>
+          <button class="accent" id="pvToMp3" style="display:none" title="用后端 ffmpeg 把 ogg 转成 MP3 并下载（兼容性更好）">🎵 转 MP3</button>
           <button class="accent" id="pvCopyImage" style="display:none" title="复制图片到系统剪贴板，到微信/PS 按 Ctrl+V 粘贴">📋 复制图片</button>
           <button class="accent" id="pvDownload">⬇ 下载</button>
+          <button class="accent" id="pvAria2" style="display:none" title="通过本机 Aria2 下载（适合大文件/网盘直链，支持多连接加速与断点续传）">🚀 用 Aria2 下载</button>
           <button id="pvSaveLocal">💾 存到本地</button>
           <button id="pvCopyLink">📋 复制链接</button>
           <button id="pvOpenTab">🔗 新标签页打开</button>
           <button id="pvSimilar">🔍 找相似</button>
+          <button class="accent" id="pvSwitchDouyinEpisode" style="display:none" title="自动切换抖音合集源页到该集播放，然后重新扫描捕获">▶ 切到此集播放</button>
+          <button class="accent" id="pvSourcePlay" style="display:none" title="抖音防盗链无法在侧栏播放时，在源页继续播放（不跳页、不重载，保持源视频播放状态）">▶ 在源页播放</button>
         </div>
       </div>
     </div>
@@ -191,7 +265,7 @@
       <button data-action="save">💾 存到本地</button>
       <button data-action="copy">📋 复制链接</button>
       <button data-action="open">🔗 新标签页打开</button>
-      <button data-action="netresolve">🔓 网盘深度解析</button>
+      <button id="pvNetResolve" data-action="netresolve" style="display:none">🔓 网盘深度解析</button>
       <button data-action="similar">🔍 找相似</button>
     </div>
 
@@ -240,7 +314,7 @@
     </div>
 
     <!-- ===== 视频下载面板（双击视频→点下载→弹出，选分辨率后下载）===== -->
-    <div class="overlay" id="downloadPanel" style="display:none">
+    <div class="overlay" id="downloadPanel">
       <div class="overlayContent" style="max-width:520px">
         <button class="closeBtn" id="closeDownloadPanel">&times;</button>
         <div class="pname" id="dlTitle" style="margin-bottom:8px">⬇ 下载视频</div>
@@ -257,15 +331,22 @@
 
     <script src="vendor/mp4box.all.min.js"></script>
     <script src="vendor/mp4-muxer.js"></script>
+    <script src="config-runtime.js"></script>
     <script src="ui-utils.js"></script>
+    <script src="license.js"></script>
     <script src="assetTypes.js"></script>
+    <script src="shared/messages.js"></script>
+    <script src="features/feature-manager.js"></script>
+    <script src="features/screenshot-ocr.js"></script>
     <script src="media-transcode.js"></script>
     <script src="sidepanel.js"></script>
     <script src="media-fetch.js"></script>
-    <script src="card-render.js"></script>
+    <script src="card-render.js?v=20260911c"></script>
     <script src="bulk-actions.js"></script>
     <script src="audio-playback.js"></script>
+    <script src="audio-transcode.js"></script>
     <script src="context-menu.js"></script>
+    <script src="progress.js"></script>
     <script src="download.js"></script>
     <script src="preview-render.js"></script>
     <script src="vendor/hls.min.js"></script>
