@@ -338,11 +338,21 @@ function coverFetch(url) {
 }
 
 // 仅当卡片进入视口（含 600px 预取）才真正取缩略图；命中缓存则同步直给
+// ★2026-09-12 修复（控制台 `card-render.js:692 Uncaught TypeError: Cannot read properties of
+//   undefined (reading 'catch')` → renderNow 的 forEach 直接抛飞 → 卡片渲染中断、列表卡一半/全空）：
+//   调用点写的是 `coverWhenVisible(...).catch(()=>{})`，但旧实现在 `!url` / 缓存命中两条分支里
+//   直接 `return;`（返回 undefined）→ `.catch` 在 undefined 上调用即抛。缓存命中是高频路径
+//   （同一批卡片第二次渲染必命中），于是每次重渲染都抛一次，renderNow 循环被中断，后续卡片
+//   全部不被挂载 → 侧栏列表"卡片都消失了"。现保证【所有分支都返回 Promise.resolve()】。
 function coverWhenVisible(card, url, apply) {
-  if (!url) return;
+  const done = () => Promise.resolve();
+  if (!url) return done();
   const key = coverCacheKey(url);
-  if (HMDAO_COVER_CACHE.has(key)) { try { apply(HMDAO_COVER_CACHE.get(key)); } catch (_) {} return; }
-  if (typeof IntersectionObserver === 'undefined') { coverFetch(url).then((b) => { if (card.isConnected) apply(b); }); return; }
+  if (HMDAO_COVER_CACHE.has(key)) { try { apply(HMDAO_COVER_CACHE.get(key)); } catch (_) {} return done(); }
+  if (typeof IntersectionObserver === 'undefined') {
+    coverFetch(url).then((b) => { if (card.isConnected) apply(b); }).catch(() => {});
+    return done();
+  }
   if (!HMDAO_COVER_IO) {
     HMDAO_COVER_IO = new IntersectionObserver((entries) => {
       for (const e of entries) {
@@ -358,6 +368,7 @@ function coverWhenVisible(card, url, apply) {
   card.dataset.coverWant = url;
   card.__applyCover = apply;
   HMDAO_COVER_IO.observe(card);
+  return done();
 }
 
 function coverVisibleNow(card) {
@@ -438,14 +449,30 @@ function applyHoverFrameToTag(a, tag, burl) {
 //   正确释放顺序：先让媒体元素彻底停止并解绑 src（pause → removeAttribute('src') → load() 触发
 //   资源选择算法中止在途请求），再 revoke —— 此后不会再有任何请求打到已注销的 blob。
 function releaseFrameVideo(tv, vurl) {
+  // ★2026-09-13 修复（blob ERR_FILE_NOT_FOUND 控制台噪声根因闭环）：
+  //   旧逻辑在 tv.load() 之后【同步】URL.revokeObjectURL(vurl)——但 load() 中止在途 Range 请求是
+  //   异步的，revoke 先于请求取消生效 → 浏览器仍在读已注销的 blob → 报 ERR_FILE_NOT_FOUND。
+  //   正确做法：解绑 src 后，等媒体元素真正释放资源（'emptied' 事件，load() 中止 pending 请求后触发）
+  //   再 revoke；并加超时兜底，防止极端情况下 'emptied' 不触发导致 blob 泄漏（配对且时机正确）。
+  const revoke = () => { try { if (vurl) URL.revokeObjectURL(vurl); } catch (_) {} };
   try {
     if (tv) {
       try { tv.pause(); } catch (_) {}
       tv.removeAttribute('src');
-      try { tv.load(); } catch (_) {}
+      let done = false;
+      let timer = null;
+      const once = () => { if (done) return; done = true; if (timer) clearTimeout(timer); revoke(); };
+      // 'emptied' 在 load() 真正中止在途请求后触发 → 此刻 revoke 才安全（消除 ERR_FILE_NOT_FOUND）
+      tv.addEventListener('emptied', once, { once: true });
+      // 兜底：异常路径或事件未触发时超时强回收，避免 blob 泄漏（done 守卫防重复 revoke）
+      timer = setTimeout(once, 300);
+      try { tv.load(); } catch (_) { once(); }
+    } else {
+      revoke();
     }
-  } catch (_) {}
-  try { if (vurl) URL.revokeObjectURL(vurl); } catch (_) {}
+  } catch (_) {
+    revoke();
+  }
 }
 
 // ===== 2026-09-12 抽帧统一调度器：分批懒加载 + 自动续批 + 失败集防死循环 + 自动停止 =====
@@ -745,7 +772,16 @@ function renderNow() {
   if (__m) __m.c.__hmdaoFilteredLen = filtered.length;
   const __win = (__m) ? hmdaoComputeWindow(__m) : { start: 0, end: filtered.length };
   const fullSig = sig + '|win:' + __win.start + ':' + __win.end;
-  if (fullSig === __lastRenderSig) { console.log('[HMDAO][render] renderNow 跳过(签名未变) filtered=' + filtered.length); return; } // 无变化：跳过重建，消除闪烁
+  // ★2026-09-12 诊断（云桥网「filtered=0 却不知道是没素材还是被筛选掉」）：
+  //   跳过分支原先只打印 filtered，无法区分两种完全不同的故障：
+  //     ① window.assets 为空 → 扫描结果根本没到侧栏（广播/合并链路问题）
+  //     ② window.assets 有素材，但 currentFilter 模块不匹配 → 用户切错模块，采集其实正常
+  //   现在两个数字都打出来，配合侧栏空态文案即可一次定位。
+  if (fullSig === __lastRenderSig) {
+    console.log('[HMDAO][render] renderNow 跳过(签名未变) filtered=' + filtered.length
+      + ' assets=' + (window.assets || []).length + ' filter=' + currentFilter);
+    return;
+  } // 无变化：跳过重建，消除闪烁
   __lastRenderSig = fullSig;
   console.log('[HMDAO][render] renderNow 渲染中 filtered=' + filtered.length + ' filter=' + currentFilter + ' window.assets=' + (window.assets || []).length);
 
@@ -813,6 +849,12 @@ function renderNow() {
   //   （如需恢复分组：恢复下方 sort 块与 forEach 里的模块标题插入即可。）
 
   filtered.forEach((a, i) => {
+    // ★2026-09-12 兜底（用户实测：66 张图片只渲染出 8 张卡，banner 却显示 image:66）：
+    //   renderNow 的这个 forEach 里任何一处异常（此前是 patchCard→coverWhenVisible(...).catch
+    //   在 undefined 上抛）都会让整个 forEach 中断 → 该卡之后的卡片全部不被挂载，DOM 里只剩
+    //   打断前已建好的少数几张卡，而横幅统计的 window.assets 仍是 66 → 计数与网格对不上。
+    //   现给【单张卡片】加 try/catch：任何一张卡构建/打补丁失败只跳过它，绝不再拖垮整张列表。
+    try {
     // ★2026-08-30 修复（"视频模块混入图片素材"根因）：
     //   排序 sortByModuleThenDimension 用的是【归一化后】类型（normalizeAssetType(a.type)），
     //   而分组标题插入此前用的是【原始 a.type】→ 两者不一致 → 同类型资产在视觉上不相邻，
@@ -1410,6 +1452,9 @@ function renderNow() {
     card.dataset.stableKey = __key;
     if (HMDAO_VIRTUALIZE) hmdaoPositionCard(card, i, __m);
     c.appendChild(card);
+    } catch (__cardErr) {
+      try { console.warn('[HMDAO][render] 单卡渲染失败，已跳过（不影响其余卡片）:', (__cardErr && __cardErr.message) || __cardErr); } catch (_) {}
+    }
   });
 
   // ★2026-09-11 修复（"未发现可采集素材"闪现）：
