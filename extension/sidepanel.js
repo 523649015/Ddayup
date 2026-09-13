@@ -73,10 +73,9 @@ let statusTimer = null;
 const imgDimensions = {}; // url → { w, h }（图片加载后采集的真实尺寸）
 // ★ saveHandles 用 var 共享全局（const 不会跨 <script> 共享，导致 bulk-actions.js 读不到、保存目录失效）
 var saveHandles = { image: null, video: null, audio: null, model: null, archive: null, netdisk: null };
-// ★2026-09-11 双保险：相对子目录兜底。当浏览器不支持 showDirectoryPicker（选绝对目录）时，
-//   用户可在文本框填相对子目录名（如 浏览器下载素材/图片），下载落到「浏览器下载目录/Ddayup/<相对子目录>/」。
-//   同样用 var 保证跨 <script> 共享；落盘时由 download.js 的 dlViaChrome 拼接进 chrome.downloads 的 filename。
-var relDirs = { image: null, video: null, audio: null, model: null, archive: null, netdisk: null };
+// ★2026-09-12 移除「相对子目录兜底」(relDirs)：该机制只能落到浏览器默认下载目录下，
+//   用户输入绝对路径时会被剥离盘符、落到默认目录并重复建文件夹（误导性鸡肋）。
+//   现统一为「选择目录」→ saveHandles[type]（File System Access API）写任意绝对目录。
 // ★2026-08-22 信息流批量采集：勾选态集合（存 awemeId 或 url，独立命名空间，不污染 window.selected）
 var batchSelection = new Set();
 var batchCollectEnabled = false; // 开关态（localStorage 持久化）
@@ -288,7 +287,25 @@ function deriveFilename(a) {
   }
   const dot = base.lastIndexOf('.');
   const hasExt = dot > 0 && /^\.[a-z0-9]{1,6}$/i.test(base.slice(dot));
-  const core = hasExt ? base : base + '.' + extForType(a.type);
+  // ★2026-09-12 修复（用户实测：抖音音频轨下载成「抖音音频轨（aweme ...）_抖音.mp4」，
+  //   困惑"mp4 文件怎么归纳到音频里"）：
+  //   抖音 DASH 音频轨实际是 MP4 容器（mime_type=audio_mp4 / 后缀 .m4s），URL 里没有音频后缀
+  //   → ① 无后缀时被 extForType 兜成 .mp3（内容是 m4a，名不符实）；② 若该资产被当成 video，
+  //   后缀会变成 .mp4。这里对【明确是音频轨】的资产统一给 .m4a（MP4 音频容器的标准后缀）：
+  //   仅当 URL 命中 douyin/TikTok 的 audio_mp4/.m4s/douyinvod 或标题含「音频轨」时才生效，
+  //   普通 mp3 音频（如爱给 mp3）仍走 extForType → .mp3，不受影响。
+  const __audioTrack = !!(a && a.type === 'audio') && (
+    /audio[_-]?mp4|mime_type=audio|\.m4[as](\?|$)|douyinvod|bytedance/i.test(String((a && a.url) || '')) ||
+    /音频轨/i.test(String((a && a.title) || ''))
+  );
+  let core;
+  if (hasExt) {
+    core = (__audioTrack && /^\.(mp4|m4s)$/i.test(base.slice(dot)))
+      ? (base.slice(0, dot) + '.m4a')
+      : base;
+  } else {
+    core = base + '.' + (__audioTrack ? 'm4a' : extForType(a.type));
+  }
   const tag = platformTag(a);
   if (!tag) return core;
   const d = core.lastIndexOf('.');
@@ -825,6 +842,9 @@ function clearAssetsForNewPage() {
     window.selected = new Set();
     try { batchSelection && batchSelection.clear(); } catch (_) {}
     window.__hmdaoAssets = window.assets.slice();
+    // ★2026-09-12：换页清空旧资源时，若预览仍开着（展示的是旧页素材）→ 一并关闭，
+    //   否则旧页的视频/音频仍在源页或帧流里播放，造成"切了页却还在响"。
+    if (typeof closePreview === 'function') { try { closePreview(); } catch (_) {} }
     try { renderNow(); } catch (_) {}
   } catch (_) {}
 }
@@ -1513,11 +1533,40 @@ function showManualClickGuide(shareUrl) {
 function hostOf(u) { try { return new URL(u).hostname; } catch (_) { return u; } }
 
 // 「自动点击揭示」：点击页面下载/获取按钮，触发接口注入的动态链接后自动重扫
+// ★2026-09-12 重写（用户实测：云桥网点了之后跳到另一个素材页，而不是下载路径）：
+//   根因见 router.js 的 revealDownloadLinks —— 旧实现对「相关推荐文章标题」误判为下载按钮并 click，
+//   导致整个标签页导航走。现在后台只点真正的中转/揭示按钮、绝不点 <a href>，
+//   并把解析出的真实网盘入口回传；这里把它们挂到「☁️ 网盘」模块，源页全程不跳转。
 const revealBtn = document.getElementById('revealBtn');
 if (revealBtn) revealBtn.onclick = async () => {
   setStatus('正在自动点击下载/获取按钮…');
   const res = await chrome.runtime.sendMessage({ type: 'HMDAO_CLICK_REVEAL' });
-  setStatus(res && res.ok ? ('已点击 ' + (res.clicked || 0) + ' 个按钮，正在重扫…') : ('自动点击失败：' + errStr(res && res.error)), !(res && res.ok));
+  if (!res || !res.ok) { setStatus('自动点击失败：' + errStr(res && res.error), true); return; }
+  const links = Array.isArray(res.collected) ? res.collected : [];
+  let added = 0;
+  try {
+    if (!Array.isArray(window.assets)) window.assets = [];
+    for (const u of links) {
+      if (!u || window.assets.some((a) => a && a.url === u)) continue;
+      const label = hostOf(u) + ' 下载入口';
+      window.assets.push({
+        url: u, type: 'netdisk', source: 'reveal',
+        name: label, title: label,
+        pageUrl: window.__sourcePageUrl || res.sourceUrl || '',
+      });
+      added++;
+    }
+    if (added) { window.__hmdaoAssets = window.assets.slice(); render(); }
+  } catch (e) { console.warn('[HMDAO][reveal] 入口入库失败:', e && e.message); }
+  if (added) {
+    setStatus('✅ 已捕获 ' + added + ' 个下载入口，已加入「☁️ 网盘」模块（源页未跳转）');
+  } else if (res.navigated) {
+    setStatus('⚠ 点击过程中页面发生了跳转，已立即停止后续点击。请回到素材页后重试。', true);
+  } else if (res.needLogin) {
+    setStatus('⚠ 该资源需登录/购买后才显示下载地址（已点 ' + (res.clicked || 0) + ' 个按钮，源页未跳转）。请登录后重试。', true);
+  } else {
+    setStatus('已点 ' + (res.clicked || 0) + ' 个按钮，未发现可直接捕获的下载入口；正在重扫…');
+  }
 };
 
 // ===== 信息流批量采集开关 + 批量采集按钮（★2026-08-22）=====
@@ -1554,6 +1603,12 @@ if (batchToggle) {
       if (Array.isArray(batchAssets)) batchAssets.length = 0;
       if (Array.isArray(window.assets)) window.assets = window.assets.filter((a) => !(a && a.__batch));
       if (Array.isArray(window.__hmdaoAssets)) window.__hmdaoAssets = window.__hmdaoAssets.filter((a) => !(a && a.__batch));
+      // ★2026-09-12 修复（用户实测：关闭批量后列表清空，但耳机里仍在播视频声音）：
+      //   打开抖音视频卡时会 playInSourceTab()（源页 <video> 带声音）+ startDouyinFrameStream；
+      //   此前关闭批量只清空 window.assets 并重渲染，【从不关闭仍打开的预览】→ 源页视频继续播放、
+      //   帧流不断 → 列表清空了声音却还在。现：只要展示列表被清空，就关掉仍在开的预览
+      //   （closePreview 内部会 pauseInSourceTab 停源页 + stopDouyinFrameStream + 停悬停音频）。
+      if (typeof closePreview === 'function') { try { closePreview(); } catch (_) {} }
       try { renderNow && renderNow(); } catch (_) {}
     }
     applyBatchUI();
@@ -3006,7 +3061,7 @@ document.addEventListener('click', (e) => {
 // 静默尝试：后端已在运行则立即返回；未运行且原生主机已安装则自动拉起；
 // 原生主机未安装或启动失败 → 在状态栏与横幅给出明确提示，让用户可点「启动后端」或重新扫描唤醒。
 setTimeout(() => {
-  ensureBackendRunningNative({ silent: true }).then((r) => {
+  ensureBackendRunningNative({ silent: true, requireLocal: true }).then((r) => {
     if (!r || !r.ok) {
       console.warn('[Ddayup] 自动启动后端失败：', r);
       setStatus('⚠ Ddayup 后端未启动，点击「启动 Ddayup 后端」或重新扫描可唤醒', true);
@@ -3160,7 +3215,52 @@ async function startBackendViaNative() {
 }
 
 async function ensureBackendRunningNative(options = {}) {
-  const { silent = false, onStatus } = options;
+  const { silent = false, onStatus, requireLocal = false } = options;
+  // ★2026-09-13 F1：requireLocal 模式专为 disk-write 等「本机写盘」调用方——
+  // 必须确保「本地后端 127.0.0.1:3000」起来，不能因云端可达就被 /api/health 短路
+  // （否则本地后端没起 → ERR_CONNECTION_REFUSED → 提示「后端未启动」）。
+  if (requireLocal) {
+    // 第一步直接探本机后端，绝不用 getCloudApiBase() 探云端
+    try {
+      const r = await fetch('http://127.0.0.1:3000/api/health', { credentials: 'omit', signal: AbortSignal.timeout(2000) });
+      if (r.ok) {
+        const d = await r.json().catch(() => null);
+        onStatus?.({ ok: true, via: 'local', data: d });
+        if (!silent) refreshYtDlpNotice();
+        return { ok: true, via: 'local', data: d };
+      }
+    } catch (_) { /* 本机后端未起 → 走下方原生主机拉起 */ }
+    // 本机健康失败 → 走原生主机拉起逻辑（与非 requireLocal 分支完全一致，仅 via 标 'local'）
+    const natStatus = await getBackendStatusViaNative();
+    onStatus?.(natStatus);
+    if (natStatus.ok) {
+      if (!silent) refreshYtDlpNotice();
+      return { ok: true, via: 'local', status: natStatus };
+    }
+    if (natStatus.nativeUnavailable) {
+      onStatus?.({ ok: false, nativeUnavailable: true });
+      if (!silent) { ensureYtDlpPrompt(); refreshYtDlpNotice(); }
+      return { ok: false, nativeUnavailable: true };
+    }
+    const startRes = await startBackendViaNative();
+    onStatus?.({ ok: false, starting: true, startRes });
+    if (!startRes.ok) {
+      if (!silent) { ensureYtDlpPrompt(); refreshYtDlpNotice(); }
+      return { ok: false, startRes };
+    }
+    for (let i = 0; i < 30; i += 1) {
+      await new Promise((r) => setTimeout(r, 800));
+      const s = await getBackendStatusViaNative();
+      onStatus?.(s);
+      if (s.ok) {
+        if (!silent) { hideYtDlpPrompt(); refreshYtDlpNotice(); }
+        return { ok: true, via: 'local', status: s };
+      }
+    }
+    if (!silent) { ensureYtDlpPrompt(); refreshYtDlpNotice(); }
+    return { ok: false, error: '后端启动后健康检查超时' };
+  }
+
   // 先尝试 Web 直连（后端可能已手动启动 / 或云端部署）
   try {
     const apiBase = await getCloudApiBase();
@@ -3911,7 +4011,7 @@ async function fetchPlatformFormats(a) {
   }
   try {
     const apiBase = await getCloudApiBase();
-    const r = await fetch(apiBase + '/api/platform/ytdlp?action=formats&url=' + encodeURIComponent(normalizeYtdlpDouyinUrl(videoPageUrl)) + cookieArg, { credentials: 'omit' });
+    const r = await fetch(withDeviceAuth(apiBase + '/api/platform/ytdlp?action=formats&url=' + encodeURIComponent(normalizeYtdlpDouyinUrl(videoPageUrl)) + cookieArg, await getExtDeviceAuth()), { credentials: 'omit' });
     const d = await r.json().catch(() => null);
     if (d && d.formats && d.formats.length) {
       window.__ytFormats = d.formats;
@@ -4195,16 +4295,16 @@ async function mergeDashForPreview(a) {
   const resp = await fetch(apiBase + '/api/media/merge-dash', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+    body: JSON.stringify(withDeviceAuthBody({
       videoUrl: a.downloadAddr || a.url,
       audioUrl: a.dashAudio,
       referer,
       filename: (a.title || deriveFilename(a) || 'video'),
-    }),
+    }, await getExtDeviceAuth())),
   });
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok || !data.ok) throw new Error((data && data.error) || ('HTTP ' + resp.status));
-  const fileResp = await fetch(apiBase + data.fileUrl);
+  const fileResp = await fetch(withDeviceAuth(apiBase + data.fileUrl, await getExtDeviceAuth()));
   if (!fileResp.ok) throw new Error('拉取合并产物失败 HTTP ' + fileResp.status);
   return await fileResp.blob();
 }
@@ -4357,9 +4457,9 @@ async function fallbackCdnFetch(a, vid) {
       if (cf) dyCookie = '&cookies_file=' + encodeURIComponent(cf);
     }
     // 同时拉取格式列表（用于分辨率选择）
-    const fmtP = fetch(apiBase + '/api/platform/ytdlp?action=formats&url=' + encodeURIComponent(normalizeYtdlpDouyinUrl(videoPageUrl)) + dyCookie, { credentials: 'omit' })
+    const fmtP = fetch(withDeviceAuth(apiBase + '/api/platform/ytdlp?action=formats&url=' + encodeURIComponent(normalizeYtdlpDouyinUrl(videoPageUrl)) + dyCookie, await getExtDeviceAuth()), { credentials: 'omit' })
       .then(r => r.json()).catch(() => null);
-    const urlP = fetch(apiBase + '/api/platform/ytdlp?action=extract&url=' + encodeURIComponent(normalizeYtdlpDouyinUrl(videoPageUrl)) + dyCookie, { credentials: 'omit' })
+    const urlP = fetch(withDeviceAuth(apiBase + '/api/platform/ytdlp?action=extract&url=' + encodeURIComponent(normalizeYtdlpDouyinUrl(videoPageUrl)) + dyCookie, await getExtDeviceAuth()), { credentials: 'omit' })
       .then(r => r.json()).catch(() => null);
 
     Promise.all([urlP, fmtP]).then(([ytData, fmtData]) => {

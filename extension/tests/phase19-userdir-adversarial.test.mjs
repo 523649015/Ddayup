@@ -97,7 +97,10 @@ function buildSandbox() {
 }
 function loadAll() {
   const sandbox = buildSandbox(); const ctx = vm.createContext(sandbox);
-  const src = read('assetTypes.js') + '\n' + read('sidepanel.js') + '\n' + read('bulk-actions.js') + '\n' + read('download.js') + '\n' +
+  // ★2026-09-13 QA 修复：withDeviceAuthBody/getExtDeviceAuth 定义在 ui-utils.js（生产侧先于 sidepanel.js 加载），
+  // 此前未载入 vm → 桩里被代理成 noop → 请求体为 undefined → 部分用例的 JSON.parse(opts.body) 抛错。
+  // 补上 ui-utils.js（纯函数、无副作用），使扩展侧 fetch 真正带上 deviceId/token 包装，验证落盘逻辑。
+  const src = read('assetTypes.js') + '\n' + read('ui-utils.js') + '\n' + read('sidepanel.js') + '\n' + read('bulk-actions.js') + '\n' + read('download.js') + '\n' +
     'window.__api = { dlViaChrome, trySaveViaBackendDir, hasBackendDirFor, backendDirFor, writeBlobToUserDir, tryWriteUserDirFromUrl, dirPaths, saveDirPath };';
   vm.runInContext(src, ctx);
   return sandbox;

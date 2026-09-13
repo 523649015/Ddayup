@@ -66,7 +66,10 @@ async function loadMediaRoutes() {
     const h = routes.get(method + ' ' + p);
     assert.ok(h, `路由 ${method} ${p} 未注册`);
     const res = {};
-    await h({ method, __body: body }, res, new URL('http://127.0.0.1' + p));
+    // ★2026-09-13 F3 回归：save-to-dir / probe-dir 在环回（127.0.0.1）时跳过设备授权网关。
+    // 真实 HTTP 请求来自本机时 req.socket.remoteAddress === '127.0.0.1'，isLoopback(req) 为真、gateEntitlement 被跳过。
+    // 单测桩需模拟该环回请求，才能正确验证路由自身的「绝对路径校验 / 写盘 / 400」逻辑（否则被网关 402 短路）。
+    await h({ method, __body: body, socket: { remoteAddress: '127.0.0.1' } }, res, new URL('http://127.0.0.1' + p));
     return res;
   };
   return { invoke };

@@ -24,14 +24,6 @@ async function dlViaChrome(opts) {
     try {
       if (await tryWriteUserDirFromUrl(asset, opts.url, name)) return -1; // 绝对目录已写
     } catch (_) { /* 忽略，回退原生下载 */ }
-    // ★2026-09-11 双保险：绝对目录未设置/失败 → 若用户填了相对子目录，
-    //   把下载落到「浏览器下载目录/Ddayup/<相对子目录>/」而非默认类型子目录。
-    try {
-      if (typeof userRelDirFor === 'function') {
-        const rel = userRelDirFor(asset.type);
-        if (rel) opts = Object.assign({}, opts, { filename: 'Ddayup/' + rel + '/' + name });
-      }
-    } catch (_) {}
   }
   const dlId = window.HmdaoProgress.registerTask({ name, asset });
   // ★2026-09-02 修复（实测）：asset 是【侧栏进度任务卡】用的自定义字段，
@@ -109,7 +101,7 @@ async function mergeAndDownloadViaBackend(a, videoUrl) {
     resp = await fetch(base.replace(/\/$/, '') + '/api/media/merge-dash', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ videoUrl, audioUrl, referer: 'https://www.douyin.com/' }),
+      body: JSON.stringify(withDeviceAuthBody({ videoUrl, audioUrl, referer: 'https://www.douyin.com/' }, await getExtDeviceAuth())),
       signal: controller.signal,
     });
   } catch (fetchErr) {
@@ -123,12 +115,13 @@ async function mergeAndDownloadViaBackend(a, videoUrl) {
   const data = await resp.json().catch(() => ({}));
   if (!data || !data.ok) throw new Error('后端合并失败：' + ((data && data.error) || ('HTTP ' + resp.status)));
   if (!data.fileUrl) throw new Error('后端未返回 fileUrl');
-  // 3) 下载合并产物（本机直连，无防盗链）
-  const mergedUrl = base.replace(/\/$/, '') + data.fileUrl;
+  // 3) 下载合并产物（本机直连，无防盗链）；fileUrl 经服务端闸门，需带 deviceId
+  const mergedUrl = withDeviceAuth(base.replace(/\/$/, '') + data.fileUrl, await getExtDeviceAuth());
   const mergedName = deriveFilename(a);
   // ★2026-09-10：用户为该类型设置了目录 → 写用户目录（FileSystemAccess 可写任意路径），
   //   否则回退 chrome.downloads（默认 Ddayup/videos）。
-  if (typeof saveHandles !== 'undefined' && saveHandles && saveHandles[a.type]) {
+  // ★2026-09-12：若走「后端绝对路径」通道，则跳过「拉整段进侧栏内存」，直接交 dlViaChrome→后端流式写盘。
+  if (userHandleOnlyFor(a.type)) {
     try {
       const mb = await fetch(mergedUrl).then((r) => r.blob());
       if (await writeBlobToUserDir(a.type, mergedName, mb)) {
@@ -298,7 +291,12 @@ async function trySaveToUserDir(a) {
     }
     // 侧栏刚打开时目录还在从 IndexedDB 恢复，等它完成再判断，避免"明明设了却没生效"
     if (typeof __dirRestorePromise !== 'undefined' && __dirRestorePromise) await __dirRestorePromise;
-    const handle = (typeof saveHandles !== 'undefined' && saveHandles) ? saveHandles[a && a.type] : null;
+    const __type = a && a.type;
+    // ★通道二优先：用户填了绝对路径 → 后端流式写盘（不受 60MB / 体积未知护栏限制）
+    if (hasBackendDirFor(__type) && a && a.url && /^https?:/i.test(String(a.url))) {
+      return await trySaveViaBackendDir(a, a.url, deriveFilename(a));
+    }
+    const handle = (typeof saveHandles !== 'undefined' && saveHandles) ? saveHandles[__type] : null;
     if (!handle) { notifyUserDirSkipped(a, '未设置该类型目录'); return false; }
     // ★超时护栏：任何抓取挂起（防盗链/跨域/大文件）最多等 20 秒就放弃，回退默认下载，
     //   绝不让用户面对"无限等待"。
@@ -349,8 +347,24 @@ async function trySaveToUserDir(a) {
 //   也能落到用户目录的唯一通道（chrome.downloads 只能写下载目录+相对子目录）。
 async function writeBlobToUserDir(type, name, blob) {
   try {
+    if (!blob) return false;
+    // ★通道二优先：用户填了绝对路径 → 把 blob 字节交后端写盘（后端 fs 直写任意绝对目录）
+    if (hasBackendDirFor(type)) {
+      try {
+        if (typeof __dirRestorePromise !== 'undefined' && __dirRestorePromise) await __dirRestorePromise;
+        const buf = await blob.arrayBuffer();
+        if (!buf || !buf.byteLength) return false;
+        const b64 = bytesToB64(new Uint8Array(buf));
+        const saved = await trySaveViaBackendDir({ type }, '', name, { dataBase64: b64 });
+        return !!saved;
+      } catch (e) {
+        notifyUserDirSkipped({ type }, '写入失败');
+        return false;
+      }
+    }
+    // 通道一：FSA 句柄
     const handle = userDirHandleFor(type);
-    if (!handle || !blob) return false;
+    if (!handle) return false;
     // 权限可能在浏览器重启后过期；在用户点击流程里可以安全 requestPermission
     try {
       const perm = await handle.queryPermission({ mode: 'readwrite' });
@@ -401,6 +415,113 @@ async function tryUserDirBeforeNativeChannel(a, url, name) {
   return false;
 }
 
+// ===== 通道二：绝对路径 → 本地后端流式写盘（2026-09-12）=====
+// 为什么需要它：chrome.downloads.download 只能写【浏览器默认下载目录 + 相对子目录】，
+//   无法写任意绝对目录（D:\...）；File System Access API 在 side panel 又不可靠。
+//   故「用户填了绝对路径」这一路统一交本地后端：后端进程可 fs 写任意绝对路径，
+//   且流式落盘，不受 sendMessage ~64MB 限制，支持 GB 级大文件。
+// 返回 true = 已写入用户目录（调用方必须跳过默认下载）；false = 未设置/失败（调用方回退）。
+
+// Uint8Array → base64（分块，避免超长 String.fromCharCode 栈溢出）。供 dataBase64 通道使用。
+function bytesToB64(bytes) {
+  const u8 = (bytes instanceof Uint8Array) ? bytes : new Uint8Array(bytes);
+  const CHUNK = 0x8000;
+  let bin = '';
+  for (let i = 0; i < u8.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + CHUNK, u8.length)));
+  }
+  return btoa(bin);
+}
+
+// 调后端 /api/media/save-to-dir；连接失败时尝试拉起后端一次并重试。
+async function __backendSaveToDir(payload) {
+  const base = (typeof ddBackendBase === 'function') ? ddBackendBase() : 'http://127.0.0.1:3000';
+  const post = async () => {
+    const resp = await fetch(base + '/api/media/save-to-dir', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(withDeviceAuthBody(payload, await getExtDeviceAuth())),
+    });
+    const data = await resp.json().catch(() => ({}));
+    return { resp, data };
+  };
+  try {
+    const { resp, data } = await post();
+    if (resp.ok && data && data.success) return { ok: true, savedPath: data.savedPath, bytes: data.bytes };
+    const _msg = (data && (data.message || data.error)) || ('HTTP ' + resp.status);
+    const _code = (data && data.code) || '';
+    return { ok: false, serviceDown: false, error: (_code === 'LICENSE_REQUIRED' ? '设备未授权：' + _msg : _msg) };
+  } catch (e) {
+    // fetch reject = 连接失败 → 判定本地服务未启动，尝试拉起一次（原生主机 backend.start，内部含健康轮询）
+    const up = await (async () => {
+      try {
+        if (typeof ensureBackendRunningNative === 'function') {
+          const r = await ensureBackendRunningNative({ silent: true, requireLocal: true });
+          if (r && r.ok) return true;
+        }
+      } catch (_) {}
+      return false;
+    })();
+    if (!up) return { ok: false, serviceDown: true, error: (e && e.message) || 'connection failed' };
+    try {
+      const { resp, data } = await post();
+      if (resp.ok && data && data.success) return { ok: true, savedPath: data.savedPath, bytes: data.bytes };
+      const _msg = (data && (data.message || data.error)) || ('HTTP ' + resp.status);
+      const _code = (data && data.code) || '';
+      return { ok: false, serviceDown: false, error: (_code === 'LICENSE_REQUIRED' ? '设备未授权：' + _msg : _msg) };
+    } catch (e2) {
+      return { ok: false, serviceDown: true, error: (e2 && e2.message) || 'connection failed' };
+    }
+  }
+}
+
+// 统一入口：用户为该类型填了【绝对路径】→ 交后端写盘。url 分支流式；dataBase64 分支写已拿到的字节。
+async function trySaveViaBackendDir(a, url, name, opts = {}) {
+  try {
+    if (window.__hmdaoUserDirEnabled === false) return false;
+    const type = a && a.type;
+    if (!type) return false;
+    // 等侧栏目录/路径恢复完成，避免"明明设了却没生效"
+    if (typeof __dirRestorePromise !== 'undefined' && __dirRestorePromise) await __dirRestorePromise;
+    const abs = backendDirFor(type);
+    if (!abs) return false;
+
+    const filename = name || (typeof deriveFilename === 'function' ? deriveFilename(a) : 'file.bin');
+    const payload = { dir: abs, filename };
+    if (opts.subdir) payload.subdir = opts.subdir;
+    if (opts.dataBase64) {
+      payload.dataBase64 = opts.dataBase64;
+    } else if (url && /^https?:/i.test(String(url))) {
+      payload.url = url;
+      payload.referer = opts.referer
+        || ((type === 'audio')
+          ? (typeof sourceOrigin === 'function' ? sourceOrigin() : '')
+          : (typeof deriveMediaReferer === 'function' ? deriveMediaReferer(url, window.__sourcePageUrl || '') : (window.__sourcePageUrl || '')));
+      // 迅雷 CDN 直链要求 Referer: pan.xunlei.com 否则 403（与 chrome.downloads 直连同款要求）
+      if (/xunlei\.com|xlcdn\.com|tc\.xunlei\.com|pan\.xunlei/i.test(String(url))
+        && (type === 'netdisk' || type === 'netdisk-file' || type === 'archive')) {
+        payload.referer = 'https://pan.xunlei.com/';
+      }
+    } else {
+      return false;
+    }
+
+    const saved = await __backendSaveToDir(payload);
+    if (saved.ok) {
+      try { if (typeof pulseDownloadProgress === 'function') pulseDownloadProgress('已保存到设置目录：' + filename); } catch (_) {}
+      setStatus('✅ 已保存到设置的目录：' + filename + '（→ ' + abs + '）');
+      console.log('[Ddayup][userdir] backend ok:', type, filename, '=>', saved.savedPath || abs);
+      return true;
+    }
+    // 失败：区分「本地服务未启动」与「写入/拉取失败」，明确提示（不阻塞正常下载）
+    notifyUserDirSkipped(a, saved.serviceDown ? '本地服务未启动' : (saved.error ? ('写入失败：' + saved.error) : '写入失败'));
+    return false;
+  } catch (e) {
+    console.warn('[Ddayup][userdir] backend 异常', (e && e.message) || e);
+    return false;
+  }
+}
+
 // ★2026-09-10 P1 统一落盘出口：所有落盘路径（dlViaChrome / downloadBlobUrl）都先问它。
 //   历史教训：此前 17 个落盘点各自硬编码 'Ddayup/<typeDirs>/'，加一个平台就漏一个，
 //   用户设了目录照样下到默认目录。现在只在【两个唯一插桩点】判断一次，覆盖率 100%。
@@ -413,29 +534,52 @@ function userDirHandleFor(type) {
   if (type === 'netdisk') return saveHandles.archive || null; // 网盘无独立行 → 复用归档目录
   return null;
 }
+// ★2026-09-12：解析该 type 对应的「后端绝对路径」。网盘类（netdisk / netdisk-file）无独立设置时
+//   复用 netdisk 键（不跨到 archive —— 与 QA 用例 X6「各自独立」保持一致）。
+function backendDirFor(type) {
+  if (typeof dirPaths === 'undefined' || !dirPaths) return '';
+  if (type && dirPaths[type]) return dirPaths[type];
+  if (type === 'netdisk' || type === 'netdisk-file') return dirPaths.netdisk || '';
+  return '';
+}
+// 是否有「后端绝对路径」通道（该 type 有值）。
+function hasBackendDirFor(type) {
+  return !!backendDirFor(type);
+}
+// 是否有任一自定义目录（后端绝对路径 或 FSA 句柄）。
+function hasUserDirFor(type) {
+  return hasBackendDirFor(type) || !!userDirHandleFor(type);
+}
+// 仅句柄通道：用于「先抓字节再写」这类会占侧栏内存的旧 FSA 通道 ——
+//   若已有后端绝对路径，应改走 dlViaChrome→后端流式写盘，避免把大文件拉进侧栏内存。
+function userHandleOnlyFor(type) {
+  if (hasBackendDirFor(type)) return null;
+  return userDirHandleFor(type);
+}
 async function tryWriteUserDirFromUrl(a, url, filename) {
   try {
     if (window.__hmdaoUserDirEnabled === false) return false;
-    // 侧栏刚打开时目录还在从 IndexedDB 恢复，等它完成再判断，避免"明明设了却没生效"
     if (typeof __dirRestorePromise !== 'undefined' && __dirRestorePromise) await __dirRestorePromise;
     if (!a || !url || !/^https?:/i.test(url)) return false;
-    // 流媒体是文本播放清单，不是媒体本体 → 必须走后端 ffmpeg 拉流
+    // 流媒体是文本播放清单，不是媒体本体 → 必须走后端 ffmpeg 拉流（不属本通道）
     if (/\.(m3u8|mpd)(\?|$)/i.test(url)) {
       console.warn('[Ddayup][userdir] skip: 流媒体，走后端拉流');
       return false;
     }
     const type = a.type || '';
+    // ★通道二优先：用户填了绝对路径 → 交后端流式写盘（m3u8/mpd 之外的大文件、GB 级同样支持）
+    if (hasBackendDirFor(type)) {
+      return await trySaveViaBackendDir(a, url, filename || deriveFilename(a));
+    }
     const handle = userDirHandleFor(type);
     if (!handle) { notifyUserDirSkipped(a, '未设置该类型目录'); return false; }
     const size = Number(a.size || 0);
-    if (size > USER_DIR_MAX_BYTES) {
-      console.warn('[Ddayup][userdir] skip: 超过 60MB，走浏览器原生下载（' + Math.round(size / 1048576) + 'MB）');
-      return false;
-    }
-    // ★2026-09-11：音视频体积未知时绝不走「拉字节」通道——整段 1080P 常达数百 MB，
-    //   会白白等满 30s 超时才回退（表现为"点了没反应"）。体积已知且 ≤60MB 才尝试。
-    if ((type === 'video' || type === 'audio') && !size) {
-      console.warn('[Ddayup][userdir] skip: 音视频体积未知，走浏览器原生下载（避免整段拉取超时）');
+    // 已知体积超限 → 走浏览器原生下载（sendMessage ~64MB 上限，避免大文件拉进侧栏内存）。
+    // 体积未知时不预跳：改为抓取后按【实际字节数】再判（见下方 bytes.byteLength 检查），
+    // 这样「音视频体积未知(size=0)」也能尝试落用户目录，而非整段被跳过——直接命中用户
+    // 从 yunqiaonet 抓音频(size 常为 0)却始终下到默认目录的痛点。
+    if (size && size > USER_DIR_MAX_BYTES) {
+      console.warn('[Ddayup][userdir] skip: 已知体积超过 60MB，走浏览器原生下载（' + Math.round(size / 1048576) + 'MB）');
       return false;
     }
     const name = filename || deriveFilename(a);
@@ -449,10 +593,17 @@ async function tryWriteUserDirFromUrl(a, url, filename) {
       fetcher,
       new Promise((_, rej) => setTimeout(() => rej(new Error('抓取超时(30s)')), 30000)),
     ]);
-    if (!res || !res.ok) { console.warn('[Ddayup][userdir] skip: 抓取失败', (res && res.error) || ''); return false; }
+    if (!res || !res.ok) { notifyUserDirSkipped(a, '抓取失败'); console.warn('[Ddayup][userdir] skip: 抓取失败', (res && res.error) || ''); return false; }
     let bytes = res.arrayBuffer;
     if (!bytes && res.b64) { try { bytes = b64ToBytes(res.b64); } catch (_) { bytes = null; } }
-    if (!bytes || !bytes.byteLength) { console.warn('[Ddayup][userdir] skip: 未拿到字节'); return false; }
+    if (!bytes || !bytes.byteLength) { notifyUserDirSkipped(a, '抓取失败（无字节）'); console.warn('[Ddayup][userdir] skip: 未拿到字节'); return false; }
+    // 实际体积超限 → 走浏览器原生下载（sendMessage ~64MB 上限，避免大文件拉进侧栏内存；
+    //   对体积未知的音视频，这里才是真正的兜底，而非抓取前就整段跳过）。
+    if (bytes.byteLength > USER_DIR_MAX_BYTES) {
+      notifyUserDirSkipped(a, '文件超过 60MB，走浏览器原生下载');
+      console.warn('[Ddayup][userdir] skip: 实际体积超过 60MB，走浏览器原生下载（' + Math.round(bytes.byteLength / 1048576) + 'MB）');
+      return false;
+    }
     const blob = new Blob([bytes], { type: res.mime || 'application/octet-stream' });
     if (await writeBlobToUserDir(type, name, blob)) {
       try { if (typeof pulseDownloadProgress === 'function') pulseDownloadProgress('已保存到设置目录：' + name); } catch (_) {}
@@ -460,6 +611,7 @@ async function tryWriteUserDirFromUrl(a, url, filename) {
       console.log('[Ddayup][userdir] ok:', type, name);
       return true;
     }
+    notifyUserDirSkipped(a, '写入失败');
     console.warn('[Ddayup][userdir] skip: 写入用户目录失败（权限/磁盘）');
     return false;
   } catch (e) {
@@ -475,8 +627,8 @@ async function tryWriteUserDirFromBlob(a, blobUrl, filename) {
     // 侧栏刚打开时目录还在从 IndexedDB 恢复，等它完成再判断，避免"明明设了却没生效"
     if (typeof __dirRestorePromise !== 'undefined' && __dirRestorePromise) await __dirRestorePromise;
     if (!a || !blobUrl || !/^blob:/i.test(String(blobUrl))) return false;
-    const handle = userDirHandleFor(a.type || '');
-    if (!handle) return false;
+    // 后端绝对路径 或 FSA 句柄，任一存在即尝试落盘（writeBlobToUserDir 内部按优先级处理）
+    if (!hasUserDirFor(a.type || '')) return false;
     const name = filename || deriveFilename(a);
     const blob = await (await fetch(blobUrl)).blob();
     if (!blob || !blob.size) return false;
@@ -544,6 +696,7 @@ async function downloadSingle(a, opts = {}) {
       filename: 'Ddayup/netdisk/' + name,
       saveAs: false,
       conflictAction: 'uniquify',
+      asset: a,
       ...(isXunlei ? { headers: [{ name: 'Referer', value: 'https://pan.xunlei.com/' }] } : {}),
     }).then(() => setStatus('✅ 直链下载已触发：' + name + '（无需登录）'))
       .catch((e) => setStatus('⚠ 直链下载失败：' + (e && e.message || e), true));
@@ -630,7 +783,8 @@ async function downloadSingle(a, opts = {}) {
     });
     try {
       // ★2026-09-10：用户为该类型设置了目录 → 优先写用户目录（fetchMediaViaBackground 拿字节）
-      if (typeof saveHandles !== 'undefined' && saveHandles && saveHandles[target.type]) {
+      // ★2026-09-12：仅句柄通道才走「拉字节进侧栏」；有后端绝对路径时改走 viaChrome()→后端流式写盘。
+      if (userHandleOnlyFor(target.type)) {
         const r = await fetchMediaViaBackground(opts.downloadUrl, referer);
         if (r && r.ok && r.b64) {
           const blob = new Blob([b64ToBytes(r.b64)], { type: r.mime || 'video/mp4' });
@@ -720,6 +874,7 @@ async function downloadSingle(a, opts = {}) {
             filename: 'Ddayup/netdisk/' + name,
             saveAs: false,
             conflictAction: 'uniquify',
+            asset: a,
           }).then(() => setStatus('✅ 网盘文件下载已触发：' + name))
             .catch((e) => setStatus('⚠ 下载失败：' + (e && e.message || e), true));
         } else if (res && res.needManualClick) {
@@ -745,6 +900,7 @@ async function downloadSingle(a, opts = {}) {
         filename: 'Ddayup/netdisk/' + name,
         saveAs: false,
         conflictAction: 'uniquify',
+        asset: a,
       }).then(() => setStatus('✅ 下载已触发：' + name))
         .catch((e) => setStatus('⚠ 网盘文件下载失败：' + (e && e.message || e) + '（若提示登录，请先在浏览器登录网盘网页版）', true));
       return;
@@ -765,6 +921,7 @@ async function downloadSingle(a, opts = {}) {
           filename: 'Ddayup/netdisk/' + name,
           saveAs: false,
           conflictAction: 'uniquify',
+          asset: a,
         }).then(() => setStatus('✅ 网盘文件下载已触发：' + name))
           .catch((e) => setStatus('⚠ 下载失败：' + (e && e.message || e), true));
       } else {
@@ -781,7 +938,8 @@ async function downloadSingle(a, opts = {}) {
   if (a.__mergedDash && typeof a.url === 'string' && a.url.startsWith('blob:')) {
     const name = a.__mergedName || 'video_merged.mp4';
     // ★2026-09-10：用户为视频设置了目录 → 优先写用户目录（blob 字节可直接写 FileSystemAccess）
-    if (typeof saveHandles !== 'undefined' && saveHandles && saveHandles[a.type]) {
+    // ★2026-09-12：带后端绝对路径时，writeBlobToUserDir 内部改走「dataBase64 → 后端写盘」。
+    if (hasUserDirFor(a.type)) {
       try {
         const b = await fetch(a.url).then((r) => r.blob());
         if (await writeBlobToUserDir(a.type, name, b)) {
@@ -1048,7 +1206,8 @@ async function downloadSingle(a, opts = {}) {
   }
   // 直接走 chrome.downloads.download（不带任何 header）—— B 站 CDN URL 自带签名参数必通
   // ★2026-09-10：用户为该类型设置了目录 → 优先写用户目录（fetchMediaViaBackground 拿字节）
-  if (typeof saveHandles !== 'undefined' && saveHandles && saveHandles[a.type]) {
+  // ★2026-09-12：仅句柄通道走「拉字节进侧栏」；有后端绝对路径时改由下方 dlViaChrome→后端流式写盘。
+  if (userHandleOnlyFor(a.type)) {
     try {
       const r = await fetchMediaViaBackground(a.url, deriveMediaReferer(a.url, sourcePage));
       if (r && r.ok && r.b64) {
@@ -1187,7 +1346,7 @@ async function downloadViaYtDlp(a, sourcePage, formatId, _retried = false, _thro
       }
     } catch (_) {}
     // ★ 走 action=download：yt-dlp 合并音视频落盘成单文件 mp4（或 audio=1 时仅 MP3）。
-    let dlUrl = 'http://127.0.0.1:3000/api/platform/ytdlp?action=download&url=' + encodeURIComponent(ytPageUrl);
+    let dlUrl = withDeviceAuth('http://127.0.0.1:3000/api/platform/ytdlp?action=download&url=' + encodeURIComponent(ytPageUrl), await getExtDeviceAuth());
     if (selFmt) dlUrl += '&format=' + encodeURIComponent(selFmt);
     if (isAudio) dlUrl += '&audio=1';
     // B站需带登录态 cookie（未登录 yt-dlp 拿不到 720P+ 高清格式 → 后端 500）；抖音/TikTok 带匿名 cookie。
@@ -1211,7 +1370,7 @@ async function downloadViaYtDlp(a, sourcePage, formatId, _retried = false, _thro
       safeTitle = safeTitle.replace(/^\[[^\]]+\]_Extracting_URL__+/i, '');
       if (safeTitle.length > 80) safeTitle = safeTitle.slice(0, 80);
       const referer = 'http://127.0.0.1:3000/';
-      const fileUrl = 'http://127.0.0.1:3000' + ytData.fileUrl;
+      const fileUrl = withDeviceAuth('http://127.0.0.1:3000' + ytData.fileUrl, await getExtDeviceAuth());
       // 合并阶段完成：状态栏提示即可，真正的下载任务卡由 dlViaChrome 在 chrome 下载开始时创建并接管进度。
       setStatus('后端合并完成，开始下载文件…');
       // 经后台带 Referer（omit cookie）拉取合并后的 mp4/mp3 字节 → blob → 下载，跨域/本地均可靠
@@ -1460,7 +1619,7 @@ async function downloadHlsViaBackend(a) {
     resp = await fetch(apiBase.replace(/\/+$/, '') + '/api/media/merge-hls', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: a.url, referer: ref, filename: __name }),
+      body: JSON.stringify(withDeviceAuthBody({ url: a.url, referer: ref, filename: __name }, await getExtDeviceAuth())),
       signal: controller.signal,
     });
   } catch (e) {
@@ -1487,6 +1646,25 @@ async function downloadHlsViaBackend(a) {
   //   bindLatestPending 会自动绑到当前未绑 downloadId 的最新进行中卡——就是这一张。
   //   后续 onChanged 的每个 tick 都会通过 HMDAO_DOWNLOAD_PROGRESS 实时更新它。
   //   视觉上：用户看到一张卡从"后端拉流中"走到"下载中 1.2GB / 1.5GB"再到"已下载完成"。
+  // ★2026-09-12：用户为该类型填了绝对路径 → 由后端直接从本地 fileUrl 拷写目标目录（流式，不占侧栏内存）。
+  //   这条 SW 代下载通道（HMDAO_DOWNLOAD_LOCAL_FILE）只写浏览器默认目录，故须在此抢先落盘。
+  try {
+    const __abs = (typeof dirPaths !== 'undefined' && dirPaths) ? dirPaths[a.type] : '';
+    if (__abs) {
+      const saved = await __backendSaveToDir({
+        dir: __abs,
+        filename: __name,
+        url: withDeviceAuth(apiBase.replace(/\/+$/, '') + json.fileUrl, await getExtDeviceAuth()),
+      });
+      if (saved.ok) {
+        __endTask(true, '已保存到设置目录');
+        setStatus('✅ 已保存到设置的目录：' + __name + '（→ ' + __abs + '）');
+        return true;
+      }
+      const __lbl = (typeof typeLabel === 'function') ? typeLabel(a.type) : (a.type || '素材');
+      setStatus('⚠ 未存入「' + __lbl + '」自定义目录：' + (saved.serviceDown ? '本地服务未启动' : (saved.error || '写入失败')) + ' → 已落默认目录', true);
+    }
+  } catch (_) { /* 后端落盘失败 → 继续走原 SW 下载 */ }
   __endTask(true, '拉流完成，开始下载');
   // 从本地 fileUrl 下载，文件名/路径由扩展完全控制
   try {
@@ -1503,7 +1681,7 @@ async function downloadHlsViaBackend(a) {
         });
       }
     } catch (_) {}
-    const fileUrl = apiBase.replace(/\/+$/, '') + json.fileUrl;
+    const fileUrl = withDeviceAuth(apiBase.replace(/\/+$/, '') + json.fileUrl, await getExtDeviceAuth());
     // 交给 Service Worker 触发 chrome.downloads（流式写盘，不占扩展内存，错误可回传）。
     // 注意：SW 侧对跨域大文件不能 await chrome.downloads.download 的 Promise，否则挂起
     // → 这里只等 { ok }；downloadId 由 background 的 onChanged 监听在广播里带回。
@@ -1539,12 +1717,12 @@ async function mergeDashViaBackend(a, dash, base, referer) {
     resp = await fetch(apiBase + '/api/media/merge-dash', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+      body: JSON.stringify(withDeviceAuthBody({
         videoUrl: dash.video,
         audioUrl: dash.audio || '',
         referer,
         filename: base + '.mp4',
-      }),
+      }, await getExtDeviceAuth())),
       signal: controller.signal,
     });
   } catch (fetchErr) {
@@ -1571,7 +1749,7 @@ async function mergeDashViaBackend(a, dash, base, referer) {
   //   忽略 chrome.downloads.download 传入的 filename。故把期望名交给服务端用
   //   Content-Disposition 下发（?filename=），确保落盘名是用户可读的文件名。
   await dlViaChrome({
-    url: apiBase + data.fileUrl + '&filename=' + encodeURIComponent(wantName),
+    url: withDeviceAuth(apiBase + data.fileUrl + '&filename=' + encodeURIComponent(wantName), await getExtDeviceAuth()),
     filename: 'Ddayup/videos/' + wantName,
     saveAs: false,
     conflictAction: 'uniquify',
@@ -1681,7 +1859,18 @@ async function downloadDashTracks(a, dash) {
 }
 
 async function saveSingleToLocal(a) {
-  const handle = saveHandles[a.type];
+  // ★2026-09-12：优先走后端绝对路径通道（支持任意盘符/大文件）；无则退回 TSA 句柄，最后回退下载。
+  if (hasBackendDirFor(a && a.type) && a && a.url && /^https?:/i.test(String(a.url))) {
+    pulseDownloadProgress('正在保存到本地：' + deriveFilename(a));
+    if (await trySaveViaBackendDir(a, a.url, deriveFilename(a))) {
+      finishDownloadProgress('✅ 已保存到本地：' + deriveFilename(a), true);
+      return;
+    }
+    // 后端失败已由 trySaveViaBackendDir 显式提示 → 回退下载（不阻塞）
+    downloadSingle(a);
+    return;
+  }
+  const handle = userDirHandleFor(a.type);
   if (!handle) {
     // 未设置该类型目录 → 回退下载
     setStatus(`「${typeLabel(a.type)}」未设保存目录，改为下载`, true);
@@ -1735,7 +1924,7 @@ async function showManualClickRetry(parentUrl, realName, fileId, asset) {
         const a = asset || {};
         a.url = res.url; a.direct = res.url; a.parentUrl = parentUrl;
         const name = fileName(res.url) || realName;
-        dlViaChrome({ url: res.url, filename: 'Ddayup/netdisk/' + name, saveAs: false, conflictAction: 'uniquify' })
+        dlViaChrome({ url: res.url, filename: 'Ddayup/netdisk/' + name, saveAs: false, conflictAction: 'uniquify', asset: a })
           .then(() => setStatus('✅ 网盘文件下载已触发：' + name))
           .catch((e) => setStatus('⚠ 下载失败：' + (e && e.message || e), true));
         return true;

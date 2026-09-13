@@ -325,7 +325,7 @@ async function __pickDirViaBackend(type) {
   } catch (e) {
     // 连接失败（本地服务未启动）→ 拉起后端一次后重试；仍失败则返回原因（不静默）
     try {
-      if (typeof ensureBackendRunningNative === 'function') await ensureBackendRunningNative({ silent: true });
+      if (typeof ensureBackendRunningNative === 'function') await ensureBackendRunningNative({ silent: true, requireLocal: true });
     } catch (_) { /* 忽略拉起失败，继续重试一次 */ }
     try { res = await call(); }
     catch (e2) { return { canceled: false, path: '', error: (e2 && e2.message) || 'connection failed' }; }
@@ -336,7 +336,9 @@ async function __pickDirViaBackend(type) {
     if (d.canceled) return { canceled: true, path: '' };
     return { canceled: false, path: d.path ? normalizeAbsDir(d.path) : '' };
   }
-  return { canceled: false, path: '', error: (d && d.error) || (r ? ('HTTP ' + r.status) : 'unknown') };
+  // ★2026-09-13 F1：把 402 LICENSE 的 code 一并带回，供 .pathPick 区分「设备未授权」与「后端未启动」。
+  const _code = (d && d.code) || '';
+  return { canceled: false, path: '', code: _code, error: (d && d.error) || (r ? ('HTTP ' + r.status) : 'unknown') };
 }
 
 document.querySelectorAll('.pathPick').forEach((btn) => {
@@ -370,6 +372,13 @@ document.querySelectorAll('.pathPick').forEach((btn) => {
     //    FSA showDirectoryPicker 在侧栏不可靠/不持久（句柄常为 null、权限误报），且不返回真实绝对路径，
     //    不满足「目录选择→真实路径」需求，故不再作为 .pathPick 的兜底；启动后端后即可重试。
     const backendErr = picked.error || '后端目录选择不可用';
+    // ★2026-09-13：设备未授权(402 LICENSE) 不应误报为「后端未启动」。
+    if (picked.code === 'LICENSE_REQUIRED' || (backendErr && /LICENSE/i.test(String(backendErr)))) {
+      const licMsg = '设备未授权，请在扩展内注册开通试用';
+      if (sp) { sp.textContent = '⚠ ' + licMsg; if (sp.classList) { sp.classList.add('warn'); } }
+      setStatus(licMsg, true);
+      return;
+    }
     const isConnErr = /failed|refused|unreachable|ECONN|fetch|timeout/i.test(String(backendErr));
     const errMsg = isConnErr
       ? `无法弹出系统目录选择框：本地 Ddayup 后端（127.0.0.1:3000）未启动。请先启动后端，然后重试。`
@@ -425,8 +434,16 @@ document.querySelectorAll('.pathTest').forEach((btn) => {
           if (sp) { sp.textContent = '✅ 已设置：' + abs; if (sp.classList) { sp.classList.add('ok'); sp.classList.remove('warn'); } }
           setStatus(`✅ 目录可写：「${typeLabel(type)}」→ ${abs}`);
         } else {
-          if (sp) { sp.textContent = '⚠ 目录不可写：' + abs; if (sp.classList) sp.classList.add('warn'); }
-          setStatus('目录验证失败：' + ((d && d.error) || ('HTTP ' + r.status)) + '（请确认本地服务已启动，且路径存在/有权限）', true);
+          // ★2026-09-13：区分「设备未授权(402)」与「目录真实不可写(500/权限)」，
+          // 避免把 LICENSE_REQUIRED 误标成「目录不可写」。
+          if (d && (d.code === 'LICENSE_REQUIRED' || d.mode === 'none' || d.mode === 'expired')) {
+            if (sp) { sp.textContent = '⚠ 设备未授权：请先在扩展内注册开通试用'; if (sp.classList) sp.classList.add('warn'); }
+            setStatus('设备未授权，无法写入本地目录：' + ((d && d.message) || '请在扩展内注册开通试用'), true);
+          } else {
+            const _why = (d && (d.error || d.message)) || ('HTTP ' + r.status);
+            if (sp) { sp.textContent = '⚠ 目录不可写：' + _why; if (sp.classList) sp.classList.add('warn'); }
+            setStatus('目录验证失败：' + _why + '（请确认本地服务已启动，且路径存在/有权限）', true);
+          }
         }
       } catch (e) {
         if (sp) { sp.textContent = '⚠ 无法连接本地服务'; if (sp.classList) sp.classList.add('warn'); }

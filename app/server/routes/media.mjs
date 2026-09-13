@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { readExtensionLicenses, computeExtensionStatus } from './extension-license.mjs';
 
 export function registerMediaRoutes(router, deps) {
   const {
@@ -24,7 +25,43 @@ export function registerMediaRoutes(router, deps) {
     send,
     serveLocalModel,
     serveTransformersModule,
+    DATA_DIR,
   } = deps;
+
+  // ── 服务端授权闸门（优先级④：把闸门下沉到服务端，单条下载也不漏）──
+  // 下载/采集代理（merge-dash/hls/file、save-to-dir、probe-dir、ytdlp/ytdlp-file）必须校验设备授权：
+  // trial/paid 放行，none/expired 拒绝（402 LICENSE_REQUIRED）。与订阅/试用系统同源
+  //（复用 readExtensionLicenses + computeExtensionStatus），避免授权逻辑漂移。
+  // 扩展端每次调用都会携带 deviceId（必要时 token），服务端据此判定，绕过扩展端 gate() 也无处遁形。
+  async function gateEntitlement(res, deviceId) {
+    const id = String(deviceId || '').trim();
+    if (!id) {
+      send(res, 402, { ok: false, code: 'LICENSE_REQUIRED', message: '缺少设备标识，无法校验授权（请更新扩展或在扩展内登录）' });
+      return false;
+    }
+    const data = await readExtensionLicenses(DATA_DIR);
+    const device = data.devices[id] || {};
+    const st = computeExtensionStatus(device);
+    if (st.mode === 'expired' || st.mode === 'none') {
+      send(res, 402, {
+        ok: false,
+        code: 'LICENSE_REQUIRED',
+        mode: st.mode,
+        message: st.mode === 'expired'
+          ? '免费试用已结束，请登录或订阅后继续下载'
+          : '设备未授权，请在扩展内注册开通试用',
+      });
+      return false;
+    }
+    return true;
+  }
+
+  // ★2026-09-13 F3=A 环回放行：probe-dir / save-to-dir 仅写本机磁盘、不碰外网，
+  // 当请求来自 127.0.0.1 时跳过设备授权网关（防代理滥用），远程(proxy/yt-dlp 等)端点保留 gateEntitlement。
+  function isLoopback(req) {
+    const a = (req && req.socket && req.socket.remoteAddress) || '';
+    return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1' || a === '::ffff:7f00:1';
+  }
 
   router.register('GET', '/api/curator/preview-proxy', async (req, res, url) => {
     return handleCuratorPreviewProxy(req, res, url);
@@ -161,6 +198,7 @@ export function registerMediaRoutes(router, deps) {
   });
 
   router.register('GET', '/api/platform/ytdlp', async (req, res, url) => {
+    if (!(await gateEntitlement(res, url.searchParams.get('deviceId')))) return;
     const videoUrl = String(url.searchParams.get('url') || '').trim();
     if (!videoUrl || !/^https?:\/\//.test(videoUrl)) {
       return send(res, 400, { error: '请提供有效的视频链接' });
@@ -368,6 +406,7 @@ export function registerMediaRoutes(router, deps) {
 
   // serve yt-dlp 合并落盘的临时文件（供扩展下载含音频的视频）
   router.register('GET', '/api/platform/ytdlp-file', async (req, res, url) => {
+    if (!(await gateEntitlement(res, url.searchParams.get('deviceId')))) return;
     const ticket = String(url.searchParams.get('ticket') || '').trim();
     if (!/^[a-f0-9]{24}$/.test(ticket)) return send(res, 400, { error: 'invalid ticket' });
     const dir = os.tmpdir();
@@ -457,6 +496,7 @@ export function registerMediaRoutes(router, deps) {
   router.register('POST', '/api/media/merge-dash', async (req, res) => {
     let body = {};
     try { body = (await readJson(req)) || {}; } catch (_) { body = {}; }
+    if (!(await gateEntitlement(res, body.deviceId))) return;
     const videoUrl = String(body.videoUrl || '').trim();
     const audioUrl = String(body.audioUrl || '').trim();
     const referer = String(body.referer || '').trim();
@@ -538,6 +578,7 @@ export function registerMediaRoutes(router, deps) {
   router.register('POST', '/api/media/merge-hls', async (req, res) => {
     let body = {};
     try { body = (await readJson(req)) || {}; } catch (_) { body = {}; }
+    if (!(await gateEntitlement(res, body.deviceId))) return;
     const streamUrl = String(body.url || body.videoUrl || '').trim();
     const referer = String(body.referer || '').trim();
     const ua = String(body.userAgent || '').trim()
@@ -606,6 +647,7 @@ export function registerMediaRoutes(router, deps) {
 
   // 提供后端合并落盘的单文件（供扩展下载；本地直连无防盗链，文件名由扩展指定）
   router.register(['GET', 'HEAD'], '/api/media/merge-file', async (req, res, url) => {
+    if (!(await gateEntitlement(res, url.searchParams.get('deviceId')))) return;
     const ticket = String(url.searchParams.get('ticket') || '').trim();
     if (!/^[a-f0-9]{24}$/.test(ticket)) return send(res, 400, { error: 'invalid ticket' });
     const filePath = dashMergePath(ticket, '.mp4');
@@ -626,6 +668,169 @@ export function registerMediaRoutes(router, deps) {
     }
     res.setHeader('Content-Length', String(fs.statSync(filePath).size));
     fs.createReadStream(filePath).pipe(res);
+  });
+
+  // ==================================================================
+  // 按类型「自定义绝对保存路径」——后端落盘通道（2026-09-12）
+  // ------------------------------------------------------------------
+  // 为什么必须由后端写盘：
+  //   1) chrome.downloads.download 的 filename 只能是【浏览器默认下载目录】下的相对路径，
+  //      根本无法写入任意绝对目录（如 D:\素材\图片）。
+  //   2) File System Access API（showDirectoryPicker）在扩展 side panel 里不可靠
+  //      （Chromium 已知缺陷：崩溃 / 伪 AbortError / 权限不持久）→ 句柄常为 null。
+  //   故「用户填了绝对路径」这一路统一交后端：后端进程可直接 fs 写任意绝对路径，
+  //   且 url 分支用【流式】落盘，不受浏览器 sendMessage 64MB 限制，支持 GB 级大文件。
+  // ==================================================================
+
+  // Windows 绝对路径 / POSIX 绝对路径 / UNC 判定
+  function isAbsoluteDir(dir) {
+    const s = String(dir == null ? '' : dir).trim();
+    if (!s) return false;
+    if (/^[a-zA-Z]:[\\/]/.test(s)) return true; // D:\... / D:/...
+    if (/^\\\\[^\\]+\\/.test(s)) return true;    // \\server\share\...
+    if (s.startsWith('/')) return true;          // POSIX /...
+    return false;
+  }
+
+  // 文件名清洗：剥离路径分隔符 / .. / 控制字符 / Windows 非法字符 / 保留名，防目录穿越。
+  const WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+  function sanitizeFilename(name, fallback = 'download.bin') {
+    let s = String(name == null ? '' : name);
+    s = s.replace(/[\u0000-\u001f\u007f]/g, '');   // 控制字符
+    s = s.replace(/[\\/]+/g, '_');                 // 路径分隔符 → 同一目录内
+    s = s.replace(/\.{2,}/g, '_');                 // 防穿越（.. / ...）
+    s = s.replace(/[<>:"|?*]/g, '_');              // Windows 非法字符
+    s = s.replace(/^[.\s]+|[.\s]+$/g, '');         // 首尾点 / 空白
+    if (!s) s = fallback;
+    if (WIN_RESERVED.test(s)) s = '_' + s;
+    if (s.length > 180) {
+      const ext = path.extname(s).slice(0, 20);
+      s = s.slice(0, 180 - ext.length) + ext;
+    }
+    return s || fallback;
+  }
+
+  // 解析后必须仍在 baseDir 之内；越界返回 null
+  function resolveInsideDir(baseDir, filename) {
+    const absDir = path.resolve(baseDir);
+    const absFile = path.resolve(absDir, filename);
+    const rel = path.relative(absDir, absFile);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+    return absFile;
+  }
+
+  router.register('POST', '/api/media/save-to-dir', async (req, res) => {
+    let body = {};
+    try { body = (await readJson(req)) || {}; } catch (_) { body = {}; }
+    if (!isLoopback(req) && !(await gateEntitlement(res, body.deviceId))) return;
+
+    const dir = String(body.dir || '').trim();
+    if (!isAbsoluteDir(dir)) {
+      return send(res, 400, { success: false, error: 'dir 必须是绝对路径（如 D:\\\\素材\\\\图片）' });
+    }
+
+    // 目标目录 = dir(/subdir)；subdir 同样清洗，禁止穿越
+    let baseDir;
+    try { baseDir = path.resolve(dir); } catch (_) {
+      return send(res, 400, { success: false, error: 'dir 非法' });
+    }
+    const subdir = String(body.subdir || '').trim();
+    if (subdir) {
+      const saniSub = sanitizeFilename(subdir, '');
+      if (saniSub) baseDir = path.resolve(baseDir, saniSub);
+    }
+
+    const filename = sanitizeFilename(String(body.filename || '').trim(), `ddayup-${Date.now()}.bin`);
+    const absFile = resolveInsideDir(baseDir, filename);
+    if (!absFile) {
+      return send(res, 400, { success: false, error: '文件名非法（路径穿越被拒绝）' });
+    }
+
+    const url = String(body.url || '').trim();
+    const dataBase64 = typeof body.dataBase64 === 'string' ? body.dataBase64 : '';
+    if (!url && !dataBase64) {
+      return send(res, 400, { success: false, error: '缺少 url 或 dataBase64' });
+    }
+    if (url && !/^https?:\/\//i.test(url)) {
+      return send(res, 400, { success: false, error: 'url 仅支持 http(s)' });
+    }
+
+    try {
+      await fs.promises.mkdir(baseDir, { recursive: true });
+    } catch (e) {
+      return send(res, 500, { success: false, error: '创建目录失败：' + String((e && e.message) || e) });
+    }
+
+    // 分支 1：dataBase64（侧栏已拿到字节，如 blob 资产）
+    if (dataBase64) {
+      try {
+        const buf = Buffer.from(dataBase64, 'base64');
+        if (!buf.length) return send(res, 400, { success: false, error: 'dataBase64 解码为空' });
+        await fs.promises.writeFile(absFile, buf);
+        return send(res, 200, { success: true, savedPath: absFile, bytes: buf.length });
+      } catch (e) {
+        return send(res, 500, { success: false, error: '写入失败：' + String((e && e.message) || e) });
+      }
+    }
+
+    // 分支 2：url —— 后端带 Referer/UA 拉取，【流式】写盘（支持 GB 级大文件，不整体读内存）
+    try {
+      const headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      };
+      const referer = String(body.referer || '').trim();
+      if (referer) headers.Referer = referer;
+      const resp = await fetch(url, { headers, redirect: 'follow' });
+      if (!resp.ok) {
+        return send(res, 502, { success: false, error: `拉取失败 HTTP ${resp.status}` });
+      }
+      if (!resp.body) {
+        return send(res, 502, { success: false, error: '响应无数据流' });
+      }
+      const { Readable } = await import('node:stream');
+      const { createWriteStream } = await import('node:fs');
+      const bytes = await new Promise((resolve, reject) => {
+        const ws = createWriteStream(absFile);
+        const rs = Readable.fromWeb(resp.body);
+        ws.on('error', reject);
+        rs.on('error', reject);
+        ws.on('finish', () => resolve(Number(ws.bytesWritten || 0)));
+        rs.pipe(ws);
+      });
+      if (!bytes) {
+        try { fs.rmSync(absFile, { force: true }); } catch (_) { /* 忽略 */ }
+        return send(res, 502, { success: false, error: '拉取字节为空（可能被防盗链拦截）' });
+      }
+      return send(res, 200, { success: true, savedPath: absFile, bytes });
+    } catch (e) {
+      try { fs.rmSync(absFile, { force: true }); } catch (_) { /* 忽略 */ }
+      return send(res, 500, { success: false, error: '写入失败：' + String((e && e.message) || e).slice(0, 200) });
+    }
+  });
+
+  // 目录可写性探针：递归建目录 + 写一个探针文件再删除，供侧栏「测试」按钮校验
+  router.register('POST', '/api/media/probe-dir', async (req, res) => {
+    let body = {};
+    try { body = (await readJson(req)) || {}; } catch (_) { body = {}; }
+    if (!isLoopback(req) && !(await gateEntitlement(res, body.deviceId))) return;
+    const dir = String(body.dir || '').trim();
+    if (!isAbsoluteDir(dir)) {
+      return send(res, 400, { success: false, ok: false, error: 'dir 必须是绝对路径（如 D:\\\\素材\\\\图片）' });
+    }
+    let absDir;
+    try { absDir = path.resolve(dir); } catch (_) {
+      return send(res, 400, { success: false, ok: false, error: 'dir 非法' });
+    }
+    try {
+      await fs.promises.mkdir(absDir, { recursive: true });
+      const probe = path.join(absDir, `.ddayup-dir-test-${crypto.randomBytes(4).toString('hex')}.txt`);
+      await fs.promises.writeFile(probe, 'Ddayup 目录写入测试 ' + new Date().toISOString());
+      const bytes = fs.statSync(probe).size;
+      await fs.promises.rm(probe, { force: true });
+      return send(res, 200, { success: true, ok: true, dir: absDir, bytes });
+    } catch (e) {
+      return send(res, 500, { success: false, ok: false, dir: absDir, error: String((e && e.message) || e).slice(0, 200) });
+    }
   });
 
   router.registerPrefix(['GET', 'HEAD'], '/api/transformers/', async (req, res, url) => {
