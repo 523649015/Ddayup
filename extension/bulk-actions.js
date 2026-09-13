@@ -83,8 +83,11 @@ document.getElementById('saveLocal').onclick = async () => {
   let done = 0, fail = 0;
   for (const a of batch) {
     try {
+      // ★2026-09-12：若有「后端绝对路径」通道，统一交 downloadSingle（→ trySaveToUserDir→后端流式写盘），
+      //   避免此处的「拉字节进侧栏」旧 FSA 通道抢占；无句柄时同样回退 downloadSingle。
+      const hasBackend = (typeof dirPaths !== 'undefined' && dirPaths && dirPaths[a.type]);
       const handle = window.saveHandles[a.type];
-      if (!handle) { downloadSingle(a); done++; continue; }
+      if (hasBackend || !handle) { downloadSingle(a); done++; continue; }
       const res = await fetchViaBackground(a.url);
       if (!res || !res.ok) { fail++; continue; }
       // ★2026-09-10：sendMessage 会丢弃 ArrayBuffer，必须改用 b64 还原。
@@ -148,6 +151,94 @@ async function loadTypeDirHandle(type) {
 //   userDirHandleFor('netdisk') 也能命中（网盘无设置时再回退 archive）。
 const PATH_TYPES = ['image', 'video', 'audio', 'model', 'archive', 'netdisk'];
 
+// ===== 绝对路径通道（后端 dirPath:<type>，由本地服务 127.0.0.1:3000 写盘）=====
+// ★2026-09-12：chrome.downloads.download 只能写「浏览器默认下载目录 + 相对子目录」，
+//   无法写任意绝对目录；File System Access API 在 side panel 里又不可靠（句柄常为 null）。
+//   故「真实绝对路径 → 后端流式落盘」是本项目写任意盘符/大文件的唯一可靠通道。
+// ★2026-09-13：绝对路径来源由「手动输入框」改为【后端原生目录选择器】（见 __pickDirViaBackend），
+//   返回值即真实绝对路径，直接存入下面的 dirPaths。
+// ★必须用 var（与 saveHandles 同理）：顶层 var 进入全局对象（window.dirPaths），跨 <script>
+//   共享，使 download.js 的后端落盘通道能读到；const/let 不跨 <script>，会导致读不到。
+var dirPaths = { image: null, video: null, audio: null, model: null, archive: null, netdisk: null };
+const dirPathStorageKey = (type) => 'dirPath:' + type;
+
+// 规范化绝对路径：去首尾空白，去掉尾部分隔符（保留根 "/" 与 "D:\"）。
+function normalizeAbsDir(p) {
+  let s = String(p == null ? '' : p).trim();
+  if (!s) return '';
+  s = s.replace(/[\\/]+$/, '');
+  return s;
+}
+// 绝对路径判定已不再在扩展侧使用（手动输入框已移除；目录由后端原生选择器返回绝对路径）。
+// 本地后端基址（save-to-dir / probe-dir / pick-directory 均为【本机专属】端点）。
+// ★2026-09-13 关键修复：这些端点「写本机磁盘 / 弹本机系统目录对话框」，只有【本机后端】能处理；
+//   而 apiBaseUrl() 在默认配置下会返回云端地址（DdayupConfig.DEFAULT_API_BASE=https://mingmingchuangyi.cn），
+//   云端既没有 /api/media/save-to-dir 路由、也无法访问本机磁盘 → 表现为「选了目录也存不进/报 No route」。
+//   故这里【只认环回地址】，非环回一律回退本机默认端口（与 router.js 的 SW 网盘落盘硬编码 127.0.0.1:3000 一致）。
+function ddBackendBase() {
+  let b = '';
+  try { if (typeof apiBaseUrl === 'function') b = String(apiBaseUrl() || '').replace(/\/+$/, ''); } catch (_) { b = ''; }
+  if (/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(b)) return b;
+  return 'http://127.0.0.1:3000';
+}
+// 持久化绝对路径到 chrome.storage.local（键 dirPath:<type>），并同步内存 dirPaths。
+// 注意：不等待 storage 回调（部分环境/桩不回调会导致 await 挂起）；写入是尽力而为 + 持久化。
+function saveDirPath(type, abs) {
+  dirPaths[type] = abs;
+  try {
+    chrome.storage.local.set({ [dirPathStorageKey(type)]: abs }, () => { void chrome.runtime.lastError; });
+  } catch (_) { /* 忽略 */ }
+  return Promise.resolve();
+}
+// 清除某类型的绝对路径（内存 + chrome.storage.local）。
+function deleteDirPath(type) {
+  dirPaths[type] = null;
+  try {
+    chrome.storage.local.remove(dirPathStorageKey(type), () => { void chrome.runtime.lastError; });
+  } catch (_) { /* 忽略 */ }
+  return Promise.resolve();
+}
+// 侧栏加载时恢复绝对路径（与 restoreSavedHandles 并行，互不阻塞）。
+// 带兜底超时：即便 storage 回调始终不来，也不会让 __dirRestorePromise 永久挂起。
+function restoreDirPaths() {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; resolve(); } };
+    const timer = setTimeout(done, 1500);
+    let keys;
+    try { keys = PATH_TYPES.map((t) => dirPathStorageKey(t)); } catch (_) { clearTimeout(timer); return done(); }
+    try {
+      chrome.storage.local.get(keys, (s) => {
+        const store = s || {};
+        for (const type of PATH_TYPES) {
+          const v = store[dirPathStorageKey(type)];
+          if (typeof v === 'string' && v.trim()) dirPaths[type] = normalizeAbsDir(v);
+        }
+        clearTimeout(timer);
+        done();
+      });
+    } catch (_) { clearTimeout(timer); done(); }
+  });
+}
+// 统一刷新 6 行 .pathText 文案：绝对路径（后端通道）优先于句柄，其次默认基线。
+function refreshPathTexts() {
+  for (const type of PATH_TYPES) {
+    const sp = document.querySelector(`.pathText[data-type="${type}"]`);
+    if (!sp) continue;
+    if (dirPaths[type]) {
+      sp.textContent = '✅ 已设置：' + dirPaths[type];
+      if (sp.classList) { sp.classList.add('ok'); sp.classList.remove('warn'); }
+    } else if (window.saveHandles && window.saveHandles[type]) {
+      sp.textContent = '✅ 已设置(句柄)：' + window.saveHandles[type].name;
+      if (sp.classList) { sp.classList.add('ok'); sp.classList.remove('warn'); }
+    } else {
+      const sub = (typeof typeDirs !== 'undefined' && typeDirs[type]) || 'other';
+      sp.textContent = `未设置 · 默认 Ddayup/${sub}/`;
+      if (sp.classList) { sp.classList.remove('ok', 'warn'); }
+    }
+  }
+}
+
 async function deleteTypeDirHandle(type) {
   const db = await openSettingsDB();
   await new Promise((resolve, reject) => {
@@ -173,8 +264,8 @@ async function restoreSavedHandles() {
         } catch (_) { resolve(''); }
       });
       if (!handle) {
-        // 无 handle 但有上次目录名 → 提示需重新授权
-        if (fallbackName) {
+        // 无 handle 但有上次目录名 → 提示需重新授权（若已设绝对路径，则由其显示优先，不覆盖）
+        if (fallbackName && !dirPaths[type]) {
           const sp = document.querySelector(`.pathText[data-type="${type}"]`);
           if (sp) sp.textContent = `⚠ ${fallbackName}（需重新授权）`;
           console.log('[Ddayup] 目录 handle 丢失，仅保留名称：', type, fallbackName);
@@ -188,10 +279,13 @@ async function restoreSavedHandles() {
       }
       // 无论权限是否持久都把 handle 挂上；真正写文件时再 requestPermission（那时是用户点击，有手势）
       window.saveHandles[type] = handle;
-      const sp = document.querySelector(`.pathText[data-type="${type}"]`);
-      if (sp) {
-        if (perm === 'granted') sp.textContent = `✓ ${handle.name}`;
-        else sp.textContent = fallbackName ? `⚠ ${fallbackName}（需重新授权）` : `⚠ ${handle.name}（需重新授权）`;
+      // 绝对路径（后端通道）显示优先，避免句柄恢复覆盖用户填的路径
+      if (!dirPaths[type]) {
+        const sp = document.querySelector(`.pathText[data-type="${type}"]`);
+        if (sp) {
+          if (perm === 'granted') sp.textContent = `✅ 已设置(句柄)：${handle.name}`;
+          else sp.textContent = fallbackName ? `⚠ ${fallbackName}（需重新授权）` : `⚠ ${handle.name}（需重新授权）`;
+        }
       }
       console.log('[Ddayup] 目录已恢复：', type, handle.name, 'perm=', perm);
     } catch (e) {
@@ -200,159 +294,120 @@ async function restoreSavedHandles() {
   }
 }
 
+// ★2026-09-13 重构（用户诉求「要目录选择、不要手动输入」的最终落点）：
+//   「选择目录」【先调后端原生目录选择器】拿【真实绝对路径】→ 存入 dirPath:<type>。
+//   ★ 为什么是后端优先：唯一可靠的落盘通道是后端 /api/media/save-to-dir，它必须【绝对路径字符串】，
+//     而手写绝对路径粘贴与此走的是【完全相同】的可靠写盘通道（phase20 E2E 已验证 sha256 一致）。
+//     后端 /api/settings/assets/pick-directory 用 PowerShell FolderBrowserDialog（-STA）返回已 path.resolve 的
+//     真实绝对路径，且无需登录态 → 点「选择目录」即可拿到与手写粘贴等价的可靠路径。
+//   ★ 为什么 FSA 仅作兜底：FSA showDirectoryPicker 只返回 FileSystemDirectoryHandle（【没有绝对路径字符串】），
+//     且在 side panel 里【不可靠/不持久】：句柄常返回 null、刚 showDirectoryPicker 之后 requestPermission 会
+//     【误报 'prompt'（实际已授权）】。若把 FSA 当主通道，就会「点选择目录像设上了，测试/下载仍提示尚未设置、
+//     落默认目录」——正是用户最初报的 bug。故 FSA 只在【后端不可用（服务未起/无交互桌面）】时兜底用。
+//   调后端原生目录选择器。返回 { canceled, path, error }：
+//   path 非空 = 用户选中（绝对路径）；canceled=true = 用户取消；error 非空 = 后端不可用/失败。
+async function __pickDirViaBackend(type) {
+  const call = async () => {
+    const r = await fetch(ddBackendBase() + '/api/settings/assets/pick-directory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initialPath: dirPaths[type] || '' }),
+      // 用户点“确定”前该请求会一直 pending → 必须给足超时（120s）
+      signal: AbortSignal.timeout(120000),
+    });
+    const d = await r.json().catch(() => ({}));
+    return { r, d };
+  };
+  let res;
+  try {
+    res = await call();
+  } catch (e) {
+    // 连接失败（本地服务未启动）→ 拉起后端一次后重试；仍失败则返回原因（不静默）
+    try {
+      if (typeof ensureBackendRunningNative === 'function') await ensureBackendRunningNative({ silent: true });
+    } catch (_) { /* 忽略拉起失败，继续重试一次 */ }
+    try { res = await call(); }
+    catch (e2) { return { canceled: false, path: '', error: (e2 && e2.message) || 'connection failed' }; }
+  }
+  const r = res && res.r;
+  const d = res && res.d;
+  if (r && r.ok && d && d.success) {
+    if (d.canceled) return { canceled: true, path: '' };
+    return { canceled: false, path: d.path ? normalizeAbsDir(d.path) : '' };
+  }
+  return { canceled: false, path: '', error: (d && d.error) || (r ? ('HTTP ' + r.status) : 'unknown') };
+}
+
 document.querySelectorAll('.pathPick').forEach((btn) => {
   btn.onclick = async () => {
     const type = btn.dataset.type;
     const sp = document.querySelector(`.pathText[data-type="${type}"]`);
-    // ★2026-09-11 修复（用户实测「选了目录仍显示未设置」）：原代码只在 setStatus 提示，
-    //   而 showDirectoryPicker 在部分 Chrome（尤其从 sidePanel 上下文调用）会因
-    //   SecurityError/NotAllowedError 静默失败 → 用户看不到任何反馈、.pathText 永远「未设置」。
-    //   现在把失败原因【直接写进 .pathText】，让用户一眼看到根因。
-    if (!window.showDirectoryPicker) {
-      if (sp) sp.textContent = '⚠ 此浏览器/扩展环境不支持目录选择';
-      setStatus('当前环境不支持「选择目录」（需 Chrome 桌面版 + 文件系统访问 API）。下载将使用默认 Ddayup/ 目录。', true);
+    if (sp) { sp.textContent = '选择中…（请在系统弹窗中选择目录）'; if (sp.classList) { sp.classList.remove('ok', 'warn'); } }
+
+    // ★2026-09-13 重构（用户诉求「要目录选择、不要手动输入」的最终落点）：
+    //   1) 后端原生目录选择器优先：FolderBrowserDialog(-STA) 返回【真实绝对路径】→ 存 dirPath:<type>。
+    //      这是与「手动粘贴绝对路径」完全相同的可靠写盘通道（后端 /api/media/save-to-dir，phase20 已验证 sha256 一致），
+    //      而 FSA showDirectoryPicker 在侧栏不可靠/不持久（句柄常为 null、权限误报），故 FSA 仅作后端不可用时的兜底。
+    let picked = { canceled: false, path: '', error: '' };
+    try { picked = await __pickDirViaBackend(type); }
+    catch (e) { picked = { canceled: false, path: '', error: (e && e.message) || 'pick failed' }; }
+
+    if (picked.canceled) { refreshPathTexts(); return; }   // 用户取消：恢复原显示，不打扰
+    if (picked.path) {
+      // 拿到绝对路径 → 清掉可能残留的 FSA 句柄（避免两套通道互相覆盖显示），存 + 显示「✅ 已设置：<path>」
+      try { if (window.saveHandles) window.saveHandles[type] = null; } catch (_) {}
+      try { await deleteTypeDirHandle(type); } catch (_) {}
+      await saveDirPath(type, picked.path);
+      if (sp) { sp.textContent = '✅ 已设置：' + picked.path; if (sp.classList) { sp.classList.add('ok'); sp.classList.remove('warn'); } }
+      setStatus(`✅ 已设置「${typeLabel(type)}」保存目录：${picked.path}（由本地服务写盘）`);
+      console.log('[Ddayup][userdir] 绝对路径已保存：', type, picked.path);
       return;
     }
-    let handle;
-    try {
-      handle = await window.showDirectoryPicker();
-    } catch (e) {
-      // AbortError = 用户主动取消，保持「未设置」即可，不打扰
-      if (e && e.name === 'AbortError') return;
-      const reason = (e && e.message) ? String(e.message).slice(0, 48) : String(e);
-      if (sp) sp.textContent = '⚠ 选择失败：' + reason;
-      setStatus('选择目录失败：' + ((e && e.message) || e) + '（下载将用默认目录）', true);
-      console.error('[Ddayup] showDirectoryPicker 异常：', type, e && e.name, e && e.message);
-      return;
+
+    // 2) 后端不可用（服务未起/无交互桌面）→ FSA 句柄兜底
+    if (window.showDirectoryPicker) {
+      try {
+        const handle = await window.showDirectoryPicker({ mode: 'readwrite', id: 'ddayup-' + type });
+        // 拿到 handle 立即采用（showDirectoryPicker 已在本点击手势内授权）；真正写权限在下载/测试的用户手势内再 requestPermission
+        window.saveHandles[type] = handle;
+        try { await deleteDirPath(type); } catch (_) {}
+        try { await saveTypeDirHandle(type, handle); } catch (_) {}
+        if (sp) { sp.textContent = `✅ 已设置(句柄)：${handle.name}`; if (sp.classList) { sp.classList.add('ok'); sp.classList.remove('warn'); } }
+        setStatus(`✅ 已设置「${typeLabel(type)}」保存目录：${handle.name}（由浏览器直接写入该文件夹）`);
+        console.log('[Ddayup][userdir] FSA 目录已设置（兜底）：', type, handle.name);
+        return;
+      } catch (e) {
+        if (e && e.name === 'AbortError') { refreshPathTexts(); return; }
+      }
     }
-    // 立即更新内存与 UI，保证当前会话可用；持久化失败再回退提示
-    window.saveHandles[type] = handle;
-    if (sp) sp.textContent = `✓ ${handle.name}`;
-    setStatus(`已设置「${typeLabel(type)}」目录：${handle.name}`);
-    try {
-      await saveTypeDirHandle(type, handle);
-    } catch (e) {
-      console.error('[Ddayup] 目录持久化失败', type, e);
-      if (sp) sp.textContent = `⚠ ${handle.name}（持久化失败，下次需重选）`;
-      setStatus('目录持久化失败（下次打开侧栏需重新选择）：' + (e && e.message || e), true);
-    }
+
+    // 3) 两条通道都不可用 → 明确提示，不静默
+    const backendErr = picked.error || '后端目录选择不可用';
+    if (sp) { sp.textContent = '⚠ 目录选择不可用：' + backendErr; if (sp.classList) { sp.classList.add('warn'); } }
+    setStatus('无法选择目录：' + backendErr + '（请确认本地服务 127.0.0.1:3000 已启动，或使用支持 File System Access 的浏览器）', true);
   };
 });
 
 // 侧栏加载时恢复已保存目录
-// 侧栏加载时恢复已保存目录（await：避免用户手快先点下载时 handle 还没挂上）
-const __dirRestorePromise = restoreSavedHandles().then(() => restoreRelDirs());
+// ★2026-09-12：并行恢复「绝对路径通道」与「句柄通道」，两者互不阻塞（allSettled）；
+//   完成后统一 refreshPathTexts，保证显示确定（绝对路径优先），避免任一恢复晚到互相覆盖。
+const __dirRestorePromise = Promise.allSettled([restoreDirPaths(), restoreSavedHandles()])
+  .then(() => { try { refreshPathTexts(); } catch (_) {} });
 
-// ===== 2026-09-11 双保险：相对子目录兜底 =====
-// 当浏览器不支持 showDirectoryPicker（选绝对目录）时，用户可在文本框填相对子目录名，
-// 下载落到「浏览器下载目录/Ddayup/<相对子目录>/」。扩展无法写入任意绝对盘符路径，
-// 故文本框仅作相对子目录语义；若用户输入绝对路径格式，自动剥离盘符/前缀并提示。
-function normalizeRelPath(raw) {
-  let s = String(raw == null ? '' : raw).trim();
-  if (!s) return null;
-  s = s.replace(/^file:\/\//i, '');
-  const m = s.match(/^[a-zA-Z]:[\\/]+(.*)$/); // Windows 盘符绝对路径 D:\ / D:/
-  if (m) {
-    const rest = m[1].replace(/^[\\/]+/, '');
-    return rest ? { path: rest, absolute: true } : null;
-  }
-  if (/^[\\/]/.test(s)) { // Unix 绝对路径 /foo/bar
-    const rest = s.replace(/^[\\/]+/, '');
-    return rest ? { path: rest, absolute: true } : null;
-  }
-  return { path: s, absolute: false };
-}
-
-function saveRelDir(type, path) {
-  try {
-    if (path) chrome.storage.local.set({ ['relDir:' + type]: { path, ts: Date.now() } });
-    else chrome.storage.local.remove('relDir:' + type);
-  } catch (_) {}
-}
-
-function loadRelDir(type) {
-  return new Promise((resolve) => {
-    try {
-      chrome.storage.local.get('relDir:' + type, (s) => {
-        const v = s && s['relDir:' + type];
-        resolve(v && v.path ? v.path : '');
-      });
-    } catch (_) { resolve(''); }
-  });
-}
-
-// ★被 download.js 的 dlViaChrome 调用（bulk-actions.js 在 download.js 之前加载，全局可见）。
-// 返回相对子目录片段（不含前导 /），无设置返回 null。netdisk 复用 archive。
-function userRelDirFor(type) {
-  if (typeof relDirs === 'undefined' || !relDirs) return null;
-  let v = relDirs[type];
-  if (!v && type === 'netdisk') v = relDirs.archive;
-  return v ? String(v).replace(/^[\\/]+/, '') : null;
-}
-
-async function restoreRelDirs() {
-  for (const type of PATH_TYPES) {
-    try {
-      const p = await loadRelDir(type);
-      if (p) {
-        relDirs[type] = p;
-        const sp = document.querySelector(`.pathText[data-type="${type}"]`);
-        // 仅在无绝对目录设置时才用相对子目录回显，避免覆盖绝对目录显示
-        if (sp && !(window.saveHandles && window.saveHandles[type])) {
-          sp.textContent = `✓ 相对：${p}`;
-          sp.classList.add('ok');
-        }
-      }
-    } catch (_) {}
-  }
-}
-
-function applyRelPath(type) {
-  const inp = document.querySelector(`.pathInput[data-type="${type}"]`);
-  const sp = document.querySelector(`.pathText[data-type="${type}"]`);
-  const raw = inp ? inp.value : '';
-  const norm = normalizeRelPath(raw);
-  if (!norm) {
-    relDirs[type] = null;
-    saveRelDir(type, '');
-    if (sp) { sp.textContent = '未设置'; sp.classList.remove('ok', 'warn'); }
-    setStatus(`已清除「${typeLabel(type)}」相对子目录设置`);
-    return;
-  }
-  relDirs[type] = norm.path;
-  saveRelDir(type, norm.path);
-  if (sp) {
-    if (norm.absolute) {
-      sp.textContent = `✓ 相对：${norm.path}（已去掉盘符；要写绝对路径请用「选择目录」）`;
-      sp.classList.add('warn'); sp.classList.remove('ok');
-    } else {
-      sp.textContent = `✓ 相对：${norm.path}`;
-      sp.classList.add('ok'); sp.classList.remove('warn');
-    }
-  }
-  setStatus(`已设置「${typeLabel(type)}」相对子目录：${norm.path}（下载存到 浏览器下载目录/Ddayup/${norm.path}/）`);
-}
-
-document.querySelectorAll('.pathApply').forEach((btn) => {
-  btn.onclick = () => applyRelPath(btn.dataset.type);
-});
-document.querySelectorAll('.pathInput').forEach((inp) => {
-  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyRelPath(inp.dataset.type); });
-  inp.addEventListener('blur', () => applyRelPath(inp.dataset.type));
-});
-
-// ★P3 清除：删掉 IndexedDB 句柄 + 目录名 + 内存引用 + 相对子目录，UI 回到「未设置」
+// ★P3 清除：删掉 绝对路径(chrome.storage.local) + IndexedDB 句柄 + 目录名 + 内存引用，UI 回到「默认路径」基线
 document.querySelectorAll('.pathClear').forEach((btn) => {
   btn.onclick = async () => {
     const type = btn.dataset.type;
     try {
+      await deleteDirPath(type);
       await deleteTypeDirHandle(type);
       if (window.saveHandles) window.saveHandles[type] = null;
-      // ★双保险：同时清除相对子目录
-      relDirs[type] = null;
-      saveRelDir(type, '');
       const sp = document.querySelector(`.pathText[data-type="${type}"]`);
-      if (sp) { sp.textContent = '未设置'; sp.classList.remove('ok', 'warn'); }
+      if (sp) {
+        const sub = (typeof typeDirs !== 'undefined' && typeDirs[type]) || 'other';
+        sp.textContent = `未设置 · 默认 Ddayup/${sub}/`;
+        sp.classList.remove('ok', 'warn');
+      }
       setStatus(`已清除「${typeLabel(type)}」目录设置`);
     } catch (e) {
       setStatus('清除失败：' + ((e && e.message) || e), true);
@@ -360,19 +415,37 @@ document.querySelectorAll('.pathClear').forEach((btn) => {
   };
 });
 
-// ★P3 测试写入：在设置的目录里写一个小文件，立刻验证「可写 / 权限 / 路径」是否正确
+// ★P3 测试写入：优先用「绝对路径」调后端 probe-dir 验证；无绝对路径时再走句柄写测试文件（原逻辑）
 document.querySelectorAll('.pathTest').forEach((btn) => {
   btn.onclick = async () => {
     const type = btn.dataset.type;
-    const handle = (window.saveHandles || {})[type];
     const sp = document.querySelector(`.pathText[data-type="${type}"]`);
-    if (!handle) {
-      // 相对子目录模式：无法在侧栏直接写测试文件（走 chrome.downloads 落盘），仅提示将落位置
-      if (relDirs[type]) {
-        setStatus(`「${typeLabel(type)}」为相对子目录模式，下载将落到 浏览器下载目录/Ddayup/${relDirs[type]}/（点一次下载即可验证）`, false);
-        return;
+    const abs = dirPaths[type];
+    if (abs) {
+      setStatus(`正在验证目录可写：${abs} …`);
+      try {
+        const r = await fetch(ddBackendBase() + '/api/media/probe-dir', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dir: abs }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok && d && d.ok) {
+          if (sp) { sp.textContent = '✅ 已设置：' + abs; if (sp.classList) { sp.classList.add('ok'); sp.classList.remove('warn'); } }
+          setStatus(`✅ 目录可写：「${typeLabel(type)}」→ ${abs}`);
+        } else {
+          if (sp) { sp.textContent = '⚠ 目录不可写：' + abs; if (sp.classList) sp.classList.add('warn'); }
+          setStatus('目录验证失败：' + ((d && d.error) || ('HTTP ' + r.status)) + '（请确认本地服务已启动，且路径存在/有权限）', true);
+        }
+      } catch (e) {
+        if (sp) { sp.textContent = '⚠ 无法连接本地服务'; if (sp.classList) sp.classList.add('warn'); }
+        setStatus('目录验证失败：无法连接本地服务 127.0.0.1:3000 → ' + ((e && e.message) || e), true);
       }
-      setStatus(`「${typeLabel(type)}」尚未设置目录（绝对或相对）`, true); return;
+      return;
+    }
+    const handle = (window.saveHandles || {})[type];
+    if (!handle) {
+      setStatus(`「${typeLabel(type)}」尚未设置目录，请点「选择目录」弹出系统目录选择框选定保存目录`, true); return;
     }
     try {
       const perm = await handle.queryPermission({ mode: 'readwrite' });
@@ -384,7 +457,7 @@ document.querySelectorAll('.pathTest').forEach((btn) => {
       const w = await fh.createWritable();
       await w.write(new Blob(['Ddayup 目录写入测试 ' + new Date().toISOString()], { type: 'text/plain' }));
       await w.close();
-      if (sp) sp.textContent = `✓ ${handle.name}`;
+      if (sp) sp.textContent = `✅ 已设置(句柄)：${handle.name}`;
       setStatus(`✅ 写入成功：「${typeLabel(type)}」→ ${handle.name}（该目录下应有 .ddayup-dir-test.txt）`);
     } catch (e) {
       if (sp) sp.textContent = `⚠ ${handle.name}（写入失败）`;

@@ -212,15 +212,11 @@ button.act:hover { border-color: #46515d; }
   font-weight: 600;
 }
 
-/* ===== 按类型自定义保存路径（双保险：绝对目录 + 相对子目录兜底）===== */
+/* ===== 按类型自定义保存路径（「选择目录」→ 任意绝对目录，File System Access API）===== */
 .pathRow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 5px 12px; font-size: 11px; }
 .pathRow .pathType { flex: 0 0 64px; color: #c9d1d9; }
 .pathPick { flex: 0 0 auto; padding: 3px 8px; border: 1px solid #30363d; border-radius: 6px; background: #161b22; color: #c9d1d9; cursor: pointer; font-size: 11px; }
 .pathPick:hover { border-color: #00d4aa; color: #00d4aa; }
-.pathInput { flex: 1 1 120px; min-width: 100px; padding: 3px 6px; border: 1px solid #30363d; border-radius: 6px; background: #0d1117; color: #c9d1d9; font-size: 11px; }
-.pathInput:focus { outline: none; border-color: #00d4aa; }
-.pathApply { flex: 0 0 auto; padding: 3px 8px; border: 1px solid #30363d; border-radius: 6px; background: #161b22; color: #c9d1d9; cursor: pointer; font-size: 11px; }
-.pathApply:hover { border-color: #00d4aa; color: #00d4aa; }
 .pathText { flex: 1 1 100%; color: #6e7681; font-size: 10px; word-break: break-all; }
 .pathText.ok { color: #00d4aa; }
 .pathText.warn { color: #d29922; }
