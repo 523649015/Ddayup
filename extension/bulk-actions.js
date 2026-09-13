@@ -300,10 +300,11 @@ async function restoreSavedHandles() {
 //     而手写绝对路径粘贴与此走的是【完全相同】的可靠写盘通道（phase20 E2E 已验证 sha256 一致）。
 //     后端 /api/settings/assets/pick-directory 用 PowerShell FolderBrowserDialog（-STA）返回已 path.resolve 的
 //     真实绝对路径，且无需登录态 → 点「选择目录」即可拿到与手写粘贴等价的可靠路径。
-//   ★ 为什么 FSA 仅作兜底：FSA showDirectoryPicker 只返回 FileSystemDirectoryHandle（【没有绝对路径字符串】），
+//   ★ 为什么 FSA 不再兜底：FSA showDirectoryPicker 只返回 FileSystemDirectoryHandle（【没有绝对路径字符串】），
 //     且在 side panel 里【不可靠/不持久】：句柄常返回 null、刚 showDirectoryPicker 之后 requestPermission 会
 //     【误报 'prompt'（实际已授权）】。若把 FSA 当主通道，就会「点选择目录像设上了，测试/下载仍提示尚未设置、
-//     落默认目录」——正是用户最初报的 bug。故 FSA 只在【后端不可用（服务未起/无交互桌面）】时兜底用。
+//     落默认目录」——正是用户最初报的 bug。故 .pathPick 只走后端原生选择器；
+//     FSA 句柄仅在恢复旧设置/手动场景下保留，不再作为「选择目录」入口的兜底。
 //   调后端原生目录选择器。返回 { canceled, path, error }：
 //   path 非空 = 用户选中（绝对路径）；canceled=true = 用户取消；error 非空 = 后端不可用/失败。
 async function __pickDirViaBackend(type) {
@@ -347,7 +348,8 @@ document.querySelectorAll('.pathPick').forEach((btn) => {
     // ★2026-09-13 重构（用户诉求「要目录选择、不要手动输入」的最终落点）：
     //   1) 后端原生目录选择器优先：FolderBrowserDialog(-STA) 返回【真实绝对路径】→ 存 dirPath:<type>。
     //      这是与「手动粘贴绝对路径」完全相同的可靠写盘通道（后端 /api/media/save-to-dir，phase20 已验证 sha256 一致），
-    //      而 FSA showDirectoryPicker 在侧栏不可靠/不持久（句柄常为 null、权限误报），故 FSA 仅作后端不可用时的兜底。
+    //      而 FSA showDirectoryPicker 在侧栏不可靠/不持久（句柄常为 null、权限误报），且不返回真实绝对路径，
+    //      故 FSA 不再作为 .pathPick 的兜底；后端不可用时无法选择目录，需启动本地服务后重试。
     let picked = { canceled: false, path: '', error: '' };
     try { picked = await __pickDirViaBackend(type); }
     catch (e) { picked = { canceled: false, path: '', error: (e && e.message) || 'pick failed' }; }
@@ -364,27 +366,16 @@ document.querySelectorAll('.pathPick').forEach((btn) => {
       return;
     }
 
-    // 2) 后端不可用（服务未起/无交互桌面）→ FSA 句柄兜底
-    if (window.showDirectoryPicker) {
-      try {
-        const handle = await window.showDirectoryPicker({ mode: 'readwrite', id: 'ddayup-' + type });
-        // 拿到 handle 立即采用（showDirectoryPicker 已在本点击手势内授权）；真正写权限在下载/测试的用户手势内再 requestPermission
-        window.saveHandles[type] = handle;
-        try { await deleteDirPath(type); } catch (_) {}
-        try { await saveTypeDirHandle(type, handle); } catch (_) {}
-        if (sp) { sp.textContent = `✅ 已设置(句柄)：${handle.name}`; if (sp.classList) { sp.classList.add('ok'); sp.classList.remove('warn'); } }
-        setStatus(`✅ 已设置「${typeLabel(type)}」保存目录：${handle.name}（由浏览器直接写入该文件夹）`);
-        console.log('[Ddayup][userdir] FSA 目录已设置（兜底）：', type, handle.name);
-        return;
-      } catch (e) {
-        if (e && e.name === 'AbortError') { refreshPathTexts(); return; }
-      }
-    }
-
-    // 3) 两条通道都不可用 → 明确提示，不静默
+    // 2) 后端不可用 → 无法弹出系统目录选择框，明确提示启动后端。
+    //    FSA showDirectoryPicker 在侧栏不可靠/不持久（句柄常为 null、权限误报），且不返回真实绝对路径，
+    //    不满足「目录选择→真实路径」需求，故不再作为 .pathPick 的兜底；启动后端后即可重试。
     const backendErr = picked.error || '后端目录选择不可用';
-    if (sp) { sp.textContent = '⚠ 目录选择不可用：' + backendErr; if (sp.classList) { sp.classList.add('warn'); } }
-    setStatus('无法选择目录：' + backendErr + '（请确认本地服务 127.0.0.1:3000 已启动，或使用支持 File System Access 的浏览器）', true);
+    const isConnErr = /failed|refused|unreachable|ECONN|fetch|timeout/i.test(String(backendErr));
+    const errMsg = isConnErr
+      ? `无法弹出系统目录选择框：本地 Ddayup 后端（127.0.0.1:3000）未启动。请先启动后端，然后重试。`
+      : `无法弹出系统目录选择框：${backendErr}（请确认本地服务 127.0.0.1:3000 已启动）`;
+    if (sp) { sp.textContent = '⚠ 后端未启动：' + backendErr; if (sp.classList) { sp.classList.add('warn'); } }
+    setStatus(errMsg, true);
   };
 });
 
@@ -427,7 +418,7 @@ document.querySelectorAll('.pathTest').forEach((btn) => {
         const r = await fetch(ddBackendBase() + '/api/media/probe-dir', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ dir: abs }),
+          body: JSON.stringify(withDeviceAuthBody({ dir: abs }, await getExtDeviceAuth())),
         });
         const d = await r.json().catch(() => ({}));
         if (r.ok && d && d.ok) {
