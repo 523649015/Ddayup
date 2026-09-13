@@ -344,11 +344,17 @@ async function trySaveToUserDir(a) {
     const name = deriveFilename(a);
     const fileHandle = await handle.getFileHandle(name, { create: true });
     const writable = await fileHandle.createWritable();
-    await writable.write(bytes);
-    await writable.close();
-    try { if (typeof pulseDownloadProgress === 'function') pulseDownloadProgress('已保存到设置目录：' + name); } catch (_) {}
-    setStatus('✅ 已保存到设置的目录：' + name);
-    return true;
+    const task = registerUserDirProgress(name);
+    try {
+      await writable.write(bytes);
+      await writable.close();
+      task.finish(true);
+      setStatus('✅ 已保存到设置的目录：' + name);
+      return true;
+    } catch (e) {
+      task.finish(false, '写入失败');
+      throw e;
+    }
   } catch (e) {
     return false; // 静默失败 → 回退默认下载
   }
@@ -458,6 +464,20 @@ function notifyUserDirSkipped(a, reason) {
   console.warn('[Ddayup][userdir] skip:', reason, (a && a.type) || '');
 }
 
+// 登记一条「保存到用户设置目录」的进度任务，并返回 finish 句柄。
+// 调用方必须在成功/失败时调用 finish，避免任务永远停在 DOWNLOADING 状态。
+function registerUserDirProgress(name) {
+  const dlId = (typeof pulseDownloadProgress === 'function')
+    ? pulseDownloadProgress('保存到设置目录：' + name)
+    : null;
+  return {
+    finish: (ok, reason) => {
+      if (!dlId || typeof finishDownloadProgress !== 'function') return;
+      finishDownloadProgress(reason || (ok ? '已保存到设置目录' : '保存失败'), ok, dlId);
+    },
+  };
+}
+
 // ★2026-09-11：B站 durl / 抖音 dNR / 后端合并产物这类「后台或源页代下载」通道，
 //   下载实际发生在 background / 源页上下文，chrome.downloads 只能写浏览器默认目录，
 //   侧栏插桩（dlViaChrome）拦不到。故在【发起之前】抢先尝试用户目录：
@@ -550,46 +570,51 @@ async function __backendSaveToDir(payload) {
 
 // 统一入口：用户为该类型填了【绝对路径】→ 交后端写盘。url 分支流式；dataBase64 分支写已拿到的字节。
 async function trySaveViaBackendDir(a, url, name, opts = {}) {
-  try {
-    if (window.__hmdaoUserDirEnabled === false) return false;
-    const type = a && a.type;
-    if (!type) return false;
-    // 等侧栏目录/路径恢复完成，避免"明明设了却没生效"
-    if (typeof __dirRestorePromise !== 'undefined' && __dirRestorePromise) await __dirRestorePromise;
-    const abs = backendDirFor(type);
-    if (!abs) return false;
+  if (window.__hmdaoUserDirEnabled === false) return false;
+  const type = a && a.type;
+  if (!type) return false;
+  // 等侧栏目录/路径恢复完成，避免"明明设了却没生效"
+  if (typeof __dirRestorePromise !== 'undefined' && __dirRestorePromise) await __dirRestorePromise;
+  const abs = backendDirFor(type);
+  if (!abs) return false;
 
-    const filename = name || (typeof deriveFilename === 'function' ? deriveFilename(a) : 'file.bin');
-    const payload = { dir: abs, filename };
-    if (opts.subdir) payload.subdir = opts.subdir;
-    if (opts.dataBase64) {
-      payload.dataBase64 = opts.dataBase64;
-    } else if (url && /^https?:/i.test(String(url))) {
-      payload.url = url;
-      payload.referer = opts.referer
-        || ((type === 'audio')
-          ? (typeof sourceOrigin === 'function' ? sourceOrigin() : '')
-          : (typeof deriveMediaReferer === 'function' ? deriveMediaReferer(url, window.__sourcePageUrl || '') : (window.__sourcePageUrl || '')));
-      // 迅雷 CDN 直链要求 Referer: pan.xunlei.com 否则 403（与 chrome.downloads 直连同款要求）
-      if (/xunlei\.com|xlcdn\.com|tc\.xunlei\.com|pan\.xunlei/i.test(String(url))
-        && (type === 'netdisk' || type === 'netdisk-file' || type === 'archive')) {
-        payload.referer = 'https://pan.xunlei.com/';
-      }
-    } else {
-      return false;
+  const filename = name || (typeof deriveFilename === 'function' ? deriveFilename(a) : 'file.bin');
+  const payload = { dir: abs, filename };
+  if (opts.subdir) payload.subdir = opts.subdir;
+  if (opts.dataBase64) {
+    payload.dataBase64 = opts.dataBase64;
+  } else if (url && /^https?:/i.test(String(url))) {
+    payload.url = url;
+    payload.referer = opts.referer
+      || ((type === 'audio')
+        ? (typeof sourceOrigin === 'function' ? sourceOrigin() : '')
+        : (typeof deriveMediaReferer === 'function' ? deriveMediaReferer(url, window.__sourcePageUrl || '') : (window.__sourcePageUrl || '')));
+    // 迅雷 CDN 直链要求 Referer: pan.xunlei.com 否则 403（与 chrome.downloads 直连同款要求）
+    if (/xunlei\.com|xlcdn\.com|tc\.xunlei\.com|pan\.xunlei/i.test(String(url))
+      && (type === 'netdisk' || type === 'netdisk-file' || type === 'archive')) {
+      payload.referer = 'https://pan.xunlei.com/';
     }
+  } else {
+    return false;
+  }
 
+  const task = registerUserDirProgress(filename);
+  try {
     const saved = await __backendSaveToDir(payload);
     if (saved.ok) {
-      try { if (typeof pulseDownloadProgress === 'function') pulseDownloadProgress('已保存到设置目录：' + filename); } catch (_) {}
-      setStatus('✅ 已保存到设置的目录：' + filename + '（→ ' + abs + '）');
-      console.log('[Ddayup][userdir] backend ok:', type, filename, '=>', saved.savedPath || abs);
+      task.finish(true);
+      const savedPath = saved.savedPath || (abs + '\\' + filename);
+      setStatus('✅ 已保存到设置的目录：' + filename + '（→ ' + savedPath + '）');
+      console.log('[Ddayup][userdir] backend ok:', type, filename, '=>', savedPath);
       return true;
     }
     // 失败：区分「本地服务未启动」与「写入/拉取失败」，明确提示（不阻塞正常下载）
-    notifyUserDirSkipped(a, saved.serviceDown ? '本地服务未启动' : (saved.error ? ('写入失败：' + saved.error) : '写入失败'));
+    const failReason = saved.serviceDown ? '本地服务未启动' : (saved.error ? ('写入失败：' + saved.error) : '写入失败');
+    task.finish(false, failReason);
+    notifyUserDirSkipped(a, failReason);
     return false;
   } catch (e) {
+    task.finish(false, (e && e.message) || '异常');
     console.warn('[Ddayup][userdir] backend 异常', (e && e.message) || e);
     return false;
   }
@@ -679,7 +704,6 @@ async function tryWriteUserDirFromUrl(a, url, filename) {
     }
     const blob = new Blob([bytes], { type: res.mime || 'application/octet-stream' });
     if (await writeBlobToUserDir(type, name, blob)) {
-      try { if (typeof pulseDownloadProgress === 'function') pulseDownloadProgress('已保存到设置目录：' + name); } catch (_) {}
       setStatus('✅ 已保存到设置的目录：' + name);
       console.log('[Ddayup][userdir] ok:', type, name);
       return true;
@@ -706,7 +730,6 @@ async function tryWriteUserDirFromBlob(a, blobUrl, filename) {
     const blob = await (await fetch(blobUrl)).blob();
     if (!blob || !blob.size) return false;
     if (await writeBlobToUserDir(a.type, name, blob)) {
-      try { if (typeof pulseDownloadProgress === 'function') pulseDownloadProgress('已保存到设置目录：' + name); } catch (_) {}
       setStatus('✅ 已保存到设置的目录：' + name);
       console.log('[Ddayup][userdir] ok(blob):', a.type, name);
       return true;

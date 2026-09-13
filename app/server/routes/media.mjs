@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { readExtensionLicenses, computeExtensionStatus } from './extension-license.mjs';
+import { checkExtensionEntitlement } from './extension-license.mjs';
 
 export function registerMediaRoutes(router, deps) {
   const {
@@ -30,8 +30,9 @@ export function registerMediaRoutes(router, deps) {
 
   // ── 服务端授权闸门（优先级④：把闸门下沉到服务端，单条下载也不漏）──
   // 下载/采集代理（merge-dash/hls/file、save-to-dir、probe-dir、ytdlp/ytdlp-file）必须校验设备授权：
-  // trial/paid 放行，none/expired 拒绝（402 LICENSE_REQUIRED）。与订阅/试用系统同源
-  //（复用 readExtensionLicenses + computeExtensionStatus），避免授权逻辑漂移。
+  // trial/paid 放行，none/expired 拒绝（402 LICENSE_REQUIRED）。
+  // ★2026-09-13：改为复用 checkExtensionEntitlement 单一真源（此前本地复制了一份
+  //   readExtensionLicenses + computeExtensionStatus，与授权侧漂移且不支持「订阅随账号」）。
   // 扩展端每次调用都会携带 deviceId（必要时 token），服务端据此判定，绕过扩展端 gate() 也无处遁形。
   async function gateEntitlement(res, deviceId) {
     const id = String(deviceId || '').trim();
@@ -39,15 +40,13 @@ export function registerMediaRoutes(router, deps) {
       send(res, 402, { ok: false, code: 'LICENSE_REQUIRED', message: '缺少设备标识，无法校验授权（请更新扩展或在扩展内登录）' });
       return false;
     }
-    const data = await readExtensionLicenses(DATA_DIR);
-    const device = data.devices[id] || {};
-    const st = computeExtensionStatus(device);
-    if (st.mode === 'expired' || st.mode === 'none') {
+    const { entitled, mode } = await checkExtensionEntitlement(DATA_DIR, id);
+    if (!entitled) {
       send(res, 402, {
         ok: false,
         code: 'LICENSE_REQUIRED',
-        mode: st.mode,
-        message: st.mode === 'expired'
+        mode,
+        message: mode === 'expired'
           ? '免费试用已结束，请登录或订阅后继续下载'
           : '设备未授权，请在扩展内注册开通试用',
       });
@@ -719,6 +718,21 @@ export function registerMediaRoutes(router, deps) {
     return absFile;
   }
 
+  // 落盘去重：目标文件已存在时，生成 base (2).ext / base (3).ext … 的不冲突唯一路径。
+  // 解决「同一链接重复下载 / 不同链接推导出同名 → 静默覆盖已有文件」问题。
+  function makeUniqueAbsPath(filePath) {
+    const dir = path.dirname(filePath);
+    const ext = path.extname(filePath);
+    const base = path.basename(filePath, ext);
+    let i = 2;
+    let cand;
+    do {
+      cand = path.join(dir, `${base} (${i})${ext}`);
+      i++;
+    } while (fs.existsSync(cand));
+    return cand;
+  }
+
   router.register('POST', '/api/media/save-to-dir', async (req, res) => {
     let body = {};
     try { body = (await readJson(req)) || {}; } catch (_) { body = {}; }
@@ -745,6 +759,13 @@ export function registerMediaRoutes(router, deps) {
     if (!absFile) {
       return send(res, 400, { success: false, error: '文件名非法（路径穿越被拒绝）' });
     }
+    // ★2026-09-15（用户反馈：同名文件被静默覆盖）：落盘前若目标已存在，自动加 (2)/(3)… 后缀，
+    // 保证「同一链接重复下载 / 不同链接推导出同名」都落为独立文件，绝不直接替换已有文件。
+    let outFile = absFile;
+    try {
+      const exists = await fs.promises.access(outFile, fs.constants.F_OK).then(() => true).catch(() => false);
+      if (exists) outFile = makeUniqueAbsPath(outFile);
+    } catch (_) { outFile = absFile; }
 
     const url = String(body.url || '').trim();
     const dataBase64 = typeof body.dataBase64 === 'string' ? body.dataBase64 : '';
@@ -766,8 +787,8 @@ export function registerMediaRoutes(router, deps) {
       try {
         const buf = Buffer.from(dataBase64, 'base64');
         if (!buf.length) return send(res, 400, { success: false, error: 'dataBase64 解码为空' });
-        await fs.promises.writeFile(absFile, buf);
-        return send(res, 200, { success: true, savedPath: absFile, bytes: buf.length });
+        await fs.promises.writeFile(outFile, buf);
+        return send(res, 200, { success: true, savedPath: outFile, bytes: buf.length });
       } catch (e) {
         return send(res, 500, { success: false, error: '写入失败：' + String((e && e.message) || e) });
       }
@@ -805,7 +826,7 @@ export function registerMediaRoutes(router, deps) {
       const { Readable } = await import('node:stream');
       const { createWriteStream } = await import('node:fs');
       const bytes = await new Promise((resolve, reject) => {
-        const ws = createWriteStream(absFile);
+        const ws = createWriteStream(outFile);
         const rs = Readable.fromWeb(resp.body);
         ws.on('error', reject);
         rs.on('error', reject);
@@ -813,12 +834,12 @@ export function registerMediaRoutes(router, deps) {
         rs.pipe(ws);
       });
       if (!bytes) {
-        try { fs.rmSync(absFile, { force: true }); } catch (_) { /* 忽略 */ }
+        try { fs.rmSync(outFile, { force: true }); } catch (_) { /* 忽略 */ }
         return send(res, 502, { success: false, error: '拉取字节为空（可能被防盗链拦截）' });
       }
-      return send(res, 200, { success: true, savedPath: absFile, bytes });
+      return send(res, 200, { success: true, savedPath: outFile, bytes });
     } catch (e) {
-      try { fs.rmSync(absFile, { force: true }); } catch (_) { /* 忽略 */ }
+      try { fs.rmSync(outFile, { force: true }); } catch (_) { /* 忽略 */ }
       return send(res, 500, { success: false, error: '写入失败：' + String((e && e.message) || e).slice(0, 200) });
     }
   });
