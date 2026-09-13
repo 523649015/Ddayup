@@ -294,7 +294,21 @@ async function trySaveToUserDir(a) {
     const __type = a && a.type;
     // ★通道二优先：用户填了绝对路径 → 后端流式写盘（不受 60MB / 体积未知护栏限制）
     if (hasBackendDirFor(__type) && a && a.url && /^https?:/i.test(String(a.url))) {
-      return await trySaveViaBackendDir(a, a.url, deriveFilename(a));
+      const savedViaBackend = await trySaveViaBackendDir(a, a.url, deriveFilename(a));
+      if (savedViaBackend) return true;
+      // ★2026-09-13 修复（侧栏"下载图片"设置目录后「点击无响应 / 图片未真正下载」真因）：
+      //   后端 save-to-dir 是【服务端】去 fetch 第三方图床 URL，图床防盗链 / 第三方 cookie / 黑连接时，
+      //   要么快速 403/404、要么无限挂起（服务端 fetch 无超时）→ 图片落不到设置目录，且
+      //   chrome.downloads 直连兜底同样被图床挡掉。而同一张图在卡片里能显示，是因为卡片走侧栏
+      //   后台 relay（credentials:'omit'）由【浏览器侧】取到了字节。故后端 url 拉取失败时，回退为
+      //   「侧栏经后台 relay 取字节 → blob → 交后端 dataBase64 写盘」（复用 writeBlobToUserDir，
+      //   正确 blob 生命周期），让浏览器能取到的图必定落盘到设置目录。
+      //   视频 / 流媒体不走此路（需后端流式合并，浏览器拉字节要么 CORS 失败要么超大）。
+      const __isVideoLike = __type === 'video' || /\.(m3u8|mpd)(\?|$)/i.test(String(a.url || ''));
+      if (!__isVideoLike) {
+        return await trySaveUserDirViaFrontendBytes(a, __type);
+      }
+      return false;
     }
     const handle = (typeof saveHandles !== 'undefined' && saveHandles) ? saveHandles[__type] : null;
     if (!handle) { notifyUserDirSkipped(a, '未设置该类型目录'); return false; }
@@ -337,6 +351,48 @@ async function trySaveToUserDir(a) {
     return true;
   } catch (e) {
     return false; // 静默失败 → 回退默认下载
+  }
+}
+
+// ★2026-09-13：后端服务端拉取第三方 URL 失败时的兜底——改为【浏览器侧】经后台 relay 取字节再写盘。
+//   卡片渲染已证明浏览器能拿到该图字节（同款 fetchMediaViaBackground / credentials:'omit'），
+//   故这里能可靠落盘到用户设置目录；且前端 30s 超时已兜底，不受后端服务端 fetch 无超时影响。
+//   正确 blob 生命周期：取 bytes → new Blob → 转 base64 → POST 后端 dataBase64 分支写盘，
+//   不在此处创建会被提前 revoke 的 blob: URL（避免 card-render 视频帧提取那种 ERR_FILE_NOT_FOUND）。
+async function trySaveUserDirViaFrontendBytes(a, type) {
+  try {
+    const name = deriveFilename(a);
+    const referer = (type === 'audio')
+      ? (typeof sourceOrigin === 'function' ? sourceOrigin() : '')
+      : (typeof deriveMediaReferer === 'function' ? deriveMediaReferer(a.url, window.__sourcePageUrl || '') : (window.__sourcePageUrl || ''));
+    const r = await Promise.race([
+      (typeof fetchMediaViaBackground === 'function'
+        ? fetchMediaViaBackground(a.url, referer)
+        : fetchViaBackground(a.url, { referer })),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('前端抓取超时(30s)')), 30000)),
+    ]);
+    if (!r || !r.ok) {
+      notifyUserDirSkipped(a, '第三方源不可达（防盗链/超时），改直连默认下载');
+      return false;
+    }
+    let bytes = r.arrayBuffer;
+    if (!bytes && r.b64) { try { bytes = b64ToBytes(r.b64); } catch (_) { bytes = null; } }
+    if (!bytes || !bytes.byteLength) {
+      notifyUserDirSkipped(a, '第三方源无字节返回，改直连默认下载');
+      return false;
+    }
+    // 大文件走浏览器原生下载（此处经 HTTP POST base64 到后端，仍避免把超大字节拉进侧栏内存）
+    if (bytes.byteLength > USER_DIR_MAX_BYTES) {
+      notifyUserDirSkipped(a, '文件超过 60MB，改直连默认下载');
+      return false;
+    }
+    const blob = new Blob([bytes], { type: r.mime || (type === 'image' ? 'image/jpeg' : 'application/octet-stream') });
+    if (await writeBlobToUserDir(type, name, blob)) return true;
+    notifyUserDirSkipped(a, '写入失败');
+    return false;
+  } catch (e) {
+    notifyUserDirSkipped(a, '抓取失败：' + ((e && e.message) || '未知'));
+    return false;
   }
 }
 
@@ -436,15 +492,27 @@ function bytesToB64(bytes) {
 // 调后端 /api/media/save-to-dir；连接失败时尝试拉起后端一次并重试。
 async function __backendSaveToDir(payload) {
   const base = (typeof ddBackendBase === 'function') ? ddBackendBase() : 'http://127.0.0.1:3000';
+  // ★2026-09-13：POST 增加 30s 超时。后端 save-to-dir 是【服务端】拉第三方 URL，
+  //   图床无响应时会长时间挂起 → 前端 click 一直 await → 表现「无响应」。超时后不再误判
+  //   「本地服务未启动」（后端其实在跑，只是第三方没回），而是当作抓取失败，交由上层前端兜底。
   const post = async () => {
-    const resp = await fetch(base + '/api/media/save-to-dir', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(withDeviceAuthBody(payload, await getExtDeviceAuth())),
-    });
-    const data = await resp.json().catch(() => ({}));
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 30000);
+    let resp, data;
+    try {
+      resp = await fetch(base + '/api/media/save-to-dir', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(withDeviceAuthBody(payload, await getExtDeviceAuth())),
+        signal: ctrl.signal,
+      });
+      data = await resp.json().catch(() => ({}));
+    } finally {
+      clearTimeout(timer);
+    }
     return { resp, data };
   };
+  const isTimeout = (e) => !!(e && (e.name === 'TimeoutError' || e.name === 'AbortError'));
   try {
     const { resp, data } = await post();
     if (resp.ok && data && data.success) return { ok: true, savedPath: data.savedPath, bytes: data.bytes };
@@ -452,6 +520,10 @@ async function __backendSaveToDir(payload) {
     const _code = (data && data.code) || '';
     return { ok: false, serviceDown: false, error: (_code === 'LICENSE_REQUIRED' ? '设备未授权：' + _msg : _msg) };
   } catch (e) {
+    // 超时 ≠ 后端挂：直接判为抓取失败，触发上层前端取字节兜底（不再拉起后端）
+    if (isTimeout(e)) {
+      return { ok: false, serviceDown: false, error: (e && e.message) || '后端写入超时（第三方源无响应）' };
+    }
     // fetch reject = 连接失败 → 判定本地服务未启动，尝试拉起一次（原生主机 backend.start，内部含健康轮询）
     const up = await (async () => {
       try {
@@ -470,6 +542,7 @@ async function __backendSaveToDir(payload) {
       const _code = (data && data.code) || '';
       return { ok: false, serviceDown: false, error: (_code === 'LICENSE_REQUIRED' ? '设备未授权：' + _msg : _msg) };
     } catch (e2) {
+      if (isTimeout(e2)) return { ok: false, serviceDown: false, error: (e2 && e2.message) || '后端写入超时（第三方源无响应）' };
       return { ok: false, serviceDown: true, error: (e2 && e2.message) || 'connection failed' };
     }
   }

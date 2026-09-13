@@ -780,7 +780,22 @@ export function registerMediaRoutes(router, deps) {
       };
       const referer = String(body.referer || '').trim();
       if (referer) headers.Referer = referer;
-      const resp = await fetch(url, { headers, redirect: 'follow' });
+      // ★2026-09-13：第三方图床无响应/黑连接会无限挂起 → 前端点下载「无响应」。
+      //   加 25s 超时（AbortController），超时/失败都返回可读错误，绝不静默挂起。
+      const ctrl = new AbortController();
+      const abortTimer = setTimeout(() => ctrl.abort(), 25000);
+      let resp;
+      try {
+        resp = await fetch(url, { headers, redirect: 'follow', signal: ctrl.signal });
+      } catch (fe) {
+        clearTimeout(abortTimer);
+        const timed = !!(fe && (fe.name === 'TimeoutError' || fe.name === 'AbortError'));
+        return send(res, timed ? 504 : 502, {
+          success: false,
+          error: timed ? '拉取超时（第三方源无响应）' : `拉取失败：${String((fe && fe.message) || fe).slice(0, 160)}`,
+        });
+      }
+      clearTimeout(abortTimer);
       if (!resp.ok) {
         return send(res, 502, { success: false, error: `拉取失败 HTTP ${resp.status}` });
       }
