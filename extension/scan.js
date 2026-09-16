@@ -803,9 +803,20 @@ async function scanTabInner(tabId, opts = {}) {
           //   实测同一条音频轨会被处理两遍（视频卡同样存在 douyin / deep-parse 双来源），
           //   不去重会渲染出两张一模一样的音频卡。
           const seenAudioUrl = new Set(networkAssets.filter((a) => a && a.type === 'audio' && a.url).map((a) => a.url));
-          const dyAudioAssets = [];
+          // ★2026-09-12 修复（用户实测：一个视频扫出 3 个音频文件）：
+          //   dyAudios 来自两个独立来源 —— ① 页面 RENDER_DATA/详情的 video.bitRateAudioList[0] 音频直链；
+          //   ② 网络拦截到的每条 mime_type=audio_mp4 请求（DASH 音频会分多次、每次带不同签名请求）。
+          //   旧逻辑仅按【完整 URL】去重 → 同一视频的同一音轨因签名不同被当成多张独立音频卡。
+          //   改为按 awemeId 归并（无 awemeId 时退回 URL），同一视频只保留最后一条（最新签名）。
+          const byAweme = new Map();
           for (const x of dyAudios) {
-            if (!x || !x.url || seenAudioUrl.has(x.url)) continue;
+            if (!x || !x.url) continue;
+            const k = x.awemeId ? ('aweme:' + x.awemeId) : ('url:' + x.url);
+            byAweme.set(k, x); // 后写覆盖前值 → 同一视频保留最新捕获的那条
+          }
+          const dyAudioAssets = [];
+          for (const x of byAweme.values()) {
+            if (seenAudioUrl.has(x.url)) continue;
             seenAudioUrl.add(x.url);
             dyAudioAssets.push({
               url: x.url,
@@ -1664,6 +1675,18 @@ async function scanTabInner(tabId, opts = {}) {
     } catch (_) {}
     return false;
   }
+  // ★2026-09-16 修复（B站/主流图床封面重复根因）：剥离 URL pathname 末尾的尺寸/格式处理后缀，
+  //   让同一张图的不同变体（如 xxx.jpg@672w_378h_1c.webp 与 @336w_189h_1c.webp）在去重中合并为一张。
+  function normalizeImagePathname(p) {
+    return String(p || '')
+      .replace(/~tplv-[^/]*$/i, '')            // 字节系：~tplv-xxx-aigc_resize_loss:480:480.webp
+      .replace(/!\w+$/i, '')                   // 又拍云：xxx.png!w600_webp
+      .replace(/:\d{1,5}:\d{1,5}\.\w{2,5}$/i, '') // 残留 :480:480.webp
+      .replace(/:\d{1,5}:\d{1,5}$/i, '')
+      .replace(/@\d+w_\d+h(_\d+c)?\.\w+$/i, '') // B站：xxx.jpg@672w_378h_1c.webp / @336w_189h.webp
+      .replace(/@!?\w+\.\w+$/i, '')             // 其他 @ 处理后缀（@!web / @xxx.webp）
+      .replace(/[-_]\d{2,4}x\d{2,4}$/i, '');   //  basename 中的 -480x480 尺寸后缀
+  }
   // ★2026-09-08 修复（即梦侧栏 200 张杂图根因）：html-fallback 是「正则扫页面 HTML 文本」的
   //   最后兜底，会把编辑器贴纸/头像/素材库等所有 CDN 变体全捞进来（实测即梦 html-fallback:156
   //   vs 真实 DOM img:44）。既然 DOM 里已有真实 <img>（DEF_IMG_SRC 命中），HTML 文本兜底就是
@@ -1711,11 +1734,7 @@ async function scanTabInner(tabId, opts = {}) {
       if (a.type === 'image') {
         try {
           const ku = new URL(keyUrl);
-          ku.pathname = ku.pathname
-            .replace(/~tplv-[^/]*$/i, '')            // 字节系处理段：...~tplv-xxx-aigc_resize_loss:480:480.webp
-            .replace(/!\w+$/i, '')                   // 又拍云别名：xxx.png!w600_webp
-            .replace(/:\d{1,5}:\d{1,5}\.\w{2,5}$/i, '') // 残留 尺寸.扩展名 尾巴
-            .replace(/:\d{1,5}:\d{1,5}$/i, '');
+          ku.pathname = normalizeImagePathname(ku.pathname);
           keyUrl = ku.href;
         } catch (_) {}
       }
@@ -2042,14 +2061,69 @@ async function scanTabInner(tabId, opts = {}) {
     srcPageUrl = (t && t.url) || '';
     pageTitle = (t && t.title) || '';
   } catch (_) {}
+  // ★2026-09-16 F5：从 title-extract.js（MAIN 世界）经 DOM 桥接读回页面素材标题
+  //   byUrl：按"素材 URL"精确关联的标题（high）；pageLevel：页面/平台级单标题，仅当页面只有 1 个视频元素时
+  //   才视为"主视频标题"（mid），多视频/合集/画廊页不套用，避免几十张卡同名/图配错标题（防错位）。
+  let __titleByUrl = {}, __titleMainVideo = null;
+  try {
+    const raw = document.documentElement.getAttribute('data-hmdao-titles');
+    if (raw) {
+      const parsed = JSON.parse(raw) || {};
+      __titleByUrl = parsed.byUrl || {};
+      if (parsed.pageLevel && parsed.pageLevel.title && parsed.pageLevel.videoCount === 1) {
+        __titleMainVideo = parsed.pageLevel.title;
+      }
+    }
+  } catch (_) {}
+  const __titleUrlBase = (u) => String(u || '').replace(/[?#].*$/, '');
+  const __titleByUrlMatch = (u) => {
+    if (!u) return null;
+    const k = __titleUrlBase(u);
+    if (__titleByUrl[k]) return __titleByUrl[k];
+    for (const key in __titleByUrl) { if (__titleUrlBase(key) === k) return __titleByUrl[key]; }
+    return null;
+  };
+  // ★2026-09-16 修复（图片卡全用主页标题根因）：按图片自身 alt / URL 基文件名派生标题。
+  function deriveImageName(a) {
+    const alt = String(a.alt || '').trim();
+    if (alt && alt.length > 2 && !/^\d+$/.test(alt) && !/\b(logo|icon|avatar|banner|spacer|placeholder|loading|default|cover|thumb)\b/i.test(alt)) {
+      return alt;
+    }
+    try {
+      const u = new URL(a.url);
+      let name = decodeURIComponent(normalizeImagePathname(u.pathname).split('/').pop() || '');
+      name = name.replace(/[-_]\d{2,4}x\d{2,4}$/i, '').replace(/[-_]?\d+$/, '').trim();
+      if (name && name.length > 1) return name;
+    } catch (_) {}
+    return '';
+  }
   for (const a of merged) {
     if (!a) continue;
     a.tabId = tabId;
     if (!a.pageUrl) a.pageUrl = srcPageUrl;
+    // ★2026-09-16 F5：素材本身标题（按 URL 精确关联，绝不按位置套用，防错位）
+    if (!a.title) {
+      const hit = __titleByUrlMatch(a.url);
+      if (hit && hit.title) {
+        a.title = hit.title;                                   // per-asset URL 命中（high）
+      } else if (__titleMainVideo && a.type === 'video' && !(a.platform === 'douyin' && a.type === 'video')) {
+        a.title = __titleMainVideo;                            // 页面级主视频标题（mid，仅单视频页）
+      }
+    }
+    // ★2026-09-16 修复：图片卡标题绝不用 pageTitle 兜底，改用自身 alt 或 URL 基文件名，
+    //   避免同一页面所有图片卡显示同一个主页标题。
+    if (!a.title && a.type === 'image') {
+      const nm = deriveImageName(a);
+      if (nm) a.title = nm;
+    }
     // ★2026-09-04 修复：不要把【页面标题】填给抖音视频卡。抖音视频标题应从详情 API 的 desc 取；
     //   取不到时显示"第N集"或"视频素材"都比"抖音精选电脑版 - 抖音"这种页面标题准确一万倍，
     //   也不会造成批量模式下几十张卡同名、用户以为"内容对应不上"。
-    if (!a.title && pageTitle && !(a.platform === 'douyin' && a.type === 'video')) a.title = pageTitle;
+    // ★2026-09-16 F5 防错位：整页兜底（low）仅对"主视频"（单视频页 videoCount===1，__titleMainVideo 已置）
+    //   与音频/模型/归档等资产保留；多视频/列表页的视频与图片资产不再套用 pageTitle。
+    if (!a.title && pageTitle && !(a.platform === 'douyin' && a.type === 'video')) {
+      if ((a.type !== 'video' && a.type !== 'image') || (__titleMainVideo && a.type === 'video')) a.title = pageTitle;
+    }
     if (!a.name && a.title) a.name = a.title;
     // 为抖音/新片场等资产补 playerUrl，让侧栏识别为 yt-dlp 平台并走统一解析
     if (!a.playerUrl && srcPageUrl) {
@@ -2178,6 +2252,17 @@ async function scanPage(networkAssets) {
   //   故在此类站点跳过重量级遍历，其余站点行为完全不变。
   let heavyDom = true;
   try { if (/(^|\.)doubao\.com$/.test(location.hostname)) heavyDom = false; } catch (_) {}
+  // ★2026-09-16 修复：scanPage 被注入页面执行，无法访问顶层作用域，必须在内部定义此 helper。
+  function normalizeImagePathname(p) {
+    return String(p || '')
+      .replace(/~tplv-[^/]*$/i, '')
+      .replace(/!\w+$/i, '')
+      .replace(/:\d{1,5}:\d{1,5}\.\w{2,5}$/i, '')
+      .replace(/:\d{1,5}:\d{1,5}$/i, '')
+      .replace(/@\d+w_\d+h(_\d+c)?\.\w+$/i, '')
+      .replace(/@!?\w+\.\w+$/i, '')
+      .replace(/[-_]\d{2,4}x\d{2,4}$/i, '');
+  }
   const push = (url, type, source, meta) => {
     if (!url) return;
     // ★2026-09-11 修复（liblib / B站等 MSE 播放器产生"假卡"根因）：
@@ -2189,6 +2274,15 @@ async function scanPage(networkAssets) {
       try {
         const s = String(url || '');
         if (/^blob:/i.test(s) || /^data:/i.test(s)) return;
+        // ★2026-09-14 修复（B 站等站点「JS 包被当成音频」根因）：
+        //   下方 [data-audio] / [data-src] 等属性嗅探是无条件推送的，而 data-src 常被用于
+        //   懒加载 JS / 图片（B 站 index-legacy-*.js 即挂在 data-src 上），
+        //   于是 1.4MB 的 application/javascript 被入库为音频，预览必然
+        //   NotSupportedError（blobType: application/javascript）。
+        //   这里在唯一入口做兜底：路径以明确的非媒体扩展名结尾 → 一律丢弃。
+        //   只按「扩展名黑名单」拒绝，不强制要求音频后缀，以免影响爱给等
+        //   「无扩展名 + 签名参数」的真实音频直链。
+        if (/\.(js|mjs|cjs|css|html?|json|jsonp|xml|svg|png|jpe?g|gif|webp|avif|bmp|ico|woff2?|ttf|otf|eot|map|txt|md|pdf)(\?|#|$)/i.test(s)) return;
       } catch (_) {}
     }
     // 动图检测：gif/apng/动图 webp 标记 animated，预览直显（不重编码），合并阶段据此免过滤
@@ -2219,11 +2313,12 @@ async function scanPage(networkAssets) {
   // 1) 图片：<img src/currentSrc/srcset> + data-* 属性 + 内联 style background + <picture>
   document.querySelectorAll('img').forEach((img) => {
     const src = img.currentSrc || img.src;
-    push(src, 'image', 'img');
+    const alt = img.alt || '';
+    push(src, 'image', 'img', { alt });
     if (img.srcset) {
       img.srcset.split(',').forEach((s) => {
         const u = s.trim().split(/\s+/)[0];
-        push(u, 'image', 'img[srcset]');
+        push(u, 'image', 'img[srcset]', { alt });
       });
     }
   });
@@ -2247,18 +2342,19 @@ async function scanPage(networkAssets) {
   //   → 真实 avif 永远采不到。扩到常见懒加载属性全集，并对 data-srcset 按 srcset 规则拆分多候选。
   const LAZY_ATTRS = ['data-src', 'data-original', 'data-lazy', 'data-bg', 'data-image', 'data-img', 'data-url', 'data-pic', 'data-thumb', 'data-preview', 'data-lazy-src', 'data-original-src', 'data-webp-src', 'data-hd-src', 'data-high-res-src', 'data-full', 'data-zoom', 'data-large', 'data-big', 'data-origin', 'data-real', 'data-actual', 'data-load-src', 'data-true-src', 'data-retina', 'data-imgurl', 'data-imageurl', 'data-bigpic', 'data-poster', 'data-file', 'data-cdn', 'data-path', 'data-link', 'data-gif', 'data-srcset'];
   document.querySelectorAll(LAZY_ATTRS.map((a) => '[' + a + ']').join(',')).forEach((el) => {
+    const lazyAlt = el.getAttribute('alt') || '';
     for (const k of LAZY_ATTRS) {
       const v = el.getAttribute(k);
       if (!v) continue;
-      if (k === 'data-srcset') { v.split(',').forEach((c) => { const u = c.trim().split(/\s+/)[0]; if (u) push(u, 'image', 'img[data]'); }); }
-      else push(v, 'image', 'img[data]');
+      if (k === 'data-srcset') { v.split(',').forEach((c) => { const u = c.trim().split(/\s+/)[0]; if (u) push(u, 'image', 'img[data]', { alt: lazyAlt }); }); }
+      else push(v, 'image', 'img[data]', { alt: lazyAlt });
     }
   });
   document.querySelectorAll('a[href]').forEach((a) => {
     const href = a.getAttribute('href');
     if (/\.(jpe?g|png|gif|webp|bmp|svg|avif|ico|tiff?)([?#]|$)/i.test(href)) {
       const img = a.querySelector('img');
-      if (img) push(img.currentSrc || img.src, 'image', 'a>img');
+      if (img) push(img.currentSrc || img.src, 'image', 'a>img', { alt: img.alt || '' });
       else push(href, 'image', 'a>img');
     } else if (/\.(pdf|docx?|pptx?|xlsx?|txt|rtf|epub|csv|md)([?#]|$)/i.test(href)) {
       // ★2026-08-23 P4（文档/模型采集）：识别普通 <a> 指向的真实文档链接，纳入侧栏「文档」素材。
@@ -2676,7 +2772,7 @@ async function scanPage(networkAssets) {
 
   // ShadowDOM 内部资源（现代站点大量使用）
   const scanRoot = (root) => {
-    root.querySelectorAll('img').forEach((img) => push(img.currentSrc || img.src, 'image', 'shadow-img'));
+    root.querySelectorAll('img').forEach((img) => push(img.currentSrc || img.src, 'image', 'shadow-img', { alt: img.alt || '' }));
     root.querySelectorAll('video').forEach((v) => push(v.src, 'video', 'shadow-video'));
     root.querySelectorAll('audio').forEach((a) => push(a.src, 'audio', 'shadow-audio'));
     root.querySelectorAll('model-viewer').forEach((m) => push(m.getAttribute('src'), 'model', 'shadow-model'));
@@ -2798,7 +2894,7 @@ async function scanPage(networkAssets) {
       let key;
       try {
         const u = new URL(a.url);
-        key = u.host + u.pathname; // 抹掉 query/hash 的尺寸参数 → 同图不同尺寸合并
+        key = u.host + normalizeImagePathname(u.pathname); // 抹掉 query/hash 与处理后缀 → 同图不同尺寸变体合并
       } catch (_) {
         key = a.url;
       }

@@ -337,6 +337,14 @@ function displayName(a) {
   //   全串，严重影响辨识。判定规则：扩展名缺失 或 形如「obj/eden-cn/xxxhash」等无意义路径 → 跳过
   const n = (a && a.url && fileName(a.url)) || '';
   if (n && !/^stream-/i.test(n) && /\.(mp4|mp3|m4a|wav|aac|flac|jpg|jpeg|png|gif|webp|avif|heic|webm|mkv|mov|ts|m3u8)(\?|$)/i.test(n)) return n;
+  // ★2026-09-16 修复：无扩展名 CDN 图片（花瓣/B站 hash 文件名等）不能退化成"图片素材"，
+  //   至少显示 URL 末段文件名，让图片卡彼此可区分且对应真实源图。
+  if (a && a.type === 'image' && a.url) {
+    try {
+      const seg = decodeURIComponent(new URL(a.url).pathname.split('/').pop() || '');
+      if (seg && seg.length > 1) return seg.replace(/[?#].*$/, '');
+    } catch (_) {}
+  }
   // ★CDN 裸链 / 无可读文件名 → 显示「视频素材 / 音频素材」，不再显示整条 CDN 路径
   return ep + ((a && a.type ? typeLabel(a.type) : '素材') + (a && a.audioIdx != null ? ('#' + a.audioIdx) : ''));
 }
@@ -806,13 +814,13 @@ async function doRescan() {
     try { renderNow(); } catch (_) {}
     try { updateScanStatus(combined, 'scanning'); } catch (_) {}
   } catch (_) {}
-  // 2) 唤醒后端（失败也继续扫描页面内素材）
-  setStatus('正在唤醒 Ddayup 后端…');
+  // 2) 探测后端健康（仅 fetch 本机 3000，不触达原生主机；失败也继续扫描页面内素材）
+  setStatus('正在探测 Ddayup 后端…');
   try {
-    const backendReady = await ensureBackendRunningNative({ silent: true });
+    const backendReady = await checkBackendHealth();
     setStatus(backendReady ? '后端已就绪，重新扫描中…' : '后端未启动，仍继续扫描页面内素材');
   } catch (e) {
-    setStatus('后端唤醒失败：' + (e && e.message ? e.message : String(e)));
+    setStatus('后端探测失败：' + (e && e.message ? e.message : String(e)));
   }
   // ★2026-09-06：每次重新扫描前清空「诊断日志」面板并折叠 —— 没在诊断时保持干净状态，
   //   不让上一轮的日志一直堆在底部（用户要求：不诊断即清空）。
@@ -2077,8 +2085,8 @@ function openPreview(idx) {
   }
 
   document.getElementById('previewInfo').innerHTML =
-    `<span>${typeLabel(a.type)} · ${displayName(a)}</span><br>` +
-    `<a href="${escapeAttr(a.url)}" target="_blank" title="${escapeAttr(a.url)}">${truncate(a.url, 60)}</a>` +
+    `<span>${escapeHtml(typeLabel(a.type))} · ${escapeHtml(displayName(a))}</span><br>` +
+    `<a href="${escapeAttr(a.url)}" target="_blank" title="${escapeAttr(a.url)}">${escapeHtml(truncate(a.url, 60))}</a>` +
     (imgDimensions[a.url] ? `<br><span>${imgDimensions[a.url].w}×${imgDimensions[a.url].h} px</span>` : '');
 
   // 仅网盘资产显示「深度解析」按钮
@@ -2274,7 +2282,7 @@ window.switchPreviewVideo = function(url, name, source) {
   v.src = url; v.load(); v.play().catch(() => {});
   window.__previewAsset = { url, type: 'video', source };
   document.getElementById('previewInfo').innerHTML =
-    `<span>视频 · ${name}</span><br><a href="${escapeAttr(url)}" target="_blank" title="${escapeAttr(url)}">${truncate(url, 60)}</a>`;
+    `<span>视频 · ${escapeHtml(name)}</span><br><a href="${escapeAttr(url)}" target="_blank" title="${escapeAttr(url)}">${escapeHtml(truncate(url, 60))}</a>`;
 };
 
 // ===== YouTube 分辨率选择器 =====
@@ -3057,30 +3065,28 @@ document.addEventListener('click', (e) => {
   }
 });
 
-// ★2026-08-11：扩展侧栏加载时自动检测/启动 Ddayup Web 后端。
-// 静默尝试：后端已在运行则立即返回；未运行且原生主机已安装则自动拉起；
-// 原生主机未安装或启动失败 → 在状态栏与横幅给出明确提示，让用户可点「启动后端」或重新扫描唤醒。
+// ★2026-09-16 F2：扩展侧栏加载时只做轻量健康探测（纯 fetch 本机 3000 后端），不再 connectNative，
+//   避免未装原生主机时报「Access to the specified native messaging host is forbidden」控制台噪音。
+//   后端未启动 → 在状态栏与横幅给出明确提示，让用户可点「启动后端」或重新扫描唤醒。
 setTimeout(() => {
-  ensureBackendRunningNative({ silent: true, requireLocal: true }).then((r) => {
-    if (!r || !r.ok) {
-      console.warn('[Ddayup] 自动启动后端失败：', r);
+  checkBackendHealth().then((ok) => {
+    if (!ok) {
       setStatus('⚠ Ddayup 后端未启动，点击「启动 Ddayup 后端」或重新扫描可唤醒', true);
       ensureYtDlpPrompt();
       refreshYtDlpNotice();
     }
-  }).catch((e) => {
-    console.warn('[Ddayup] 自动启动后端异常：', e);
-    setStatus('⚠ 后端自动启动失败：' + (e && e.message || e), true);
-    ensureYtDlpPrompt();
-    refreshYtDlpNotice();
-  });
+  }).catch(() => {});
 }, 800);
 
 // ★2026-08-17：扩展加载后自动确保 yt-dlp 就绪（朋友机器无 3000 后端也能下视频）。
 // 仅当原生主机可用且 yt-dlp 尚未安装时，静默触发 ytdlp.ensure 自动下载（多源回退 + 断点续传）。
 // 已装则跳过；原生主机不可用（朋友未跑安装器）则仅提示，不阻断。
 setTimeout(() => {
-  checkYtDlp().then(async (st) => {
+  // ★2026-09-16 F2：仅本机 3000 后端可达才做 yt-dlp 探测/静默安装；否则跳过，
+  //   避免后端未启动 + 原生主机未装时仍在加载期 connectNative 触发 forbidden 噪音。
+  checkBackendHealth().then((ok) => {
+    if (!ok) return;
+    return checkYtDlp().then(async (st) => {
     if (st !== 'missing') return; // ready / unreachable 都不动
     // ★2026-09-16 修复（B 同类隐患）：原实现用裸 port.postMessage 且【无超时】，
     //   原生主机不回包时 onMessage 监听器永不移除（泄漏），且用户得不到任何反馈。
@@ -3096,6 +3102,7 @@ setTimeout(() => {
       refreshYtDlpNotice();
     }
   }).catch(() => {});
+  });
 }, 1500);
 
 // ★2026-08-11 多任务：下载完成自动入库回调。
@@ -3136,6 +3143,10 @@ function ddNativeConnect() {
     return null;
   }
   ddNativePort.onDisconnect.addListener(() => {
+    // ★2026-09-16 F2：消费 lastError，消除「Access to the specified native messaging host is forbidden」控制台噪音。
+    //   connectNative 到未安装/被禁的主机时，错误经 onDisconnect 异步投递；若不读取即报 Unchecked runtime.lastError。
+    //   此 handler 对所有 connectNative 路径（含 yt-dlp 原生探测）统一生效。
+    void chrome.runtime.lastError;
     ddNativePort = null;
     ddNativeAvailable = false;
   });
@@ -3218,6 +3229,18 @@ async function startBackendViaNative() {
     const msg = String(e && e.message || e);
     setStatus('⚠ 无法启动后端：' + msg, true);
     return { ok: false, error: msg, nativeUnavailable: msg.includes('native_unavailable') };
+  }
+}
+
+// ★2026-09-16 F2：轻量后端健康探测（纯 fetch 本机 3000 后端，绝不 connectNative）。
+// 用于侧栏加载/扫描时判断「后端是否启动」，避免触达原生主机协议引发 forbidden 噪音。
+// 仅查本机 127.0.0.1:3000（与 requireLocal 语义一致，不查云端，避免本地后端未起被云端短路）。
+async function checkBackendHealth(timeoutMs = 2000) {
+  try {
+    const r = await fetch('http://127.0.0.1:3000/api/health', { credentials: 'omit', signal: AbortSignal.timeout(timeoutMs) });
+    return !!r.ok;
+  } catch (_) {
+    return false;
   }
 }
 
@@ -5607,7 +5630,7 @@ document.getElementById('pvRefresh').onclick = async () => {
     if (a.type === 'video' && vid) {
       vid.src = freshUrl; vid.load(); vid.play().catch(() => {});
     }
-    document.getElementById('previewInfo').innerHTML = `<span>${typeLabel(a.type)} · ${fileName(freshUrl)}（已刷新）</span><br><a href="${escapeAttr(freshUrl)}" target="_blank" title="${escapeAttr(freshUrl)}">${truncate(freshUrl, 60)}</a>`;
+    document.getElementById('previewInfo').innerHTML = `<span>${escapeHtml(typeLabel(a.type))} · ${escapeHtml(fileName(freshUrl))}（已刷新）</span><br><a href="${escapeAttr(freshUrl)}" target="_blank" title="${escapeAttr(freshUrl)}">${escapeHtml(truncate(freshUrl, 60))}</a>`;
     setStatus('✅ 已刷新 URL，正在同步侧栏…');
     // ★2026-09-05：源页刷新成功后同步侧栏 —— 把该卡的直链换成源页当前播放的那条，
     //   再触发源页重扫，让侧栏卡片集数/标题/封面与【当前源播放内容】对齐。
