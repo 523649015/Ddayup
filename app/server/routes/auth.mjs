@@ -7,6 +7,8 @@
  * 依赖通过 deps 注入，避免与主文件产生循环 import。
  */
 
+import { clientIp } from '../lib/client-ip.mjs';
+
 /**
  * 注册认证路由组。
  * @param {ReturnType<import('../core/http-router.mjs').createHttpRouter>} router
@@ -41,11 +43,8 @@ export function registerAuthRoutes(router, deps) {
   const MAX_PER_MIN = 20;
   const accountFails = new Map(); // key: email -> { count, lockedUntil }
   const ipWindow = new Map();     // key: ip -> { count, resetAt }
-  function getClientIp(req) {
-    const xff = req.headers['x-forwarded-for'];
-    if (typeof xff === 'string' && xff.length) return xff.split(',')[0].trim();
-    return req.socket?.remoteAddress || 'unknown';
-  }
+  // ★2026-09-16：客户端 IP 取法统一收敛到 lib/client-ip.mjs（此前本文件与
+  //   routes/extension-license.mjs 各写一份等价实现，行为一致但属重复代码）。
 
   /**
    * 注册与重置密码共用的入参校验。
@@ -88,7 +87,7 @@ export function registerAuthRoutes(router, deps) {
 
   router.register('POST', '/api/auth/login', async (req, res) => {
     // ---- 速率限制 / 失败锁定 ----
-    const ip = getClientIp(req);
+    const ip = clientIp(req);
     const now = Date.now();
 
     // IP 维度：滑动窗口（每分钟 MAX_PER_MIN 次）

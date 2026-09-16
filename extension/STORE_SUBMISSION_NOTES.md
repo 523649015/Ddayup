@@ -269,7 +269,7 @@ Productivity / Photo & Media
 |---|---|---|---|
 | 月付 monthly | ¥18 / 月 | 30 天 | 自动续费 |
 | 年付 yearly | ¥168 / 年（≈¥14/月） | 365 天 | 比月付省 ~22% |
-| 永久 lifetime | ¥398 一次性 | 9999 天 | 限首发期促销 |
+| 永久 lifetime | ¥498 一次性 | 9999 天 | 限首发期促销 |
 
 > 价格仅为建议，需在 `/pricing` 页与 `extension-license.mjs` 的 `PLAN_DAYS` 一致；如走 Paddle 需以美元定价（Paddle 自动换算本地币种）。
 
@@ -297,3 +297,18 @@ Productivity / Photo & Media
 - Edge 明确禁止扩展内嵌支付 UI，必须跳外部网页结账（当前 `goToPricing()` 已是该模式，✅ 合规）。
 - 商店列表里需声明"应用内购买/订阅"（`in-app purchases` 标注），避免审核下架。
 - 免费试用 7 天 + 过期阻断是符合"声明付费功能"要求的（当前 `FREE_MODE=false` 已是阻断模式）。
+
+## 十三、一键更新脚本（打包 + 自动上传）
+
+为免除每次手动走第八/九节流程，新增 `extension/tools/update-edge-store.ps1`：一条命令完成「构建商店包 →（有凭证时）自动调 Edge 加载项更新 API 上传提审 → 无凭证则回退打开网页+打印清单」。
+
+- **链路 A · 打包**：复用 `build-store-package.ps1`，与上传无关，永远执行。
+- **链路 B · 上传 API**：仅当存在 `EDGE_ADDON_API_KEY` + `EDGE_ADDON_CLIENT_ID`（微软在 Partner Center「发布 API」页面下发）时触发，走 v1.1 `ApiKey` + `X-ClientID` 认证，端点 `https://api.addons.microsoftedge.microsoft.com/v1`。
+- 用法与凭证分类存储：见 `extension/tools/EDGE_UPDATE_GUIDE.md`（含如何申请 ApiKey+ClientID、三种凭证配置方式、版本号规则、故障排查）。
+- 当前目标版本 `0.2.7`（含「版本更新提醒 + 自动更新」新功能），产品 ID `jpcnchdcjaapokighokneachmbkeafan`。
+- ✅ **2026-09-15 首次全自动提交成功**：`.\update-edge-store.ps1` 走 API 完成
+  上传包(202) → 轮询 Succeeded → 发布草稿(202) → 轮询 Succeeded → 进入审核队列，
+  全程无人工点按。凭证存于 `extension/tools/edge-api-config.ps1`（gitignore，不入库）。
+- 打包排残已加固：`build-store-package.ps1` 现排除 `probe_jingxuan/`、嵌套 `*.zip` 与开发文档，
+  商店包由 1.36MB/61 文件降至 0.66MB/53 文件；`tools/verify-store-package.ps1` 提供 16 项自动校验。
+- 若线上已发布更高版本，运行加 `-BumpPatch` 自动升版本号再打包（满足商店新包版本必须递增）。

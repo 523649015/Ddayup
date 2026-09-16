@@ -43,10 +43,15 @@
             <circle id="pupilRight" cx="62" cy="50" r="3.6" fill="#06231d"/>
           </g>
         </svg>
-        Ddayup 素材采集 <span id="statusDot" class="dot gray"></span> <span id="trialBadge" class="lic-badge"></span>
+        Ddayup 素材采集 <span id="statusDot" class="dot gray"></span> <span id="trialBadge" class="lic-badge"></span> <span id="accountBtn" class="lic-badge" style="cursor:pointer;background:rgba(88,166,255,.18);color:#58a6ff;margin-left:6px" title="账号中心：我的设备 / 订单 / 忘记密码">账号</span>
       </h1>
       <div class="sub" id="pageInfo">初始化中…</div>
     </header>
+
+    <!-- 授权到期提醒横幅（试用剩余≤3天 / 已过期时由 license.js 显示，显著引导前往官网注册/订阅）-->
+    <div id="licNotice" style="display:none"></div>
+    <!-- 版本更新提醒横幅（发现新版本时由版本更新模块显示，支持「立即更新」/ 自动应用）-->
+    <div id="updateNotice" style="display:none"></div>
 
     <div class="preview">
       <img id="previewThumb" class="previewThumb" alt="" />
@@ -126,12 +131,16 @@
 
     <details>
       <summary>按类型自定义保存路径（支持中文）</summary>
-      <div class="pathRow" data-type="image"><span class="pathType">📸 图片</span><button class="pathPick" data-type="image" title="点此弹出系统目录选择框，选中任意绝对目录（如 D:\素材\图片）。需 Chrome 桌面版支持「文件系统访问 API」。">选择目录</button><input class="pathInput" data-type="image" type="text" placeholder="或填相对子目录，如 浏览器下载素材/图片" title="若浏览器不支持选目录，可在此填相对子目录名（用 / 或 \ 分隔），下载会存到「浏览器下载目录\Ddayup\<你填的>\」。注意：扩展无法写入任意绝对盘符路径（如 D:\...），要指定绝对路径请用上方「选择目录」按钮。" /><button class="pathApply" data-type="image" title="应用上方文本框输入的子目录">应用</button><span class="pathText" data-type="image">未设置</span><button class="pathTest" data-type="image" title="写入一个测试文件，验证该目录可写">测试</button><button class="pathClear" data-type="image" title="清除该类型的目录设置（含相对子目录）">✕</button></div>
-      <div class="pathRow" data-type="video"><span class="pathType">🎬 视频</span><button class="pathPick" data-type="video" title="点此弹出系统目录选择框，选中任意绝对目录（如 D:\素材\视频）。需 Chrome 桌面版支持「文件系统访问 API」。">选择目录</button><input class="pathInput" data-type="video" type="text" placeholder="或填相对子目录，如 浏览器下载素材/视频" title="若浏览器不支持选目录，可在此填相对子目录名（用 / 或 \ 分隔），下载会存到「浏览器下载目录\Ddayup\<你填的>\」。注意：扩展无法写入任意绝对盘符路径（如 D:\...），要指定绝对路径请用上方「选择目录」按钮。" /><button class="pathApply" data-type="video" title="应用上方文本框输入的子目录">应用</button><span class="pathText" data-type="video">未设置</span><button class="pathTest" data-type="video" title="写入一个测试文件，验证该目录可写">测试</button><button class="pathClear" data-type="video" title="清除该类型的目录设置（含相对子目录）">✕</button></div>
-      <div class="pathRow" data-type="audio"><span class="pathType">🎵 音频</span><button class="pathPick" data-type="audio" title="点此弹出系统目录选择框，选中任意绝对目录（如 D:\素材\音频）。需 Chrome 桌面版支持「文件系统访问 API」。">选择目录</button><input class="pathInput" data-type="audio" type="text" placeholder="或填相对子目录，如 浏览器下载素材/音频" title="若浏览器不支持选目录，可在此填相对子目录名（用 / 或 \ 分隔），下载会存到「浏览器下载目录\Ddayup\<你填的>\」。注意：扩展无法写入任意绝对盘符路径（如 D:\...），要指定绝对路径请用上方「选择目录」按钮。" /><button class="pathApply" data-type="audio" title="应用上方文本框输入的子目录">应用</button><span class="pathText" data-type="audio">未设置</span><button class="pathTest" data-type="audio" title="写入一个测试文件，验证该目录可写">测试</button><button class="pathClear" data-type="audio" title="清除该类型的目录设置（含相对子目录）">✕</button></div>
-      <div class="pathRow" data-type="model"><span class="pathType">🧊 3D模型</span><button class="pathPick" data-type="model" title="点此弹出系统目录选择框，选中任意绝对目录（如 D:\素材\模型）。需 Chrome 桌面版支持「文件系统访问 API」。">选择目录</button><input class="pathInput" data-type="model" type="text" placeholder="或填相对子目录，如 浏览器下载素材/模型" title="若浏览器不支持选目录，可在此填相对子目录名（用 / 或 \ 分隔），下载会存到「浏览器下载目录\Ddayup\<你填的>\」。注意：扩展无法写入任意绝对盘符路径（如 D:\...），要指定绝对路径请用上方「选择目录」按钮。" /><button class="pathApply" data-type="model" title="应用上方文本框输入的子目录">应用</button><span class="pathText" data-type="model">未设置</span><button class="pathTest" data-type="model" title="写入一个测试文件，验证该目录可写">测试</button><button class="pathClear" data-type="model" title="清除该类型的目录设置（含相对子目录）">✕</button></div>
-      <div class="pathRow" data-type="archive"><span class="pathType">📦 归档</span><button class="pathPick" data-type="archive" title="点此弹出系统目录选择框，选中任意绝对目录（如 D:\素材\归档）。需 Chrome 桌面版支持「文件系统访问 API」。">选择目录</button><input class="pathInput" data-type="archive" type="text" placeholder="或填相对子目录，如 浏览器下载素材/归档" title="若浏览器不支持选目录，可在此填相对子目录名（用 / 或 \ 分隔），下载会存到「浏览器下载目录\Ddayup\<你填的>\」。注意：扩展无法写入任意绝对盘符路径（如 D:\...），要指定绝对路径请用上方「选择目录」按钮。" /><button class="pathApply" data-type="archive" title="应用上方文本框输入的子目录">应用</button><span class="pathText" data-type="archive">未设置</span><button class="pathTest" data-type="archive" title="写入一个测试文件，验证该目录可写">测试</button><button class="pathClear" data-type="archive" title="清除该类型的目录设置（含相对子目录）">✕</button></div>
-      <div class="pathRow" data-type="netdisk"><span class="pathType">☁ 网盘</span><button class="pathPick" data-type="netdisk" title="点此弹出系统目录选择框，选中任意绝对目录。需 Chrome 桌面版支持「文件系统访问 API」。未单独设则复用「归档」目录。">选择目录</button><input class="pathInput" data-type="netdisk" type="text" placeholder="或填相对子目录，如 浏览器下载素材/网盘" title="若浏览器不支持选目录，可在此填相对子目录名（用 / 或 \ 分隔），下载会存到「浏览器下载目录\Ddayup\<你填的>\」。注意：扩展无法写入任意绝对盘符路径（如 D:\...），要指定绝对路径请用上方「选择目录」按钮。" /><button class="pathApply" data-type="netdisk" title="应用上方文本框输入的子目录">应用</button><span class="pathText" data-type="netdisk">未设置</span><button class="pathTest" data-type="netdisk" title="写入一个测试文件，验证该目录可写">测试</button><button class="pathClear" data-type="netdisk" title="清除该类型的目录设置（含相对子目录）">✕</button></div>
+      <!-- 保存路径（单一入口「选择目录」）：点按钮 → 后端原生目录选择器(FolderBrowserDialog)弹出系统目录框，
+           返回【真实绝对路径】→ 存入 dirPath:<type> → 下载时由本地服务(127.0.0.1:3000)经 /api/media/save-to-dir
+           直写该目录（落盘可靠、已 E2E 验证 sha256 一致）。这与「手动粘贴绝对路径」是同一可靠通道，只是入口是系统对话框。
+           FSA 句柄(showDirectoryPicker)在侧栏不可靠/不持久，仅作后端不可用时的兜底。未设置则落默认 Ddayup/<sub>/。 -->
+      <div class="pathRow" data-type="image"><span class="pathType">📸 图片</span><button class="pathPick" data-type="image" title="点此选择该类型素材的保存目录（弹出系统目录选择框，返回真实绝对路径）。选定后该类素材将直接存入该目录。">选择目录</button><span class="pathText" data-type="image">未设置 · 默认 Ddayup/images/</span><button class="pathTest" data-type="image" title="验证该目录可写">测试</button><button class="pathClear" data-type="image" title="清除该类型的目录设置">✕</button></div>
+      <div class="pathRow" data-type="video"><span class="pathType">🎬 视频</span><button class="pathPick" data-type="video" title="点此选择该类型素材的保存目录（弹出系统目录选择框，返回真实绝对路径）。选定后该类素材将直接存入该目录。">选择目录</button><span class="pathText" data-type="video">未设置 · 默认 Ddayup/videos/</span><button class="pathTest" data-type="video" title="验证该目录可写">测试</button><button class="pathClear" data-type="video" title="清除该类型的目录设置">✕</button></div>
+      <div class="pathRow" data-type="audio"><span class="pathType">🎵 音频</span><button class="pathPick" data-type="audio" title="点此选择该类型素材的保存目录（弹出系统目录选择框，返回真实绝对路径）。选定后该类素材将直接存入该目录。">选择目录</button><span class="pathText" data-type="audio">未设置 · 默认 Ddayup/audio/</span><button class="pathTest" data-type="audio" title="验证该目录可写">测试</button><button class="pathClear" data-type="audio" title="清除该类型的目录设置">✕</button></div>
+      <div class="pathRow" data-type="model"><span class="pathType">🧊 3D模型</span><button class="pathPick" data-type="model" title="点此选择该类型素材的保存目录（弹出系统目录选择框，返回真实绝对路径）。选定后该类素材将直接存入该目录。">选择目录</button><span class="pathText" data-type="model">未设置 · 默认 Ddayup/models/</span><button class="pathTest" data-type="model" title="验证该目录可写">测试</button><button class="pathClear" data-type="model" title="清除该类型的目录设置">✕</button></div>
+      <div class="pathRow" data-type="archive"><span class="pathType">📦 归档</span><button class="pathPick" data-type="archive" title="点此选择该类型素材的保存目录（弹出系统目录选择框，返回真实绝对路径）。选定后该类素材将直接存入该目录。">选择目录</button><span class="pathText" data-type="archive">未设置 · 默认 Ddayup/archives/</span><button class="pathTest" data-type="archive" title="验证该目录可写">测试</button><button class="pathClear" data-type="archive" title="清除该类型的目录设置">✕</button></div>
+      <div class="pathRow" data-type="netdisk"><span class="pathType">☁ 网盘</span><button class="pathPick" data-type="netdisk" title="点此选择该类型素材的保存目录（弹出系统目录选择框，返回真实绝对路径）。选定后该类素材将直接存入该目录。">选择目录</button><span class="pathText" data-type="netdisk">未设置 · 默认 Ddayup/netdisk/</span><button class="pathTest" data-type="netdisk" title="验证该目录可写">测试</button><button class="pathClear" data-type="netdisk" title="清除该类型的目录设置">✕</button></div>
       <div class="pathDiagRow" style="display:flex;align-items:center;gap:8px;padding:8px 12px 4px"><button id="pathDiagnose" style="flex:0 0 auto;padding:4px 10px;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9;cursor:pointer;font-size:11px">🔍 诊断保存目录</button><span style="color:#6e7681;font-size:10px">点一下，把下方结果截图发我即可定位</span></div>
     </details>
 
@@ -151,7 +160,7 @@
       <div id="ydDesc" style="color:#8b949e;margin-bottom:10px;">正在检查本机 yt-dlp 与 Ddayup Web 后端（127.0.0.1:3000）。</div>
       <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
         <button class="install-btn" id="ydStartBackendBtn" style="display:none;padding:6px 14px;border:0;border-radius:7px;background:#238636;color:#fff;cursor:pointer;font-size:12px;font-weight:600;">▶ 启动 Ddayup 后端</button>
-        <button class="install-btn" id="ydConnectBtn" style="padding:6px 14px;border:0;border-radius:7px;background:#3b82f6;color:#fff;cursor:pointer;font-size:12px;font-weight:600;">⚡ 一键连接 yt-dlp（本地）</button>
+        <button class="install-btn" id="ydConnectBtn" style="display:none;padding:6px 14px;border:0;border-radius:7px;background:#3b82f6;color:#fff;cursor:pointer;font-size:12px;font-weight:600;">⚡ 一键连接 yt-dlp（本地）</button>
         <button class="yd-link" id="ydWebBtn" style="padding:6px 10px;border:1px solid #30363d;border-radius:7px;background:transparent;color:#58a6ff;cursor:pointer;font-size:12px;">或前往 Web 模型面板</button>
         <span id="ydSpinner" style="display:none;color:#8b949e;font-size:12px;">⏳ 正在安装 / 连接…</span>
         <span id="ydDismiss" style="margin-left:auto;color:#6e7681;cursor:pointer;font-size:11px;user-select:none;" title="不再提示（本机永久隐藏）">不再提示 ✕</span>
@@ -169,6 +178,56 @@
     <div class="hint">双击预览原图/视频/音频 · 右键保存/下载/找相似 · 直接拖拽卡片仅可到<b>桌面/文件夹</b>（Chrome 限制，拖到微信/PS 无效）· 图片请点预览里的「📋 复制图片」再在微信按 Ctrl+V · 顶部筛选栏可排除小图标与低分辨率</div>
     <div class="hint" style="color:#6e7681;border-top:1px solid #21262d;padding-top:8px;margin-top:2px;">⚠️ 温馨提示：本面板采集的素材仅供个人<b>自用与学习参考</b>，请勿用于商业用途或二次分发；使用前请遵守各素材源平台的版权与许可协议。</div>
 
+    <!-- ===== 底部：Bug 反馈入口（点击弹出联系二维码）===== -->
+    <div id="feedbackBar" style="display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;padding:9px 0 4px;border-top:1px solid #21262d;margin-top:6px;">
+      <button id="feedbackBtn" title="遇到问题？点此扫码反馈" style="cursor:pointer;border:1px solid #30363d;background:#121518;color:#c9d1d9;padding:5px 12px;border-radius:8px;font-size:12px">🐞 Bug 反馈</button>
+      <span style="font-size:11px;color:#6e7681">QQ 523649015@qq.com</span>
+    </div>
+
+    <!-- ===== 账号中心（我的设备 / 订单 / 忘记密码）===== -->
+    <div class="overlay" id="accountOverlay" style="display:none;z-index:1001">
+      <div class="overlayContent" style="max-width:480px">
+        <button class="closeBtn" id="accClose">&times;</button>
+        <div class="pname" style="margin-bottom:8px">👤 我的账号</div>
+        <div id="accEmail" style="font-size:13px;color:#c9d1d9;margin-bottom:4px">未登录</div>
+        <!-- 未登录引导（对应「账号」功能）：去官网完成登录 / 注册。
+             与底部「订阅 / 支付」是两个不同引导页 —— 账号→官网登录页，订阅→官网付费页。 -->
+        <div id="accGoWebWrap" style="display:none;margin:8px 0 4px">
+          <button id="accGoWeb" class="accent" style="padding:7px 12px;font-size:12px">去官网登录 / 注册</button>
+          <div style="font-size:11px;color:#6e7681;margin-top:6px">在官网完成登录 / 注册后，回到本面板点「刷新授权」即可同步状态。</div>
+        </div>
+        <!-- accMaxWrap 默认隐藏：未登录时不显示「最多 N 台」，避免用户误以为已同步到后端数据 -->
+        <div id="accMaxWrap" style="font-size:12px;color:#8b949e;margin-bottom:6px;display:none">我的设备（最多 <span id="accMax">3</span> 台，超出后需解绑旧设备）</div>
+        <div id="accDevices" style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px"></div>
+        <!-- 我的订单：折叠显示（默认收起，避免面板被订单列表撑长） -->
+        <details id="accOrdersFold" style="margin-bottom:12px">
+          <summary style="cursor:pointer;font-size:12px;color:#8b949e;user-select:none">我的订单（<span id="accOrdersCount">0</span>）</summary>
+          <div id="accOrdersList" style="display:flex;flex-direction:column;gap:8px;margin-top:8px"></div>
+        </details>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button id="accForgot" class="hint" style="cursor:pointer;border:1px solid #30363d;background:transparent;color:#58a6ff;padding:6px 12px;border-radius:7px">忘记密码？</button>
+          <button id="accOrders" class="hint" style="cursor:pointer;border:1px solid #30363d;background:transparent;color:#58a6ff;padding:6px 12px;border-radius:7px" title="前往官网完成订阅与支付（订单明细已在上方列表展示）">订阅 / 支付</button>
+          <button id="accRefresh" class="hint" style="cursor:pointer;border:1px solid #30363d;background:transparent;color:#3fb950;padding:6px 12px;border-radius:7px" title="重新查询授权状态（付款 / 登录后点此立即生效，无需重开面板）">刷新授权</button>
+          <button id="accForceLogin" class="hint" style="display:none;cursor:pointer;border:1px solid #d29922;background:transparent;color:#f0c674;padding:6px 12px;border-radius:7px" title="该账号已在其他设备登录">踢出旧设备并登录</button>
+          <button id="accLogout" class="hint" style="cursor:pointer;border:1px solid #7f1d1d;background:transparent;color:#fca5a5;padding:6px 12px;border-radius:7px">退出登录</button>
+        </div>
+        <div id="accStatus" style="font-size:12px;color:#58a6ff;min-height:16px;margin-top:8px"></div>
+      </div>
+    </div>
+
+    <!-- ===== Bug 反馈二维码（点击底部「Bug 反馈」弹出）===== -->
+    <div class="overlay" id="feedbackOverlay" style="display:none;z-index:1002">
+      <div class="overlayContent" style="max-width:340px;text-align:center">
+        <button class="closeBtn" id="fbClose">&times;</button>
+        <div class="pname" style="margin-bottom:10px">🐞 Bug 反馈 / 联系我</div>
+        <img src="icons/feedback-qr.png" alt="联系二维码" style="width:220px;height:220px;border-radius:10px;background:#fff;padding:6px" />
+        <div style="font-size:12px;color:#8b949e;margin-top:10px;line-height:1.6">
+          微信扫码添加好友反馈问题<br />
+          或邮件至 <b style="color:#c9d1d9">523649015@qq.com</b>
+        </div>
+      </div>
+    </div>
+
     <!-- ===== 授权 / 付费墙（试用过期或需激活时显示）===== -->
     <div class="overlay" id="licensePaywall" style="display:none;z-index:1000">
       <div class="overlayContent" style="max-width:460px">
@@ -181,13 +240,16 @@
         <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px">
           <input id="lpEmail" type="email" placeholder="邮箱" style="padding:8px 10px;border-radius:6px;border:1px solid #30363d;background:#0d1117;color:#e6edf3" />
           <input id="lpPassword" type="password" placeholder="密码（至少 6 位）" style="padding:8px 10px;border-radius:6px;border:1px solid #30363d;background:#0d1117;color:#e6edf3" />
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#8b949e;cursor:pointer;user-select:none"><input id="lpRemember" type="checkbox" checked style="margin:0" /> 记住我（本机保存，下次自动登录，与官网账号同一套）</label>
           <button id="lpLogin" class="accent" style="padding:8px 0">登录</button>
           <button id="lpRegister" class="accent" style="padding:8px 0;background:#238636">注册并开通试用</button>
         </div>
 
         <!-- 付费订阅：仅跳转官网网页（Edge 禁止扩展内嵌支付 UI）-->
         <div style="font-size:12px;color:#8b949e;margin:6px 0">7 天试用结束后需付费订阅才能继续使用采集功能</div>
-        <button id="lpUpgrade" class="accent" style="width:100%;padding:10px 0;background:#2f81f7;font-size:14px;margin-bottom:10px">💳 去官网订阅（微信 / 国际卡）</button>
+        <button id="lpUpgrade" class="accent" style="width:100%;padding:10px 0;background:#2f81f7;font-size:14px;margin-bottom:6px">💳 去官网订阅（微信 / 国际卡）</button>
+        <!-- 付款后无需重开面板：点此立即重新查询授权状态 -->
+        <button id="lpRefresh" class="hint" style="width:100%;padding:7px 0;background:transparent;border:1px solid #30363d;color:#3fb950;font-size:12px;border-radius:8px;cursor:pointer;margin-bottom:10px">已完成支付 / 登录？点此刷新授权</button>
 
         <!-- 激活码（兼容离线购买渠道）-->
         <div style="font-size:12px;color:#8b949e;margin-bottom:6px">或输入付费激活码</div>

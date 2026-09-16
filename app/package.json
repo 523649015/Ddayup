@@ -33,6 +33,7 @@
     "test:gate": "node ../scripts/run-decision-gate.mjs",
     "preview": "vite preview",
     "test": "vitest run",
+    "test:server": "vitest run --config vitest.server.config.mjs",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:e2e": "playwright test"

@@ -54,6 +54,8 @@ import {
   getImageAnalysisEngineOptions,
   type AnalysisEngineOption,
 } from '@/config/analysisModelOptions';
+import { EXTENSION_STORE_URL } from '@/config/extensionStore';
+import { SHOW_DEV_INSTALL } from '@/config/environment';
 
 import { SourceBadge } from '@/components/SourceBadge';
 
@@ -1564,13 +1566,35 @@ export function AssetLibrary() {
               )}
             </div>
             <div className="mt-3 text-xs leading-relaxed text-[#8b949e]">
-              <strong className="text-[#e6edf3]">安装步骤：</strong>
-              <ol className="mt-1 list-decimal space-y-1 pl-4">
-                <li>在「模型下载」面板下载扩展包（.zip）并解压到本地目录；</li>
-                <li>打开 <code className="rounded bg-[#0f1317] px-1 text-[#9bf5df]">chrome://extensions</code>（Edge 为 edge://extensions）；</li>
-                <li>右上角开启「开发者模式」，点「加载已解压的扩展程序」并选择解压目录；</li>
-                <li>确认扩展已「启用」（开关打开、无报错），回到本页刷新即可采集。</li>
-              </ol>
+              <strong className="text-[#e6edf3]">安装方式（推荐）：</strong>
+              <div className="mt-1.5">
+                <a
+                  href={EXTENSION_STORE_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-[#1f6feb] bg-[#1f6feb]/15 px-3 py-1.5 text-xs font-medium text-[#7cc4ff] transition hover:bg-[#1f6feb]/25"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  从 Edge 加载项商店安装
+                </a>
+                <div className="mt-1.5 text-[10px]">
+                  在商店页点「获取」即完成安装；安装后由 Edge 自动保持最新版本，回到本页刷新即可采集。
+                </div>
+              </div>
+              {/* 本地开发环境才展示本地加载方式；线上站点整块隐藏，不暴露 edge://extensions */}
+              {SHOW_DEV_INSTALL ? (
+                <details className="mt-2">
+                  <summary className="cursor-pointer text-[10px] text-[#8b949e]">备用方案：本地加载（本地开发 / 调试用）</summary>
+                  <ol className="mt-1 list-decimal space-y-1 pl-4 text-[10px]">
+                    <li>打开 <code className="rounded bg-[#0f1317] px-1 text-[#9bf5df]">chrome://extensions</code>（Edge 为 edge://extensions）；</li>
+                    <li>右上角开启「开发者模式」，点「加载已解压的扩展程序」并选择 <code className="rounded bg-[#0f1317] px-1 text-[#9bf5df]">extension/</code> 目录；</li>
+                    <li>确认扩展已「启用」（开关打开、无报错），回到本页刷新即可采集。</li>
+                    <li className="text-[#8b949e]">此方式不会自动更新，仅供本地开发调试。</li>
+                  </ol>
+                </details>
+              ) : (
+                <div className="mt-2 text-[10px] text-[#6e7681]">Chrome 版正在上架流程中，敬请期待。</div>
+              )}
             </div>
             <div className="mt-4 flex justify-end gap-2">
               <button

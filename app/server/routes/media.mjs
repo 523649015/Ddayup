@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { checkExtensionEntitlement } from './extension-license.mjs';
+import { isTrustedLoopbackRequest } from '../lib/client-ip.mjs';
 
 export function registerMediaRoutes(router, deps) {
   const {
@@ -56,11 +57,11 @@ export function registerMediaRoutes(router, deps) {
   }
 
   // ★2026-09-13 F3=A 环回放行：probe-dir / save-to-dir 仅写本机磁盘、不碰外网，
-  // 当请求来自 127.0.0.1 时跳过设备授权网关（防代理滥用），远程(proxy/yt-dlp 等)端点保留 gateEntitlement。
-  function isLoopback(req) {
-    const a = (req && req.socket && req.socket.remoteAddress) || '';
-    return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1' || a === '::ffff:7f00:1';
-  }
+  // 本机直连时跳过设备授权网关，远程(proxy/yt-dlp 等)端点保留 gateEntitlement。
+  // ★2026-09-16 安全修复（隐藏缺陷）：原实现只看 req.socket.remoteAddress，
+  //   而线上 nginx 反代到 127.0.0.1:8792 后它对【所有公网请求】都是 127.0.0.1
+  //   → 等于公网匿名可绕过授权网关。现改用 XFF 首跳判定的 isTrustedLoopbackRequest。
+  const isLoopback = (req) => isTrustedLoopbackRequest(req);
 
   router.register('GET', '/api/curator/preview-proxy', async (req, res, url) => {
     return handleCuratorPreviewProxy(req, res, url);

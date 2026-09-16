@@ -124,6 +124,19 @@ console.log('BACKEND_DOWN'
 console.log(p+'
 f.endsWith('.mjs'))
 
+# 部署脚本产生的日志（本机）
+.deploy-dist-log.txt
+.deploy-log.txt
+
+# Edge 加载项「一键更新」工具目录需要入库。
+# 注意：上方第 14 行的通用规则 `tools/` 会把 extension/tools/ 整个目录排除，
+# 导致一键更新脚本与文档丢失，故在此显式放行该目录及其内容。
+!extension/tools/
+!extension/tools/*
+# API 凭证（与「一键打包」无关，单独分类存储，绝不入库）
+extension/tools/edge-api-config.ps1
+extension/tools/.env
+
 # 扩展大二进制 / 构建产物（Node 运行时副本 91MB、打包 exe 37MB、录像产物 79MB —— 绝不入库）
 extension/*.zip
 extension/native-host/*.exe

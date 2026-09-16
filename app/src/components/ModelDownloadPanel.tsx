@@ -14,6 +14,8 @@ import {
 } from 'lucide-react';
 import { clearProgress, getAllDownloadProgress, loadModel, type ModelDownloadProgress } from '@/services/modelLoader';
 import { PRESET_MODELS, SEARCH_EXTENSIONS, type PresetModel } from '@/config/presetModels';
+import { EXTENSION_STORE_URL } from '@/config/extensionStore';
+import { SHOW_DEV_INSTALL } from '@/config/environment';
 import {
   checkPresetUpdates,
   clearPresetInstalled,
@@ -149,6 +151,29 @@ interface RuntimeCardItem {
   job?: RuntimeInstallJob | null;
 }
 
+/**
+ * 运行时安装接口的身份（2026-09-16 服务端收紧为「已授权设备 / 运维 Key」才可调用）。
+ * 官网侧优先取 URL query（与 PricingPage 的 ?deviceId=&token= 同源约定），
+ * 其次读 localStorage（供扩展同步登录后写入的场景）；本机直连由服务端回环放行，不依赖此值。
+ */
+function readRuntimeAuth(): { deviceId: string; token: string } {
+  try {
+    const sp = new URLSearchParams(window.location.search);
+    const deviceId = (sp.get('deviceId') || '').trim();
+    const token = (sp.get('token') || '').trim();
+    if (deviceId) return { deviceId, token };
+    return {
+      deviceId: (window.localStorage.getItem('hmdaoDeviceId') || '').trim(),
+      token: (window.localStorage.getItem('hmdaoToken') || '').trim(),
+    };
+  } catch {
+    return { deviceId: '', token: '' };
+  }
+}
+
+const INSTALL_AUTH_HINT_401 = '缺少设备标识：请从浏览器扩展内进入本页，或先在扩展内登录 / 开启试用。';
+const INSTALL_AUTH_HINT_402 = '当前设备未授权（试用已到期或未开通）：请订阅后重试运行时安装。';
+
 // PRESET_MODELS 与 SEARCH_EXTENSIONS 现统一定义于 @/config/presetModels，便于全局引用与扩展。
 
 function formatBytes(bytes: number): string {
@@ -239,9 +264,15 @@ function runtimeBadge(configured: boolean, detected: boolean) {
 }
 
 function doctorBadge(status: RuntimeDoctorRuntime['status'] | undefined) {
+  // 仅在用户主动自检（或安装完成后自动自检）后才会有结果：
+  //   ok   → 自检通过
+  //   warn → 需补完整链路
+  //   其它（未安装/校验未通过）→ 显示「未安装」，不再用刺眼的「自检失败」
+  // 未自检（status 为空）→ 返回 null，徽标整体不渲染
   if (status === 'ok') return { className: 'bg-[#00d4aa]/12 text-[#9bf5df]', label: '自检通过' };
   if (status === 'warn') return { className: 'bg-[#f59e0b]/12 text-[#fbd38d]', label: '需补完整链路' };
-  return { className: 'bg-[#f85149]/12 text-[#ffb4b4]', label: '自检失败' };
+  if (status) return { className: 'bg-[#1a8cff]/12 text-[#7cc4ff]', label: '未安装' };
+  return null;
 }
 
 function updateBadge(update: RuntimeUpdateStatus | undefined) {
@@ -851,7 +882,7 @@ function ComfyEngineCard() {
   );
 }
 
-export function ModelDownloadPanel() {
+export function ModelDownloadPanel({ active = true }: { active?: boolean } = {}) {
   const [progressList, setProgressList] = useState<ModelDownloadProgress[]>([]);
   const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set());
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimePayload>(null);
@@ -928,11 +959,13 @@ export function ModelDownloadPanel() {
   };
 
   useEffect(() => {
+    // ★性能：面板不可见时停止 300ms 进度轮询（常驻面板不再后台空转）
+    if (!active) return undefined;
     const timer = setInterval(() => {
       setProgressList(getAllDownloadProgress());
     }, 300);
     return () => clearInterval(timer);
-  }, []);
+  }, [active]);
 
   // 挂载时基于 IndexedDB 真实缓存重新判定「已安装」并做版本检查（刷新/重登后不丢状态）
   useEffect(() => {
@@ -1006,9 +1039,13 @@ export function ModelDownloadPanel() {
 
   const loadRuntimeInstallJobs = useCallback(async () => {
     try {
-      const response = await fetch('/api/health/local-post/runtime/install-jobs');
+      const auth = readRuntimeAuth();
+      const jobsQuery = auth.deviceId ? `?deviceId=${encodeURIComponent(auth.deviceId)}` : '';
+      const response = await fetch(`/api/health/local-post/runtime/install-jobs${jobsQuery}`);
       if (!response.ok) {
-        throw new Error(`运行时安装任务读取失败：HTTP ${response.status}`);
+        throw new Error(response.status === 401 || response.status === 402
+          ? '需要先在扩展内登录 / 开启试用后才能查看云端安装任务。'
+          : `运行时安装任务读取失败：HTTP ${response.status}`);
       }
       const payload = await response.json().catch(() => null) as { jobs?: RuntimeInstallJob[] } | null;
       const nextJobs = Object.fromEntries(
@@ -1021,10 +1058,14 @@ export function ModelDownloadPanel() {
   }, []);
 
   useEffect(() => {
+    // ★注意：这里【不要】自动执行 runRuntimeDoctor。
+    //   以前挂载即全量自检，用户一打开面板就满屏红色「自检失败」——
+    //   用户尚未安装这些本地运行时，失败是预期状态，不该以失败告警的形式呈现。
+    //   现在改为：仅加载「已配置/已发现」状态与安装任务；自检结果只在
+    //   用户点「安装后一键自检」或安装任务完成（runRuntimeDoctor(true)）后才展示。
     void loadRuntimeStatus(false);
-    void runRuntimeDoctor(false);
     void loadRuntimeInstallJobs();
-  }, [loadRuntimeInstallJobs, loadRuntimeStatus, runRuntimeDoctor]);
+  }, [loadRuntimeInstallJobs, loadRuntimeStatus]);
 
   useEffect(() => {
     const activeJobs = Object.values(runtimeJobs).filter((job) => isRuntimeJobActive(job));
@@ -1111,15 +1152,22 @@ export function ModelDownloadPanel() {
     if (isRuntimeJobActive(runtimeJobs[runtimeKey])) return;
     setRuntimeError('');
     try {
-      const response = await fetch('/api/health/local-post/runtime/install', {
+      // 服务端闸门需身份（已授权设备 / 运维 Key），本机直连由回环放行
+      const auth = readRuntimeAuth();
+      const installQuery = auth.deviceId ? `?deviceId=${encodeURIComponent(auth.deviceId)}` : '';
+      const response = await fetch(`/api/health/local-post/runtime/install${installQuery}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           runtimeKey,
           requestedAction: runtimeDoctor.runtimes[runtimeKey]?.update?.updateAvailable ? 'update' : 'install',
           targetDir: runtimeTargetDir.trim(),
+          deviceId: auth.deviceId,
+          token: auth.token,
         }),
       });
+      if (response.status === 401) throw new Error(INSTALL_AUTH_HINT_401);
+      if (response.status === 402) throw new Error(INSTALL_AUTH_HINT_402);
       if (!response.ok) {
         throw new Error(`启动安装失败：HTTP ${response.status}`);
       }
@@ -1582,11 +1630,11 @@ export function ModelDownloadPanel() {
 
         {/* ===== 分区三：浏览器内模型 ===== */}
         <div style={{ order: 1 }}>
-        <PluginZone title="浏览器内模型" accent="purple" summary="免费 · 本地运行" subtitle="NLLB 翻译 · 搜索 / 素材采集扩展">
+        <PluginZone title="浏览器内模型" accent="purple" summary="本地运行" subtitle="NLLB 翻译 · 搜索 / 素材采集扩展">
         {/* ===== 浏览器扩展安装入口（MV3，Chrome / Edge 通用） ===== */}
         <div className="space-y-2">
           <div className="flex items-center justify-between">
-            <span className="text-[10px] font-medium uppercase tracking-wider text-[#6e7681]">网页素材采集扩展</span>
+            <span className="text-[10px] font-medium uppercase tracking-wider text-[#6e7681]">Ddayup网页素材采集扩展</span>
             <button
               type="button"
               onClick={async () => {
@@ -1615,10 +1663,11 @@ export function ModelDownloadPanel() {
                     draggable={false}
                   />
                   <span className="text-[9px] text-[#00d4aa] bg-[#00d4aa]/10 px-1.5 py-0.5 rounded">MV3</span>
-                  <span className="text-[9px] text-[#7cc4ff] bg-[#1a8cff]/10 px-1.5 py-0.5 rounded">Chrome / Edge</span>
+                  <span className="text-[9px] text-[#7cc4ff] bg-[#1a8cff]/10 px-1.5 py-0.5 rounded">Edge 商店已上架</span>
+                  <span className="text-[9px] text-[#f59e0b] bg-[#f59e0b]/10 px-1.5 py-0.5 rounded">7天免费体验 · 付费</span>
                 </div>
                 <p className="mt-0.5 text-[10px] text-[#6e7681]">
-                  解压加载后，可一键采集任意网页的图片 / 视频 / 音效 / 3D 模型，支持「保存到本地自定义目录（含中文路径）」与「导入 HMDao 素材库」。
+                  安装即享 7 天免费体验，到期后需订阅（微信 / 国际卡）才能继续采集。可一键采集任意网页的图片 / 视频 / 音效 / 3D 模型，支持「保存到本地自定义目录（含中文路径）」与「导入 Ddayup 素材库」。
                 </p>
                 <div className="mt-2 flex flex-wrap items-center gap-2">
                   {extInstalled === null ? (
@@ -1628,24 +1677,51 @@ export function ModelDownloadPanel() {
                       已安装 ✓ {renderBuildSummary(extBuilds)} · 在素材库点「网络资产采集」直接使用
                     </span>
                   ) : (
-                    <span className="text-[9px] text-[#d29922] bg-[#d29922]/10 px-1.5 py-0.5 rounded">未安装，按下方步骤加载</span>
+                    <span className="text-[9px] text-[#d29922] bg-[#d29922]/10 px-1.5 py-0.5 rounded">未安装，点击下方「从 Edge 商店安装」</span>
                   )}
                 </div>
               </div>
             </div>
 
-            {/* 安装步骤（默认折叠） */}
+            {/* 首选：Edge 加载项商店一键安装（链接由扩展 ID 决定，永久不变） */}
+            <div className="mt-2.5 flex flex-wrap items-center gap-2">
+              <a
+                href={EXTENSION_STORE_URL}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-[#1f6feb] bg-[#1f6feb]/15 px-2.5 py-1.5 text-[10px] font-medium text-[#7cc4ff] transition hover:bg-[#1f6feb]/25"
+              >
+                <ExternalLink className="h-3 w-3" />
+                从 Edge 加载项商店安装
+              </a>
+              <span className="text-[9px] text-[#6e7681]">安装后由 Edge 自动保持最新版本</span>
+            </div>
+
+            {/* 安装说明（默认折叠） */}
             <details className="group mt-3 border-t border-[#21262d] pt-3">
               <summary className="flex cursor-pointer list-none items-center gap-2 text-[10px] text-[#c9d1d9] marker:content-none">
-                <span>安装步骤</span>
+                <span>安装说明 / 备用方案</span>
                 <ChevronDown className="h-3 w-3 text-[#8b949e] transition group-open:rotate-180" />
               </summary>
               <ol className="mt-2 space-y-1.5 text-[10px] leading-5 text-[#9aa4af]">
-                <li>1. 打开浏览器扩展页：Chrome 访问 <code className="text-[#7cc4ff]">chrome://extensions</code>，Edge 访问 <code className="text-[#7cc4ff]">edge://extensions</code>，并开启「开发者模式」。</li>
-                <li>2. 点「加载已解压的扩展程序」，选择本项目目录下的 <code className="text-[#7cc4ff]">extension/</code> 文件夹。</li>
-                <li>3. 加载后扩展即生效；在素材库点「网络资产采集」即可（无需复制扩展 ID）。</li>
-                <li>4. 也可直接点击浏览器工具栏的 Ddayup 扩展图标，自动打开采集侧栏并扫描当前页。</li>
+                <li>1. 点上方「从 Edge 加载项商店安装」，在商店页点「获取」即完成安装（推荐，后续自动更新）。</li>
+                <li>2. 安装后扩展即生效；在素材库点「网络资产采集」即可。</li>
+                <li>3. 也可直接点击浏览器工具栏的 Ddayup 扩展图标，自动打开采集侧栏并扫描当前页。</li>
+                <li className="text-[#8b949e]">该商店链接永久不变（由扩展 ID 决定，与版本无关），无需随版本更新更换。</li>
               </ol>
+
+              {/* 备用方案：本地加载 —— 仅本地开发环境展示（线上自动隐藏，避免外部二次加载/二次开发）。
+                  线上站点访问时 SHOW_DEV_INSTALL=false，整块不渲染，页面不含任何 edge://extensions 字样。 */}
+              {SHOW_DEV_INSTALL && (
+                <details className="mt-2 border-t border-[#21262d] pt-2">
+                  <summary className="cursor-pointer text-[10px] text-[#8b949e]">备用方案：本地加载（本地开发 / 调试用）</summary>
+                  <ol className="mt-1.5 space-y-1.5 text-[10px] leading-5 text-[#9aa4af]">
+                    <li>1. 打开浏览器扩展页：Chrome 访问 <code className="text-[#7cc4ff]">chrome://extensions</code>，Edge 访问 <code className="text-[#7cc4ff]">edge://extensions</code>，并开启「开发者模式」。</li>
+                    <li>2. 点「加载已解压的扩展程序」，选择本项目目录下的 <code className="text-[#7cc4ff]">extension/</code> 文件夹。</li>
+                    <li>3. 此方式不会自动更新、需手动重载；普通用户请优先使用上方商店安装。</li>
+                  </ol>
+                </details>
+              )}
             </details>
 
             <div className="mt-2 flex items-center gap-2">
@@ -1818,7 +1894,7 @@ export function ModelDownloadPanel() {
                     <div className="flex flex-wrap items-center gap-2">
                       <p className="text-xs font-medium text-[#c9d1d9]">{runtime.title}</p>
                       <span className={`rounded-full px-2 py-0.5 text-[9px] ${statusBadge.className}`}>{statusBadge.label}</span>
-                      {doctor ? <span className={`rounded-full px-2 py-0.5 text-[9px] ${doctorState.className}`}>{doctorState.label}</span> : null}
+                      {doctor && doctorState ? <span className={`rounded-full px-2 py-0.5 text-[9px] ${doctorState.className}`}>{doctorState.label}</span> : null}
                       <span className={`rounded-full px-2 py-0.5 text-[9px] ${nextUpdate.className}`}>{nextUpdate.label}</span>
                       {jobState ? <span className={`rounded-full px-2 py-0.5 text-[9px] ${jobState.className}`}>{jobState.label}</span> : null}
                     </div>

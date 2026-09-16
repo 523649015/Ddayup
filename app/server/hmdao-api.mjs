@@ -124,6 +124,7 @@ import { createHttpRouter } from './core/http-router.mjs';
 import { registerHealthRoutes } from './routes/health.mjs';
 import { registerAuthRoutes } from './routes/auth.mjs';
 import { registerExtensionLicenseRoutes } from './routes/extension-license.mjs';
+import { registerExtensionOcrRoutes } from './routes/extension-ocr.mjs';
 import { registerByokRoutes } from './routes/byok.mjs';
 import { registerAria2Routes } from './routes/aria2.mjs';
 import * as aria2Manager from './lib/aria2-manager.mjs';
@@ -709,13 +710,32 @@ import {
 // ★2026-08-18 修复：删除硬编码 C:\Users\123\yt-dlp.exe 兜底 —— 该路径遗留的是 PyInstaller onefile 旧版，
 // 仍会触发"运行时自解压黑窗"问题（windowsHide:true 无法抑制 onefile 内置 bootloader 的弹窗）。
 // 现仅保留「受信任位置」（全局 PATH），其他位置必须由「模型下载面板」一键安装到本机独立目录。
-const YT_DLP_PATHS = [
-  '/usr/local/bin/yt-dlp',
-  '/usr/bin/yt-dlp',
-  'yt-dlp',
-];
+// ★2026-09-16 修复（A）：旧清单 ['/usr/local/bin/yt-dlp','/usr/bin/yt-dlp','yt-dlp'] 有两个硬伤：
+//   1) 缺平台后缀名 —— Linux/macOS 的 onedir 产物名为 yt-dlp_linux / yt-dlp_macos，装了也匹配不到；
+//   2) 裸文件名 'yt-dlp' 交给 existsSync 时按【当前工作目录】解析（不是 PATH 查找）→ 几乎永不命中。
+//   现改为「平台候选名 × PATH + 常见 bin 目录」的显式路径展开（候选名与安装/探测同源，
+//   均走 platformExecutableCandidates，避免三处漂移）。
+function resolveYtDlpPathCandidates() {
+  const info = buildPlatformInfo();
+  const names = platformExecutableCandidates('yt-dlp', info.platform);
+  const dirs = [
+    info.homedir ? path.join(info.homedir, '.local', 'bin') : '',
+    ...info.extraBinDirs,
+    ...info.pathDirs,
+  ].filter(Boolean);
+  const out = [];
+  for (const dir of dirs) {
+    for (const name of names) out.push(path.join(dir, name));
+  }
+  return [...new Set(out)];
+}
 function resolveYtDlpPath() {
-  // 优先使用「模型下载面板」一键安装的托管运行时（用户可在任意机器下载安装，已强制 onedir，无黑窗）。
+  // 0) 显式环境变量优先：运维在服务器上手工装好 yt-dlp 后可直接指向，无需依赖「一键安装」。
+  const envPath = String(process.env.HMDAO_YT_DLP_PATH || '').trim();
+  if (envPath) {
+    try { if (existsSync(envPath)) return envPath; } catch (_) {}
+  }
+  // 1) 优先使用「模型下载面板」一键安装的托管运行时（用户可在任意机器下载安装，已强制 onedir，无黑窗）。
   // ★2026-09-01 修复（/api/platform/ytdlp 与 /api/youtube/extract 恒 503 的真凶）：
   //   旧代码用 require('fs').accessSync(...) —— 本文件是 ESM(.mjs)，且顶层只 import 了
   //   `promises as fs`（注意：那是 fs.promises，**没有 accessSync**），也从未 createRequire
@@ -727,7 +747,8 @@ function resolveYtDlpPath() {
   if (managed) {
     try { if (existsSync(managed)) return managed; } catch (_) {}
   }
-  for (const p of YT_DLP_PATHS) {
+  // 2) PATH / 常见 bin 目录 × 平台候选名（含 yt-dlp_linux / yt-dlp_macos）
+  for (const p of resolveYtDlpPathCandidates()) {
     try { if (existsSync(p)) return p; } catch (_) {}
   }
   return null; // 找不到就返回 null，让上层 spawn 报错走「安装 yt-dlp」提示
@@ -1649,7 +1670,7 @@ function pickActivatedCloudImageAnalysisRuntime(preferred = null) {
 // 聊天与图片分析都走"平台里免费额度的模型"，并在多个免费模型之间轮换，避免单模型限流/额度耗尽。
 // TokenHub 内置免费文本/视觉模型池（走 HMDAO_AI_KEY，腾讯免费额度通道）。
 const TOKENHUB_FREE_CHAT_MODELS = [
-  'hy3', 'glm-5.2', 'qwen3.5-plus', 'deepseek-v4-flash',
+  'qwen3.7-flash', 'hy3', 'glm-5.2', 'qwen3.5-plus', 'deepseek-v4-flash',
   'minimax-m3', 'kimi-k2.7-code', 'qwen3.5-flash', 'hunyuan-t1-vision',
 ];
 // 平台免费额度（腾讯 TokenHub）当前无可用视觉模型（hunyuan-t1-vision 不存在、glm-5.2 不收图），
@@ -2080,7 +2101,7 @@ async function refineLocalAnalysisWithFreeLlm(result, fallback) {
   if (!candidate) return result;
   const apiKey = String(candidate.apiKey || process.env.HMDAO_AI_KEY || '').trim();
   const apiUrl = String(candidate.endpoint || process.env.HMDAO_AI_URL || 'https://tokenhub.tencentmaas.com/v1/chat/completions').trim();
-  const model = String(candidate.model || process.env.HMDAO_AI_MODEL || 'hy3').trim();
+  const model = String(candidate.model || process.env.HMDAO_AI_MODEL || 'qwen3.7-flash').trim();
   const prompt = `下面是一段英文图片描述（来自 Florence-2 视觉模型）。请翻译成中文，并拆解为结构化字段，只返回 JSON，不要额外解释：\n{ "subject":"中文主体描述", "subjectColors":"具体颜色如酒红色丝绒", "subjectDetails":"材质/纹理/服饰/细节", "action":"动作或姿态，无则写静态", "expression":"表情，无人物脸部写none", "scene":"场景", "style":"风格", "lighting":"光影", "camera":"镜头/运镜", "mood":"情绪", "promptZh":"可复现的中文生成提示词(可附推荐模型与比例)", "promptEn":"英文生成提示词" }\n英文描述：${rawCaption}`;
   try {
     const controller = new AbortController();
@@ -11553,6 +11574,8 @@ registerHealthRoutes(apiRouter, {
   PORT,
   send,
   readJson,
+  // ★2026-09-16：运行时写操作闸门需读设备授权数据（checkExtensionEntitlement(DATA_DIR, deviceId)）
+  DATA_DIR,
   isRealApiProxyEnabled,
   buildPlatformInfo,
   buildLocalPostBackendStatus,
@@ -11606,6 +11629,9 @@ registerExtensionLicenseRoutes(apiRouter, {
   writeUsers,
   hashPassword,
   verifyPassword,
+  // 供「官网登录态 → 扩展令牌」打通使用：按官网 access_token 解析当前用户 id。
+  // 注意不能复用 requireToken（它也读 Authorization: Bearer，会把官网令牌误判成 BAD_TOKEN）。
+  getUserFromRequest,
   // 方案 A：供 Edge 扩展查询本机 yt-dlp 状态（原生主机握手接口用）。
   // 直接复用既有的托管目录探测函数，零新增探测逻辑。
   detectYtDlpStatus: () => {
@@ -11614,6 +11640,9 @@ registerExtensionLicenseRoutes(apiRouter, {
     return Promise.resolve({ installed: false, path: null, version: null });
   },
 });
+
+// 截图识文 OCR / 翻译接口（自带授权闸口：trial/paid 可用，none/expired 拒绝）
+registerExtensionOcrRoutes(apiRouter, { send, readJson, DATA_DIR });
 
 registerByokRoutes(apiRouter, {
   send,
@@ -11741,6 +11770,7 @@ registerMediaRoutes(apiRouter, {
   send,
   serveLocalModel,
   serveTransformersModule,
+  DATA_DIR,
 });
 
 registerCobuildRoutes(apiRouter, {
@@ -11915,7 +11945,7 @@ function parseAgentPlan(content) {
 async function runAgentReasoning({ text, history = [], canvasSummary = '', scope = 'global' }) {
   const fallbackKey = process.env.HMDAO_AI_KEY || 'sk-dAViKE9mAm0RqXdfc8nFYn4xAYyOlMjp0l0LcfnmgYdfUcni';
   const fallbackUrl = process.env.HMDAO_AI_URL || 'https://tokenhub.tencentmaas.com/v1/chat/completions';
-  const fallbackModel = process.env.HMDAO_AI_MODEL || 'hy3';
+  const fallbackModel = process.env.HMDAO_AI_MODEL || 'qwen3.7-flash';
   // 轮换：优先用 nextFreeLlm 选中的那个免费模型，失败再依次回退其余候选
   const chatPool = collectFreeLlmCandidates('chat');
   const chatStart = nextFreeLlm('chat');

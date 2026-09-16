@@ -45,7 +45,16 @@ export function platformExecutableCandidates(baseName, platform = process.platfo
   const base = String(baseName || '').trim().replace(/\.exe$/i, '');
   if (!base) return [];
   // 各平台都保留 .exe 候选，兼容用户手动放入的跨平台产物
-  return platform === 'win32' ? [`${base}.exe`, base] : [base, `${base}.exe`];
+  if (platform === 'win32') return [`${base}.exe`, base];
+  // ★2026-09-16 修复（A：云端/线上「一键安装 yt-dlp」必然失败的真因）：
+  //   yt-dlp 的 onedir 产物是【带平台后缀】的二进制（Linux=yt-dlp_linux / macOS=yt-dlp_macos），
+  //   而旧候选只有 [base, base.exe] → findFileRecursively 是「文件名精确匹配」→ 恒不命中 →
+  //     ① 安装阶段直接抛 'ytdlp-executable-missing-after-prepare'（装不上）；
+  //     ② 探测阶段 detectManagedLocalPostYtDlpPath 恒返回空（configured:false → 上层一律 503）。
+  //   纯增量：多出的候选只有在同名文件真实存在时才命中，对 gmic / oiiotool / ocioconvert /
+  //   aria2c / ffmpeg（这些本身无平台后缀）的既有行为零影响。
+  const platformSuffix = platform === 'darwin' ? '_macos' : '_linux';
+  return [...new Set([base, `${base}${platformSuffix}`, `${base}.exe`])];
 }
 
 // P1-3: 当前平台对应的 yt-dlp GitHub 资产名与落地文件名。

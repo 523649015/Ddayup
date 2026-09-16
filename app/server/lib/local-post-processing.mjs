@@ -508,19 +508,42 @@ export function detectManagedLocalPostOcioConfigPath() {
   return readManagedRuntimeFile('ocio', 'configPath');
 }
 
+// ★2026-09-16 新增（PATH 回退）：旧探测只看「托管清单 + 托管目录」，
+//   于是用系统包管理器装的运行时（apt install ffmpeg / aria2，brew install ffmpeg 等）
+//   一律被判成"未安装"，面板永远显示未就绪 —— 而这正是境内网络下最现实的安装方式。
+//   现按平台候选名扫描 PATH + 常见 bin 目录（与 hmdao-api 的 yt-dlp 解析口径一致）。
+export function findInSystemPath(baseName, info = buildPlatformInfo()) {
+  const names = platformExecutableCandidates(baseName, info.platform);
+  const dirs = [
+    info.homedir ? path.join(info.homedir, '.local', 'bin') : '',
+    ...(info.extraBinDirs || []),
+    ...(info.pathDirs || []),
+  ].filter(Boolean);
+  for (const dir of dirs) {
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      try { if (existsSync(candidate)) return candidate; } catch (_) { /* 忽略无权限目录 */ }
+    }
+  }
+  return '';
+}
+
 export function detectManagedLocalPostYtDlpPath() {
   return readManagedRuntimeFile('ytdlp', 'executablePath')
-    || findFileRecursively(buildManagedRuntimePaths('ytdlp').currentDir, platformExecutableCandidates('yt-dlp'));
+    || findFileRecursively(buildManagedRuntimePaths('ytdlp').currentDir, platformExecutableCandidates('yt-dlp'))
+    || findInSystemPath('yt-dlp');
 }
 
 export function detectManagedLocalPostAria2Path() {
   return readManagedRuntimeFile('aria2', 'executablePath')
-    || findFileRecursively(buildManagedRuntimePaths('aria2').currentDir, platformExecutableCandidates('aria2c'));
+    || findFileRecursively(buildManagedRuntimePaths('aria2').currentDir, platformExecutableCandidates('aria2c'))
+    || findInSystemPath('aria2c');
 }
 
 export function detectManagedLocalPostFfmpegPath() {
   return readManagedRuntimeFile('ffmpeg', 'executablePath')
-    || findFileRecursively(buildManagedRuntimePaths('ffmpeg').currentDir, platformExecutableCandidates('ffmpeg'));
+    || findFileRecursively(buildManagedRuntimePaths('ffmpeg').currentDir, platformExecutableCandidates('ffmpeg'))
+    || findInSystemPath('ffmpeg');
 }
 
 export function resolveLocalPostYtDlpBackend() {

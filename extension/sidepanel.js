@@ -3080,20 +3080,21 @@ setTimeout(() => {
 // 仅当原生主机可用且 yt-dlp 尚未安装时，静默触发 ytdlp.ensure 自动下载（多源回退 + 断点续传）。
 // 已装则跳过；原生主机不可用（朋友未跑安装器）则仅提示，不阻断。
 setTimeout(() => {
-  checkYtDlp().then((st) => {
+  checkYtDlp().then(async (st) => {
     if (st !== 'missing') return; // ready / unreachable 都不动
-    const port = ddNativeConnect();
-    if (!port) { ensureYtDlpPrompt(); refreshYtDlpNotice(); return; }
-    const id = 'sidepanel-autoensure-' + Date.now();
-    const onMsg = (msg) => {
-      if (msg && msg.id === id) {
-        port.onMessage.removeListener(onMsg);
-        if (msg.ok && msg.installed) { hideYtDlpPrompt(); refreshYtDlpNotice(); }
-      }
-    };
-    port.onMessage.addListener(onMsg);
-    try { port.postMessage({ id, type: 'ytdlp.ensure' }); }
-    catch (_) { ensureYtDlpPrompt(); refreshYtDlpNotice(); }
+    // ★2026-09-16 修复（B 同类隐患）：原实现用裸 port.postMessage 且【无超时】，
+    //   原生主机不回包时 onMessage 监听器永不移除（泄漏），且用户得不到任何反馈。
+    //   现统一走带超时的 ddNativeRpc；本路径是静默自动行为，失败只回退到横幅引导，不打断用户。
+    try {
+      // ★2026-09-16（审查 重要-4）：与用户点「一键连接」共用单飞 Promise，
+      //   否则首屏"静默安装 + 用户点击"两路并发会让 host 侧同写一个 .part 文件而损坏。
+      const r = await ensureYtDlpOnce();
+      if (r && r.ok && (r.installed || r.success)) { hideYtDlpPrompt(); refreshYtDlpNotice(); }
+      else { ensureYtDlpPrompt(); refreshYtDlpNotice(); }
+    } catch (_) {
+      ensureYtDlpPrompt();
+      refreshYtDlpNotice();
+    }
   }).catch(() => {});
 }, 1500);
 
@@ -3142,52 +3143,58 @@ function ddNativeConnect() {
   return ddNativePort;
 }
 
-// 通用原生主机 RPC（请求-响应，带超时）
+// 通用原生主机 RPC（请求-响应，带超时 + 断开即拒绝）
 function ddNativeRpc(type, payload = {}, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
     const port = ddNativeConnect();
     if (!port) { ddNativeAvailable = false; return reject(new Error('native_unavailable')); }
     const id = 'dd-native-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
     let done = false;
+    const cleanup = () => {
+      try { port.onMessage.removeListener(onMsg); } catch (_) {}
+      try { port.onDisconnect.removeListener(onDisc); } catch (_) {}
+      clearTimeout(timer);
+    };
+    // ★2026-09-16 修复（审查 重要-1）：原生主机中途崩溃/被结束时 onDisconnect 会触发，
+    //   但旧实现只把 ddNativePort 置空、不 reject 在飞请求 → 请求要等满 timeoutMs 才失败，
+    //   而 ytdlp.ensure 的超时是 180s，用户体感仍是"点了没反应"（只是从"永久"变成"最长 3 分钟"）。
+    //   现与 nativeClient.js 的 rpc() 语义对齐：断开立刻以 native_disconnected 拒绝。
+    const onDisc = () => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(new Error('native_disconnected'));
+    };
     const timer = setTimeout(() => {
-      if (!done) { done = true; port.onMessage.removeListener(onMsg); reject(new Error('native_timeout')); }
+      if (!done) { done = true; cleanup(); reject(new Error('native_timeout')); }
     }, timeoutMs);
     const onMsg = (msg) => {
       if (msg && msg.id === id) {
         if (done) return;
         done = true;
-        clearTimeout(timer);
-        port.onMessage.removeListener(onMsg);
+        cleanup();
         resolve(msg);
       }
     };
     port.onMessage.addListener(onMsg);
+    try { port.onDisconnect.addListener(onDisc); } catch (_) {}
     try { port.postMessage({ id, type, ...payload }); }
-    catch (e) { if (!done) { done = true; clearTimeout(timer); reject(e); } }
+    // ★原实现此处只 reject 不摘监听器 → 遗留监听器；现统一走 cleanup()
+    catch (e) { if (!done) { done = true; cleanup(); reject(e); } }
   });
 }
 
 // 经原生主机查询 yt-dlp 状态（返回 {installed, nativeUnavailable?}）
-function checkNativeYtDlp() {
-  return new Promise((resolve) => {
-    const port = ddNativeConnect();
-    if (!port) return resolve({ installed: false, nativeUnavailable: true });
-    let done = false;
-    const timer = setTimeout(() => { if (!done) { done = true; resolve({ installed: false, nativeUnavailable: true }); } }, 8000);
-    const onMsg = (msg) => {
-      if (msg && (msg.type === 'ytdlp.status' || msg.type === 'host.ready')) {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        port.onMessage.removeListener(onMsg);
-        const installed = !!(msg.installed || (msg.ytdlp && msg.ytdlp.installed));
-        resolve({ installed, nativeUnavailable: false });
-      }
-    };
-    port.onMessage.addListener(onMsg);
-    try { port.postMessage({ id: 'sidepanel-status', type: 'ytdlp.status' }); }
-    catch (_) { if (!done) { done = true; clearTimeout(timer); resolve({ installed: false, nativeUnavailable: true }); } }
-  });
+// ★2026-09-16 修复（审查 次要-4）：原实现手写裸 port.postMessage + 固定 id，并发调用会互相
+//   错配应答，且超时分支不摘监听器（每次刷新都遗留一个）。现统一走带超时/断开拒绝的 ddNativeRpc。
+async function checkNativeYtDlp() {
+  try {
+    const msg = await ddNativeRpc('ytdlp.status', {}, 8000);
+    const installed = !!(msg && (msg.installed || (msg.ytdlp && msg.ytdlp.installed)));
+    return { installed, nativeUnavailable: false };
+  } catch (e) {
+    return { installed: false, nativeUnavailable: true, reason: String((e && e.message) || e) };
+  }
 }
 
 // ★2026-08-11：扩展加载时自动检测并启动 Ddayup Web 后端（原生主机托管 Node 进程）
@@ -3310,11 +3317,19 @@ async function ensureBackendRunningNative(options = {}) {
   return { ok: false, error: '后端启动后健康检查超时' };
 }
 
-async function checkYtDlp() {
+// ★2026-09-16（审查 阻断-1）：新增 autoInstall 开关。
+//   渲染横幅（refreshYtDlpNotice）/状态轮询只读探测，绝不触发安装；否则会形成
+//   refresh → checkYtDlp → autoInstallYtDlpViaCloud → refresh 的无限请求循环（已实测复现）。
+async function checkYtDlp(options = {}) {
+  const { autoInstall = true } = options || {};
   // 优先问原生主机（方案 A 主通道）
   const nat = await checkNativeYtDlp().catch(() => ({ installed: false, nativeUnavailable: true }));
   if (nat.nativeUnavailable === false) {
     ddNativeAvailable = true;
+    // ★2026-09-16 修复（审查 重要-2）：记录结论来源，供文案区分「本机缺」与「云端缺」。
+    //   旧实现只看配置里的 base 是否云端，而默认配置（DEFAULT_API_BASE 就是云端域名）下，
+    //   本机通道给出的 missing 会被写成"云端未安装 yt-dlp" —— 但云端其实从未被探测过。
+    __ytDlpLastSource = 'native';
     return nat.installed ? 'ready' : 'missing';
   }
   // 回退：Web 后端 /api/health（走云端配置地址）
@@ -3338,68 +3353,158 @@ async function checkYtDlp() {
     const auto = await ensureBackendRunningNative({ silent: true }).catch(() => ({ ok: false }));
     if (auto.ok) webSt = await probeWeb();
   }
+  // ★2026-09-16（审查 重要-2）：以下结论来自 Web / 云端通道，而非本机原生主机通道
+  __ytDlpLastSource = 'web';
   // ★2026-08-24 自愈：云端部署场景下，后端可达但 yt-dlp 未装 → 自动触发云端安装，无需用户手动点。
   // 仅当云端地址非本机时启用（本机场景保留原生主机「一键连接」交互）。
   if (webSt === 'missing') {
     const base = await getCloudApiBase().catch(() => 'http://127.0.0.1:3000');
     const isCloud = !/127\.0\.0\.1|localhost/.test(base);
-    if (isCloud && !autoYtDlpInstallInFlight()) {
+    if (autoInstall && isCloud && !autoYtDlpInstallInFlight()) {
       autoInstallYtDlpViaCloud(base);
     }
   }
   return webSt;
 }
 
-// 标记自愈安装是否正在进行（避免重复触发 install 任务）。
+// 自愈安装的再入保护：内存占位 + 时间戳冷却。
+// ★2026-09-16 修复（审查 阻断-2 / 重要-2）：
+//   旧实现用 localStorage 布尔量且【从不清零、无 TTL】——侧栏在 3 分钟轮询中被关闭，
+//   标记会永久留在 '1'，之后所有会话的自愈安装全部失效（且没有任何提示）；
+//   而无身份/被拒分支又不置位 → refreshYtDlpNotice → checkYtDlp → 再次自愈 → 无限请求循环。
+//   现改为「进行中标记（内存）+ 最近尝试时间戳（冷却窗口）」，两者任一命中都不再触发。
+const YTDLP_AUTO_INSTALL_COOLDOWN_MS = 5 * 60 * 1000;
+// ★审查 重要-1：占位若因异常/挂起没能复位，会永久禁用自愈。故占位带"开始时间"，
+//   超过 STALE 视为失效（不依赖 finally 必达；finally 仍是主要复位手段）。
+const YTDLP_AUTO_INSTALL_STALE_MS = 30 * 1000;
+let __ytDlpAutoInstallRunning = false;
+let __ytDlpAutoInstallStartedAt = 0;
+let __ytDlpLastAttemptAt = 0; // 内存兜底：localStorage 写入失败时冷却依然生效（审查 次要-4）
 function autoYtDlpInstallInFlight() {
-  try { return localStorage.getItem('hmdao_ytDlpAutoInstalling') === '1'; } catch (_) { return false; }
+  if (__ytDlpAutoInstallRunning) {
+    return (Date.now() - __ytDlpAutoInstallStartedAt) < YTDLP_AUTO_INSTALL_STALE_MS;
+  }
+  let persisted = 0;
+  try { persisted = Number(localStorage.getItem('hmdao_ytDlpAutoInstallingAt') || 0) || 0; } catch (_) { persisted = 0; }
+  const lastAt = Math.max(__ytDlpLastAttemptAt, persisted);
+  return lastAt > 0 && (Date.now() - lastAt) < YTDLP_AUTO_INSTALL_COOLDOWN_MS;
 }
-function setAutoYtDlpInstallInFlight(v) {
-  try { localStorage.setItem('hmdao_ytDlpAutoInstalling', v ? '1' : '0'); } catch (_) {}
+function markAutoYtDlpInstallAttempt() {
+  __ytDlpLastAttemptAt = Date.now();
+  try { localStorage.setItem('hmdao_ytDlpAutoInstallingAt', String(__ytDlpLastAttemptAt)); } catch (_) {}
+  // 清理历史布尔键：它没有 TTL，会把用户永久卡在"不再自动安装"的死状态
+  try { localStorage.removeItem('hmdao_ytDlpAutoInstalling'); } catch (_) {}
+}
+// 给「可能永不 settle」的读取加超时（chrome.storage 回调在极端情况下不回，会让自愈卡死）
+function withTimeout(promise, ms, fallback) {
+  return Promise.race([
+    Promise.resolve(promise).catch(() => fallback),
+    new Promise((resolve) => { setTimeout(() => resolve(fallback), ms); }),
+  ]);
 }
 
 // 云端自愈：POST /api/health/local-post/runtime/install 触发后端静默安装 yt-dlp，并轮询就绪。
-// 云端部署后该接口受 HMDAO_API_KEY 保护：运维可在扩展「选项」页填写 API Key（storage key: ddayupApiKey），
-// 配置后扩展可自动安装；未配置则降级为「提示联系站长」，避免匿名滥用服务器算力。
+// ★2026-09-16 鉴权收紧：该接口已不允许匿名调用——需「已授权设备（trial/paid）」或「运维 API Key」。
+//   因此必须携带 deviceId(+token)，统一取自 ui-utils.js 的 getExtDeviceAuth / withDeviceAuth*（单一来源）。
+//   既无身份也不硬试，只给可执行引导。
+// ★2026-09-16 修复（审查 阻断-1/阻断-2）：
+//   ① 一进函数就占位（__ytDlpAutoInstallRunning）并记录尝试时间，任何分支（含随后的刷新）都不会再入；
+//   ② 横幅刷新放在 finally 且【在复位之后】，避免"被拒 → 立即重试"的热循环；
+//   ③ 请求加 15s 超时，避免挂起的 fetch 让自愈永久锁死。
 async function autoInstallYtDlpViaCloud(base) {
   if (autoYtDlpInstallInFlight()) return;
-  let apiKey = '';
+  __ytDlpAutoInstallRunning = true;
+  __ytDlpAutoInstallStartedAt = Date.now();
+  let hint = '';
+  let needRefresh = false;
   try {
-    if (window.DdayupConfig && window.DdayupConfig.getApiKey) apiKey = String(await window.DdayupConfig.getApiKey());
-  } catch (_) { apiKey = ''; }
-  if (!apiKey) {
-    // 无运维 Key：不匿名调用受保护接口，改为提示站长预装。
-    panelLog('ytDlp-auto-install', { skipped: true, reason: 'no-api-key', hint: '云端运行时未就绪，请联系站长安装 yt-dlp（或在扩展选项填写 API Key 自助安装）。' });
-    const n = document.getElementById('ytDlpNotice');
-    if (n && (!n.style.display || n.style.display === 'none')) {
-      n.style.display = '';
-      const msg = n.querySelector('.ytDlpNoticeMsg');
-      if (msg) msg.textContent = '⚠ 云端 yt-dlp 运行时未就绪，请联系站长安装；运维可在扩展选项填写 API Key 自助安装。';
+    // ★审查 重要-1：身份读取加 3s 超时——chrome.storage 回调若不返回，本函数会卡在 await，
+    //   导致 finally 不可达（占位虽有 STALE 兜底，但也不该把用户晾着）。
+    let apiKey = '';
+    try {
+      if (window.DdayupConfig && window.DdayupConfig.getApiKey) {
+        apiKey = String(await withTimeout(window.DdayupConfig.getApiKey(), 3000, '') || '');
+      }
+    } catch (_) { apiKey = ''; }
+    let auth = { deviceId: '', token: '' };
+    try {
+      if (typeof getExtDeviceAuth === 'function') {
+        const raw = await withTimeout(getExtDeviceAuth(), 3000, null);
+        if (raw) auth = { deviceId: String(raw.deviceId || ''), token: String(raw.token || '') };
+      }
+    } catch (_) { auth = { deviceId: '', token: '' }; }
+
+    if (!auth.deviceId && !apiKey) {
+      // 既无设备身份也无运维 Key：不做匿名尝试（服务端会 401），把原因交给横幅统一渲染。
+      panelLog('ytDlp-auto-install', { skipped: true, reason: 'no-identity' });
+      hint = '（云端未安装 yt-dlp：请在扩展内登录或开启试用后自动安装；运维也可在扩展「选项」填 API Key 自助安装。）';
+      needRefresh = true;
+      return;
     }
-    return;
-  }
-  setAutoYtDlpInstallInFlight(true);
-  panelLog('ytDlp-auto-install', { base, ts: Date.now() });
-  try {
-    const headers = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + apiKey };
-    const r = await fetch(base + '/api/health/local-post/runtime/install?apiKey=' + encodeURIComponent(apiKey), {
+
+    // ★审查 次要-1：打点放在"确定要发请求"之后——否则"无身份"早退也会吃掉 5 分钟冷却，
+    //   用户随后登录/开启试用时会遭遇"该装却装不了"的空窗。
+    markAutoYtDlpInstallAttempt();
+    panelLog('ytDlp-auto-install', { base, ts: Date.now(), byDevice: Boolean(auth.deviceId), byApiKey: Boolean(apiKey) });
+    const headers = { 'Content-Type': 'application/json' };
+    // ★审查 次要-1：运维 Key 只走 Authorization 头，不放进 query（URL 会进访问日志 / Referer）
+    if (apiKey) headers.Authorization = 'Bearer ' + apiKey;
+    // deviceId/token 走请求体（服务端优先读 body.deviceId），URL 保持干净
+    const body = (typeof withDeviceAuthBody === 'function')
+      ? withDeviceAuthBody({ runtimeKey: 'ytdlp' }, auth)
+      : { runtimeKey: 'ytdlp', deviceId: auth.deviceId, token: auth.token };
+    const r = await fetch(base + '/api/health/local-post/runtime/install', {
       method: 'POST',
       credentials: 'omit',
       headers,
-      body: JSON.stringify({ runtimeKey: 'ytdlp' }),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15000),
     });
-    if (!r.ok) { setAutoYtDlpInstallInFlight(false); return; }
-    // 轮询最多约 3 分钟等待 yt-dlp 就绪；就绪后清除标记并刷新横幅。
+    if (!r.ok) {
+      // 401/402 是可解释的拒绝（缺身份 / 未授权）：给出可执行引导，而不是静默失败
+      if (r.status === 401 || r.status === 402) {
+        // ★审查 重要-3：消费服务端可区分的 mode，避免把"从未开通"也写成"试用已到期"
+        const payload = await r.json().catch(() => null);
+        const mode = String((payload && payload.mode) || '');
+        const serverMessage = String((payload && payload.error && payload.error.message) || '');
+        if (serverMessage) panelLog('ytDlp-auto-install', { serverMessage });
+        // ★审查 次要-3：mode 解析失败/未知时用中性文案，避免把"已到期"误述成"从未开通"
+        hint = r.status === 401
+          ? '（云端安装需要身份：请在扩展内登录或开启试用后自动安装。）'
+          : (mode === 'expired'
+            ? '（试用已到期：订阅后即可自动安装云端运行时。）'
+            : (mode === 'none'
+              ? '（本机尚未开通试用：在扩展内开启试用后即可自动安装云端运行时。）'
+              : '（需要先在扩展内开启试用或完成订阅，之后会自动安装云端运行时。）'));
+        needRefresh = true;
+      }
+      panelLog('ytDlp-auto-install', { failed: true, status: r.status });
+      return;
+    }
+
+    // 安装任务已受理：清空历史提示，轮询最多约 3 分钟等待就绪
+    __ytDlpCloudInstallHint = '';
     const start = Date.now();
     const tick = async () => {
-      if (Date.now() - start > 180000) { setAutoYtDlpInstallInFlight(false); return; }
-      const st = await checkYtDlp().catch(() => 'unreachable');
-      if (st === 'ready') { setAutoYtDlpInstallInFlight(false); refreshYtDlpNotice(); return; }
+      if (Date.now() - start > 180000) {
+        // ★审查 次要-3：超时不再静默，写失败原因交单一文案源渲染
+        __ytDlpLastFailure = '⚠ 云端 yt-dlp 自动安装超时（3 分钟未就绪），可在模型下载面板手动重试。';
+        refreshYtDlpNotice();
+        return;
+      }
+      const st = await checkYtDlp({ autoInstall: false }).catch(() => 'unreachable');
+      if (st === 'ready') { refreshYtDlpNotice(); return; }
       setTimeout(tick, 3000);
     };
     setTimeout(tick, 3000);
-  } catch (_) {
-    setAutoYtDlpInstallInFlight(false);
+  } catch (e) {
+    panelLog('ytDlp-auto-install', { error: String((e && e.message) || e) });
+  } finally {
+    // ★顺序关键：先复位占位，再刷新横幅（刷新只做只读探测，不会再触发安装）
+    __ytDlpAutoInstallRunning = false;
+    __ytDlpAutoInstallStartedAt = 0;
+    if (hint) __ytDlpCloudInstallHint = hint;
+    if (needRefresh) { ensureYtDlpPrompt(); refreshYtDlpNotice(); }
   }
 }
 
@@ -3411,6 +3516,49 @@ let __ytDlpPromptShownThisSession = false;
 function ytDlpPromptSuppressed() {
   try { return localStorage.getItem('hmdao_ytDlpPromptSuppressed') === '1'; } catch (_) { return false; }
 }
+// ===== yt-dlp 横幅交互辅助（2026-09-16 修复 B/C/D）=====
+// 单一文案源约定：横幅文案只由 refreshYtDlpNotice() 生成，其它函数只改状态 / 触发刷新。
+// （旧实现在 autoInstallYtDlpViaCloud 内直接 querySelector('.ytDlpNoticeMsg') 写文案，
+//   而 sidepanel.html 中并无该元素 → 那句"云端未安装"提示永远不显示，属死代码。）
+let __ytDlpCloudInstallHint = '';
+// 上一次缺失/就绪结论的来源：'native'=原生主机通道（本机）；'web'=Web/云端通道（审查 重要-2）
+let __ytDlpLastSource = '';
+// 最近一次安装失败原因（由点击入口写入，refreshYtDlpNotice 统一渲染，避免文案与按钮状态脱节）
+let __ytDlpLastFailure = '';
+
+// ★2026-09-16（审查 重要-4）：ytdlp.ensure 单飞。
+//   加载后 1.5s 的静默自动安装、用户点「一键连接」、两路可能同时发生，而 host 侧无锁、
+//   且共用同一个 .part 文件（追加写）→ 并发会让下载交错损坏，表现为"两个入口都失败"。
+//   统一收敛到同一个在飞 Promise，谁先来谁发起，其余复用结果。
+let __ytDlpEnsurePromise = null;
+function ensureYtDlpOnce(timeoutMs = 180000) {
+  if (__ytDlpEnsurePromise) return __ytDlpEnsurePromise;
+  __ytDlpEnsurePromise = ddNativeRpc('ytdlp.ensure', {}, timeoutMs)
+    .finally(() => { __ytDlpEnsurePromise = null; });
+  return __ytDlpEnsurePromise;
+}
+
+// 判定当前后端是「云端」还是「本机」（用于区分缺失文案，避免误导用户去点注定失败的按钮）
+async function isCloudBackend() {
+  try {
+    const base = await getCloudApiBase();
+    return !/127\.0\.0\.1|localhost/i.test(String(base || ''));
+  } catch (_) {
+    return false;
+  }
+}
+
+// 把「一键连接（本地）」换成「前往 Web 模型面板」：
+// 原生主机不可用时该按钮注定失败，留着只会让用户反复点击、反复等待（B 的兜底目标）。
+function switchYtDlpConnectToWeb(connectBtn, webBtn) {
+  try {
+    if (connectBtn) { connectBtn.style.display = 'none'; connectBtn.disabled = true; }
+  } catch (_) {}
+  try {
+    if (webBtn) { webBtn.style.display = ''; webBtn.textContent = '去模型下载面板安装'; }
+  } catch (_) {}
+}
+
 function ensureYtDlpPrompt() {
   const n = document.getElementById('ytDlpNotice');
   if (!n) return;
@@ -3449,27 +3597,50 @@ function ensureYtDlpPrompt() {
   if (connectBtn && !connectBtn.__bound) {
     connectBtn.__bound = true;
     connectBtn.addEventListener('click', async () => {
+      // ★2026-09-16 修复（B）：改用带超时的 ddNativeRpc（与 download.js 的 ytdlp.ensure 一致），
+      //   并保证【任何】失败路径都复位按钮状态。
+      //   旧实现用裸 port.postMessage + 无超时监听：原生主机不回包时 connectBtn.disabled
+      //   永久为 true，表现为"卡死 / 没反应"（用户只能重开侧栏），且没有任何兜底出口。
+      __ytDlpLastFailure = '';
       spinner.style.display = '';
+      spinner.style.color = '#8b949e';
+      spinner.textContent = '⏳ 正在安装 / 连接…';
       connectBtn.disabled = true;
-      const port = ddNativeConnect();
-      if (!port) {
-        spinner.textContent = '原生主机未安装，请先运行安装器';
-        setTimeout(() => { spinner.style.display = 'none'; connectBtn.disabled = false; }, 2500);
+      let result = null;
+      let failure = '';
+      try {
+        // ★2026-09-16（审查 重要-4）：与静默自动安装共用单飞 Promise，避免并发写坏 .part
+        result = await ensureYtDlpOnce(180000);
+      } catch (e) {
+        const msg = String((e && e.message) || e || '');
+        if (msg === 'native_unavailable') failure = 'native_unavailable';
+        else if (msg === 'native_timeout') failure = 'native_timeout';
+        else if (msg === 'native_disconnected') failure = 'native_disconnected';
+        else failure = msg || 'unknown';
+      } finally {
+        // ★关键：无论成功/异常/超时/断开，按钮与转圈一定复位（旧实现漏了异常与超时两条路径）
+        connectBtn.disabled = false;
+        spinner.style.display = 'none';
+        spinner.textContent = '';
+      }
+      if (result && result.ok && (result.installed || result.success)) {
+        __ytDlpLastFailure = '';
+        hideYtDlpPrompt();
+        refreshYtDlpNotice();
         return;
       }
-      const id = 'sidepanel-ensure-' + Date.now();
-      const onMsg = (msg) => {
-        if (msg && msg.id === id) {
-          port.onMessage.removeListener(onMsg);
-          spinner.style.display = 'none';
-          connectBtn.disabled = false;
-          if (msg.ok && msg.installed) { hideYtDlpPrompt(); refreshYtDlpNotice(); }
-          else { spinner.textContent = '连接失败：' + (msg.error || '未知错误'); setTimeout(() => spinner.style.display = 'none', 2500); }
-        }
-      };
-      port.onMessage.addListener(onMsg);
-      try { port.postMessage({ id, type: 'ytdlp.ensure' }); }
-      catch (e) { spinner.style.display = 'none'; connectBtn.disabled = false; }
+      // ★2026-09-16（审查 重要-5）：失败原因写入状态变量，统一交给 refreshYtDlpNotice 渲染，
+      //   并立即重排按钮出口。旧实现只在 spinner 留一句橙字、不刷新 → #ydDesc 仍在教用户
+      //   点一个刚被隐藏的按钮，且按钮文案被永久改写、恢复只能等别的偶然事件。
+      const detail = failure === 'native_unavailable'
+        ? '未检测到原生主机（未安装或被浏览器禁用）'
+        : failure === 'native_timeout'
+          ? '原生主机 180 秒未响应'
+          : failure === 'native_disconnected'
+            ? '原生主机连接中断（进程退出或被结束）'
+            : (result && result.error) ? String(result.error) : (failure || '未知错误');
+      __ytDlpLastFailure = '⚠ 本地安装不可用（' + detail + '），已改用网页安装入口。';
+      refreshYtDlpNotice();
     });
   }
   if (webBtn && !webBtn.__bound) {
@@ -3491,7 +3662,8 @@ function ensureYtDlpPrompt() {
     let tries = 0;
     const t = setInterval(() => {
       tries++;
-      checkYtDlp().then((st) => {
+      // ★2026-09-16（审查 阻断-1）：等待就绪的轮询只做只读探测，不得触发自愈安装
+      checkYtDlp({ autoInstall: false }).then((st) => {
         if (st === 'ready') { hideYtDlpPrompt(); clearInterval(t); n.__watching = false; }
         else if (tries >= 10) { clearInterval(t); n.__watching = false; }
       });
@@ -3511,13 +3683,25 @@ function refreshYtDlpNotice() {
   const wBtn = document.getElementById('ydWebBtn');
 
   Promise.all([
-    checkYtDlp().catch(() => 'unreachable'),
+    // ★2026-09-16（审查 阻断-1）：渲染只读探测，禁止在此触发自愈安装（防无限循环）
+    checkYtDlp({ autoInstall: false }).catch(() => 'unreachable'),
     getBackendStatusViaNative().catch(() => ({ ok: false, nativeUnavailable: true })),
-  ]).then(([ytSt, backendSt]) => {
+    isCloudBackend(),
+  ]).then(([ytSt, backendSt, cloudBackend]) => {
+    // 结论来源：'native'=原生主机通道（本机）；'web'=Web/云端通道（审查 重要-2）
+    const fromNative = __ytDlpLastSource === 'native';
+    const failureNote = __ytDlpLastFailure ? ' ' + __ytDlpLastFailure : '';
+    const showWeb = (label) => { if (wBtn) { wBtn.style.display = ''; wBtn.textContent = label; } };
+
     if (ytSt === 'ready') {
+      __ytDlpLastFailure = '';
       if (dot) dot.style.background = '#3fb950';
       if (title) title.textContent = 'yt-dlp 已就绪';
-      if (desc) desc.textContent = '本机 yt-dlp 可用于解析视频多分辨率与下载。';
+      if (desc) {
+        desc.textContent = fromNative
+          ? '本机 yt-dlp 已就绪，可用于解析视频多分辨率与下载。'
+          : (cloudBackend ? '云端 yt-dlp 已就绪，可用于解析视频多分辨率。' : '后端 yt-dlp 已就绪，可用于解析视频多分辨率。');
+      }
       if (startBtn) startBtn.style.display = 'none';
       if (cBtn) cBtn.style.display = 'none';
       if (wBtn) wBtn.style.display = 'none';
@@ -3528,30 +3712,53 @@ function refreshYtDlpNotice() {
     if (ytSt === 'missing') {
       if (dot) dot.style.background = '#e0b341';
       if (title) title.textContent = '需要 yt-dlp 解析视频直链';
-      if (desc) desc.textContent = '后端已连接，但 yt-dlp 未安装。点击「一键连接」安装本机 yt-dlp，或前往 Web 模型面板安装。';
+      // ★2026-09-16 修复（C+D）：只在原生主机【真正可用】时才展示「一键连接（本地）」——
+      //   否则该按钮注定失败（原生主机都没装，点它只会干等 180 秒），必须直接引导去模型下载面板。
+      const nativeOk = !backendSt.nativeUnavailable;
+      if (nativeOk) {
+        // 该 missing 结论来自原生主机通道 → 就是【本机】缺，不再误写成"云端未安装"
+        if (desc) desc.textContent = '本机 yt-dlp 未安装。点「一键连接」安装到本机，或前往 Web 模型面板安装。' + failureNote;
+        if (cBtn) {
+          // 静默自动安装进行中 → 按钮进入占用态，避免用户重复触发（审查 重要-4）
+          const busy = Boolean(__ytDlpEnsurePromise);
+          cBtn.style.display = '';
+          cBtn.disabled = busy;
+          cBtn.textContent = busy ? '⏳ 正在安装 yt-dlp…' : '⚡ 一键连接 yt-dlp（本地）';
+        }
+        showWeb('或前往 Web 模型面板');
+      } else {
+        // 本机通道不可用：结论若来自 Web 通道且指向云端 → 云端缺失；否则本机/内网后端缺失
+        const cloudMissing = !fromNative && cloudBackend;
+        if (desc) {
+          const base = cloudMissing
+            ? '云端未安装 yt-dlp：请在 Web 模型面板点「安装」，由服务器自行下载安装。'
+            : '未检测到原生主机（未安装或被浏览器禁用），无法自动安装到本机。请前往模型下载面板安装 yt-dlp。';
+          const hint = cloudMissing && __ytDlpCloudInstallHint ? ' ' + __ytDlpCloudInstallHint : '';
+          desc.textContent = base + hint + failureNote;
+        }
+        // 不展示「一键连接（本地）」，直接换成「去模型下载面板安装」
+        switchYtDlpConnectToWeb(cBtn, wBtn);
+      }
       if (startBtn) startBtn.style.display = 'none';
-      if (cBtn) cBtn.style.display = '';
-      if (wBtn) wBtn.style.display = '';
       return;
     }
 
-    // ytSt === 'unreachable'
+    // ytSt === 'unreachable'：两个通道都不可达
     if (backendSt.nativeUnavailable) {
-      // 原生主机未安装：无法自动启动，提示手动方案
       if (dot) dot.style.background = '#8b949e';
       if (title) title.textContent = 'Ddayup 后端未启动';
-      if (desc) desc.textContent = '未检测到原生主机，无法自动启动后端。请先运行 extension/native-host/install-host.ps1 安装原生主机，或手动启动 Ddayup Web App（npm run start / node server/hmdao-api.mjs）。';
+      if (desc) desc.textContent = '未检测到原生主机，且后端不可达。请前往模型下载面板按引导安装 / 启动后端（开发者可运行 extension/native-host/install-host.ps1）。' + failureNote;
       if (startBtn) startBtn.style.display = 'none';
       if (cBtn) cBtn.style.display = 'none';
-      if (wBtn) wBtn.style.display = '';
+      // ★审查 次要-2：所有分支都回写文案，避免上一条状态留下的文案串味
+      showWeb('前往 Web 模型面板');
     } else {
-      // 原生主机已安装但后端未启动：显示启动按钮
       if (dot) dot.style.background = '#1a8cff';
       if (title) title.textContent = 'Ddayup 后端未启动';
-      if (desc) desc.textContent = '原生主机已就绪，可自动启动后端（127.0.0.1:3000 / 8792）。';
+      if (desc) desc.textContent = '原生主机已就绪，可自动启动后端（127.0.0.1:3000 / 8792）。' + failureNote;
       if (startBtn) startBtn.style.display = '';
       if (cBtn) cBtn.style.display = 'none';
-      if (wBtn) wBtn.style.display = '';
+      showWeb('前往 Web 模型面板');
     }
   });
 }
@@ -6678,3 +6885,337 @@ async function maybePromptCloudConfig() {
     }
   } catch (_) {}
 }
+
+// ===== 账号中心：我的设备 / 订单 / 忘记密码（与后端 /api/extension/* 配合）=====
+(function initAccountPanel() {
+  function webBase() {
+    try { return (window.DdayupConfig && window.DdayupConfig.getApiBaseSync && window.DdayupConfig.getApiBaseSync()) || 'https://mingmingchuangyi.cn'; }
+    catch (_) { return 'https://mingmingchuangyi.cn'; }
+  }
+  function $(id) { return document.getElementById(id); }
+  const modeText = { paid: '已授权', trial: '试用中', expired: '已过期', none: '未授权' };
+  const modeClass = { paid: 'paid', trial: 'trial', expired: 'expired', none: '' };
+
+  async function refreshAccount() {
+    const L = window.HMDaoLicense;
+    const emailEl = $('accEmail'), devEl = $('accDevices'), maxEl = $('accMax'), stEl = $('accStatus'), ordEl = $('accOrdersList');
+    const maxWrapEl = $('accMaxWrap');
+    if (!L) return;
+    let prof;
+    try {
+      prof = await L.fetchProfile();
+    } catch (_) {
+      if (emailEl) emailEl.textContent = '网络异常，请检查后端是否可达';
+      if (devEl) devEl.innerHTML = '';
+      if (ordEl) ordEl.innerHTML = '';
+      return;
+    }
+    if (!prof || prof.success === false) {
+      const httpStatus0 = prof && prof.status;
+      const code0 = (prof && prof.error && prof.error.code) || '';
+      // ★2026-09-14 新增：令牌缺失/失效但本机记住过密码 → 静默自动重登一次再重试（_retried 防重入）。
+      if (!refreshAccount._retried && L.autoLoginIfRemembered
+        && (httpStatus0 === 401 || code0 === 'NO_TOKEN' || code0 === 'BAD_TOKEN')) {
+        refreshAccount._retried = true;
+        try {
+          const relogin = await L.autoLoginIfRemembered({ skipTokenCheck: true });
+          if (relogin && relogin.success) { const r = await refreshAccount(); refreshAccount._retried = false; return r; }
+          // ★设备冲突 UX：账号已在其他设备登录 → 不静默踢设备，改为在面板给出「踢出旧设备并登录」入口
+          if (relogin && relogin.error && relogin.error.code === 'NEW_DEVICE_CONFLICT') refreshAccount._deviceConflict = true;
+        } catch (_) { /* ignore */ }
+        refreshAccount._retried = false;
+      }
+      // ★2026-09-14 自愈（令牌失效 + 本机无凭据）：请仍登录的官网重新签发绑定码，自动恢复登录态。
+      //   这是「官网登录过 → 侧栏免登录」的最后一道保险，覆盖服务端重启导致令牌失效的场景。
+      if (!refreshAccount._healed && (httpStatus0 === 401 || code0 === 'NO_TOKEN' || code0 === 'BAD_TOKEN')) {
+        refreshAccount._healed = true;
+        try {
+          const r = await chrome.runtime.sendMessage({ type: 'HMDAO_REQUEST_SITE_LOGIN_SYNC' });
+          if (r && r.ok) {
+            await new Promise((res) => setTimeout(res, 2500)); // 等官网换码 + 扩展绑定完成
+            const rr = await refreshAccount();
+            refreshAccount._healed = false;
+            return rr;
+          }
+        } catch (_) { /* 扩展未就绪：忽略 */ }
+        refreshAccount._healed = false;
+      }
+      // ★分级提示（2026-09-14）：旧实现把所有失败一律写成「未登录或令牌已失效」，
+      //   导致「线上后端未部署该接口（404）」也被误报成令牌问题，排查方向完全跑偏。
+      //   authed() 已把 HTTP 状态码放进 status 字段，这里据此区分。
+      const httpStatus = prof && prof.status;
+      const code = (prof && prof.error && prof.error.code) || '';
+      let msg;
+      if (httpStatus === 404 || httpStatus === 501) {
+        msg = '后端缺少该接口（线上服务未更新），请重新部署后重试';
+      } else if (httpStatus === 401 && code === 'BAD_TOKEN') {
+        msg = '登录已失效，请重新登录（点下方「去官网登录 / 注册」）';
+      } else if (httpStatus === 401 || code === 'NO_TOKEN') {
+        msg = '未登录：点下方「去官网登录 / 注册」完成登录，或在扩展付费墙内登录';
+      } else if (httpStatus === 403) {
+        msg = '无权访问（' + (code || 'FORBIDDEN') + '）';
+      } else if (!httpStatus) {
+        msg = '网络异常，请检查后端是否可达';
+      } else {
+        msg = '加载失败（HTTP ' + httpStatus + (code ? ' · ' + code : '') + '）';
+      }
+      // ★设备冲突：用明确文案 + 显示「踢出旧设备并登录」按钮（用户二次确认后才带 force）
+      const deviceConflict = !!refreshAccount._deviceConflict;
+      refreshAccount._deviceConflict = false;
+      if (deviceConflict) {
+        msg = '该账号已在其他设备登录。要继续在本机使用，请点下方「踢出旧设备并登录」'
+          + '（旧设备上的已购订阅会保留，不影响其付费权益）。';
+      }
+      if (emailEl) emailEl.textContent = msg;
+      if (devEl) devEl.innerHTML = '';
+      if (ordEl) ordEl.innerHTML = '';
+      const forceBtn = $('accForceLogin');
+      if (forceBtn) forceBtn.style.display = deviceConflict ? '' : 'none';
+      if (maxWrapEl) maxWrapEl.style.display = 'none'; // 未登录时不显示「最多 N 台」，避免误导
+      // 未登录：显示「去官网登录 / 注册」引导（与「订阅 / 支付」对应两个不同引导页）
+      const goWrapOff = $('accGoWebWrap'); if (goWrapOff) goWrapOff.style.display = '';
+      // ★修复：未登录时隐藏「退出登录」（此前无条件显示，逻辑不严谨）
+      const logoutOff = $('accLogout'); if (logoutOff) logoutOff.style.display = 'none';
+      const cntOff = $('accOrdersCount'); if (cntOff) cntOff.textContent = '0';
+      return;
+    }
+    // 已登录：隐藏设备冲突入口
+    const forceBtnHide = $('accForceLogin'); if (forceBtnHide) forceBtnHide.style.display = 'none';
+    // 已登录：隐藏「去官网登录 / 注册」引导；显示「退出登录」
+    const goWrapOn = $('accGoWebWrap'); if (goWrapOn) goWrapOn.style.display = 'none';
+    const logoutOn = $('accLogout'); if (logoutOn) logoutOn.style.display = '';
+    if (emailEl) emailEl.textContent = prof.email || '(未知邮箱)';
+    if (maxEl) maxEl.textContent = String(prof.maxDevices || 3);
+    if (maxWrapEl) maxWrapEl.style.display = ''; // 已登录才展示设备上限文案
+    const devices = prof.devices || [];
+    devEl.innerHTML = '';
+    if (!devices.length) { devEl.innerHTML = '<div style="color:#8b949e;font-size:12px">暂无绑定设备</div>'; }
+    else {
+      for (const d of devices) {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid #30363d;border-radius:8px;background:#0d1117;';
+        const info = document.createElement('div');
+        info.style.cssText = 'flex:1;min-width:0';
+        info.innerHTML = `<div style="font-size:13px;color:#c9d1d9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${d.deviceId}${d.isCurrent ? '（当前设备）' : ''}</div>`
+          + `<div style="font-size:11px;color:#8b949e">${modeText[d.mode] || d.mode}${d.plan ? ' · ' + d.plan : ''}</div>`;
+        row.appendChild(info);
+        if (!d.isCurrent) {
+          const btn = document.createElement('button');
+          btn.textContent = '解绑 / 踢下线';
+          btn.style.cssText = 'border:1px solid #7f1d1d;background:transparent;color:#fca5a5;padding:5px 10px;border-radius:7px;cursor:pointer;font-size:12px;white-space:nowrap';
+          btn.addEventListener('click', async () => {
+            btn.disabled = true; btn.textContent = '解绑中…';
+            const r = await L.unbindDevice(d.deviceId);
+            if (r && r.success) { if (stEl) { stEl.textContent = '已解绑 ' + d.deviceId; } refreshAccount(); }
+            else { btn.disabled = false; btn.textContent = '解绑 / 踢下线'; if (stEl) stEl.textContent = '解绑失败：' + ((r && r.error && r.error.message) || '未知错误'); }
+          });
+          row.appendChild(btn);
+        }
+        devEl.appendChild(row);
+      }
+    }
+    // 订单列表（内联查询，token 鉴权）
+    if (ordEl) {
+      ordEl.innerHTML = '';
+      try {
+        const ord = await L.fetchOrders();
+        const list = (ord && ord.orders) || [];
+        // 折叠摘要显示订单条数，便于用户在收起状态下一眼看到是否有订单
+        const cntEl = $('accOrdersCount'); if (cntEl) cntEl.textContent = String(list.length);
+        if (!list.length) { ordEl.innerHTML = '<div style="color:#8b949e;font-size:12px">暂无订单</div>'; }
+        else {
+          for (const o of list) {
+            const card = document.createElement('div');
+            card.style.cssText = 'padding:8px 10px;border:1px solid #30363d;border-radius:8px;background:#0d1117;font-size:12px;color:#c9d1d9';
+            const statusText = o.status === 'paid' ? '已支付' : (o.status === 'pending' ? '待支付' : (o.status || '未知'));
+            const period = o.periodEnd ? new Date(o.periodEnd).toLocaleDateString() : '—';
+            card.innerHTML = `<div style="display:flex;justify-content:space-between"><span>${o.plan || '—'}</span><span style="color:${o.status === 'paid' ? '#3fb950' : '#d29922'}">${statusText}</span></div>`
+              + `<div style="color:#8b949e;font-size:11px">${o.provider || ''} · 到期 ${period}</div>`;
+            ordEl.appendChild(card);
+          }
+        }
+      } catch (_) {
+        ordEl.innerHTML = '<div style="color:#8b949e;font-size:12px">订单加载失败</div>';
+      }
+    }
+  }
+
+  async function openAccount() {
+    const o = $('accountOverlay'); if (o) o.style.display = 'flex';
+    // 打开账号面板：若本机记住过密码且当前无令牌，先静默自动登录再拉取资料（免受 SW 重启影响）
+    try {
+      const L = window.HMDaoLicense;
+      if (L && L.autoLoginIfRemembered) {
+        const token = await L.getToken();
+        if (!token) await L.autoLoginIfRemembered();
+      }
+    } catch (_) { /* ignore */ }
+    refreshAccount();
+  }
+
+  // 官网「同步登录到扩展」成功后，background 广播 HMDAO_ACCOUNT_SYNCED：
+  // 侧栏据此立即刷新账号面板，无需用户手动重开「我的账号」。
+  if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (msg && msg.type === 'HMDAO_ACCOUNT_SYNCED') {
+        try { refreshAccount(); } catch (_) { /* ignore */ }
+        // 官网登录态同步到扩展后，一并刷新授权状态（付费用户同步后应立即变为已授权）
+        try {
+          const L = window.HMDaoLicense;
+          if (L && typeof L.refreshLicenseUI === 'function') L.refreshLicenseUI();
+        } catch (_) { /* ignore */ }
+      }
+    });
+  }
+
+  function bind() {
+    // ★Bug 反馈入口：点击弹出联系二维码（与隐私政策的联系方式保持一致）
+    const fbBtn = $('feedbackBtn'), fbOv = $('feedbackOverlay');
+    if (fbBtn && fbOv) {
+      fbBtn.addEventListener('click', () => { fbOv.style.display = 'flex'; });
+      const fbClose = $('fbClose');
+      if (fbClose) fbClose.addEventListener('click', () => { fbOv.style.display = 'none'; });
+      fbOv.addEventListener('click', (e) => { if (e.target === fbOv) fbOv.style.display = 'none'; });
+    }
+    const btn = $('accountBtn'), o = $('accountOverlay');
+    if (btn) btn.addEventListener('click', openAccount);
+    if (o) {
+      const close = $('accClose'); if (close) close.addEventListener('click', () => { o.style.display = 'none'; });
+      o.addEventListener('click', (e) => { if (e.target === o) o.style.display = 'none'; });
+      const forgot = $('accForgot'); if (forgot) forgot.addEventListener('click', () => { if (window.HMDaoLicense && window.HMDaoLicense.openForgotPassword) window.HMDaoLicense.openForgotPassword(); o.style.display = 'none'; });
+      // ★2026-09-14 修复（「我的订单」点了没反应）：官网并没有 /orders 路由，请求会命中 nginx 的
+      //   SPA 回退返回 index.html，再由 React Router 的 path="*" 重定向回首页 —— 用户观感就是
+      //   「点了没跳转」。改为跳真正的订阅支付页 /pricing.html（复用 goToPricing，携带 deviceId+token，
+      //   支付后能正确激活当前设备授权），与付费墙「去官网订阅」走同一条已验证路径。
+      //   订单明细本身已在上方面板内联展示（fetchOrders），无需再跳独立订单页。
+      // 「账号」引导：未登录时去官网完成登录 / 注册（与「订阅 / 支付」对应两个不同引导页）
+      const goWeb = $('accGoWeb');
+      if (goWeb) goWeb.addEventListener('click', () => {
+        const u = webBase() + '/login';
+        if (typeof chrome !== 'undefined' && chrome.tabs) chrome.tabs.create({ url: u }); else window.open(u, '_blank');
+      });
+      // 「刷新授权」：付款 / 登录后立即重新查询授权状态，无需重开面板
+      const accRefresh = $('accRefresh');
+      if (accRefresh) accRefresh.addEventListener('click', async () => {
+        const L = window.HMDaoLicense;
+        const rEl = $('accStatus');
+        if (rEl) rEl.textContent = '正在刷新授权…';
+        try {
+          if (L && typeof L.refreshLicenseUI === 'function') {
+            const st = await L.refreshLicenseUI();
+            if (rEl) rEl.textContent = st.mode === 'paid' ? '已确认订阅 ✓'
+              : (st.mode === 'trial' ? '当前为试用中' : '暂未查询到有效授权');
+          } else if (rEl) { rEl.textContent = '刷新失败：授权模块未就绪'; }
+        } catch (_) { if (rEl) rEl.textContent = '刷新失败，请稍后重试'; }
+        refreshAccount();
+      });
+      const orders = $('accOrders');
+      if (orders) orders.addEventListener('click', () => {
+        const L = window.HMDaoLicense;
+        if (L && typeof L.goToPricing === 'function') {
+          L.goToPricing();
+        } else {
+          const u = webBase() + '/pricing.html';
+          if (chrome && chrome.tabs) chrome.tabs.create({ url: u }); else window.open(u, '_blank');
+        }
+        o.style.display = 'none';
+      });
+      // 设备冲突：用户在面板确认后带 force 重登（踢出旧设备）。force 只在此显式路径使用。
+      const forceLoginBtn = $('accForceLogin');
+      if (forceLoginBtn) forceLoginBtn.addEventListener('click', async () => {
+        if (!window.confirm('将踢出该账号在其它设备上的登录（其已购订阅仍会保留在该设备上）。确定继续？')) return;
+        const st = $('accStatus');
+        if (st) st.textContent = '正在踢出旧设备并登录…';
+        forceLoginBtn.disabled = true;
+        try {
+          const fn = window.HMDaoLicense && window.HMDaoLicense.forceLoginWithRemembered;
+          const r = fn ? await fn() : { success: false, error: { message: '本机未记住账号密码，请在授权面板重新登录' } };
+          if (st) st.textContent = (r && r.success) ? '已在本机登录（旧设备已下线）' : ((r && r.error && r.error.message) || '登录失败');
+        } catch (_) { if (st) st.textContent = '登录失败'; }
+        forceLoginBtn.disabled = false;
+        refreshAccount();
+      });
+      // 退出登录：清除令牌与「记住我」保存的凭据，避免下次被自动登录
+      const logoutBtn = $('accLogout');
+      if (logoutBtn) logoutBtn.addEventListener('click', async () => {
+        if (!window.confirm('退出登录将清除本机记住的密码，下次需重新登录。确定退出？')) return;
+        try { if (window.HMDaoLicense && window.HMDaoLicense.logout) await window.HMDaoLicense.logout(); } catch (_) { /* ignore */ }
+        if (o) o.style.display = 'none';
+        refreshAccount();
+      });
+    }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bind);
+  else bind();
+
+  // 侧栏启动即尝试一次自动重登：勾选「记住我」的用户无需再输入密码；成功后刷新账号面板。
+  try {
+    if (window.HMDaoLicense && window.HMDaoLicense.autoLoginIfRemembered) {
+      window.HMDaoLicense.autoLoginIfRemembered()
+        .then((r) => { if (r && r.success && !r.skipped) refreshAccount(); })
+        .catch(() => {});
+    }
+  } catch (_) { /* ignore */ }
+})();
+
+// ===== 版本更新提醒（2026-09-15 新增）=====
+// 与 background.js 的版本更新模块配套：
+//   - 收到 HMDAO_EXT_UPDATE_AVAILABLE → 显示「发现新版本」横幅；点「立即更新」立即应用，
+//     不点也会在宽限期后由 background 自动 reload 完成更新（即"自动完成更新"）。
+//   - 扩展启动时读 hmdaoJustUpdated 标记 → 一次性展示「已更新到 vX」。
+//   - 侧栏打开时主动触发一次检查，让用户尽早感知新版本。
+(function () {
+  function el() { return document.getElementById('updateNotice'); }
+  function hide() { const e = el(); if (e) { e.style.display = 'none'; e.innerHTML = ''; } }
+
+  function showUpdateAvailable(ver) {
+    const e = el();
+    if (!e) return;
+    const v = ver ? (' v' + ver) : '';
+    e.style.display = 'block';
+    e.innerHTML = '发现新版本' + v + '，即将自动更新'
+      + ' <button id="updNow" style="margin-left:8px;cursor:pointer;border:1px solid #30363d;background:#2f81f7;color:#fff;padding:4px 10px;border-radius:6px">立即更新</button>'
+      + ' <button id="updLater" style="margin-left:6px;cursor:pointer;border:1px solid #30363d;background:transparent;color:#8b949e;padding:4px 10px;border-radius:6px">稍后</button>';
+    e.style.cssText += ';background:rgba(47,129,247,.12);border:1px solid rgba(47,129,247,.4);color:#c9d1d9;padding:8px 10px;border-radius:8px;font-size:12px;margin-bottom:8px';
+    const now = document.getElementById('updNow');
+    if (now) now.addEventListener('click', () => {
+      try { chrome.runtime.sendMessage({ type: 'HMDAO_APPLY_EXT_UPDATE' }).catch(() => {}); } catch (_) {}
+    });
+    const later = document.getElementById('updLater');
+    if (later) later.addEventListener('click', hide);
+  }
+
+  function showJustUpdated(ver) {
+    const e = el();
+    if (!e) return;
+    e.style.display = 'block';
+    e.style.cssText += ';background:rgba(35,134,54,.12);border:1px solid rgba(35,134,54,.4);color:#c9d1d9;padding:8px 10px;border-radius:8px;font-size:12px;margin-bottom:8px';
+    e.innerHTML = '已更新到 v' + ver + '，本次更新已自动生效。';
+    setTimeout(hide, 6000);
+  }
+
+  try {
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (!msg || msg.type !== 'HMDAO_EXT_UPDATE_AVAILABLE') return;
+      showUpdateAvailable((msg.info && msg.info.version) || '');
+    });
+  } catch (_) {}
+
+  function boot() {
+    try {
+      chrome.storage.local.get('hmdaoJustUpdated', (res) => {
+        try {
+          const v = res && res.hmdaoJustUpdated;
+          if (v) {
+            showJustUpdated(v);
+            chrome.storage.local.remove('hmdaoJustUpdated');
+          }
+        } catch (_) {}
+      });
+    } catch (_) {}
+    try { chrome.runtime.sendMessage({ type: 'HMDAO_CHECK_EXT_UPDATE' }).catch(() => {}); } catch (_) {}
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})();

@@ -2,6 +2,7 @@
 // 从 hmdao-api.mjs 原样搬移（ESM 单例：Map 缓存与安装任务表跨模块共享同一实例，行为零变更）。
 import path from 'node:path';
 import { APP_DIR, DATA_DIR } from './server-paths.mjs';
+import { buildPlatformInfo, platformExecutableCandidates } from '../platform-utils.mjs';
 
 export const LOCAL_POST_SELF_CHECK_TIMEOUT_MS = 12000;
 
@@ -30,6 +31,24 @@ export const LOCAL_POST_BACKEND_WRAPPERS = {
 //   现统一由真实目录推导，文档与实现永远一致。
 const MANAGED_RUNTIME_DIR = path.join(DATA_DIR, 'local-post-runtimes');
 const managedRuntimePath = (runtimeKey, ...rest) => path.join(MANAGED_RUNTIME_DIR, runtimeKey, ...rest);
+
+// ★2026-09-16 修复（E）：面板「常见安装路径」此前把 yt-dlp.exe / aria2c.exe / ffmpeg.exe 写死，
+//   在 Linux / macOS 上展示的是不存在的路径 → 排障时按提示找文件必然扑空。
+//   现按平台推导，且可执行文件名与探测/安装【同源】（复用 platformExecutableCandidates），
+//   保证「面板展示的路径」与「后端实际探测的名字」永远一致，不再出现三处漂移。
+const RUNTIME_EXECUTABLE_BASENAMES = {
+  ytdlp: 'yt-dlp',
+  aria2: 'aria2c',
+  ffmpeg: 'ffmpeg',
+};
+export function buildRuntimeCommonInstallPaths(runtimeKey, info = buildPlatformInfo()) {
+  const base = RUNTIME_EXECUTABLE_BASENAMES[runtimeKey];
+  if (!base) return [];
+  const executableName = platformExecutableCandidates(base, info.platform)[0] || base;
+  // ffmpeg 的静态构建解压后位于 current/bin/ 下，其余运行时直接在 current/ 下
+  if (runtimeKey === 'ffmpeg') return [managedRuntimePath('ffmpeg', 'current', 'bin', executableName)];
+  return [managedRuntimePath(runtimeKey, 'current', executableName)];
+}
 
 export const LOCAL_POST_RUNTIME_GUIDES = {
   ocio: {
@@ -84,11 +103,9 @@ export const LOCAL_POST_RUNTIME_GUIDES = {
     envCommand: 'HMDAO_YT_DLP_COMMAND',
     docsUrl: 'https://github.com/yt-dlp/yt-dlp',
     downloadUrl: 'https://github.com/yt-dlp/yt-dlp/releases/latest',
-    installHint: 'yt-dlp 是浏览器扩展采集 YouTube/B站/抖音等平台直链所依赖的独立命令行工具。点「一键安装」即可从 GitHub 下载最新版 yt-dlp.exe（自带 Python，无需安装环境），下载后后端 /api/youtube/extract 即可工作。',
+    installHint: 'yt-dlp 是浏览器扩展采集 YouTube/B站/抖音等平台直链所依赖的独立命令行工具。点「一键安装」即可从 GitHub 下载当前平台最新版 yt-dlp（跨平台命名：Windows=yt-dlp.exe / macOS=yt-dlp_macos / Linux=yt-dlp_linux），下载后后端 /api/youtube/extract 即可工作。',
     successHint: '探测成功后，扩展侧栏采集 YouTube 视频会直接返回可下载的直链，不再报错「后端返回空直链」。',
-    commonInstallPaths: [
-      managedRuntimePath('ytdlp', 'current', 'yt-dlp.exe'),
-    ],
+    commonInstallPaths: buildRuntimeCommonInstallPaths('ytdlp'),
     supportsImage: false,
     supportsVideo: true,
   },
@@ -114,9 +131,7 @@ export const LOCAL_POST_RUNTIME_GUIDES = {
     downloadUrl: 'https://github.com/aria2/aria2/releases',
     installHint: 'Aria2 是高性能多线程下载引擎，浏览器扩展采集到的网盘直链（迅雷/百度/夸克等）可由后端转发给 Aria2 接管下载，支持断点续传、多线程，且不占用浏览器内存。点「一键安装」即从 GitHub 下载 aria2c 可执行文件到本地运行时目录（可自定义安装路径）。',
     successHint: '探测成功后，扩展侧栏采集的网盘素材可一键用 Aria2 高速下载，不再依赖浏览器内置下载。',
-    commonInstallPaths: [
-      managedRuntimePath('aria2', 'current', 'aria2c.exe'),
-    ],
+    commonInstallPaths: buildRuntimeCommonInstallPaths('aria2'),
     supportsImage: false,
     supportsVideo: true,
   },
@@ -126,11 +141,9 @@ export const LOCAL_POST_RUNTIME_GUIDES = {
     envCommand: 'HMDAO_FFMPEG_COMMAND',
     docsUrl: 'https://ffmpeg.org/',
     downloadUrl: 'https://github.com/BtbN/FFmpeg-Builds/releases',
-    installHint: 'FFmpeg 是 yt-dlp 处理 m3u8 分片、合并音视频流所必需的独立命令行工具。点「一键安装」即从 FFmpeg-Builds 静态构建下载 ffmpeg.exe（含 ffprobe）到本地运行时目录（可自定义安装路径），安装后 yt-dlp 即可完整合并输出。',
+    installHint: 'FFmpeg 是 yt-dlp 处理 m3u8 分片、合并音视频流所必需的独立命令行工具。点「一键安装」即从 FFmpeg-Builds 静态构建下载当前平台 ffmpeg（含 ffprobe）到本地运行时目录（可自定义安装路径），安装后 yt-dlp 即可完整合并输出。',
     successHint: '探测成功后，yt-dlp 下载的视频将自动完成音视频合并，不再出现"缺 ffmpeg"的告警。',
-    commonInstallPaths: [
-      managedRuntimePath('ffmpeg', 'current', 'bin', 'ffmpeg.exe'),
-    ],
+    commonInstallPaths: buildRuntimeCommonInstallPaths('ffmpeg'),
     supportsImage: false,
     supportsVideo: true,
   },
