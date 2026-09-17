@@ -548,7 +548,7 @@ function VideoScene({ hue, label }: { hue: number; label: string }) {
   );
 }
 
-function UiScene({ hue }: { hue: number; label: string }) {
+function UiScene({ hue }: { hue: number; label?: string }) {
   const v = pickVariant(hue, 3);
   return (
     <div className="pointer-events-none absolute inset-0 z-[5] overflow-hidden opacity-40">
@@ -624,7 +624,7 @@ function AudioScene({ hue, label }: { hue: number; label: string }) {
   );
 }
 
-function ModelScene({ hue }: { hue: number; label: string }) {
+function ModelScene({ hue }: { hue: number; label?: string }) {
   return (
     <div className="pointer-events-none absolute inset-0 z-[5] overflow-hidden opacity-40">
       {/* 展台：水平圆盘 */}
@@ -637,7 +637,7 @@ function ModelScene({ hue }: { hue: number; label: string }) {
   );
 }
 
-function BannerScene({ hue }: { hue: number; label: string }) {
+function BannerScene({ hue }: { hue: number; label?: string }) {
   return (
     <div className="pointer-events-none absolute inset-0 z-[5] overflow-hidden opacity-50">
       {/* 舞台聚光 */}
@@ -650,7 +650,7 @@ function BannerScene({ hue }: { hue: number; label: string }) {
   );
 }
 
-function ArtScene({ hue }: { hue: number; label: string }) {
+function ArtScene({ hue }: { hue: number; label?: string }) {
   return (
     <div className="pointer-events-none absolute inset-0 z-[5] overflow-hidden opacity-30">
       <svg viewBox="0 0 100 100" className="absolute inset-0 h-full w-full">
@@ -664,7 +664,7 @@ function ArtScene({ hue }: { hue: number; label: string }) {
   );
 }
 
-function ProductScene({ hue }: { hue: number; label: string }) {
+function ProductScene({ hue }: { hue: number; label?: string }) {
   return (
     <div className="pointer-events-none absolute inset-0 z-[5] overflow-hidden opacity-50">
       {/* 货架背板 */}

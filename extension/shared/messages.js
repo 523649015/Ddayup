@@ -92,15 +92,33 @@
     // background → sidepanel：sendResponse({ ok, dataUrl, restricted, isLong, width, height })
     SCREENSHOT_CAPTURE: 'HMDAO_SCREENSHOT_CAPTURE',
     SCREENSHOT_CAPTURE_LONG: 'HMDAO_SCREENSHOT_CAPTURE_LONG',
+    // 注入页 → sidepanel：用户取消框选
+    SCREENSHOT_CANCEL: 'HMDAO_SCREENSHOT_CANCEL',
+    // robot-overlay（网页浮标 content script）→ sidepanel：触发截图
+    //   payload: { mode: 'region' | 'long' }
+    SCREENSHOT_OPEN: 'HMDAO_SCREENSHOT_OPEN',
     // 注入页 → sidepanel：用户框选完区域后回传矩形
     //   payload: { x, y, w, h, dpr, scrollX, scrollY, vw, vh }
     SCREENSHOT_REGION_READY: 'HMDAO_SCREENSHOT_REGION_READY',
-    // 注入页 → sidepanel：用户取消框选
-    SCREENSHOT_CANCEL: 'HMDAO_SCREENSHOT_CANCEL',
     // sidepanel → background：把截图发后端做 OCR / 翻译（不传画布）
-    //   payload: { image: dataURL, task: 'ocr' | 'translate', lang? }
-    // background → sidepanel：sendResponse({ ok, text, error })
+    //   payload: { image: dataURL, task: 'ocr' | 'translate', lang?, deviceId?, token? }
+    // background → sidepanel：sendResponse({ ok, text, error, licenseRequired })
     SCREENSHOT_OCR: 'HMDAO_SCREENSHOT_OCR',
+    // sidepanel → robot-overlay：OCR / 翻译结果回传（robot 不在页时回退侧栏面板）
+    //   payload: { text, error, licenseRequired }
+    SCREENSHOT_OCR_RESULT: 'HMDAO_SCREENSHOT_OCR_RESULT',
+    // sidepanel → robot-overlay：截图结果回传（渲染到网页机器人浮标，跟随锚点）
+    //   payload: { dataUrl, isLong, width, height }
+    SCREENSHOT_RESULT: 'HMDAO_SCREENSHOT_RESULT',
+    // sidepanel → robot-overlay：错误 / 提示（复制成功或失败也复用此通道）
+    //   payload: { error }
+    SCREENSHOT_ERROR: 'HMDAO_SCREENSHOT_ERROR',
+    // robot-overlay → sidepanel：复制截图（由 sidepanel 在 active tab MAIN 世界执行，最可靠）
+    //   payload: { dataUrl }
+    SCREENSHOT_COPY: 'HMDAO_SCREENSHOT_COPY',
+    // robot-overlay → sidepanel：保存截图到本地（由 sidepanel 调 chrome.downloads.download）
+    //   payload: { dataUrl }
+    SCREENSHOT_SAVE: 'HMDAO_SCREENSHOT_SAVE',
 
     // --- 扩展心跳 / build ---
     EXT_PING: 'HMDAO_EXT_PING',

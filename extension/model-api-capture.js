@@ -764,10 +764,15 @@ if (typeof module !== 'undefined' && module.exports) {
   // 部分站点会错误地把封面图/jpg 传进 soundManager.createSound，不过滤会让音频模块混入图片。
   function isObviousNonAudioUrl(url) {
     try {
-      const path = new URL(url).pathname.toLowerCase();
+      const u = String(url).toLowerCase();
+      const path = (function () { try { return new URL(url).pathname.toLowerCase(); } catch (_) { return u; } })();
       if (/\.(jpg|jpeg|png|gif|webp|bmp|svg|ico|avif|apng|tif|tiff)(\?|#|$)/.test(path)) return true;
       if (/\.(mp4|webm|mov|m4v|mkv|ogv|m3u8|mpd|flv|avi|wmv|ts|3gp|f4v)(\?|#|$)/.test(path)) return true;
       if (/\.(json|xml|html?|css|js|pdf|docx?|zip|rar|7z|gz|tar)(\?|#|$)/.test(path)) return true;
+      // ★2026-09-16 F3：图片型接口 URL（无图片扩展名但路径含图片关键词），如 storage.live.com/.../profilephoto
+      //   这类 URL 经 new Audio()/src setter/soundManager 被误当音频捕获，拉回的是图片字节或 HTML 错误页，
+      //   播放时 <audio> 报 NotSupportedError。按路径关键词提前拦截。
+      if (/(profilephoto|profile_pic|profilepic|headimg|head_img|userphoto|user_photo|avatar|avatars|imageview|image_view|thumbnails?|thumbnail_|\/img\/|\/images?\/|\/photo(s)?\/|\/pics?\/|\/picture(s)?\/)/i.test(u)) return true;
       if (/(^|\/)(1x1|spacer|pixel|beacon|track|collect|analytics)(\.[^/]*)?$/i.test(path)) return true;
     } catch (_) {}
     return false;

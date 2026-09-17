@@ -52,7 +52,12 @@ Write-Host ""
 Check ((($entries | Where-Object { $_ -like '*.zip' }).Count) -eq 0) 'no nested .zip (no old store package inside)'
 Check ((($entries | Where-Object { $_ -like 'probe_jingxuan/*' }).Count) -eq 0) 'no probe_jingxuan/ (dev probes)'
 Check ((($entries | Where-Object { $_ -like 'tests/*' }).Count) -eq 0) 'no tests/'
-Check ((($entries | Where-Object { $_ -like 'vendor/*' }).Count) -eq 0) 'no vendor/'
+# ★2026-09-16 F1：vendor/ 现已纳入商店包（sidepanel.html 直接 <script src="vendor/*"> 引用），
+#   此处改为正向校验关键 vendor 文件存在，避免侧栏加载报 net::ERR_FILE_NOT_FOUND。
+$vendorOk = @('vendor/mp4box.all.min.js','vendor/mp4-muxer.js','vendor/hls.min.js','vendor/three/build/three.module.min.js') |
+  ForEach-Object { $entries -contains $_ }
+Check ($vendorOk -notcontains $false) 'vendor/ 关键文件均在包内（mp4box/mp4-muxer/hls/three）'
+Check ((($entries | Where-Object { $_ -like 'vendor/*' }).Count) -gt 0) 'vendor/ 已纳入商店包'
 Check ((($entries | Where-Object { $_ -like 'native-host/*' }).Count) -eq 0) 'no native-host/'
 Check ((($entries | Where-Object { $_ -like 'store-assets/*' }).Count) -eq 0) 'no store-assets/'
 Check ((($entries | Where-Object { $_ -like 'tools/*' }).Count) -eq 0) 'no tools/'

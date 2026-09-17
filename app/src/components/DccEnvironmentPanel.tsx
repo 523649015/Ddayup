@@ -169,7 +169,7 @@ import {
   type UnrealActionGuardState,
   type UnrealPluginStatus,
 } from './DccEnvironmentPanel.shared';
-export function DccEnvironmentPanel() {
+export function DccEnvironmentPanel({ active = true }: { active?: boolean } = {}) {
 
 
 
@@ -566,6 +566,8 @@ export function DccEnvironmentPanel() {
 
 
     if (statusWatchUntil <= Date.now()) return undefined;
+    // ★面板不可见时停止轮询，避免切走后仍在后台重复请求
+    if (!active) return undefined;
 
 
 
@@ -604,7 +606,7 @@ export function DccEnvironmentPanel() {
 
 
 
-  }, [selectedEngine, statusWatchUntil]);
+  }, [selectedEngine, statusWatchUntil, active]);
 
 
 
@@ -692,13 +694,10 @@ export function DccEnvironmentPanel() {
 
   }
 
-  useEffect(() => {
-
-    if (hasLoadedStatus) return;
-
-    void requestStatusProbe({ force: true, watchMs: 12000, engine: selectedEngine });
-
-  }, [hasLoadedStatus, selectedEngine]);
+  // ★2026-09-14 按需探测（用户要求「常规状态不启动」）：
+  //   已移除「挂载即自动探测」与「切换引擎即自动探测」。进入面板不再发起任何
+  //   /api/dcc/* 请求，也不会长期停在“正在加载状态”；只有用户点击引擎卡片或
+  //   「检测 / 刷新」按钮时，才探测对应引擎（见下方 onProbeEngine / refreshPluginManager）。
 
   async function executeRunAction(action: DccPluginAction) {
 
@@ -1695,7 +1694,7 @@ export function DccEnvironmentPanel() {
 
 
 
-                onClick={() => setSelectedEngine(engine)}
+                onClick={() => { void requestStatusProbe({ force: true, watchMs: 12000, engine }); }}
 
 
 

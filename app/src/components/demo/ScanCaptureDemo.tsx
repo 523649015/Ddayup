@@ -9,7 +9,7 @@ import MediaThumb from '@/components/demo/MediaThumb';
  * - 纯前端模拟，不发任何 API
  */
 
-type Item = { key: number; seed: number; label: string; kind: string };
+type Item = { key: number; seed: number; label: string; kind: string; dist?: number };
 
 // 真实感的"网页素材"占位池（与 Ddayup 扩展采集结果风格一致：电商/视频/UI 截图/插画等）
 const POOL: Omit<Item, 'key'>[] = [

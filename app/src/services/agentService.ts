@@ -21,7 +21,7 @@ export interface AgentConfig {
 const DEFAULT_CONFIG: AgentConfig = {
   provider: 'local',
   apiKey: '',
-  model: 'gpt-4o',
+  model: 'qwen3.7-flash',
   temperature: 0.7,
   maxTokens: 2048,
 };
@@ -318,7 +318,7 @@ export function intentToWorkflowPlan(intent: IntentResult): WorkflowPlan {
         prompt: s.prompt,
         content: s.prompt,
         provider: s.type === 'image' || s.type === 'video' ? 'fal' : s.type === 'audio' ? 'minimax' : 'openai',
-        model: s.type === 'image' ? 'flux-pro' : s.type === 'video' ? 'seedance-v2' : s.type === 'audio' ? 'speech-2.8-turbo' : 'gpt-4o',
+        model: s.type === 'image' ? 'flux-pro' : s.type === 'video' ? 'seedance-v2' : s.type === 'audio' ? 'speech-2.8-turbo' : 'qwen3.7-flash',
         status: 'idle' as const,
       },
     })),
@@ -340,7 +340,7 @@ export function getAgentConfig(): AgentConfig {
         provider: parsed.provider || 'local',
         apiKey: parsed.apiKey || '',
         baseUrl: parsed.baseUrl || undefined,
-        model: parsed.model || 'gpt-4o',
+        model: parsed.model || 'qwen3.7-flash',
         temperature: parsed.temperature ?? 0.7,
         maxTokens: parsed.maxTokens ?? 2048,
       };

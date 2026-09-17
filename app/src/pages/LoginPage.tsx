@@ -6,6 +6,7 @@ import { Eye, EyeOff, LogIn, Loader2 } from 'lucide-react';
 import { usePublicUILanguage } from '@/i18n/publicUi';
 import { emailLoginSchema, type EmailLoginInput } from '@/schemas/authSchemas';
 import { signInWithEmail } from '@/services/authService';
+import { syncLoginToExtension } from '@/services/extensionBridge';
 import { useAuthStore } from '@/store/useAuthStore';
 import { ComplianceNotice } from '@/components/ComplianceNotice';
 import { ElfLogo } from '@/components/ElfLogo';
@@ -86,6 +87,10 @@ export default function LoginPage() {
     try {
       const result = await signInWithEmail(data);
       if (result.success) {
+        // 官网登录成功 → 静默把登录态同步到扩展（一次性绑定码），侧栏无需再手动点「同步登录到扩展」。
+        // ★fire-and-forget：内部跳转是 SPA 路由（不卸载 document），同步会在后台继续完成；
+        //   失败也不阻断登录，SubscribePage 仍保留手动按钮兜底。
+        syncLoginToExtension(6000).catch(() => { /* 扩展未安装/未响应：静默忽略 */ });
         const next = (location.state as { from?: string } | null)?.from || '/?skipLaunch=1';
         navigate(next, { replace: true });
       } else {

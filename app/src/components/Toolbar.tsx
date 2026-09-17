@@ -2,7 +2,7 @@ import { useCanvasStore } from '@/store/useCanvasStore';
 import { useDonationStore } from '@/store/useDonationStore';
 import { useCobuildStore } from '@/store/useCobuildStore';
 import {
-  Settings, Undo2, Redo2, Sun, Moon, Heart, Globe, Menu,
+  Settings, Undo2, Redo2, Sun, Moon, Heart, Globe, Menu, Sparkles,
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useUILanguage } from '@/i18n/ui';
@@ -20,6 +20,9 @@ export function Toolbar({ isMobile = false, onMobileMenuToggle }: ToolbarProps) 
   const redo = useCanvasStore((s) => s.redo);
   const toggleDarkMode = useCanvasStore((s) => s.toggleDarkMode);
   const darkMode = useCanvasStore((s) => s.darkMode);
+  // 右侧 docked AI 面板开关（G11）：状态由 store 持久化白名单负责跨会话保持。
+  const showAIPanel = useCanvasStore((s) => s.showAIPanel);
+  const toggleAIPanel = useCanvasStore((s) => s.toggleAIPanel);
   const { language, setLanguage, t } = useUILanguage();
   const { toggleDonationPanel, toggleWorldChannel, showWorldChannel } = useDonationStore();
   const cobuildEntries = useCobuildStore((s) => s.entries);
@@ -129,6 +132,20 @@ export function Toolbar({ isMobile = false, onMobileMenuToggle }: ToolbarProps) 
         <button type="button" onClick={() => navigate('/settings/api-keys')} className="hidden sm:flex h-8 px-2.5 rounded-lg items-center gap-1.5 text-[#8b949e] hover:bg-[#21262d] hover:text-white transition-colors text-xs" title={t('API Key 管理', 'API Keys')}>
           <Settings className="w-3.5 h-3.5" />
           <span className="hidden xl:inline">{t('设置', 'Settings')}</span>
+        </button>
+        <button
+          type="button"
+          onClick={toggleAIPanel}
+          data-testid="toolbar-ai-panel-toggle"
+          aria-pressed={showAIPanel}
+          className={`w-8 h-8 rounded-lg flex items-center justify-center transition-colors ${
+            showAIPanel
+              ? 'bg-[#00d4aa]/10 text-[#00d4aa] ring-1 ring-[#00d4aa]/40'
+              : 'text-[#8b949e] hover:bg-[#21262d] hover:text-white'
+          }`}
+          title={showAIPanel ? t('收起 AI 面板', 'Hide AI panel') : t('展开 AI 面板', 'Show AI panel')}
+        >
+          <Sparkles className="w-4 h-4" />
         </button>
       </div>
     </div>

@@ -1,7 +1,7 @@
 /**
  * onnxruntime-web 运行时封装（浏览器端本地推理）
  *
- * - wasm 文件同源托管在 /ort-wasm/（已由构建脚本从 node_modules 复制），
+ * - wasm 文件同源托管在 /ort-wasm-v1/（已由构建脚本从 node_modules 复制，旧 /ort-wasm/ 已弃用），
  *   不依赖外部 CDN，也不受生产环境 COEP 限制。
  * - 使用单线程 WASM（numThreads=1），避免 SharedArrayBuffer / COOP-COEP 依赖，
  *   在普通静态托管下即可运行（代价是推理稍慢，对本地预览可接受）。

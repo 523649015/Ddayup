@@ -1,5 +1,6 @@
 import { Link } from 'react-router-dom';
 import { Sparkles, PenTool, MessageCircle, Image as ImageIcon, Video, Music, FileText, ChevronRight, MapPin } from 'lucide-react';
+import { useExtensionPlans } from '@/hooks/useExtensionPlans';
 
 /**
  * 支付宝商户号申请 · "网站首页"素材
@@ -9,6 +10,8 @@ import { Sparkles, PenTool, MessageCircle, Image as ImageIcon, Video, Music, Fil
  * - 顶部 nav + 业务介绍 + 服务列表（三类）+ CTA，价格页 /pricing、服务页 /services 互通
  */
 export default function LandingHome() {
+  // 价格统一从 /api/extension/plans 读取（单一真源），避免页面写死金额与后端实收不一致
+  const { plans, priceLabel } = useExtensionPlans();
   // 三类业务，严格对应营业执照经营范围
   const domains = [
     {
@@ -118,7 +121,11 @@ export default function LandingHome() {
         <div className="rounded-2xl border border-[#21262d] bg-[#161b22] p-8">
           <Sparkles className="mx-auto mb-2 text-[#4bd3b2]" size={24} />
           <h3 className="text-lg font-semibold">选择适合你的服务包</h3>
-          <p className="mt-2 text-xs text-[#8b949e]">月度 ¥18 / 年度 ¥168 / 数字内容服务包（一次性）¥398</p>
+          <p className="mt-2 text-xs text-[#8b949e]">
+            {plans.length
+              ? plans.map((p) => `${p.name.zh} ${priceLabel(p.id)}`).join(' · ')
+              : '订阅方案加载中…'}
+          </p>
           <Link
             to="/subscribe"
             className="mt-4 inline-block rounded-md bg-[#4bd3b2] px-6 py-2 text-sm font-medium text-black hover:brightness-110"

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ViewportPortal } from '@xyflow/react';
 import { Check, Grid3x3, Palette, Save, Ungroup, X } from 'lucide-react';
 import { useCanvasStore } from '@/store/useCanvasStore';
+import { animateGroupArrange, requestUngroup } from '@/lib/canvasGroupAnimation';
 import type { CanvasNode, NodeGroup, NodeType } from '@/types';
 
 const GROUP_COLORS = ['#00d4aa', '#1a8cff', '#ff6b35', '#a855f7', '#fbbf24', '#ef4444', '#06b6d4', '#ec4899'];
@@ -95,6 +96,11 @@ export function CanvasGroupLayer({ autoEditGroupId = null, onAutoEditHandled, is
   const dragPreviewOffsetRef = useRef<DragOffset>({ x: 0, y: 0 });
   const pendingOffsetRef = useRef<DragOffset | null>(null);
   const previewFrameRef = useRef<number | null>(null);
+  // 「新出现的分组」追踪：用于给组框挂一次入场动画。首次挂载时把已有分组全部
+  // 记为已见，避免打开画布时所有历史分组一起做入场动画。
+  const seenGroupIdsRef = useRef<Set<string>>(new Set());
+  const seenInitializedRef = useRef(false);
+  const [enteringGroupIds, setEnteringGroupIds] = useState<string[]>([]);
 
   // 计算每个分组的实际成员（按当前画布节点过滤，剔除 phantom ID），
   // 并把「真实成员数」带回 items，chip 直接使用 memberCount 显示，保证与主画布节点数严格同步。
@@ -120,6 +126,26 @@ export function CanvasGroupLayer({ autoEditGroupId = null, onAutoEditHandled, is
     setDraftName(targetGroup.name);
     onAutoEditHandled?.(targetGroup.id);
   }, [autoEditGroupId, groups, onAutoEditHandled]);
+
+  // 组框入场动画：按 group id 做差集，任何来源新增的分组（手动打组 Ctrl+G、
+  // 工具栏打组、createWorkflowFromPlan 自动打组）都会自动获得一次入场动画，
+  // 无需在每个调用点单独埋点（对齐 R05：两条路径共用同一动画封装）。
+  useEffect(() => {
+    const currentIds = items.map((item) => item.group.id);
+    if (!seenInitializedRef.current) {
+      seenInitializedRef.current = true;
+      currentIds.forEach((id) => seenGroupIdsRef.current.add(id));
+      return;
+    }
+    const freshIds = currentIds.filter((id) => !seenGroupIdsRef.current.has(id));
+    currentIds.forEach((id) => seenGroupIdsRef.current.add(id));
+    if (freshIds.length === 0) return;
+    setEnteringGroupIds((prev) => Array.from(new Set([...prev, ...freshIds])));
+    const timer = window.setTimeout(() => {
+      setEnteringGroupIds((prev) => prev.filter((id) => !freshIds.includes(id)));
+    }, 380);
+    return () => window.clearTimeout(timer);
+  }, [items]);
 
   useEffect(() => () => {
     if (previewFrameRef.current !== null) cancelAnimationFrame(previewFrameRef.current);
@@ -258,22 +284,36 @@ export function CanvasGroupLayer({ autoEditGroupId = null, onAutoEditHandled, is
         const dragCursor = isDragging ? 'cursor-grabbing' : 'cursor-grab';
         const offsetX = isDragging ? dragPreviewOffset.x : 0;
         const offsetY = isDragging ? dragPreviewOffset.y : 0;
+        const isEntering = enteringGroupIds.includes(group.id);
 
         return (
           <div
             key={group.id}
-            className={`nodrag absolute rounded-[28px] border border-dashed transition-[box-shadow,border-color] duration-150 ${
-              selectedInGroup ? 'shadow-[0_0_0_3px_rgba(255,255,255,0.06)]' : ''
+            data-group-id={group.id}
+            data-testid={`canvas-group-frame-${group.id}`}
+            className={`nodrag absolute ${
+              // 拖拽整组时必须关掉过渡：此时 transform 由 dragPreviewOffset 逐帧驱动，
+              // 挂过渡会明显拖影、不跟手。松手后恢复，让 store 写回的最终位置平滑收敛。
+              isDragging
+                ? ''
+                : 'transition-[transform,width,height] duration-[260ms] ease-[cubic-bezier(0.22,1,0.36,1)]'
             }`}
             style={{
               transform: `translate(${bounds.x + offsetX}px, ${bounds.y + offsetY}px)`,
               width: bounds.width,
               height: bounds.height,
-              borderColor: group.color,
-              background: 'transparent',
               pointerEvents: 'none',
             }}
           >
+            {/* 虚线组框单独一层：入场/退场的 scale 动画挂在这层，
+                避免 animation 的 transform 覆盖外层用于定位的 translate。 */}
+            <div
+              data-group-frame="1"
+              className={`absolute inset-0 rounded-[28px] border border-dashed transition-[box-shadow,border-color] duration-150 ${
+                selectedInGroup ? 'shadow-[0_0_0_3px_rgba(255,255,255,0.06)]' : ''
+              } ${isEntering ? 'hmdao-group-enter' : ''}`}
+              style={{ borderColor: group.color, background: 'transparent' }}
+            />
             <div
               className={`pointer-events-auto absolute left-0 right-0 top-[-8px] h-4 ${dragCursor}`}
               onPointerDown={(event) => beginDrag(event, group)}
@@ -363,7 +403,7 @@ export function CanvasGroupLayer({ autoEditGroupId = null, onAutoEditHandled, is
               <button
                 type="button"
                 onPointerDown={(event) => event.stopPropagation()}
-                onClick={() => arrangeGroup(group.id, 'grid')}
+                onClick={() => animateGroupArrange(group.nodeIds, () => arrangeGroup(group.id, 'grid'))}
                 title="自动排列"
                 className="rounded-md p-1 hover:bg-white/10"
               >
@@ -384,7 +424,7 @@ export function CanvasGroupLayer({ autoEditGroupId = null, onAutoEditHandled, is
               <button
                 type="button"
                 onPointerDown={(event) => event.stopPropagation()}
-                onClick={() => ungroup(group.id)}
+                onClick={() => requestUngroup(group.id, () => ungroup(group.id))}
                 title="解组"
                 className="rounded-md p-1 hover:bg-white/10"
               >

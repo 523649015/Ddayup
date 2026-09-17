@@ -23,7 +23,7 @@
     "verify:tagging-contract": "node server/verify-tagging-contract-preview.mjs",
     "verify:browser:visible": "node scripts/verify-browser-visible-flow.mjs",
     "dev": "vite",
-    "build": "vite build && node scripts/prune-dist-wasm.mjs",
+    "build": "tsc -b && vite build && node scripts/prune-dist-wasm.mjs",
     "update-browserslist-db": "update-browserslist-db@latest",
     "typecheck": "tsc -b",
     "lint": "eslint .",

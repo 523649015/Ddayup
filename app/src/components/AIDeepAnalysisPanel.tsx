@@ -428,6 +428,7 @@ export function AIDeepAnalysisPanel({
                   <button
                     key={`${model.provider}:${model.id}`}
                     onClick={() => setSelectedModel(model)}
+                    title={model.inputCost != null ? `平台费用：输入 ¥${model.inputCost}/M tokens，输出 ¥${model.outputCost}/M tokens（CNY）` : (model.freeQuota || model.description)}
                     className={`w-full text-left flex items-start gap-2 p-2 rounded-lg transition-colors ${
                       selectedModel.id === model.id && selectedModel.provider === model.provider
                         ? 'bg-[#1a8cff]/10 ring-1 ring-[#1a8cff]/20'

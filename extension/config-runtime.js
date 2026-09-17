@@ -2,11 +2,12 @@
 // 供非 ESM 上下文（sidepanel.js / license.js）使用；config.js 作为 ESM 薄代理复用本实现。
 // 所有 apiBase 读取/写入逻辑仅此一份，避免多文件内联导致的漂移。
 (function () {
-  const DEFAULT_API_BASE = 'http://127.0.0.1:3000';
+  const DEFAULT_API_BASE = 'https://mingmingchuangyi.cn';
   const STORAGE_KEY = 'ddayupApiBase';
 
-  // 上架模式：true=免费版（试用过期不阻断核心功能，仅提示，符合 Edge 审核要求）。接真实支付后改 false。
-  const FREE_MODE = true;
+  // 上架模式：false=试用到期硬阻断（必须订阅付费后才能继续使用采集功能）。
+  // 真实支付已接入（微信 v2 NATIVE），故启用硬阻断；本地联调如需放宽可临时改回 true。
+  const FREE_MODE = false;
   const NATIVE_HOST_NAME = 'com.ddayup.host';
 
   let cache = null;

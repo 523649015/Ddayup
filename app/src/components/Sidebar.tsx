@@ -1,9 +1,35 @@
-﻿import { useMemo, useState, type CSSProperties } from 'react';
+﻿import { Suspense, lazy, memo, useEffect, useMemo, useState, type CSSProperties } from 'react';
 import { useCanvasStore } from '@/store/useCanvasStore';
-import { AssetLibrary } from './AssetLibrary';
-import { DccEnvironmentPanel } from './DccEnvironmentPanel';
 import { ResizableAssetPanel } from './ResizableAssetPanel';
-import { ModelDownloadPanel } from './ModelDownloadPanel';
+
+// ★性能（2026-09-14）：三个重量级面板改为按需加载，移出入口 chunk（此前入口 840KB）。
+//   lazy 需要 default 导出，这里用 .then 做命名导出映射。
+const AssetLibrary = lazy(() => import('./AssetLibrary').then((m) => ({ default: m.AssetLibrary })));
+const ModelDownloadPanel = lazy(() => import('./ModelDownloadPanel').then((m) => ({ default: m.ModelDownloadPanel })));
+const DccEnvironmentPanel = lazy(() => import('./DccEnvironmentPanel').then((m) => ({ default: m.DccEnvironmentPanel })));
+
+/** 重面板懒加载骨架（仅首次进入该面板的极短时间内可见） */
+function PanelSkeleton() {
+  return (
+    <div className="flex h-full items-center justify-center p-4 text-xs text-[#6e7681]">
+      正在加载面板…
+    </div>
+  );
+}
+
+// ★性能（2026-09-14）：常驻面板必须 memo 化。
+//   Sidebar 订阅了 canvas / workflows（画布拖拽时高频更新），若不 memo，
+//   每次 Sidebar 重渲染都会连带重渲染这些常驻大面板 —— 比原先卸载重建更糟。
+//   这里用轻量包装组件做 memo，props 只有 active（切 tab 才变），可稳定跳过重渲染。
+const MemoModelPanel = memo(function MemoModelPanel({ active }: { active: boolean }) {
+  return <ModelDownloadPanel active={active} />;
+});
+const MemoDccPanel = memo(function MemoDccPanel({ active }: { active: boolean }) {
+  return <DccEnvironmentPanel active={active} />;
+});
+const MemoAssetLibrary = memo(function MemoAssetLibrary() {
+  return <AssetLibrary />;
+});
 import {
   AudioLines,
   ChevronLeft,
@@ -91,6 +117,12 @@ export function Sidebar() {
 
   const [wfRenameId, setWfRenameId] = useState<string | null>(null);
   const [wfRenameVal, setWfRenameVal] = useState('');
+
+  // ★性能：重面板（models / dcc）首次访问后保持挂载，切回时不再重复请求与 DOM 重建。
+  const [visitedTabs, setVisitedTabs] = useState<Set<SidebarTab>>(() => new Set<SidebarTab>());
+  useEffect(() => {
+    setVisitedTabs((prev) => (prev.has(activeSidebarTab) ? prev : new Set(prev).add(activeSidebarTab)));
+  }, [activeSidebarTab]);
 
   const mediaNodes = useMemo(
     () => canvas?.nodes.filter((node) => MEDIA_NODE_TYPES.has(node.type as NodeType)) || [],
@@ -346,9 +378,9 @@ export function Sidebar() {
       case 'director':
         return renderDirectorPanel();
       case 'models':
-        return <ModelDownloadPanel />;
       case 'dcc':
-        return <DccEnvironmentPanel />;
+        // 由下方「常驻重面板容器」渲染（懒加载 + 首访后保持挂载）
+        return null;
       default:
         return renderAddPanel();
     }
@@ -399,12 +431,27 @@ export function Sidebar() {
       {!sidebarCollapsed ? (
         <div className={`${panelWidth} flex flex-col overflow-hidden border-r border-[#21262d] bg-[#161b22]`}>
           {renderPanelContent()}
+          {/* ★性能：重面板首次访问后常驻，用 hidden 切换（避免切回时重复请求 / 重建 DOM） */}
+          <Suspense fallback={<PanelSkeleton />}>
+            {visitedTabs.has('models') ? (
+              <div className={activeSidebarTab === 'models' ? 'flex h-full min-h-0 flex-col overflow-hidden' : 'hidden'}>
+                <MemoModelPanel active={activeSidebarTab === 'models'} />
+              </div>
+            ) : null}
+            {visitedTabs.has('dcc') ? (
+              <div className={activeSidebarTab === 'dcc' ? 'flex h-full min-h-0 flex-col overflow-hidden' : 'hidden'}>
+                <MemoDccPanel active={activeSidebarTab === 'dcc'} />
+              </div>
+            ) : null}
+          </Suspense>
         </div>
       ) : null}
 
       {activeSidebarTab === 'assets' && !sidebarCollapsed ? (
         <ResizableAssetPanel isOpen={true} onClose={() => setSidebarTab('add')} title="资产库">
-          <AssetLibrary />
+          <Suspense fallback={<PanelSkeleton />}>
+            <MemoAssetLibrary />
+          </Suspense>
         </ResizableAssetPanel>
       ) : null}
     </div>

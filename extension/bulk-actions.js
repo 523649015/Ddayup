@@ -307,29 +307,24 @@ async function restoreSavedHandles() {
 //     FSA 句柄仅在恢复旧设置/手动场景下保留，不再作为「选择目录」入口的兜底。
 //   调后端原生目录选择器。返回 { canceled, path, error }：
 //   path 非空 = 用户选中（绝对路径）；canceled=true = 用户取消；error 非空 = 后端不可用/失败。
-async function __pickDirViaBackend(type) {
-  const call = async () => {
-    const r = await fetch(ddBackendBase() + '/api/settings/assets/pick-directory', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initialPath: dirPaths[type] || '' }),
-      // 用户点“确定”前该请求会一直 pending → 必须给足超时（120s）
-      signal: AbortSignal.timeout(120000),
-    });
-    const d = await r.json().catch(() => ({}));
-    return { r, d };
-  };
-  let res;
+// ★2026-09-16 F4：目录选择卡顿优化。
+// 旧逻辑：直接 fetch pick-directory（120s 超时），后端未启动/云端地址不可达时连接要等很久才超时，
+// catch 才拉起后端 → 用户长时间看到"选择中…"。
+// 新逻辑：先 300~500ms 短超时探本机 3000 健康；在线直接弹原生目录框；失败才启动后端再重试；
+// 全程文案分层，且用模块级缓存跳过重复探测。
+let __backendHealthCache = null; // true / false / null(未知)
+async function __backendHealth(timeoutMs = 500) {
   try {
-    res = await call();
-  } catch (e) {
-    // 连接失败（本地服务未启动）→ 拉起后端一次后重试；仍失败则返回原因（不静默）
-    try {
-      if (typeof ensureBackendRunningNative === 'function') await ensureBackendRunningNative({ silent: true, requireLocal: true });
-    } catch (_) { /* 忽略拉起失败，继续重试一次 */ }
-    try { res = await call(); }
-    catch (e2) { return { canceled: false, path: '', error: (e2 && e2.message) || 'connection failed' }; }
+    const r = await fetch('http://127.0.0.1:3000/api/health', { credentials: 'omit', signal: AbortSignal.timeout(timeoutMs) });
+    __backendHealthCache = !!r.ok;
+    return __backendHealthCache;
+  } catch (_) {
+    __backendHealthCache = false;
+    return false;
   }
+}
+
+function __parsePickResult(res) {
   const r = res && res.r;
   const d = res && res.d;
   if (r && r.ok && d && d.success) {
@@ -341,11 +336,62 @@ async function __pickDirViaBackend(type) {
   return { canceled: false, path: '', code: _code, error: (d && d.error) || (r ? ('HTTP ' + r.status) : 'unknown') };
 }
 
+// type: 资产类型；onPhase(phase): 'probe'|'dialog'|'starting' 用于侧栏文案分层
+async function __pickDirViaBackend(type, onPhase) {
+  const call = async (timeoutMs) => {
+    const r = await fetch(ddBackendBase() + '/api/settings/assets/pick-directory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initialPath: dirPaths[type] || '' }),
+      // 用户点“确定”前该请求会一直 pending → 必须给足超时（120s）
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const d = await r.json().catch(() => ({}));
+    return { r, d };
+  };
+  // 1) 健康快检（优先用缓存，避免每次点击都探一次）
+  let healthy = (__backendHealthCache === true);
+  if (__backendHealthCache === null || __backendHealthCache !== true) {
+    healthy = await __backendHealth(500);
+  }
+  // 2) 后端在线 → 直接弹原生目录框（保留 120s 等用户选目录）
+  if (healthy) {
+    try {
+      if (onPhase) onPhase('dialog');
+      const res = await call(120000);
+      return __parsePickResult(res);
+    } catch (e) {
+      // 探测通过但弹框请求失败（极少）→ 清缓存，走下方"启动后端再重试"
+      __backendHealthCache = null;
+    }
+  }
+  // 3) 后端未启动 → 文案转"正在启动本地服务…"，拉起后端后重试
+  try {
+    if (onPhase) onPhase('starting');
+    if (typeof ensureBackendRunningNative === 'function') {
+      await ensureBackendRunningNative({ silent: true, requireLocal: true });
+    }
+  } catch (_) { /* 忽略拉起失败，继续重试一次 */ }
+  try {
+    if (onPhase) onPhase('dialog');
+    const res = await call(120000);
+    return __parsePickResult(res);
+  } catch (e2) {
+    return { canceled: false, path: '', error: (e2 && e2.message) || 'connection failed' };
+  }
+}
+
 document.querySelectorAll('.pathPick').forEach((btn) => {
   btn.onclick = async () => {
     const type = btn.dataset.type;
     const sp = document.querySelector(`.pathText[data-type="${type}"]`);
-    if (sp) { sp.textContent = '选择中…（请在系统弹窗中选择目录）'; if (sp.classList) { sp.classList.remove('ok', 'warn'); } }
+    const setTxt = (t, cls) => {
+      if (!sp) return;
+      sp.textContent = t;
+      if (sp.classList) { sp.classList.remove('ok', 'warn'); if (cls) sp.classList.add(cls); }
+    };
+    // ★2026-09-16 F4：点击先显示"连接中"，待真正弹出系统目录框或启动后端时再分层切换
+    setTxt('正在连接本地服务…');
 
     // ★2026-09-13 重构（用户诉求「要目录选择、不要手动输入」的最终落点）：
     //   1) 后端原生目录选择器优先：FolderBrowserDialog(-STA) 返回【真实绝对路径】→ 存 dirPath:<type>。
@@ -353,7 +399,10 @@ document.querySelectorAll('.pathPick').forEach((btn) => {
     //      而 FSA showDirectoryPicker 在侧栏不可靠/不持久（句柄常为 null、权限误报），且不返回真实绝对路径，
     //      故 FSA 不再作为 .pathPick 的兜底；后端不可用时无法选择目录，需启动本地服务后重试。
     let picked = { canceled: false, path: '', error: '' };
-    try { picked = await __pickDirViaBackend(type); }
+    try { picked = await __pickDirViaBackend(type, (phase) => {
+      if (phase === 'starting') setTxt('正在启动本地服务…');
+      else if (phase === 'dialog') setTxt('选择中…（请在系统弹窗中选择目录）');
+    }); }
     catch (e) { picked = { canceled: false, path: '', error: (e && e.message) || 'pick failed' }; }
 
     if (picked.canceled) { refreshPathTexts(); return; }   // 用户取消：恢复原显示，不打扰

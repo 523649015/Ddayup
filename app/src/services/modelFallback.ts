@@ -60,7 +60,7 @@ export const FREE_FIRST_CHAINS: Record<string, ModelCandidate[]> = {
     { id: 'qwen3.5-flash', provider: 'tokenhub', model: 'qwen3.5-flash', isFree: true, label: '通义千问免费', capabilities: { generationModes: ['textToText'] } },
     { id: 'glm-5.2', provider: 'tokenhub', model: 'glm-5.2', isFree: true, label: '智谱免费', capabilities: { generationModes: ['textToText'] } },
     { id: 'hy3', provider: 'tokenhub', model: 'hy3', isFree: true, label: '混元免费', capabilities: { generationModes: ['textToText'] } },
-    { id: 'gpt-4o', provider: 'openai', model: 'gpt-4o', isFree: false, label: 'GPT-4o', capabilities: { generationModes: ['textToText'] } },
+    { id: 'qwen3.8-flash', provider: 'bailian', model: 'qwen3.8-flash', isFree: true, label: 'Qwen3.8-Flash 备选', capabilities: { generationModes: ['textToText'] } },
     { id: 'gpt-4.1', provider: 'openai', model: 'gpt-4.1', isFree: false, label: 'GPT-4.1 高保真', capabilities: { generationModes: ['textToText'] } },
   ],
   // 图片：需要 textToImage；含参考图需求时还需 imageToImage + referenceRoles

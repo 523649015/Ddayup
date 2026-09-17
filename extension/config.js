@@ -21,7 +21,7 @@ export const SUPPORTED_PLATFORMS = [
 // 若全局尚未就绪（极早加载），回退默认本机地址，保证不崩。
 export async function getApiBase() {
   if (typeof window !== 'undefined' && window.DdayupConfig) return window.DdayupConfig.getApiBase();
-  return 'https://ddayup.example.com';
+  return 'https://mingmingchuangyi.cn';
 }
 export async function setApiBase(base) {
   if (typeof window !== 'undefined' && window.DdayupConfig) return window.DdayupConfig.setApiBase(base);
@@ -29,7 +29,7 @@ export async function setApiBase(base) {
 }
 export function defaultApiBase() {
   if (typeof window !== 'undefined' && window.DdayupConfig) return window.DdayupConfig.defaultApiBase();
-  return 'https://ddayup.example.com';
+  return 'https://mingmingchuangyi.cn';
 }
 export async function getApiKey() {
   if (typeof window !== 'undefined' && window.DdayupConfig) return window.DdayupConfig.getApiKey();

@@ -2171,13 +2171,21 @@ function buildVideoAltResolutions(current) {
   }).slice(0, 6);
   if (!related.length) { altDiv.style.display = 'none'; return; }
 
-  const buttons = related.map(r => {
+  // ★CSP 修复：不再用 innerHTML 拼内联 onclick（会被 script-src 拦截），改为 DOM 创建 + addEventListener
+  altDiv.textContent = '';
+  const altTip = document.createElement('div');
+  altTip.style.color = '#d29922';
+  altTip.textContent = '⬇ 备选分辨率（点击切换源，再点「下载」）：';
+  altDiv.appendChild(altTip);
+  altDiv.appendChild(document.createElement('br'));
+  related.forEach(r => {
     const name = fileName(r.url);
     const resTag = extractResolutionHint(r.url);
-    return `<button onclick="switchPreviewVideo('${escapeAttr(r.url)}','${escapeAttr(name)}','${escapeAttr(r.source || '')}')">${resTag ? resTag + ' · ' : ''}${name}</button>`;
-  }).join('');
-
-  altDiv.innerHTML = `<span style="color:#d29922">⬇ 备选分辨率（点击切换源，再点「下载」）：</span><br>${buttons}`;
+    const btn = document.createElement('button');
+    btn.textContent = (resTag ? resTag + ' · ' : '') + name;
+    btn.addEventListener('click', () => switchPreviewVideo(r.url, name, r.source || ''));
+    altDiv.appendChild(btn);
+  });
   altDiv.style.display = '';
 }
 
@@ -2304,21 +2312,46 @@ function buildYoutubeFormatSelector(formats) {
   const defaultFmt = videoFormats.find(f => f.has_audio) || videoFormats[0];
   window.__ytSelectedFormat = defaultFmt ? defaultFmt.format_id : '';
 
-  const opts = videoFormats.map(f => {
-    const sel = f.format_id === window.__ytSelectedFormat ? ' selected' : '';
+  // ★CSP 修复：不再用 innerHTML 拼内联 onchange，改为 DOM 创建 + addEventListener
+  altDiv.textContent = '';
+  const ytTip = document.createElement('div');
+  ytTip.style.color = '#d29922';
+  ytTip.style.fontSize = '12px';
+  ytTip.textContent = '🎬 分辨率（点击切换后重新预览/下载）';
+  altDiv.appendChild(ytTip);
+  altDiv.appendChild(document.createElement('br'));
+
+  const sel = document.createElement('select');
+  sel.id = 'ytFmtSelect';
+  sel.style.margin = '4px 0';
+  sel.style.padding = '4px';
+  sel.style.borderRadius = '6px';
+  sel.style.background = '#1a1a2e';
+  sel.style.color = '#ccc';
+  sel.style.border = '1px solid #444';
+  sel.style.fontSize = '12px';
+  sel.style.maxWidth = '100%';
+  sel.addEventListener('change', (e) => { window.__ytSelectedFormat = e.target.value; });
+  videoFormats.forEach(f => {
+    const opt = document.createElement('option');
+    opt.value = f.format_id;
     // 下载会合并音视频，无音轨条目不再标负面标记（避免误以为选了就没声音）
     const label = f.height + 'p' + (f.fps ? ` ${f.fps}fps` : '') + (f.has_audio ? ' 🔊' : '');
-    return `<option value="${f.format_id}"${sel}>${label}${f.filesize_mb ? ' (' + f.filesize_mb + 'MB)' : ''}</option>`;
-  }).join('');
+    opt.textContent = label + (f.filesize_mb ? ' (' + f.filesize_mb + 'MB)' : '');
+    if (f.format_id === window.__ytSelectedFormat) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  altDiv.appendChild(sel);
 
   const hasDirect = formats.some(f => /^(direct-|d-)/i.test(f.format_id || ''));
-  altDiv.innerHTML = `<span style="color:#d29922;font-size:12px">🎬 分辨率（点击切换后重新预览/下载）</span><br>
-    <select id="ytFmtSelect" style="margin:4px 0;padding:4px;border-radius:6px;background:#1a1a2e;color:#ccc;border:1px solid #444;font-size:12px;max-width:100%"
-      onchange="var s=document.getElementById('ytFmtSelect');window.__ytSelectedFormat=s.value;">
-      ${opts}
-    </select>` + (hasDirect
-      ? `<div style="color:#7fd1ff;font-size:11px;margin-top:4px">⏱ 源页直链分辨率（已绕过后端）。直链有时效，建议下载后立即保存。</div>`
-      : '');
+  if (hasDirect) {
+    const note = document.createElement('div');
+    note.style.color = '#7fd1ff';
+    note.style.fontSize = '11px';
+    note.style.marginTop = '4px';
+    note.textContent = '⏱ 源页直链分辨率（已绕过后端）。直链有时效，建议下载后立即保存。';
+    altDiv.appendChild(note);
+  }
   altDiv.style.display = '';
   window.__ytFormats = formats;
 }
@@ -2330,16 +2363,43 @@ function buildDyFormatSelector(formats) {
   const defaultFmt = formats.find(f => f.is_default) || formats[0];
   window.__dySelectedFormat = defaultFmt ? defaultFmt.url : '';
 
-  const opts = formats.map(f => {
-    const sel = f.url === window.__dySelectedFormat ? ' selected' : '';
-    return `<option value="${f.url.replace(/"/g,'&quot;')}" data-label="${(f.label||'').replace(/"/g,'&quot;')}"${sel}>${f.label}</option>`;
-  }).join('');
+  // ★CSP 修复：不再用 innerHTML 拼内联 onchange，改为 DOM 创建 + addEventListener
+  altDiv.textContent = '';
+  const dyTip = document.createElement('div');
+  dyTip.style.color = '#d29922';
+  dyTip.style.fontSize = '12px';
+  dyTip.textContent = '🎬 抖音画质（来自页面数据）';
+  altDiv.appendChild(dyTip);
+  altDiv.appendChild(document.createElement('br'));
 
-  altDiv.innerHTML = `<span style="color:#d29922;font-size:12px">🎬 抖音画质（来自页面数据）</span><br>
-    <select id="dyFmtSelect" style="margin:4px 0;padding:4px;border-radius:6px;background:#1a1a2e;color:#ccc;border:1px solid #444;font-size:12px;max-width:100%"
-      onchange="var s=document.getElementById('dyFmtSelect');var v=document.getElementById('previewVideo');if(s&&s.value){window.__dySelectedFormat=s.value;if(window.__previewAsset){window.__previewAsset.url=s.value;}setStatus('▶ 已切换抖音画质直链（源页侧栏帧预览不受影响，源页按此直链播放）', true);}">
-      ${opts}
-    </select>`;
+  const sel = document.createElement('select');
+  sel.id = 'dyFmtSelect';
+  sel.style.margin = '4px 0';
+  sel.style.padding = '4px';
+  sel.style.borderRadius = '6px';
+  sel.style.background = '#1a1a2e';
+  sel.style.color = '#ccc';
+  sel.style.border = '1px solid #444';
+  sel.style.fontSize = '12px';
+  sel.style.maxWidth = '100%';
+  sel.addEventListener('change', (e) => {
+    const s = e.target;
+    const v = document.getElementById('previewVideo');
+    if (s && s.value) {
+      window.__dySelectedFormat = s.value;
+      if (window.__previewAsset) { window.__previewAsset.url = s.value; }
+      setStatus('▶ 已切换抖音画质直链（源页侧栏帧预览不受影响，源页按此直链播放）', true);
+    }
+  });
+  formats.forEach(f => {
+    const opt = document.createElement('option');
+    opt.value = f.url;
+    opt.setAttribute('data-label', f.label || '');
+    opt.textContent = f.label;
+    if (f.url === window.__dySelectedFormat) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  altDiv.appendChild(sel);
   altDiv.style.display = '';
   window.__dyFormats = formats;
 }

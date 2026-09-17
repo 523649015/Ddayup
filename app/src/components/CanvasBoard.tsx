@@ -15,6 +15,7 @@ import {
   type NodeChange,
   type EdgeChange,
   type Connection,
+  type OnConnectStart,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { z } from 'zod';
@@ -38,6 +39,10 @@ import type { NodeData, NodeType, RegionPackContract } from '@/types';
 import { Toolbar } from './Toolbar';
 import { Sidebar } from './Sidebar';
 import { SmartAgent } from './SmartAgent';
+import { NodeGeneratePanel } from './AIPanel';
+import { GenerationQueuePlaceholder } from './GenerationQueuePlaceholder';
+import { GenerationNodePulse } from './GenerationNodePulse';
+import { requestUngroup } from '@/lib/canvasGroupAnimation';
 import { DonationPanel } from './DonationPanel';
 import { WorldChannel } from './WorldChannel';
 import { ShortcutsDialog } from './ShortcutsDialog';
@@ -91,7 +96,7 @@ interface FlowCanvasProps {
   onNodeClick: (event: React.MouseEvent, node: Node) => void;
   onPaneClick: () => void;
   onNodeContextMenu?: (event: React.MouseEvent, node: Node) => void;
-  onConnectStart?: (event: any, payload: { nodeId: string; handleId: string | null; handleType: string }) => void;
+  onConnectStart?: OnConnectStart;
   onConnectEnd?: (event: MouseEvent | TouchEvent) => void;
   onSelectionChange: (params?: { nodes?: Node[] | null }) => void;
   onMove: () => void;
@@ -331,6 +336,25 @@ function CanvasFlow() {
   const syncPersistedItems = useAssetStore((s) => s.syncPersistedItems);
   const { fitView, getViewport, screenToFlowPosition, setCenter, setNodes: setFlowNodes } = useReactFlow();
   const lastDeleteRef = useRef(0);
+
+  // DEV-only 测试桥：供 scripts/test-canvas-animation.mjs 在真实浏览器里稳定驱动选中/成组。
+  // 无头环境下合成鼠标无法触发 React Flow 的框选/节点拖拽；直接写 store 的 selectedNodeIds
+  // （应用真正的选中真源，组工具条与打组均读它），避免改 React Flow 受控 nodes 被 store 回写覆盖。
+  // 仅 DEV 挂载，生产构建（import.meta.env.DEV=false）完全不暴露，零运行时成本。
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const api = {
+      selectAll: () => {
+        const st = useCanvasStore.getState();
+        const ids = (st.canvas?.nodes || []).map((n) => n.id);
+        st.setSelectedNodeIds(ids);
+      },
+    };
+    (window as unknown as { __hmdaoCanvas?: unknown }).__hmdaoCanvas = api;
+    return () => {
+      delete (window as unknown as { __hmdaoCanvas?: unknown }).__hmdaoCanvas;
+    };
+  }, []);
   const lastSelectionChangeRef = useRef(0);
   const suppressNodeInteractionUntilRef = useRef(0);
   const lastClipboardPasteHandledAtRef = useRef(0);
@@ -664,7 +688,7 @@ function CanvasFlow() {
   }, []);
 
   // 记录拖动开始的 source（让 onConnectEnd 知道从哪个 handle 出发）
-  const onConnectStart = useCallback((_event: any, payload: { nodeId: string; handleId: string | null; handleType: string }) => {
+  const onConnectStart = useCallback<OnConnectStart>((_event, payload) => {
     if (payload.handleType !== 'source') return;
     const node = canvas?.nodes.find((n) => n.id === payload.nodeId);
     (window as any).__hmdao_pendingSource = {
@@ -2497,7 +2521,8 @@ function CanvasFlow() {
       const matchedNodeIds = group.nodeIds.filter((nodeId) => selectedSet.has(nodeId));
       if (matchedNodeIds.length === 0) continue;
       if (matchedNodeIds.length === group.nodeIds.length) {
-        ungroup(group.id);
+        // 与组框上的「解组」按钮走同一封装：先播放退场动画再真正移除（G04）。
+        requestUngroup(group.id, () => ungroup(group.id));
       } else {
         removeNodesFromGroup(group.id, matchedNodeIds);
       }
@@ -3111,6 +3136,12 @@ export function CanvasBoard() {
           <ReactFlowProvider>
             <CanvasFlow />
           </ReactFlowProvider>
+          {/* 左下角「N 个生成中的任务」占位卡（G09），仅当有任务在跑时常驻。 */}
+          <GenerationQueuePlaceholder />
+          {/* 生成中节点的呼吸微光（G14），本身不渲染任何 DOM。 */}
+          <GenerationNodePulse />
+          {/* 右侧常驻 AI 生成面板（G05）：受 showAIPanel 控制，由顶栏开关切换。 */}
+          <NodeGeneratePanel docked />
           <SmartAgent isMobile={isMobile} canvasHostRef={canvasShellRef} />
         </div>
       </div>

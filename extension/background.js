@@ -171,8 +171,15 @@ const HMDAO_BUILDS = {
   injectMain: null,
 };
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+  // ★2026-09-15：记录"刚完成更新"，供侧栏展示「已更新到 vX」（见下方版本更新模块）。
+  try {
+    if (details && details.reason === 'update') {
+      const v = (chrome.runtime.getManifest() || {}).version || '';
+      chrome.storage.local.set({ hmdaoJustUpdated: v });
+    }
+  } catch (_) {}
   // ★2026-09-05：重载/更新扩展后清空 lastScan 持久化缓存。
   //   lastScan 里存着【旧版扫描逻辑产出的资产】（错误的集数编号、过期签名直链、旧合集的卡），
   //   扩展一重载侧栏就把它原样恢复回来 → 用户看到"还是历史内容/集数不对/点开播不了"，
@@ -206,6 +213,74 @@ chrome.runtime.onInstalled.addListener(() => {
     });
   } catch (_) {}
 });
+
+// ===== 版本更新：提醒用户 + 自动完成更新（2026-09-15 新增）=====
+// 需求：体验期/使用期间若商店发布了新版本，要提醒用户；能自动完成的就自动完成。
+// 实现（全部走浏览器原生能力，【不新增任何权限】、不依赖自建服务器）：
+//   1) chrome.runtime.onUpdateAvailable：商店新版本已下载就绪 → 通知侧栏 + 宽限期后自动 reload 应用。
+//      （这是"自动完成更新"的关键：商店扩展本就会自动下载，缺的是"应用"这一步。）
+//   2) chrome.runtime.requestUpdateCheck()：主动询问商店是否有新版本（扩展启动 / 侧栏打开时各一次）。
+//   3) onInstalled(reason==='update')：更新落地后写入标记，侧栏展示"已更新到 vX"。
+const HMDAO_UPDATE_GRACE_MS = 20000; // 自动应用前的宽限期，留时间给用户点「立即更新」
+let hmdaoUpdateTimer = null;
+
+function hmdaoNotifyUpdate(info) {
+  try { chrome.runtime.sendMessage({ type: 'HMDAO_EXT_UPDATE_AVAILABLE', info: info || {} }).catch(() => {}); } catch (_) {}
+}
+
+// 宽限期结束后自动应用更新；用户点「立即更新」可提前触发。
+function hmdaoScheduleAutoApply() {
+  if (hmdaoUpdateTimer) return;
+  hmdaoUpdateTimer = setTimeout(() => {
+    hmdaoUpdateTimer = null;
+    try { chrome.runtime.reload(); } catch (_) {}
+  }, HMDAO_UPDATE_GRACE_MS);
+}
+
+try {
+  chrome.runtime.onUpdateAvailable.addListener(() => {
+    console.log('[HMDAO][bg] 新版本已就绪，通知侧栏并在 ' + (HMDAO_UPDATE_GRACE_MS / 1000) + 's 后自动应用');
+    hmdaoNotifyUpdate({ stage: 'ready' });
+    hmdaoScheduleAutoApply();
+  });
+} catch (_) {}
+
+function hmdaoCheckUpdate() {
+  try {
+    if (!chrome.runtime || !chrome.runtime.requestUpdateCheck) return;
+    // 注意：回调形式与 Promise 形式在不同浏览器版本表现不一，统一用回调并吞掉异常。
+    chrome.runtime.requestUpdateCheck((status, details) => {
+      try {
+        if (status === 'update_available') {
+          console.log('[HMDAO][bg] 商店有新版本: ' + (details && details.version));
+          hmdaoNotifyUpdate({ stage: 'available', version: (details && details.version) || '' });
+          hmdaoScheduleAutoApply();
+        }
+      } catch (_) {}
+    });
+  } catch (_) {}
+}
+
+// 侧栏点「立即更新」→ 立刻应用
+try {
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg) return false;
+    if (msg.type === 'HMDAO_APPLY_EXT_UPDATE') {
+      try { chrome.runtime.reload(); } catch (_) {}
+      if (sendResponse) sendResponse({ ok: true });
+      return true;
+    }
+    if (msg.type === 'HMDAO_CHECK_EXT_UPDATE') {
+      hmdaoCheckUpdate();
+      if (sendResponse) sendResponse({ ok: true });
+      return true;
+    }
+    return false;
+  });
+} catch (_) {}
+
+// 扩展启动/唤醒时查一次（商店版本检查由浏览器自身周期性执行，这里只是加快首次感知）
+hmdaoCheckUpdate();
 
 // ===== 规则层（Referer 注入 / 音频 CORS / 域名工具 / 捕获扩展名白名单）=====
 // 已抽取到 rules.js，由上方 importScripts('rules.js') 引入，避免 background.js 过度臃肿。
@@ -701,13 +776,96 @@ async function xunleiProxyFetch(url, headers, method) {
   }
 }
 
-// 来自 Web App（http://127.0.0.1:3000）的外部消息
+// ===== 官网 → 扩展 登录同步（2026-09-14）=====
+// 背景：官网(/api/auth/login)与扩展(/api/extension/account/login)原本是两套独立令牌体系，
+//   用户在官网登录后扩展仍提示「未登录或令牌已失效」。
+// 方案：官网用登录态换一个 6 位一次性绑定码，扩展拿「绑定码 + 本机 deviceId」换扩展令牌。
+//   长令牌绝不经网页传递，绑定码 5 分钟有效、单次消费。
+// 本函数是唯一收口：外部消息（官网已知扩展 ID）与内部消息（site-auth-bridge.js 转发）都走这里。
+async function bindFromWebCode(code, force) {
+  const c = String(code || '').trim();
+  if (!c) return { success: false, error: '缺少绑定码' };
+
+  // 一次读取拿到设备标识与 apiBase（合并 IO：MV3 下每个 await 都是 SW 被回收的机会窗口）
+  let deviceId = '';
+  let base = 'https://mingmingchuangyi.cn';
+  try {
+    const s = await new Promise((res) => chrome.storage.local.get(['hmdaoDeviceId', 'ddayupApiBase'], (o) => res(o || {})));
+    deviceId = s.hmdaoDeviceId || '';
+    const v = s.ddayupApiBase;
+    if (v && typeof v === 'string' && /^https?:\/\//.test(v)) base = v.replace(/\/+$/, '');
+  } catch (_) { /* ignore */ }
+  // 与 license.js 的 getDeviceId() 保持同一个键与同一种 ID 格式
+  if (!deviceId) {
+    deviceId = 'dd-' + ((typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now() + Math.random()));
+    try { await new Promise((res) => chrome.storage.local.set({ hmdaoDeviceId: deviceId }, () => res())); } catch (_) { /* ignore */ }
+  }
+
+  try {
+    const r = await fetch(base + '/api/extension/account/bind', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: c, deviceId, force: !!force }),
+      // 超时护栏：服务端挂起时不让 SW 事件无限等待（MV3 单事件上限 5 分钟）
+      signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(15000) : undefined,
+    });
+    let json = null;
+    try { json = await r.json(); } catch (_) { json = {}; }
+    if (r.ok && json && json.success) {
+      const merged = Object.assign({}, json, { cachedAt: Date.now() });
+      // ★四个键必须一起写：hmdaoLicenseFetched / hmdaoLastMode / hmdaoLastPlan 是
+      //   license.js 离线判定的依据，漏写会让「官网绑定付费账号」的用户在清缓存+离线时被误判 expired。
+      await new Promise((res) => chrome.storage.local.set({
+        hmdaoToken: json.token,
+        hmdaoLicense: merged,
+        hmdaoLicenseFetched: true,
+        hmdaoLastMode: merged.mode || null,
+        hmdaoLastPlan: merged.plan || null,
+      }, () => res()));
+      // 广播给侧栏刷新账号面板；无监听者时 MV3 会 reject，必须 catch
+      try {
+        const p = chrome.runtime.sendMessage({ type: 'HMDAO_ACCOUNT_SYNCED', email: json.email || null });
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      } catch (_) { /* ignore */ }
+      return { success: true, email: json.email || null };
+    }
+    return { success: false, error: (json && json.error && (json.error.message || json.error.code)) || ('http-' + r.status) };
+  } catch (e) {
+    return { success: false, error: String((e && e.message) || e) };
+  }
+}
+
+// 外部消息来源白名单（本机 Web App + 官网，含子域）
+function isTrustedExternalSender(sender) {
+  const o = String((sender && (sender.origin || sender.url)) || '');
+  return /^http:\/\/(127\.0\.0\.1|localhost):3000\b/.test(o)
+    || /^https:\/\/([\w-]+\.)*mingmingchuangyi\.cn(:\d+)?\b/.test(o);
+}
+
+// 来自 Web App（http://127.0.0.1:3000）与官网（mingmingchuangyi.cn）的外部消息
 chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
+  if (!isTrustedExternalSender(sender)) {
+    sendResponse({ ok: false, success: false, error: 'forbidden' });
+    return;
+  }
   if (msg && msg.type === HMDAO_MSG.OPEN_SCAN && sender.tab && sender.tab.id) {
     chrome.sidePanel.open({ tabId: sender.tab.id }).catch(() => {});
     scanTab(sender.tab.id);
     sendResponse({ ok: true });
+    return;
   }
+  // 官网在 manifest 的 externally_connectable 名单内且已知扩展 ID 时，可直接送绑定码。
+  // ★force 恒 false：外部网页不具备「踢掉用户其它设备」的能力，冲突须由侧栏 UI 确认后内部发起。
+  if (msg && msg.type === 'HMDAO_BIND_FROM_WEB') {
+    if (!/^\d{6}$/.test(String((msg && msg.code) || ''))) {
+      sendResponse({ success: false, error: '绑定码格式不正确' });
+      return;
+    }
+    bindFromWebCode(msg.code, false).then(sendResponse, (e) => sendResponse({ success: false, error: String((e && e.message) || e) }));
+    return true; // 异步响应
+  }
+  // 兜底响应，避免发送端 Promise 一直 pending
+  sendResponse({ ok: false, success: false, error: 'unsupported' });
 });
 
 // 来自扩展侧栏（内部消息）
@@ -716,6 +874,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // 并直接返回其同步布尔结果（true=异步保持通道）；未注册类型走下方原 if 链。
   if (typeof hasHandler === 'function' && hasHandler(msg)) {
     return dispatchMessage(msg, _sender, sendResponse);
+  }
+  // 官网「同步登录到扩展」：由注入 mingmingchuangyi.cn 的 site-auth-bridge.js 转发而来
+  if (msg && msg.type === 'HMDAO_BIND_FROM_WEB') {
+    bindFromWebCode(msg.code, false).then(sendResponse, (e) => sendResponse({ success: false, error: String((e && e.message) || e) }));
+    return true; // 异步响应
+  }
+  // ===== 扩展 ↔ 官网 登录态打通（2026-09-14）=====
+  // ★L1：这里曾有一个 HMDAO_GET_REMEMBERED_CREDS handler（把明文密码返回给调用方），
+  //   但 site-auth-bridge.js 实际是直接读 chrome.storage.local，该端点无人调用，
+  //   属死代码且是「明文密码出站」的多余暴露面，已删除。
+  // 扩展侧登录成功后通知：主动把登录态推给已打开的官网标签（官网免重复输入）
+  if (msg && msg.type === 'HMDAO_NOTIFY_EXT_LOGIN') {
+    pushAutoLoginToSite().then(sendResponse, (e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+    return true; // 异步响应
+  }
+  // ★自愈：扩展令牌失效时，请官网标签重新签发绑定码（官网仍登录态则自动恢复，无需用户操作）
+  if (msg && msg.type === 'HMDAO_REQUEST_SITE_LOGIN_SYNC') {
+    pushSiteRefreshLogin().then(sendResponse, (e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+    return true; // 异步响应
   }
   // ===== 以下分支已迁移至 router.js（D1 路由表），由 hasHandler/dispatchMessage 优先接管 =====
   // - REPORT_BUILD / GET_BUILDS / PAGE_MUTATION
@@ -4947,6 +5124,40 @@ async function fetchMediaInYoutubeTab(tabId, url, referer) {
 async function findHmdaoTab() {
   const tabs = await chrome.tabs.query({ url: 'http://127.0.0.1:3000/*' });
   return tabs[0] || null;
+}
+
+// ★2026-09-14：官网（mingmingchuangyi.cn）标签查找。与 findHmdaoTab 分离，不改动既有 3000 逻辑。
+// ★M3：仅匹配官网 apex 域，避免把本机凭据推送到信任级别更低的子域页面。
+//   子域页面仍可通过「页面主动索取」（HMDAO_WEB_REQUEST_CREDS）自动登录，只是不接收主动推送。
+async function findSiteTab() {
+  const tabs = await chrome.tabs.query({ url: ['https://mingmingchuangyi.cn/*'] });
+  return tabs[0] || null;
+}
+
+// 扩展侧登录成功后，主动让已打开的官网标签自动登录（凭据经 site-auth-bridge.js 同源传递，不出本机）。
+async function pushAutoLoginToSite() {
+  try {
+    const tab = await findSiteTab();
+    if (!tab || !tab.id) return { ok: false, error: 'no-site-tab' };
+    await chrome.tabs.sendMessage(tab.id, { type: 'HMDAO_EXT_AUTOLOGIN' });
+    return { ok: true, tabId: tab.id };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
+// ★2026-09-14 自愈：扩展令牌失效（服务端重启/被吊销）且本机无记住的凭据时，
+//   请仍处于登录态的官网标签重新走一次「绑定码」同步，用户无需手动操作。
+//   链路：sidepanel → background(本函数) → site-auth-bridge → 页面 → /bind-code → /bind → 新令牌
+async function pushSiteRefreshLogin() {
+  try {
+    const tab = await findSiteTab();
+    if (!tab || !tab.id) return { ok: false, error: 'no-site-tab' };
+    await chrome.tabs.sendMessage(tab.id, { type: 'HMDAO_SITE_REFRESH_LOGIN' });
+    return { ok: true, tabId: tab.id };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
 }
 
 // 已注入智能机器人浮标的标签页集合（用于侧栏随时「收回」）

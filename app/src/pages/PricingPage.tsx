@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams, Link } from 'react-router-dom';
-import { toDataURL } from 'qrcode';
+import QRCode from 'qrcode';
 import { Check, Loader2, Sparkles, ShieldCheck } from 'lucide-react';
 import PricingDemo from '@/components/demo/PricingDemo';
 import ScanCaptureDemo from '@/components/demo/ScanCaptureDemo';
@@ -8,14 +8,15 @@ import { usePublicUILanguage } from '@/i18n/publicUi';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 
-// 价格档位（必须与后端 extension-license.mjs 的 PLAN_PRICE_CNY / PLAN_DAYS 保持一致）
-const PLANS = [
-  {
-    id: 'monthly',
+// 营销文案（仅展示用，不含价格——价格一律由后端 GET /api/extension/plans 下发，杜绝前后端金额不一致）
+const PLAN_MARKETING: Record<string, {
+  name: { zh: string; en: string };
+  tagline: { zh: string; en: string };
+  highlight: boolean;
+  features: { zh: string[]; en: string[] };
+}> = {
+  monthly: {
     name: { zh: '基础版', en: 'Basic' },
-    priceCny: 18,
-    priceUsd: 2.99,
-    days: 30,
     tagline: { zh: '轻量使用，按月灵活订阅', en: 'Light use, flexible monthly' },
     highlight: false,
     features: {
@@ -23,12 +24,17 @@ const PLANS = [
       en: ['Plugin tutorial', 'Bug report & fix', 'Basic support'],
     },
   },
-  {
-    id: 'yearly',
+  quarterly: {
+    name: { zh: '季度版', en: 'Quarterly' },
+    tagline: { zh: '按季订阅，性价比之选', en: 'Quarterly, balanced value' },
+    highlight: false,
+    features: {
+      zh: ['含基础版全部', '季度优先支持'],
+      en: ['Everything in Basic', 'Quarterly priority support'],
+    },
+  },
+  yearly: {
     name: { zh: '专业版', en: 'Pro' },
-    priceCny: 120,
-    priceUsd: 16.99,
-    days: 365,
     tagline: { zh: '进阶用户首选，按年更省', en: 'For power users, yearly saving' },
     highlight: true,
     features: {
@@ -36,12 +42,8 @@ const PLANS = [
       en: ['Everything in Basic', 'Priority tickets', 'Custom scan rules'],
     },
   },
-  {
-    id: 'lifetime',
+  lifetime: {
     name: { zh: '豪华版', en: 'Deluxe' },
-    priceCny: 500,
-    priceUsd: 69.99,
-    days: 9999,
     tagline: { zh: '一次性买断，永久使用', en: 'One-time, forever' },
     highlight: false,
     features: {
@@ -49,9 +51,12 @@ const PLANS = [
       en: ['Everything in Pro', '1-on-1 remote help', 'Exclusive customization'],
     },
   },
-] as const;
+};
 
-type PlanId = (typeof PLANS)[number]['id'];
+type PlanId = 'monthly' | 'quarterly' | 'yearly' | 'lifetime';
+
+// 套餐价格（来自后端单一真源）；加载完成前为空数组
+type PlanPrice = { id: PlanId; name: { zh: string; en: string }; priceCny: number; priceUsd: number; days: number };
 
 async function createSubscription(deviceId: string, token: string, plan: PlanId, provider: 'wechat' | 'alipay') {
   const resp = await fetch('/api/extension/subscription/create', {
@@ -91,6 +96,23 @@ export default function PricingPage() {
   const [expireAt, setExpireAt] = useState<number | null>(null);
   const [polling, setPolling] = useState(paidParam); // URL 里有 ?paid=1 先进入轮询态，等真实状态确认
   const [verifyingReturn, setVerifyingReturn] = useState(paidParam); // 回跳态：正在向服务端核实
+
+  // 套餐价格（来自后端单一真源）；加载完成前为空数组
+  const [plans, setPlans] = useState<PlanPrice[]>([]);
+  const [plansLoading, setPlansLoading] = useState(true);
+  // 从后端 GET /api/extension/plans 拉取套餐（价格单一事实来源，前端不再硬编码金额）
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch('/api/extension/plans', { credentials: 'omit' });
+        const j = await r.json();
+        if (!cancelled && j?.success && Array.isArray(j.plans)) setPlans(j.plans as PlanPrice[]);
+      } catch { /* ignore */ }
+      finally { if (!cancelled) setPlansLoading(false); }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   // 回跳 ?paid=1 时立刻向服务端核实真实授权状态，避免异步回调未到就误显"成功"
   useEffect(() => {
@@ -141,7 +163,7 @@ export default function PricingPage() {
       }
       // 微信 / 支付宝 均为扫码支付，返回 codeUrl → 前端生成二维码
       if ((provider === 'wechat' || provider === 'alipay') && data.codeUrl) {
-        const url = await toDataURL(data.codeUrl, { width: 220, margin: 1 });
+        const url = await QRCode.toDataURL(data.codeUrl, { width: 220, margin: 1 });
         setQrDataUrl(url);
         setPolling(true);
       }
@@ -180,8 +202,6 @@ export default function PricingPage() {
     tick();
     return () => clearInterval(timer);
   }, [polling, deviceId, t]);
-
-  const currentPlan = useMemo(() => PLANS.find((p) => p.id === selected)!, [selected]);
 
   return (
     <div className="min-h-screen bg-[#0d1117] px-4 py-10 text-[#e6edf3]">
@@ -254,24 +274,30 @@ export default function PricingPage() {
             </div>
 
             <div className="grid gap-4 sm:grid-cols-3">
-              {PLANS.map((plan) => (
+              {plansLoading || plans.length === 0 ? (
+                <div className="col-span-full flex items-center justify-center gap-2 py-10 text-sm text-[#8b949e]">
+                  <Loader2 size={16} className="animate-spin" /> {t('正在加载套餐…', 'Loading plans…')}
+                </div>
+              ) : plans.map((plan) => {
+                const m = PLAN_MARKETING[plan.id] || { name: plan.name, tagline: { zh: '', en: '' }, highlight: false, features: { zh: [], en: [] } };
+                return (
                 <Card
                   key={plan.id}
-                  className={`cursor-pointer transition ${selected === plan.id ? 'border-[#1f6feb] ring-1 ring-[#1f6feb]' : 'border-[#30363d]'} ${plan.highlight ? 'bg-[#111d2e]' : 'bg-[#161b22]'}`}
+                  className={`cursor-pointer transition ${selected === plan.id ? 'border-[#1f6feb] ring-1 ring-[#1f6feb]' : 'border-[#30363d]'} ${m.highlight ? 'bg-[#111d2e]' : 'bg-[#161b22]'}`}
                   onClick={() => setSelected(plan.id)}
                 >
                   <CardHeader>
                     <div className="flex items-center justify-between">
                       <CardTitle className="text-lg">{plan.name[language === 'zh' ? 'zh' : 'en']}</CardTitle>
-                      {plan.highlight && <span className="rounded bg-[#1f6feb] px-2 py-0.5 text-[10px] text-white">{t('推荐', 'Popular')}</span>}
+                      {m.highlight && <span className="rounded bg-[#1f6feb] px-2 py-0.5 text-[10px] text-white">{t('推荐', 'Popular')}</span>}
                     </div>
-                    <CardDescription className="text-[#8b949e]">{plan.tagline[language === 'zh' ? 'zh' : 'en']}</CardDescription>
+                    <CardDescription className="text-[#8b949e]">{m.tagline[language === 'zh' ? 'zh' : 'en']}</CardDescription>
                   </CardHeader>
                   <CardContent>
                     <div className="text-2xl font-bold">¥{plan.priceCny}<span className="text-sm font-normal text-[#8b949e]"> / {(plan.days >= 9999 ? t('永久', 'forever') : (plan.id as string) === 'monthly' ? t('月', 'month') : (plan.id as string) === 'quarterly' ? t('季', 'quarter') : t('年', 'year'))}</span></div>
                     <div className="mt-1 text-xs text-[#6e7681]">≈ ${plan.priceUsd}</div>
                     <ul className="mt-3 space-y-1.5 text-xs text-[#c9d1d9]">
-                      {plan.features[language === 'zh' ? 'zh' : 'en'].map((f) => (
+                      {m.features[language === 'zh' ? 'zh' : 'en'].map((f) => (
                         <li key={f} className="flex gap-1.5"><Check size={13} className="mt-0.5 shrink-0 text-[#4bd3b2]" />{f}</li>
                       ))}
                     </ul>
@@ -282,7 +308,8 @@ export default function PricingPage() {
                     </div>
                   </CardFooter>
                 </Card>
-              ))}
+                );
+              })}
             </div>
 
             <div className="mt-8 flex flex-col items-center gap-4">

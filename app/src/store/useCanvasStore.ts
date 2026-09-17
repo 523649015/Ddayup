@@ -67,8 +67,8 @@ function isBrokenNodeLabel(value: string) {
 const BASE_NODE_DATA: Record<NodeType, Omit<Partial<NodeData>, 'label'>> = {
   text: {
     content: '',
-    provider: 'openai',
-    model: 'gpt-4o',
+    provider: 'bailian',
+    model: 'qwen3.7-flash',
     status: 'idle',
     cost: 0,
   },

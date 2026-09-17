@@ -101,6 +101,8 @@ type RuntimeDoctorReport = {
     gmic?: RuntimeDoctorRuntime;
     ytdlp?: RuntimeDoctorRuntime;
     florence2?: RuntimeDoctorRuntime;
+    aria2?: RuntimeDoctorRuntime;
+    ffmpeg?: RuntimeDoctorRuntime;
   };
 };
 
@@ -112,6 +114,8 @@ type RuntimePayload = {
       gmic?: RuntimeBackendStatus;
       ytdlp?: RuntimeBackendStatus;
       florence2?: RuntimeBackendStatus;
+      aria2?: RuntimeBackendStatus;
+      ffmpeg?: RuntimeBackendStatus;
     };
   };
 } | null;
@@ -139,7 +143,7 @@ type RuntimeInstallJob = {
 };
 
 interface RuntimeCardItem {
-  id: 'oiio' | 'gmic' | 'ocio' | 'ytdlp' | 'florence2';
+  id: 'oiio' | 'gmic' | 'ocio' | 'ytdlp' | 'florence2' | 'aria2' | 'ffmpeg';
   title: string;
   scope: string;
   /** 备注：该依赖的功能用途 */

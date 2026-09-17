@@ -4,10 +4,11 @@
 // 经 window.FeatureManager.register(...) 自注册；由 feature-manager.js 在 DOMContentLoaded
 // 时自动 init。不修改 sidepanel.js 主逻辑。
 //
-// 能力：智能机器人(#aiBotBtn) 悬停 1s → 弹出「截图识文」入口（区域截图 / 截长图）
-//   → 区域截图：注入选区覆盖层框选 → 后台 png 高保真截图 → 本地 Canvas 裁切
-//   → 结果面板：翻译 / 提取文字 / 复制截图（复制到剪贴板，可粘微信）
-//   截长图：后台滚动拼接整页 → 结果面板同上
+// 第二阶段（UI 整合层）改造点：
+//   - 保留 #aiBotBtn 悬停 1s 兜底入口（robot 不在页时仍可用）；
+//   - 优先把截图结果 / OCR 结果回传 robot-overlay（网页机器人浮标），失败回退侧栏面板；
+//   - 复制改为在 active tab MAIN 世界执行（最可靠，可粘微信/QQ），失败降级侧栏；
+//   - 保存走 chrome.downloads（F2）；长图框选 UI 在 robot-overlay 内实现（F3 UI）。
 // ============================================================================
 (function (root) {
   'use strict';
@@ -31,7 +32,11 @@
   let lastImage = null;     // 当前结果图 dataURL
   let regionListener = null;
 
-  // ===== 悬停入口 =====
+  // robot-overlay 协调状态：收到 SCREENSHOT_OPEN 时置位，作为本次结果回传目标
+  let robotPresent = false;
+  let robotTabId = null;
+
+  // ===== 悬停入口（兜底：robot 不在页时仍可触发）=====
   function showHotPanel() {
     if (!hotPanel) buildHotPanel();
     // 受限页检测：当前活动页不可截图则提示
@@ -82,18 +87,27 @@
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tab = tabs && tabs[0];
       if (!tab || isRestrictedUrl(tab.url)) { toast('当前页面不支持截图'); return; }
-      // 注入选区覆盖层（先 messages.js 让注入脚本能用 HMDAO_MSG 常量）
+      // 注入前先发清理消息，复位机制层守卫（修 B7：避免上次异常残留导致框不出现）
+      chrome.tabs.sendMessage(tab.id, { type: MSG.SCREENSHOT_CANCEL }).catch(() => {});
+      // 注入选区覆盖层（先发 messages.js 让注入脚本能用 HMDAO_MSG 常量）
       chrome.scripting.executeScript({
         target: { tabId: tab.id },
         files: ['shared/messages.js', 'features/screenshot-select-inject.js'],
       }).catch((e) => { toast('注入选区失败：' + (e && e.message || e)); });
-      // 监听选区结果（一次性）
+      // 监听选区结果（一次性，确认才回传 REGION_READY；取消也清理，避免残留重复捕获 修 B6）
       if (regionListener) chrome.runtime.onMessage.removeListener(regionListener);
       regionListener = (msg) => {
-        if (!msg || msg.type !== MSG.SCREENSHOT_REGION_READY) return;
-        chrome.runtime.onMessage.removeListener(regionListener); regionListener = null;
-        pendingRect = msg.payload;
-        captureAndShow(tab.id, false);
+        if (!msg || !msg.type) return;
+        if (msg.type === MSG.SCREENSHOT_REGION_READY) {
+          chrome.runtime.onMessage.removeListener(regionListener); regionListener = null;
+          pendingRect = msg.payload;
+          captureAndShow(tab.id, false);
+        } else if (msg.type === MSG.SCREENSHOT_CANCEL) {
+          // 用户取消框选：清理，避免 listener 永久残留导致下次重复捕获（修 B6）
+          chrome.runtime.onMessage.removeListener(regionListener); regionListener = null;
+          pendingRect = null;
+          toast('已取消截图');
+        }
       };
       chrome.runtime.onMessage.addListener(regionListener);
       toast('请在页面上拖拽框选区域…');
@@ -119,16 +133,42 @@
     );
   }
 
+  // 截图完成：成功且 robot 在页 → 回传 robot；否则（受限/失败/robot 关闭）回退侧栏或 toast
   function onCaptured(resp, long) {
-    if (!resp || resp.restricted) { toast('当前页面不支持截图（受限页）'); return; }
-    if (!resp.ok) { toast('截图失败：' + (resp.error || '未知错误')); return; }
+    if (!resp || resp.restricted) { notifyError('当前页面不支持截图（受限页）'); return; }
+    if (!resp.ok) { notifyError('截图失败：' + (resp.error || '未知错误')); return; }
+    const w = resp.width || null, h = resp.height || null;
     let img = resp.dataUrl;
-    // 区域截图：按框选矩形裁切
     if (!long && pendingRect) {
-      cropImage(img, pendingRect, (cropped) => { pendingRect = null; showResult(cropped); });
+      cropImage(img, pendingRect, (cropped) => { pendingRect = null; deliverResult(cropped, false, w, h); });
       return;
     }
-    showResult(img, long);
+    deliverResult(img, long, w, h);
+  }
+
+  // robot 在页时回传结果；sendMessage 失败（robot 已关闭）→ 回退侧栏面板
+  function deliverResult(dataUrl, long, width, height) {
+    if (robotPresent && robotTabId != null) {
+      chrome.tabs.sendMessage(robotTabId, {
+        type: MSG.SCREENSHOT_RESULT,
+        payload: { dataUrl: dataUrl, isLong: !!long, width: width || null, height: height || null },
+      }).catch((e) => {
+        robotPresent = false; // robot 已关闭，回退侧栏
+        showResult(dataUrl, long);
+      });
+      return;
+    }
+    showResult(dataUrl, long);
+  }
+
+  // robot 在页时回传错误提示；失败回退侧栏 toast
+  function notifyError(text) {
+    if (robotPresent && robotTabId != null) {
+      chrome.tabs.sendMessage(robotTabId, { type: MSG.SCREENSHOT_ERROR, payload: { error: text } })
+        .catch(() => { robotPresent = false; toast(text); });
+      return;
+    }
+    toast(text);
   }
 
   // 按矩形裁切（自动用 截图尺寸/视口尺寸 修正缩放，规避 dpr 不确定）
@@ -148,7 +188,7 @@
     img.src = dataUrl;
   }
 
-  // ===== 结果面板 =====
+  // ===== 结果面板（侧栏兜底；robot 在页时不显示，结果回传 robot）=====
   function showResult(dataUrl, long) {
     lastImage = dataUrl;
     if (!resultPanel) buildResultPanel();
@@ -157,6 +197,7 @@
     img.style.maxHeight = long ? '50vh' : '38vh';
     resultPanel.textArea.value = '';
     resultPanel.textArea.style.display = 'none';
+    resultPanel.copyText.style.display = 'none';
     resultPanel.el.style.display = 'flex';
   }
 
@@ -180,10 +221,12 @@
     const bTranslate = mkBtn('🌐 翻译');
     const bExtract = mkBtn('📝 提取文字');
     const bCopy = mkBtn('📋 复制截图');
+    const bSave = mkBtn('💾 保存本地');
     bTranslate.onclick = () => runOcr(lastImage, 'translate');
     bExtract.onclick = () => runOcr(lastImage, 'ocr');
-    bCopy.onclick = () => copyImage(lastImage);
-    row.append(bTranslate, bExtract, bCopy);
+    bCopy.onclick = () => copyImageInPage(null, lastImage);  // 优先 MAIN 世界复制
+    bSave.onclick = () => saveImage(lastImage);
+    row.append(bTranslate, bExtract, bCopy, bSave);
     const textArea = document.createElement('textarea');
     textArea.style.cssText = 'display:none;width:100%;height:120px;box-sizing:border-box;background:#0b1118;color:#c9d1d9;border:1px solid #2a3a44;border-radius:8px;padding:8px;font-size:12px;resize:vertical;';
     const copyText = mkBtn('复制文字');
@@ -194,39 +237,135 @@
     resultPanel = { el, img, textArea, copyText };
   }
 
-  function runOcr(dataUrl, task) {
+  async function runOcr(dataUrl, task) {
     toast(task === 'translate' ? '正在翻译…' : '正在提取文字…');
-    chrome.runtime.sendMessage({ type: MSG.SCREENSHOT_OCR, payload: { image: dataUrl, task, lang: 'zh' } }, (resp) => {
-      if (!resultPanel) return;
-      if (resp && resp.ok) {
-        resultPanel.textArea.value = resp.text || '';
-        resultPanel.textArea.style.display = 'block';
-        resultPanel.copyText.style.display = 'inline-block';
-        toast('识别完成');
-      } else {
-        resultPanel.textArea.value = '识别失败：' + ((resp && resp.error) || '未知错误');
-        resultPanel.textArea.style.display = 'block';
-        resultPanel.copyText.style.display = 'none';
-        toast('识别失败');
+    // 取设备标识与令牌，供后端授权闸口判定试用/订阅状态
+    let deviceId = '', token = '';
+    try {
+      const s = await chrome.storage.local.get(['hmdaoDeviceId', 'hmdaoToken']);
+      deviceId = s.hmdaoDeviceId || '';
+      token = s.hmdaoToken || '';
+    } catch (_) {}
+    chrome.runtime.sendMessage({ type: MSG.SCREENSHOT_OCR, payload: { image: dataUrl, task, lang: 'zh', deviceId, token } }, (resp) => {
+      // robot 在页：结果回传 robot（含 licenseRequired），侧栏仅负责 license 跳转
+      if (robotPresent && robotTabId != null) {
+        chrome.tabs.sendMessage(robotTabId, {
+          type: MSG.SCREENSHOT_OCR_RESULT,
+          payload: {
+            text: (resp && resp.text) || '',
+            error: (resp && resp.error) || '',
+            licenseRequired: !!(resp && resp.licenseRequired),
+          },
+        }).catch(() => { robotPresent = false; renderOcrToSidePanel(resp); });
+        if (resp && resp.licenseRequired && typeof window !== 'undefined' && window.HMDaoLicense) {
+          window.HMDaoLicense.goToPricing(); // 侧栏上下文执行跳转
+        }
+        return;
       }
+      renderOcrToSidePanel(resp);
     });
   }
 
-  async function copyImage(dataUrl) {
+  // 把 OCR 结果写到侧栏兜底面板
+  function renderOcrToSidePanel(resp) {
+    if (!resultPanel) return;
+    if (resp && resp.ok) {
+      resultPanel.textArea.value = resp.text || '';
+      resultPanel.textArea.style.display = 'block';
+      resultPanel.copyText.style.display = 'inline-block';
+      toast('识别完成');
+    } else if (resp && resp.licenseRequired) {
+      resultPanel.textArea.value = (resp.error || '免费试用已结束') + '\n\n可点击「去订阅」继续使用。';
+      resultPanel.textArea.style.display = 'block';
+      resultPanel.copyText.style.display = 'none';
+      if (typeof window !== 'undefined' && window.HMDaoLicense) window.HMDaoLicense.goToPricing();
+      toast('试用已结束');
+    } else {
+      resultPanel.textArea.value = '识别失败：' + ((resp && resp.error) || '未知错误');
+      resultPanel.textArea.style.display = 'block';
+      resultPanel.copyText.style.display = 'none';
+      toast('识别失败');
+    }
+  }
+
+  // ===== 复制截图（修 B9：MAIN 世界执行，最可靠；失败降级侧栏）=====
+  async function copyImageInPage(tabId, dataUrl) {
+    let targetTab = (typeof tabId === 'number' && tabId >= 0) ? tabId : null;
+    if (targetTab == null) { targetTab = await getActiveTabId(); }
+    if (targetTab == null) { toast('复制失败：未找到目标标签页'); return; }
+    const ok = await execCopyInPage(targetTab, dataUrl);
+    if (ok) {
+      toast('✅ 已复制截图，到微信按 Ctrl+V 粘贴');
+      notifyCopyResult(true);
+      return;
+    }
+    // 降级 1：侧栏文档内直接复制（需焦点）
     try {
       const res = await fetch(dataUrl);
       const blob = await res.blob();
       await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
       toast('✅ 已复制截图，到微信按 Ctrl+V 粘贴');
-    } catch (e) {
-      toast('复制失败：' + (e && e.message || e));
+      notifyCopyResult(true);
+      return;
+    } catch (e2) {
+      const hint = '复制失败，请点「保存本地」再用微信 Ctrl+V';
+      toast(hint);
+      notifyCopyResult(false, hint);
     }
+  }
+
+  // 在 active tab 的 MAIN 世界执行复制（返回 Promise<boolean>）
+  function execCopyInPage(tabId, dataUrl) {
+    return chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      world: 'MAIN',
+      func: (url) => {
+        return fetch(url).then((r) => r.blob()).then((blob) => {
+          return navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+        }).then(() => true).catch(() => false);
+      },
+      args: [dataUrl],
+    }).then((results) => {
+      const r = results && results[0];
+      return !!(r && r.result);
+    }).catch(() => false);
+  }
+
+  // 复制结果回传 robot（复用 SCREENSHOT_ERROR 通道作 toast；ok 时带成功提示）
+  function notifyCopyResult(ok, text) {
+    if (!robotPresent || robotTabId == null) return;
+    const msg = ok ? '✅ 已复制截图，到微信按 Ctrl+V 粘贴' : (text || '复制失败');
+    chrome.tabs.sendMessage(robotTabId, { type: MSG.SCREENSHOT_ERROR, payload: { error: msg } })
+      .catch(() => {});
+  }
+
+  // ===== 保存本地（chrome.downloads；data: URL 直下，避免 blob: 不被下载 API 支持的坑）=====
+  function saveImage(dataUrl) {
+    const filename = 'Ddayup-截图-' + Date.now() + '.png';
+    if (!dataUrl) { toast('保存失败：无图片数据'); return; }
+    // Chrome 的 downloads.download 不支持 blob: URL，必须用 data: URL（content script 内亦同）
+    chrome.downloads.download({ url: dataUrl, filename: filename, saveAs: false })
+      .then(() => toast('已保存到下载文件夹'))
+      .catch((e) => toast('保存失败：' + (e && e.message || e)));
+  }
+
+  function getActiveTabId() {
+    return new Promise((resolve) => {
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        resolve(tabs && tabs[0] && typeof tabs[0].id === 'number' ? tabs[0].id : null);
+      });
+    });
   }
 
   function toast(text) {
     const el = document.getElementById('status');
     if (el) { el.textContent = text; el.style.color = '#00d4aa'; }
   }
+
+  // ===== 机器人协调消息已迁移至 background（screenshot-ocr-bg.js）=====
+  // 侧栏仅保留 #aiBotBtn 悬停兜底入口（robot 不在页时直接本地协调），
+  // 机器人发起的截图/长图/OCR/保存/复制统一由常驻 Service Worker 接收并回传，
+  // 避免侧栏关闭后全部功能失效。
 
   // ===== 注册特性 =====
   FM.register({
@@ -235,16 +374,20 @@
     enabled: () => root.FeatureManager ? root.FeatureManager.getFlag('screenshot-ocr') : Promise.resolve(true),
     init() {
       botBtn = document.getElementById('aiBotBtn');
-      if (!botBtn) { console.warn('[HMDAO][screenshot] #aiBotBtn 不存在，跳过悬停入口'); return; }
-      botBtn.addEventListener('mouseenter', () => {
-        if (hoverTimer) clearTimeout(hoverTimer);
-        hoverTimer = setTimeout(showHotPanel, 1000);
-      });
-      botBtn.addEventListener('mouseleave', () => {
-        if (hoverTimer) clearTimeout(hoverTimer);
-        hideTimer = setTimeout(hideHotPanel, 250);
-      });
-      console.log('[HMDAO][screenshot] 侧栏特性已初始化（悬停 1s 入口已挂载）');
+      if (botBtn) {
+        // 保留悬停 1s 兜底入口（robot 不在页时仍可用）
+        botBtn.addEventListener('mouseenter', () => {
+          if (hoverTimer) clearTimeout(hoverTimer);
+          hoverTimer = setTimeout(showHotPanel, 1000);
+        });
+        botBtn.addEventListener('mouseleave', () => {
+          if (hoverTimer) clearTimeout(hoverTimer);
+          hideTimer = setTimeout(hideHotPanel, 250);
+        });
+      } else {
+        console.warn('[HMDAO][screenshot] #aiBotBtn 不存在，跳过悬停入口');
+      }
+      console.log('[HMDAO][screenshot] 侧栏特性已初始化（悬停 1s 兜底入口；机器人协调已由 background 接管）');
     },
     teardown() {
       hideHotPanel();

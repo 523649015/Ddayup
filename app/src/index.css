@@ -39,6 +39,127 @@
   50% { transform: translateX(-50%) translateY(calc(-50% - 4px)); }
 }
 
+/* ===== 打组动画：组框入场（由内向外展开并轻微过冲） ===== */
+@keyframes groupFrameIn {
+  0% { opacity: 0; transform: scale(0.9); }
+  55% { opacity: 1; transform: scale(1.03); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+/* ===== 打组动画：组框退场（解组） ===== */
+@keyframes groupFrameOut {
+  0% { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1.06); }
+}
+
+/* ===== 打组动画：成员节点落位回弹（配合 transform 过渡） ===== */
+@keyframes nodeSettle {
+  0% { filter: brightness(1); }
+  45% { filter: brightness(1.18); }
+  100% { filter: brightness(1); }
+}
+
+/* ===== 生成动画：结果卡流式铺开（带轻微上浮 + 过冲） ===== */
+@keyframes genCardIn {
+  0% { opacity: 0; transform: translateY(14px) scale(0.94); }
+  60% { opacity: 1; transform: translateY(-3px) scale(1.02); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* ===== 生成动画：生成中扫光（横向） ===== */
+@keyframes genShimmer {
+  0% { background-position: -160% 0; }
+  100% { background-position: 260% 0; }
+}
+
+/* ===== 生成动画：生成中呼吸脉冲 ===== */
+@keyframes genPulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+
+/* ===== 生成动画：任务卡入场（从右侧滑入） ===== */
+@keyframes queueCardIn {
+  0% { opacity: 0; transform: translateX(18px); }
+  100% { opacity: 1; transform: translateX(0); }
+}
+
+/* ===== UI 布局：右侧 AI 面板滑入 ===== */
+@keyframes aiDockIn {
+  0% { opacity: 0; transform: translateX(24px); }
+  100% { opacity: 1; transform: translateX(0); }
+}
+
+/* ===== 生成动画：进度条流动条纹 ===== */
+@keyframes genStripe {
+  0% { background-position: 0 0; }
+  100% { background-position: 32px 0; }
+}
+
+/* 打组：节点位移动画过渡（由 JS 临时挂载，动画结束后移除） */
+.hmdao-node-transition,
+.hmdao-node-transition.react-flow__node,
+.hmdao-node-transition .react-flow__node {
+  transition: transform 420ms cubic-bezier(0.22, 1, 0.36, 1) !important;
+  will-change: transform;
+}
+
+/* 打组：组框入场 / 退场 */
+.hmdao-group-enter { animation: groupFrameIn 340ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+.hmdao-group-exit { animation: groupFrameOut 200ms ease-in both; pointer-events: none !important; }
+
+/* 打组：自动排布落位后的高亮反馈 */
+.hmdao-node-settle { animation: nodeSettle 520ms ease-out both; }
+
+/* 生成：结果卡流式铺开 */
+.hmdao-gen-card-in { animation: genCardIn 380ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+/* 生成：生成中扫光条 */
+.hmdao-gen-shimmer {
+  background-image: linear-gradient(
+    100deg,
+    rgba(255, 255, 255, 0) 20%,
+    rgba(0, 212, 170, 0.55) 48%,
+    rgba(255, 255, 255, 0) 76%
+  );
+  background-size: 220% 100%;
+  animation: genShimmer 1.35s linear infinite;
+}
+
+/* 生成：生成中脉冲圆点 */
+.hmdao-gen-pulse { animation: genPulse 1.2s ease-in-out infinite; }
+
+/* 生成：任务卡入场 */
+.hmdao-queue-card-in { animation: queueCardIn 260ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+/* UI：右侧 AI 面板滑入 */
+.hmdao-ai-dock-in { animation: aiDockIn 220ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+/* 生成中节点：外圈呼吸微光（G14）。
+   只动 box-shadow 不动 opacity，避免整个节点内容跟着闪烁。 */
+@keyframes nodeGenGlow {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(0, 212, 170, 0.35), 0 0 12px rgba(0, 212, 170, 0.12); }
+  50% { box-shadow: 0 0 0 2px rgba(0, 212, 170, 0.7), 0 0 22px rgba(0, 212, 170, 0.32); }
+}
+
+.hmdao-node-generating {
+  animation: nodeGenGlow 1.6s ease-in-out infinite;
+  border-radius: 12px;
+}
+
+/* 生成：进度条流动条纹 */
+.hmdao-gen-stripe {
+  background-image: linear-gradient(
+    115deg,
+    rgba(0, 212, 170, 0.85) 25%,
+    rgba(0, 212, 170, 0.35) 25% 50%,
+    rgba(0, 212, 170, 0.85) 50% 75%,
+    rgba(0, 212, 170, 0.35) 75%
+  );
+  background-size: 32px 32px;
+  animation: genStripe 700ms linear infinite;
+}
+
 @layer base {
   :root {
     --background: 0 0% 100%;

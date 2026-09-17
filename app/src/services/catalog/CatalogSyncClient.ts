@@ -14,6 +14,7 @@ const DEFAULT_CONFIG: Required<CatalogSyncClientConfig> = {
   reconnectMaxDelayMs: 10_000,
 };
 
+
 let singleton: CatalogSyncClient | null = null;
 
 function buildDefaultUrl() {
@@ -47,6 +48,7 @@ export class CatalogSyncClient {
   private heartbeatTimer: number | null = null;
   private intentionalClose = false;
   private handlers = new Set<CatalogUpdateHandler>();
+  private onVisibility: (() => void) | null = null;
 
   constructor(config: CatalogSyncClientConfig = {}) {
     this.config = {
@@ -54,6 +56,18 @@ export class CatalogSyncClient {
       ...config,
       url: config.url || buildDefaultUrl(),
     };
+    // ★性能（2026-09-14）：页面从后台恢复可见时立即补一次连接，避免隐藏期间暂停后长时间不同步。
+    //   隐藏期间不主动重连（见 scheduleReconnect）、不放心跳（见 startHeartbeat）。
+    if (typeof document !== 'undefined' && typeof window !== 'undefined') {
+      this.onVisibility = () => {
+        if (document.hidden) return;
+        if (this.state === 'connected' || this.connectPromise) return;
+        if (this.handlers.size === 0) return;
+        if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+        void this.connect().catch(() => { this.scheduleReconnect(); });
+      };
+      document.addEventListener('visibilitychange', this.onVisibility);
+    }
   }
 
   static getInstance(config?: CatalogSyncClientConfig) {
@@ -157,6 +171,8 @@ export class CatalogSyncClient {
     this.stopHeartbeat();
     this.heartbeatTimer = window.setInterval(() => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      // ★性能：页面不可见时跳过心跳，避免后台标签页空转（连接本身保持，不误断）
+      if (typeof document !== 'undefined' && document.hidden) return;
       this.ws.send(JSON.stringify({
         msg_id: nextId('catalog-ping'),
         msg_type: 'ping',
@@ -175,6 +191,9 @@ export class CatalogSyncClient {
 
   private scheduleReconnect() {
     if (this.intentionalClose || this.reconnectTimer || this.handlers.size === 0) return;
+    // ★性能：页面不可见时不重连（避免后台标签页 1→10s 反复重连的无效开销），
+    //   恢复可见时由 visibilitychange 监听立即重连。
+    if (typeof document !== 'undefined' && document.hidden) return;
     const delay = Math.min(
       this.config.reconnectInitialDelayMs * 2 ** this.reconnectAttempts,
       this.config.reconnectMaxDelayMs,

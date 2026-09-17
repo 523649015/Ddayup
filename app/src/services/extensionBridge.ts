@@ -7,6 +7,7 @@
 // HMDAO_EXTENSION_ID 仅作为可选项：填了可让 Web 端主动弹侧栏；不填也能用。
 
 import type { AssetItem, AIDeepAnalysis } from '@/types/assets';
+import { useAuthStore } from '@/store/useAuthStore';
 
 export const HMDAO_EXTENSION_ID = ''; // 可选：加载解压版后的扩展 ID（留空则靠手动点图标触发）
 
@@ -81,9 +82,13 @@ export function detectHmdaoExtension(timeoutMs = 600): Promise<boolean> {
   if (_extInstalled) return Promise.resolve(true);
   return new Promise((resolve) => {
     const w = window as any;
-    if (w.__hmdaoExtInstalled) {
+    // 扩展的桥接脚本运行在 ISOLATED 世界，直接挂 window 的属性页面读不到，
+    // 因此存在标记同时打在 <html> 的 data 属性上（DOM 在两个世界间共享）。
+    const el = document.documentElement;
+    const domFlag = el && el.getAttribute('data-hmdao-ext') === '1';
+    if (w.__hmdaoExtInstalled || domFlag) {
       _extInstalled = true;
-      _hmdaoExtBuild = w.__hmdaoExtBuild || null;
+      _hmdaoExtBuild = w.__hmdaoExtBuild || (el && el.getAttribute('data-hmdao-ext-build')) || null;
       return resolve(true);
     }
     const cleanup = () => {
@@ -285,6 +290,141 @@ export function initExtensionAiBridge(): void {
   };
 
   window.addEventListener('hmdao:ai-chat', handler as EventListener);
+}
+
+// ===== 官网登录态 → 扩展 同步（2026-09-14）=====
+// 官网与扩展原本是两套独立令牌（session vs extToken），用户官网登录后扩展仍提示未登录。
+// 这里用「一次性绑定码」打通：官网凭 session 换 6 位短码 → 投递给扩展 → 扩展用短码 + deviceId 换令牌。
+// 长令牌绝不经网页传递，短码 5 分钟有效、单次消费，泄露窗口极小。
+export interface SyncLoginResult {
+  success: boolean;
+  error?: string | null;
+  email?: string | null;
+}
+
+export function syncLoginToExtension(timeoutMs = 8000): Promise<SyncLoginResult> {
+  return new Promise((resolve) => {
+    let settled = false;
+    // ★timer 必须先声明为可变变量：done() 可能在 const timer 赋值前被同步调用
+    //   （如「官网未登录」分支），否则会命中 TDZ 抛错、Promise 永不 resolve（调用方挂起）。
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const done = (v: SyncLoginResult) => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('message', onRes);
+      if (timer) clearTimeout(timer);
+      resolve(v);
+    };
+
+    const onRes = (e: MessageEvent) => {
+      const d = e.data;
+      if (!d || d.type !== 'HMDAO_WEB_BIND_RESULT') return;
+      done({ success: !!d.success, error: d.error || null, email: d.email || null });
+    };
+
+    (async () => {
+      try {
+        const token = useAuthStore.getState().session?.accessToken;
+        if (!token) { done({ success: false, error: '请先在官网登录' }); return; }
+
+        const resp = await fetch('/api/extension/account/bind-code', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({}),
+        });
+        const data = await resp.json().catch(() => ({} as any));
+        if (!resp.ok || !data?.success) {
+          done({ success: false, error: (data?.error?.message) || `获取绑定码失败（HTTP ${resp.status}）` });
+          return;
+        }
+        const code = String(data.code || '');
+        if (!code) { done({ success: false, error: '绑定码为空' }); return; }
+
+        window.addEventListener('message', onRes);
+        // 通道 1（可选）：已知扩展 ID 时直接 sendMessage（商店版/固定 ID 场景）
+        const w = window as any;
+        if (w.chrome?.runtime && HMDAO_EXTENSION_ID) {
+          try { await w.chrome.runtime.sendMessage(HMDAO_EXTENSION_ID, { type: 'HMDAO_BIND_FROM_WEB', code }); } catch { /* 忽略，走兜底 */ }
+        }
+        // 通道 2（兜底，无需扩展 ID）：postMessage 由注入本站的 site-auth-bridge.js 接收
+        window.postMessage({ type: 'HMDAO_WEB_BIND', code }, '*');
+      } catch (err: any) {
+        done({ success: false, error: err?.message || '同步失败' });
+      }
+    })();
+
+    timer = setTimeout(() => {
+      done({ success: false, error: '扩展未响应，请确认已安装并启用「Ddayup 网页素材采集扩展」后重试' });
+    }, timeoutMs);
+  });
+}
+
+// ===== 扩展登录态 → 官网 反向自动登录（2026-09-14）=====
+// 官网页面处于 MAIN 世界、拿不到 chrome.runtime，必须经注入本站的 site-auth-bridge.js（ISOLATED）中转。
+// 凭据只在「扩展存储 → 内容脚本 → 同源页面」之间流动，全程不出本机、不跨域。
+export interface ExtensionCredsResult {
+  ok: boolean;
+  email?: string | null;
+  password?: string | null;
+  error?: string | null;
+}
+
+/**
+ * 主动向扩展索取本机记住的凭据（官网未登录时自动登录）。
+ * 链路：window.postMessage(HMDAO_WEB_REQUEST_CREDS) → site-auth-bridge → background 读 chrome.storage → 同源回传。
+ * 超时 / 扩展未安装 / 本机无记住的凭据 → 返回 ok:false（调用方静默降级）。
+ */
+export function requestExtensionCreds(timeoutMs = 1500): Promise<ExtensionCredsResult> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v: ExtensionCredsResult) => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('message', onRes);
+      clearTimeout(timer);
+      resolve(v);
+    };
+    const onRes = (e: MessageEvent) => {
+      const d = e.data;
+      if (!d || d.type !== 'HMDAO_EXT_CREDS') return;
+      if (d.source === 'push') return; // push 由 onExtensionAutoLogin 消费，避免重复触发
+      if (d.email && d.password) done({ ok: true, email: d.email, password: d.password });
+    };
+    const timer = setTimeout(() => done({ ok: false, error: 'timeout' }), timeoutMs);
+    window.addEventListener('message', onRes);
+    window.postMessage({ type: 'HMDAO_WEB_REQUEST_CREDS' }, '*');
+  });
+}
+
+/**
+ * 监听扩展「登录成功」主动推送的凭据（background → site-auth-bridge → 本页）。
+ * 返回取消订阅函数。
+ */
+export function onExtensionAutoLogin(cb: (creds: { email: string; password: string }) => void): () => void {
+  const handler = (e: MessageEvent) => {
+    const d = e.data;
+    if (!d || d.type !== 'HMDAO_EXT_CREDS') return;
+    if (d.source && d.source !== 'push') return; // 仅消费主动推送，避免与 requestExtensionCreds 重复
+    if (d.email && d.password) cb({ email: d.email, password: d.password });
+  };
+  window.addEventListener('message', handler);
+  return () => window.removeEventListener('message', handler);
+}
+
+/**
+ * 监听扩展发来的「请重新同步登录态」请求。
+ * 场景：扩展侧令牌失效（服务端重启/令牌被吊销）且本机没有可自动重登的凭据时，
+ *   扩展会请求本页重新走一次「绑定码」同步（自愈），用户无需手动点任何按钮。
+ * 返回取消订阅函数。
+ */
+export function onSiteRefreshLoginRequest(cb: () => void): () => void {
+  const handler = (e: MessageEvent) => {
+    const d = e.data;
+    if (!d || d.type !== 'HMDAO_SITE_REFRESH_LOGIN') return;
+    cb();
+  };
+  window.addEventListener('message', handler);
+  return () => window.removeEventListener('message', handler);
 }
 
 // 模块加载即自动注册（extensionBridge 已被常驻组件引入），保证 Web App 打开即生效

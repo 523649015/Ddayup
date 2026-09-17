@@ -75,17 +75,28 @@ export function registerAssetsRoutes(router, deps) {
   });
 
   router.register('POST', '/api/settings/assets/pick-directory', async (req, res) => {
-    const body = await readJson(req);
-    const settings = await deps.readAssetLibrarySettings();
-    const picked = await deps.pickLocalDirectory(
-      String(body?.initialPath || settings.storagePath || deps.DEFAULT_ASSET_LIBRARY_STORAGE_DIR),
-      String(body?.autoSelectPath || ''),
-    );
-    return send(res, 200, {
-      success: true,
-      canceled: picked.canceled,
-      path: picked.path,
-    });
+    try {
+      const body = await readJson(req);
+      const settings = await deps.readAssetLibrarySettings();
+      const picked = await deps.pickLocalDirectory(
+        String(body?.initialPath || settings.storagePath || deps.DEFAULT_ASSET_LIBRARY_STORAGE_DIR),
+        String(body?.autoSelectPath || ''),
+      );
+      if (picked.canceled || !picked.path) {
+        return send(res, 200, { success: true, canceled: true, path: '' });
+      }
+      return send(res, 200, {
+        success: true,
+        canceled: false,
+        path: picked.path,
+      });
+    } catch (error) {
+      // FolderBrowserDialog 在「无交互桌面 / 服务会话」环境会抛 InvalidOperationException；
+      // 返回结构化错误（而非 500）让前端给出明确提示，避免静默失败。
+      const message = String((error && error.message) || error || 'pick-directory-failed');
+      console.error(`[api] pick-directory failed: ${message}`);
+      return send(res, 200, { success: false, canceled: false, path: '', error: message });
+    }
   });
 
   // ---- 素材库（按用户硬隔离：所有操作须携带有效登录态，未登录返回 401）----

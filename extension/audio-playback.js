@@ -122,14 +122,17 @@ async function playAudioViaBlob(a, { visual = false, url: overrideUrl } = {}) {
     const binary = atob(res.b64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    // 魔数校验：确认真的是音频字节，避免把 HTML/JSON 喂给 <audio> 报 NotSupportedError
+    // 魔数 + MIME 联合校验：确认真的是音频字节，避免把 HTML/JSON/图片/错误页喂给 <audio> 报 NotSupportedError。
+    // 仅当「MIME 是 audio/*」或「字节是音频魔数」二者至少其一成立才继续，否则一律拒绝——
+    // 这能拦住 storage.live.com/profilephoto 这类被通用音频捕获误判、实际返回图片/网页的 URL（blobType=text/html 报错）。
     const head = String.fromCharCode.apply(null, Array.from(bytes.slice(0, 16)));
     const isAudioMagic = /^ID3/.test(head) || (bytes[0] === 0xFF && (bytes[1] & 0xE0) === 0xE0) // mp3
       || /^OggS/.test(head) || /^RIFF/.test(head) || /^fLaC/.test(head)
       || (bytes.length > 8 && String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]) === 'ftyp'); // m4a/aac
-    if (/^\s*(<!doctype|<html|<head|\{)/i.test(head)) {
-      console.error('[HMDAO][audio] 拉到的是网页/JSON 而非音频 ' + dbg({ head: head.slice(0, 40), mime, size: bytes.length }));
-      setStatus('⚠ 源站返回的是网页而非音频（防盗链拦截），请到源页试听', true);
+    const looksLikeAudio = /^audio\//.test(mime) || isAudioMagic;
+    if (!looksLikeAudio) {
+      console.error('[HMDAO][audio] 源站返回的并非音频字节 ' + dbg({ head: head.slice(0, 40), mime, size: bytes.length }));
+      setStatus('⚠ 源站返回的不是音频（可能是图片/网页/错误页，被通用音频捕获误判），请到源页试听', true);
       return false;
     }
     // MIME 补正：非 audio/* 会让 <audio> 直接拒绝 blob

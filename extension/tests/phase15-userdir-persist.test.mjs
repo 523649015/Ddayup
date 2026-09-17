@@ -152,6 +152,9 @@ function buildSandbox() {
     b64ToBytes: (s) => Uint8Array.from(Buffer.from(String(s || ''), 'base64')),
     sourceOrigin: () => '',
     pulseDownloadProgress: () => {},
+    // ★2026-09-13：.pathPick 现优先调后端原生目录选择器（fetch）。桩成「后端不可用」，
+    //   使 A1-A4 走 FSA 兜底（句柄）分支，且绝不触发真实网络 / 真实系统目录框。
+    fetch: async () => ({ ok: false, status: 503, json: async () => ({}) }),
     // 已知可选全局（真实页面可能为 undefined）；显式置 undefined 以免被代理当成 noop
     HMDaoLicense: undefined,
     // 测试可控的 showDirectoryPicker：返回带名称的目录句柄

@@ -49,6 +49,10 @@ import {
   useSharedAgentMemoryGraph,
 } from '@/services/agentMemory';
 import { useCanvasStore, type WorkflowPlan } from '@/store/useCanvasStore';
+import { useGenerationQueueStore } from '@/store/useGenerationQueueStore';
+import { staggerNodeEntrance } from '@/lib/canvasGroupAnimation';
+import { AI_PANEL_DOCK_WIDTH } from './AIPanel';
+import { GenerationProgressCard } from './GenerationProgressCard';
 import { importLocalAssetFile } from '@/api/assetLibrary';
 import type { AssetItem } from '@/types/assets';
 import { analyzeAssetImage } from '@/services/assetImageAnalysis';
@@ -198,6 +202,11 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
     },
   ]);
 
+  // 右侧 docked AI 面板开启时，把智能体浮层的可用区域右侧内缩，
+  // 避免两者重叠（docked 面板 z-[60]，智能体 z-[90]，重叠会互相遮挡）。
+  const showAIPanel = useCanvasStore((state) => state.showAIPanel);
+  const dockInset = showAIPanel && !isMobile ? AI_PANEL_DOCK_WIDTH + 24 : 0;
+
   const dragRef = useRef<{ startX: number; startY: number; initX: number; initY: number } | null>(null);
   const dragMovedRef = useRef(false);
   const dragActiveRef = useRef(false);
@@ -212,13 +221,28 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
   const snapshotVaultRef = useRef<Record<string, { beforeSnapshot: string; afterSnapshot?: string }>>({});
 
   useEffect(() => {
-    const host = getCanvasHostBounds(canvasHostRef);
+    const host = getCanvasHostBounds(canvasHostRef, dockInset);
     setPosition(clampLauncherPosition(
       host.width - SMART_AGENT_LAUNCHER_SIZE - 24,
       host.height - SMART_AGENT_LAUNCHER_SIZE - 96,
       canvasHostRef,
+      undefined,
+      dockInset,
     ));
   }, [canvasHostRef]);
+
+  // 右侧面板「打开」时把浮层收进可用区域，避免被 docked 面板压住。
+  // 关闭时不动位置：用户可能已把浮层拖到喜欢的地方，没必要强行挪回去。
+  useEffect(() => {
+    if (dockInset === 0) return;
+    setPosition((current) => clampLauncherPosition(
+      current.x,
+      current.y,
+      canvasHostRef,
+      undefined,
+      dockInset,
+    ));
+  }, [canvasHostRef, dockInset]);
 
   useEffect(() => {
     persistStorage(TRACE_STORAGE_KEY, traceRuns);
@@ -237,8 +261,8 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
   useEffect(() => {
     if (typeof window === 'undefined') return undefined;
     const handleResize = () => {
-      const host = getCanvasHostBounds(canvasHostRef);
-      setPosition((current) => clampLauncherPosition(current.x, current.y, canvasHostRef));
+      const host = getCanvasHostBounds(canvasHostRef, dockInset);
+      setPosition((current) => clampLauncherPosition(current.x, current.y, canvasHostRef, undefined, dockInset));
       setPanelSize((current) => ({
         width: Math.min(current.width, Math.max(320, host.width - 24)),
         height: Math.min(current.height, Math.max(360, host.height - 24)),
@@ -256,7 +280,7 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
       resizeObserver?.disconnect();
       window.removeEventListener('resize', handleResize);
     };
-  }, [canvasHostRef]);
+  }, [canvasHostRef, dockInset]);
 
   const syncLauncherGaze = useCallback(() => {
     gazeFrameRef.current = null;
@@ -317,7 +341,7 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
   const activeTrace = useMemo(() => traceRuns.find((trace) => trace.id === activeTraceId) || traceRuns[0] || null, [activeTraceId, traceRuns]);
   const desktopPanelPosition = useMemo(() => {
     if (isMobile) return null;
-    const host = getCanvasHostBounds(canvasHostRef);
+    const host = getCanvasHostBounds(canvasHostRef, dockInset);
     const spacing = 18;
     const preferredRight = position.x + SMART_AGENT_LAUNCHER_SIZE + spacing;
     const preferredLeft = position.x - panelSize.width - spacing;
@@ -333,7 +357,7 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
       left: nextLeft,
       top: clampValue(preferredTop, minInset, Math.max(minInset, host.height - panelSize.height - minInset)),
     };
-  }, [canvasHostRef, isMobile, panelSize.height, panelSize.width, position.x, position.y]);
+  }, [canvasHostRef, dockInset, isMobile, panelSize.height, panelSize.width, position.x, position.y]);
 
   const appendTraceEvent = useCallback((traceId: string, event: Omit<AgentTraceEvent, 'id' | 'at'>) => {
     const nextEvent: AgentTraceEvent = {
@@ -455,7 +479,7 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
       if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
         dragMovedRef.current = true;
       }
-      setPosition(clampLauncherPosition(dragRef.current.initX + dx, dragRef.current.initY + dy, canvasHostRef));
+      setPosition(clampLauncherPosition(dragRef.current.initX + dx, dragRef.current.initY + dy, canvasHostRef, undefined, dockInset));
     };
 
     const handleUp = () => {
@@ -474,7 +498,8 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
     window.addEventListener('pointerup', handleUp);
     window.addEventListener('mousemove', handleMove);
     window.addEventListener('mouseup', handleUp);
-  }, [canvasHostRef]);
+    // dockInset 必须进依赖：否则面板开合后拖拽仍按旧边界钳制，浮层会被压在面板下。
+  }, [canvasHostRef, dockInset]);
 
   const handleDragHandlePointerDown = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
     event.stopPropagation();
@@ -602,6 +627,11 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
       },
     ]);
 
+    // 计划步骤入队：右侧进度卡 / 左下占位卡实时反映「共 N 个任务，已完成 M 个」（G12 / G13）。
+    const queueTaskIds = useGenerationQueueStore.getState().enqueueMany(
+      workflowSteps.map((step) => ({ label: step.label || '步骤' })),
+    );
+
     for (let index = 0; index < workflowSteps.length; index += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, 240));
       const nextSteps = workflowSteps.map((step, stepIndex) => {
@@ -623,6 +653,7 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
         detail: `执行节点阶段 ${index + 1}/${workflowSteps.length}`,
         status: 'running',
       });
+      useGenerationQueueStore.getState().markSuccess(queueTaskIds[index]);
       setMessages((prev) =>
         prev.map((message) => {
           if (message.id !== messageId || !message.workflowSteps) return message;
@@ -642,6 +673,12 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
     const startedAt = Date.now();
     const result = await createWorkflowFromPlan(run.plan);
     if (!result.success) {
+      // 未完成的步骤标记为失败，避免进度卡永远停在「已完成 M/N」的中间态。
+      const queueStore = useGenerationQueueStore.getState();
+      queueTaskIds.forEach((taskId) => {
+        const task = queueStore.tasks.find((item) => item.id === taskId);
+        if (task && task.status !== 'success') queueStore.markFailed(taskId, result.error || '创建失败');
+      });
       const failedSteps = workflowSteps.map((step, index) => ({
         ...step,
         status: index < (result.nodeIds?.length || 0) ? 'done' as const : 'error' as const,
@@ -701,6 +738,9 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
       detail: `已创建 ${result.nodeIds.length} 个节点，耗时 ${Math.max(1, Math.round((Date.now() - startedAt) / 1000))} 秒。`,
       status: 'done',
     });
+    // 新节点按序号错峰入场（G08）。延后一帧执行：此时 React 尚未把节点渲染到 DOM，
+    // 立即查询会取不到元素导致动画静默丢失。
+    window.setTimeout(() => staggerNodeEntrance(result.nodeIds), 60);
     setMessages((prev) => [
       ...prev,
       {
@@ -2118,6 +2158,11 @@ export function SmartAgent({ isMobile = false, canvasHostRef }: SmartAgentProps)
                             </button>
                           </div>
                         ) : null}
+                      </div>
+
+                      {/* 生成任务进度聚合（G13）：与右侧 docked 面板共用同一份队列真源。 */}
+                      <div data-testid="smart-agent-queue-aggregate">
+                        <GenerationProgressCard />
                       </div>
 
                       <div

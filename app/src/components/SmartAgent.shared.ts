@@ -400,33 +400,33 @@ export function clampValue(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
-export function getCanvasHostBounds(canvasHostRef?: RefObject<HTMLDivElement | null>) {
+/**
+ * 画布宿主可用区域。
+ *
+ * @param reservedRight 右侧被常驻面板（如 docked AI 面板）占用的宽度。
+ *   传入后返回的 width / right 会相应收窄，使依赖它的钳制逻辑自动避让，
+ *   不必在每处调用点重复减一次。
+ */
+export function getCanvasHostBounds(canvasHostRef?: RefObject<HTMLDivElement | null>, reservedRight = 0) {
   const hostRect = canvasHostRef?.current?.getBoundingClientRect();
-  if (hostRect) {
-    return hostRect;
-  }
-  if (typeof window === 'undefined') {
-    return {
-      left: 0,
-      top: 0,
-      width: 1280,
-      height: 720,
-      right: 1280,
-      bottom: 720,
-      x: 0,
-      y: 0,
-      toJSON: () => ({}),
-    } as DOMRect;
-  }
+  const base = hostRect || (typeof window === 'undefined'
+    ? { left: 0, top: 0, width: 1280, height: 720, bottom: 720 }
+    : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight, bottom: window.innerHeight });
+
+  const minWidth = 160;
+  // 内缩不能超过可用宽度，否则宿主被挤没，钳制结果会变成负坐标。
+  const inset = Math.max(0, Math.min(reservedRight, Math.max(0, base.width - minWidth)));
+  const width = Math.max(minWidth, base.width - inset);
+
   return {
-    left: 0,
-    top: 0,
-    width: window.innerWidth,
-    height: window.innerHeight,
-    right: window.innerWidth,
-    bottom: window.innerHeight,
-    x: 0,
-    y: 0,
+    left: base.left,
+    top: base.top,
+    width,
+    height: base.height,
+    right: base.left + width,
+    bottom: base.bottom,
+    x: base.left,
+    y: base.top,
     toJSON: () => ({}),
   } as DOMRect;
 }
@@ -436,8 +436,9 @@ export function clampLauncherPosition(
   y: number,
   canvasHostRef?: RefObject<HTMLDivElement | null>,
   size = SMART_AGENT_LAUNCHER_SIZE,
+  reservedRight = 0,
 ) {
-  const host = getCanvasHostBounds(canvasHostRef);
+  const host = getCanvasHostBounds(canvasHostRef, reservedRight);
   const paddingX = 12;
   const paddingTop = 12;
   const paddingBottom = 20;
@@ -498,7 +499,7 @@ export function buildRouteRecommendations(plan: WorkflowPlan, skillId: string): 
       videoRes?.isFree ? '视频：免费模型' : '视频：已回退到付费模型',
     ],
     textProvider: textRes?.provider || 'openai',
-    textModel: textRes?.model || 'gpt-4o',
+    textModel: textRes?.model || 'qwen3.7-flash',
     imageProvider: imageRes?.provider || 'fal',
     imageModel: imageRes?.model || 'flux-pro',
     videoProvider: videoRes?.provider || 'fal',
@@ -523,7 +524,7 @@ export function buildRouteRecommendations(plan: WorkflowPlan, skillId: string): 
         needs.hasVideo ? '视频节点质量均衡' : '交付节奏自然',
       ],
       textProvider: 'openai',
-      textModel: 'gpt-4o',
+      textModel: 'qwen3.7-flash',
       imageProvider: 'fal',
       imageModel: 'flux-pro',
       videoProvider: 'fal',

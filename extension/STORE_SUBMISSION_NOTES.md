@@ -171,10 +171,10 @@ Productivity / Photo & Media
 2. 进入草稿编辑界面，通常左侧有几个分区：**Packages（包） / Listings（列表） / Properties（属性） / Availability（可用性）**。
 
 **第 3 步 · 替换包（Packages）**
-1. 在 **Packages** 分区，找到现有的 `0.1.3` 包，点 **Remove（移除）**。
+1. 在 **Packages** 分区，找到现有的 `0.2.9` 包，点 **Remove（移除）**。
 2. 点 **Upload（上传）**，选择本地文件：
-   `F:\Work\HMDAODAO\extension\ddayup-edge-store-v0.1.4.zip`
-3. 上传后系统会校验 manifest（版本号必须 > 0.1.3，已设为 0.1.4 ✅）。校验通过即显示新包。
+   `F:\Work\HMDAODAO\extension\ddayup-edge-store-v0.2.10.zip`
+3. 上传后系统会校验 manifest（版本号必须 > 0.2.9，已设为 0.2.10 ✅）。校验通过即显示新包。
 
 **第 4 步 · 补英文列表（Listings，关键：解决搜索看不到）**
 1. 进入 **Listings** 分区。
@@ -192,8 +192,8 @@ Productivity / Photo & Media
 **第 5 步 · 填更新说明（Submission notes / What's new）**
 在提交页的「Notes for certification（认证说明）」或列表里的「What's new in this version」填入：
 ```
-修复若干素材采集稳定性问题；优化 YouTube / 抖音 / 网盘资源捕获；补全英文商店列表提升搜索可见性。
-（Fixed several media-capture stability issues; improved YouTube / Douyin / netdisk asset capture; added English store listing for better search visibility.）
+修复侧栏内联脚本处理器以符合内容安全策略(CSP)，提升加载稳定性与商店合规性；并改进素材采集与扩展授权相关功能稳定性。
+（Fixed inline script handlers in the side panel to comply with Content Security Policy (CSP), improving load stability and store compliance; improved stability of media-capture and extension-licensing features.）
 ```
 
 **第 6 步 · 提交审核（Submit）**
@@ -305,10 +305,20 @@ Productivity / Photo & Media
 - **链路 A · 打包**：复用 `build-store-package.ps1`，与上传无关，永远执行。
 - **链路 B · 上传 API**：仅当存在 `EDGE_ADDON_API_KEY` + `EDGE_ADDON_CLIENT_ID`（微软在 Partner Center「发布 API」页面下发）时触发，走 v1.1 `ApiKey` + `X-ClientID` 认证，端点 `https://api.addons.microsoftedge.microsoft.com/v1`。
 - 用法与凭证分类存储：见 `extension/tools/EDGE_UPDATE_GUIDE.md`（含如何申请 ApiKey+ClientID、三种凭证配置方式、版本号规则、故障排查）。
-- 当前目标版本 `0.2.7`（含「版本更新提醒 + 自动更新」新功能），产品 ID `jpcnchdcjaapokighokneachmbkeafan`。
+- 当前目标版本 `0.2.10`（含 CSP 合规修复、网页截图 OCR、扩展授权与试用管理、站点登录态桥接、页面标题提取，以及素材采集稳定性改进），产品 ID `jpcnchdcjaapokighokneachmbkeafan`。
 - ✅ **2026-09-15 首次全自动提交成功**：`.\update-edge-store.ps1` 走 API 完成
   上传包(202) → 轮询 Succeeded → 发布草稿(202) → 轮询 Succeeded → 进入审核队列，
   全程无人工点按。凭证存于 `extension/tools/edge-api-config.ps1`（gitignore，不入库）。
 - 打包排残已加固：`build-store-package.ps1` 现排除 `probe_jingxuan/`、嵌套 `*.zip` 与开发文档，
   商店包由 1.36MB/61 文件降至 0.66MB/53 文件；`tools/verify-store-package.ps1` 提供 16 项自动校验。
 - 若线上已发布更高版本，运行加 `-BumpPatch` 自动升版本号再打包（满足商店新包版本必须递增）。
+
+### 0.2.10 提交记录（2026-09-17）
+
+- 范围：按用户确认，**打包整个当前工作树**（含截图 OCR、授权/试用网关、site-auth-bridge、title-extract、CSP 修复等），而非仅 CSP 修复。
+- 版本号 `0.2.9 → 0.2.10`（manifest.json 已改）。
+- 包：`extension/ddayup-edge-store-v0.2.10.zip`（1.69 MB，83 文件），`verify-store-package.ps1` **16/16 全过**；`test-csp-inline.mjs` 内联处理器扫描 **0 违规 / 52 文件**；extension 全部 `.js` `node --check` 语法体检通过。
+- **API 自动发布受阻（重要）**：`.\update-edge-store.ps1` 两次走 Edge 加载项更新 API v1.1，均「上传包(202)→轮询 Succeeded（微软已校验通过 zip）」成功，但「发布草稿(202)→轮询」稳定 `Failed`（操作 `69148e25…` 与 `c6deea60…`）。
+  - 根因：该最小 API 流程（仅上传包 + 带 notes 发布）**无法补齐提交所需的元数据**（列表 Listings / 可见性 Availability 等），即计划已说明的「API 不能改元数据」限制；微软接受并校验了 zip，但发布校验要求这些字段，故失败。
+  - 结论：0.2.10 **必须人工在 Partner Center 提交**（见第八节 8.2 步骤；本次人工提交同时顺手补 English (US) 列表，二者合一）。
+  - 待人工动作：登录 Partner Center → 该扩展点 **Update** → Packages 上传 `ddayup-edge-store-v0.2.10.zip` → Listings 补英文（第八节文案）→ Notes 填 CSP 合规说明 → **Submit**。审核通常 1–3 个工作日，通过后自动覆盖线上 0.2.9。

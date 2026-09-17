@@ -1,11 +1,13 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, KeyRound, Loader2, Maximize2, Send } from 'lucide-react';
+import { AlertCircle, KeyRound, Loader2, Maximize2, Minimize2, Send } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { ModelActivationPrompt } from '@/components/ModelActivationPrompt';
+import { GenerationProgressCard } from '@/components/GenerationProgressCard';
+import { GenerationResultCard } from '@/components/GenerationResultCard';
 import { ErrorDetailBlock, ProgressBadge } from '@/nodes/NodeShellShared';
 import {
   describeGenerationError,
-  generateNodeOutput,
+  generateNodeOutputWithFallback,
   GenerationError,
   resolveGenerationAccess,
   type GenerationAccess,
@@ -14,10 +16,17 @@ import { getSharedMemorySuggestions, type SharedAgentMemory } from '@/services/a
 import { isUnusableProviderKeyStatus, useApiKeyStore } from '@/store/useApiKeyStore';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useCanvasStore } from '@/store/useCanvasStore';
+import { useGenerationQueueStore } from '@/store/useGenerationQueueStore';
 import { useModelCatalogStore } from '@/store/useModelCatalogStore';
 import { useUILanguage } from '@/i18n/ui';
 import type { NodeData, NodeType } from '@/types';
 import type { CatalogModel } from '@/api/models';
+
+/**
+ * 右侧 docked 面板的默认宽度。SmartAgent 的避让计算复用同一常量，
+ * 避免两边各写死一个数字后逐渐漂移。
+ */
+export const AI_PANEL_DOCK_WIDTH = 340;
 
 const NODE_TYPE_LABELS: Record<NodeType, { zh: string; en: string }> = {
   text: { zh: '文本', en: 'Text' },
@@ -64,6 +73,11 @@ export function AIPanel() {
 
 interface NodeGeneratePanelProps {
   embedded?: boolean;
+  /**
+   * 右侧常驻（docked）形态：挂在画布右侧而非底部浮层，与参考视频的
+   * 三段式布局一致。默认 false 保持原有底部浮层行为，零回归。
+   */
+  docked?: boolean;
 }
 
 const AUTO_FREE_MODEL: CatalogModel = {
@@ -80,22 +94,26 @@ const AUTO_FREE_MODEL: CatalogModel = {
 
 const FREE_FIRST_NODE_TYPES = new Set<NodeType>(['text', 'script', 'storyboard', 'aiapp']);
 
-export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) {
+export function NodeGeneratePanel({ embedded = false, docked = false }: NodeGeneratePanelProps) {
   const { t } = useUILanguage();
   const canvas = useCanvasStore((state) => state.canvas);
   const selectedNodeIds = useCanvasStore((state) => state.selectedNodeIds);
   const showAIPanel = useCanvasStore((state) => state.showAIPanel);
   const floatingPanel = useCanvasStore((state) => state.floatingPanel);
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
+  const setSelectedNodeIds = useCanvasStore((state) => state.setSelectedNodeIds);
   const apiKeys = useApiKeyStore((state) => state.keys);
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const catalogItems = useModelCatalogStore((state) => state.models);
+  const queueTasks = useGenerationQueueStore((state) => state.tasks);
 
   const [prompt, setPrompt] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [genError, setGenError] = useState<string | null>(null);
   const [activation, setActivation] = useState<GenerationAccess | null>(null);
   const [selectedModelId, setSelectedModelId] = useState('');
+  // 面板展开态：原来「展开」按钮是个死按钮（无 onClick），这里接上真实交互（G10）。
+  const [expanded, setExpanded] = useState(false);
 
   const lastNodeIdRef = useRef<string | null>(null);
   const submitRunIdRef = useRef('');
@@ -240,6 +258,13 @@ export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) 
     setIsGenerating(true);
     setGenError(null);
 
+    // 入队：让右侧 docked 面板的进度卡与左下占位卡能实时反映这个任务（G07 / G09）。
+    const queueTaskId = useGenerationQueueStore.getState().enqueue({
+      nodeId: selectedNode.id,
+      label: trimmedPrompt.length > 24 ? `${trimmedPrompt.slice(0, 24)}…` : trimmedPrompt,
+    });
+    useGenerationQueueStore.getState().markRunning(queueTaskId);
+
     const runId = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
       ? crypto.randomUUID()
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -289,7 +314,7 @@ export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) 
         nodeId: selectedNode.id,
         runId,
       });
-      const result = await generateNodeOutput({
+      const result = await generateNodeOutputWithFallback({
         nodeId: selectedNode.id,
         nodeType,
         prompt: trimmedPrompt,
@@ -320,6 +345,7 @@ export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) 
 
       updateNodeData(selectedNode.id, result);
       setPrompt('');
+      useGenerationQueueStore.getState().markSuccess(queueTaskId);
     } catch (error) {
       pushAIPanelTrace('submit:catch', {
         nodeId: selectedNode.id,
@@ -336,6 +362,7 @@ export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) 
       const generationError = error instanceof GenerationError ? error : null;
       const message = describeGenerationError(error);
       setGenError(message);
+      useGenerationQueueStore.getState().markFailed(queueTaskId, message);
       updateNodeData(selectedNode.id, {
         status: 'error',
         error: message,
@@ -350,6 +377,11 @@ export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) 
         },
       });
     } finally {
+      // 提前 return 的分支（例如 runId 不匹配、被更新的运行取代）也要收尾，
+      // 否则任务会永远停在 running，进度卡与左下占位卡无法归零。
+      const queue = useGenerationQueueStore.getState();
+      const task = queue.tasks.find((item) => item.id === queueTaskId);
+      if (task && task.status === 'running') queue.markFailed(queueTaskId, '已取消');
       setIsGenerating(false);
     }
   }, [apiKeys, authed, isAggregatedFree, isGenerating, nodeType, prompt, selectedModel, selectedNode, updateNodeData]);
@@ -364,7 +396,13 @@ export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) 
   if (!embedded && !showAIPanel) return null;
 
   const shell = (
-    <div className="overflow-hidden rounded-lg border border-[#30363d] bg-[#161b22]/95 shadow-2xl backdrop-blur-xl">
+    <div
+      className={
+        docked
+          ? 'flex min-h-0 flex-1 flex-col overflow-y-auto rounded-lg border border-[#30363d] bg-[#161b22]/95 shadow-2xl backdrop-blur-xl'
+          : 'overflow-hidden rounded-lg border border-[#30363d] bg-[#161b22]/95 shadow-2xl backdrop-blur-xl'
+      }
+    >
       <div className="flex flex-wrap items-center gap-2 border-b border-[#21262d] px-4 py-2.5">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
           <select
@@ -404,14 +442,37 @@ export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) 
           {!embedded ? (
             <button
               type="button"
+              data-testid="ai-panel-expand-toggle"
+              onClick={() => setExpanded((value) => !value)}
               className="flex h-7 w-7 items-center justify-center rounded-md bg-[#0d1117] text-[#8b949e] hover:text-white"
-              title={t('展开', 'Expand')}
+              title={expanded ? t('收起', 'Collapse') : t('展开', 'Expand')}
             >
-              <Maximize2 className="h-3.5 w-3.5" />
+              {expanded ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
             </button>
           ) : null}
         </div>
       </div>
+
+      {queueTasks.length > 0 ? (
+        <div
+          className="border-b border-[#21262d] px-4 py-3"
+          data-testid={embedded ? 'smart-agent-generation-queue' : 'ai-panel-generation-queue'}
+        >
+          <GenerationProgressCard />
+          <div className="mt-2.5 space-y-1.5">
+            {queueTasks.map((task, index) => (
+              <GenerationResultCard
+                key={task.id}
+                index={index}
+                label={task.label}
+                status={task.status}
+                error={task.error}
+                onClick={task.nodeId ? () => setSelectedNodeIds([task.nodeId as string]) : undefined}
+              />
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       <div className="px-4 py-3">
         <textarea
@@ -559,9 +620,20 @@ export function NodeGeneratePanel({ embedded = false }: NodeGeneratePanelProps) 
         <div data-testid="smart-agent-generate-panel" className="w-full">
           {shell}
         </div>
+      ) : docked ? (
+        // 右侧常驻（G05）：与参考视频一致的三段式布局，不再用底部居中浮层。
+        <div
+          data-testid="ai-panel-docked"
+          style={{ width: expanded ? AI_PANEL_DOCK_WIDTH + 220 : AI_PANEL_DOCK_WIDTH }}
+          className="hmdao-ai-dock-in pointer-events-auto absolute bottom-4 right-4 top-4 z-[60] flex max-h-[calc(100%-2rem)] max-w-[calc(100%-2rem)] flex-col transition-[width] duration-200 ease-out"
+        >
+          {shell}
+        </div>
       ) : (
         <div
-          className={`absolute bottom-4 left-1/2 w-[min(680px,calc(100vw-32px))] -translate-x-1/2 transition-all duration-150 ${
+          className={`absolute bottom-4 left-1/2 -translate-x-1/2 transition-all duration-150 ${
+            expanded ? 'w-[min(980px,calc(100vw-32px))]' : 'w-[min(680px,calc(100vw-32px))]'
+          } ${
             suppressedByFloatingPanel ? 'pointer-events-none z-20 opacity-35' : 'z-30 opacity-100'
           }`}
         >

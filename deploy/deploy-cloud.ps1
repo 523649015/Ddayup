@@ -1,4 +1,11 @@
 <#
+  ⛔ DEPRECATED / 已弃用（2026-09-16）：本脚本基于 pm2 常驻后端，与线上真实架构不符。
+     线上服务器（43.139.15.112）没有 pm2 进程，后端是 ubuntu 用户手动运行的
+     node /home/ubuntu/app/server/hmdao-api.mjs。用本脚本会用 pm2 另起进程，与现有
+     进程抢占 8792 端口，可能导致线上 API 异常。
+     → 后端重启请用 deploy/ubuntu-deploy.sh 的第 4 步；前端更新用 deploy/deploy-dist.ps1。
+     详见 deploy/ENVIRONMENTS.md。
+
 .SYNOPSIS
   Ddayup 后端一键云端部署（pm2 常驻 + 鉴权 Key + 输出扩展配置）。
 

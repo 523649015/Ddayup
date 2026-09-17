@@ -85,15 +85,15 @@ const PREFERRED_MEDIA_TYPES_BY_NODE: Partial<Record<NodeType, Array<MediaInput['
   dcc: ['image', 'video'],
 };
 
-export function buildReferenceSettingsKey(edge: Pick<CanvasEdge, 'id' | 'source' | 'targetHandle'>, mediaType: MediaInput['type']) {
+export function buildReferenceSettingsKey(edge: Pick<CanvasEdge, 'id' | 'source' | 'targetHandle'>, mediaType: string) {
   return `${edge.id}:${edge.source}:${edge.targetHandle || 'default'}:${mediaType}`;
 }
 
-function buildManualReferenceKey(handleId: string | undefined, sourceNodeId: string, mediaType: MediaInput['type']) {
+function buildManualReferenceKey(handleId: string | undefined, sourceNodeId: string, mediaType: string) {
   return `manual:${sourceNodeId}:${handleId || 'default'}:${mediaType}`;
 }
 
-function buildReferenceIdentityKey(sourceNodeId: string, mediaType: MediaInput['type'], channel: ReferenceChannel, handleId: string) {
+function buildReferenceIdentityKey(sourceNodeId: string, mediaType: string, channel: ReferenceChannel, handleId: string) {
   return `${sourceNodeId}:${mediaType}:${channel}:${handleId}`;
 }
 
@@ -129,7 +129,7 @@ function clampWeight(value: unknown, fallback: number) {
   return Math.max(0, Math.min(100, Math.round(next)));
 }
 
-function normalizeLabel(node: Pick<CanvasNode, 'data'> | null | undefined, mediaType: MediaInput['type']) {
+function normalizeLabel(node: Pick<CanvasNode, 'data'> | null | undefined, mediaType: string) {
   const label = String(node?.data?.label || '').trim();
   if (label) return label;
   if (mediaType === 'video') return '视频素材';
@@ -201,7 +201,7 @@ function prefersSubjectReplacement(
   targetNode: CanvasNode | undefined,
   targetNodeType: NodeType,
   channel: ReferenceChannel,
-  mediaType: MediaInput['type'],
+  mediaType: string,
 ) {
   if (channel === 'primary' || mediaType !== 'image') return false;
   const params = (targetNode?.data?.params && typeof targetNode.data.params === 'object')
@@ -218,7 +218,7 @@ function defaultReferenceRole(
   targetNode: CanvasNode | undefined,
   targetNodeType: NodeType,
   channel: ReferenceChannel,
-  mediaType: MediaInput['type'],
+  mediaType: string,
   handleId: string | undefined,
 ): ReferenceRole {
   if (channel === 'primary') return 'primary';
@@ -231,7 +231,7 @@ function defaultReferenceRole(
   return 'style';
 }
 
-function roleOptionsFor(targetNodeType: NodeType, channel: ReferenceChannel, mediaType: MediaInput['type']) {
+function roleOptionsFor(targetNodeType: NodeType, channel: ReferenceChannel, mediaType: string) {
   if (channel === 'primary') {
     return [{ value: 'primary', label: '主素材' }] satisfies ReferenceRoleOption[];
   }
@@ -331,8 +331,8 @@ export function collectConnectedReferenceInputs(
 
     items.push({
       id: `${sourceNode.id}:${edge.id}:${asset.type}`,
-      type: asset.type,
-      url: asset.url,
+      type: asset.type as MediaInput['type'],
+      url: asset.url ?? '',
       metadata: asset.metadata || manualInput?.metadata,
       label: String(manualInput?.label || normalizeLabel(sourceNode, asset.type)),
       sourceNodeId: sourceNode.id,

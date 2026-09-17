@@ -1,5 +1,6 @@
 import { Link } from 'react-router-dom';
 import { Check, PenTool, MessageCircle, Sparkles, Camera, FileText, Music, Image as ImageIcon, MapPin } from 'lucide-react';
+import { useExtensionPlans } from '@/hooks/useExtensionPlans';
 
 /**
  * 支付宝商户号申请 · "商品/服务页"素材
@@ -8,24 +9,29 @@ import { Check, PenTool, MessageCircle, Sparkles, Camera, FileText, Music, Image
  * - 经营场所：抖音平台，本网站为展示与预约渠道
  */
 export default function ServicesPage() {
+  // 价格统一从 /api/extension/plans 读取（单一真源）。
+  // 注意：此前此处写死「一次性 ¥398」，与后端永久版 ¥498 不一致，现统一。
+  // 预留：设计服务下单链路尚未打通（实际沟通/下单以抖音平台为准），
+  //       后续接入服务档位时在此扩展，价格仍走同一来源。
+  const { priceLabel } = useExtensionPlans();
   const tiers = [
     {
       name: '基础包',
       tag: '个人尝鲜',
-      price: '¥18 / 月',
+      price: priceLabel('monthly') || '¥18 / 月',
       points: ['单类设计服务（海报 / 修图 / 插画三选一）', '基础数字内容制作咨询', '7×12 小时工单响应'],
     },
     {
       name: '专业包',
       tag: '最受欢迎',
-      price: '¥168 / 年',
+      price: priceLabel('yearly') || '¥168 / 年',
       points: ['设计 + 咨询 + 数字内容三类服务', '短视频剪辑 / 音频处理任选', '一对一创作方案咨询', '优先交付排期'],
       highlight: true,
     },
     {
       name: '工作室包',
       tag: '深度合作',
-      price: '¥398 一次性',
+      price: priceLabel('lifetime') || '¥498 一次性',
       points: ['专业包全部服务', '数字内容综合服务包（一次性）', '多项目整体视觉规划', '专属交付沟通'],
     },
   ];

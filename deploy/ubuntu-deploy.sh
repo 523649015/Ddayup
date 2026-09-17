@@ -18,6 +18,9 @@ fi
 
 echo "==> [2/6] 安装依赖"
 cd "$APP"
+# 国内镜像：规避腾讯云服务器访问 GitHub 下载 sharp/libvips 二进制被中断
+npm config set registry https://registry.npmmirror.com 2>/dev/null || true
+export SHARP_LIBVIPS_BASE_URL=https://registry.npmmirror.com/-/binary/sharp-libvips
 npm ci
 
 echo "==> [3/6] 构建前端"
@@ -28,11 +31,24 @@ sudo mkdir -p "$WWW"
 sudo rm -rf "$WWW"/*
 sudo cp -r dist/. "$WWW"/
 
-echo "==> [4/6] 停掉旧的演示服务，启动正式后端"
-pm2 stop pay-api 2>/dev/null || true
-pm2 restart ddayup-backend \
-  || pm2 start deploy/ecosystem.config.cjs --only ddayup-backend --env production
-pm2 save
+echo "==> [4/6] 重启后端 API（systemd）"
+# ★2026-09-16：后端已迁移到 systemd 单元 ddayup-api.service（单进程、开机自启、崩溃自动拉起）。
+#   历史遗留的 PM2（ubuntu 用户上下文）中的 ddayup-backend 已删除并 pm2 save，
+#   pm2-ubuntu.service 已停用 —— 不要再用 pm2 start，否则会与 systemd 实例抢 8792 端口。
+if systemctl list-unit-files | grep -q '^ddayup-api.service'; then
+  systemctl restart ddayup-api
+  sleep 3
+else
+  echo "未检测到 ddayup-api.service，请先安装："
+  echo "  cp deploy/ddayup-api.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now ddayup-api"
+  exit 1
+fi
+# 健康检查：确认 8792 真的起来了，避免"部署完才发现 API 挂了"
+API_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://127.0.0.1:8792/api/health || echo "000")
+echo "API health: $API_CODE"
+if [ "$API_CODE" != "200" ]; then
+  echo "警告：API 健康检查未返回 200，请执行 journalctl -u ddayup-api -n 50 排查"
+fi
 
 echo "==> [5/6] 部署 Nginx 配置"
 sudo cp deploy/nginx-hmdao.conf /etc/nginx/sites-available/hmdao

@@ -12,6 +12,67 @@ const HANDLERS = {};
 // 网盘单文件下载请求防重入表（requestKey -> timestamp），防止连续点击导致开多个 hidden tab。
 let netdiskDownloadInFlight = null;
 
+// ==================================================================
+// ★2026-09-12 SW 侧「网盘自定义绝对目录」落盘通道
+// ------------------------------------------------------------------
+// 背景：网盘深解析直下在 Service Worker 上下文发起，SW 读不到侧栏全局 dirPaths，
+//       遂硬编码落 Ddayup/netdisk/ —— 用户给「☁ 网盘」设了绝对目录照样落默认目录。
+// 方案：SW 能读 chrome.storage.local，而侧栏已把绝对路径存在 dirPath:<type>。
+//   优先级：dirPath:netdisk → dirPath:archive（与侧栏 userDirHandleFor('netdisk')→archive 语义一致）
+//           → 无路径/失败 → 回退原 chrome.downloads（默认 Ddayup/netdisk/）。
+// ==================================================================
+async function swReadUserDirForNetdisk() {
+  try {
+    const s = await chrome.storage.local.get(['dirPath:netdisk', 'dirPath:archive']);
+    const netdisk = (s && typeof s['dirPath:netdisk'] === 'string') ? s['dirPath:netdisk'].trim() : '';
+    if (netdisk) return { dir: netdisk, via: 'netdisk' };
+    const archive = (s && typeof s['dirPath:archive'] === 'string') ? s['dirPath:archive'].trim() : '';
+    if (archive) return { dir: archive, via: 'archive' };
+    return { dir: '', via: '' };
+  } catch (_) { return { dir: '', via: '' }; }
+}
+
+// 返回 true = 已写入用户绝对目录（调用方必须跳过 chrome.downloads）；false = 未设置/失败（回退默认，并 console.warn 原因）。
+async function swTrySaveToUserDir(url, referer, filename) {
+  try {
+    if (!url || !/^https?:/i.test(String(url))) return false;
+    const { dir } = await swReadUserDirForNetdisk();
+    if (!dir) {
+      console.warn('[Ddayup][netdisk][sw] 未设置网盘目录 → 回退默认 Ddayup/netdisk/');
+      return false;
+    }
+    let resp;
+    try {
+      const signal = (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(120000) : undefined;
+      // 服务端下载代理闸门：携带设备标识供校验 entitlement（绕过扩展端 gate 也无处遁形）
+      const devAuth = await chrome.storage.local.get(['hmdaoDeviceId', 'hmdaoToken']).catch(() => ({}));
+      resp = await fetch('http://127.0.0.1:3000/api/media/save-to-dir', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url, referer: referer || '', dir, filename: filename || 'netdisk-file',
+          deviceId: String((devAuth && devAuth.hmdaoDeviceId) || '').trim(),
+          token: String((devAuth && devAuth.hmdaoToken) || '').trim(),
+        }),
+        signal,
+      });
+    } catch (e) {
+      console.warn('[Ddayup][netdisk][sw] 本地服务未启动 → 回退默认：', (e && e.message) || e);
+      return false;
+    }
+    const data = await resp.json().catch(() => ({}));
+    if (resp.ok && data && data.success) {
+      console.log('[Ddayup][netdisk][sw] 已保存到设置目录：', data.savedPath || dir);
+      return true;
+    }
+    console.warn('[Ddayup][netdisk][sw] 写入失败 → 回退默认：', (data && data.error) || ('HTTP ' + resp.status));
+    return false;
+  } catch (e) {
+    console.warn('[Ddayup][netdisk][sw] 异常 → 回退默认：', (e && e.message) || e);
+    return false;
+  }
+}
+
 function registerHandler(type, fn) {
   HANDLERS[type] = fn;
 }
@@ -123,6 +184,12 @@ registerHandler(HMDAO_MSG.NETDISK_DOWNLOAD, (msg, _sender, sendResponse) => {
               conflictAction: 'uniquify',
             };
             if (isXlDirect) dlOpts.headers = [{ name: 'Referer', value: 'https://pan.xunlei.com/' }];
+            // ★2026-09-12：用户为「网盘」设了绝对目录 → 后端落盘（SW 读 storage），成功即跳过默认下载。
+            if (await swTrySaveToUserDir(direct, isXlDirect ? 'https://pan.xunlei.com/' : '', name)) {
+              diag.step = 'saved-user-dir';
+              sendResponse({ ok: true, url: direct, name, via: 'direct-api-userdir', diag });
+              return;
+            }
             let dlId = null;
             try { dlId = await chrome.downloads.download(dlOpts); } catch (e) { dlId = null; }
             diag.step = 'download-started';
@@ -292,7 +359,7 @@ registerHandler(HMDAO_MSG.NETDISK_DOWNLOAD, (msg, _sender, sendResponse) => {
         if (timeoutTimer) { clearTimeout(timeoutTimer); timeoutTimer = null; }
       };
       // 后台直下：带迅雷 Referer，避免 403；成功即视为下载已发起
-      const startDirectDownload = (dlUrl, via) => {
+      const startDirectDownload = async (dlUrl, via) => {
         if (done) return;
         done = true;
         cleanup();
@@ -305,6 +372,14 @@ registerHandler(HMDAO_MSG.NETDISK_DOWNLOAD, (msg, _sender, sendResponse) => {
           sendResponse({ ok: true, url: dlUrl, name: targetName || clickRes.name, via, diag });
           return;
         }
+        // ★2026-09-12：用户为「网盘」设了绝对目录 → 后端落盘，成功即跳过默认下载。
+        try {
+          if (await swTrySaveToUserDir(dlUrl, 'https://pan.xunlei.com/', targetName || clickRes.name)) {
+            diag.step = 'saved-user-dir';
+            sendResponse({ ok: true, url: dlUrl, name: targetName || clickRes.name, via: via + '-userdir', diag });
+            return;
+          }
+        } catch (_) { /* 回退默认下载 */ }
         chrome.downloads.download({
           url: dlUrl,
           filename: 'Ddayup/netdisk/' + (targetName || ''),
@@ -466,6 +541,91 @@ registerHandler(HMDAO_MSG.PAGE_MUTATION, (_msg, sender) => {
 });
 
 // ---- 主动点击「下载/获取」按钮触发动态链接（原 CLICK_REVEAL 分支）----
+// ★2026-09-12 重写（用户实测：云桥网点「自动点击揭示」跳到了【另一个素材页】而不是下载路径）。
+//   旧实现两个致命缺陷：
+//   ① 选择器过宽 + 文案正则含裸「资源」「download」→ 误命中侧栏「相关推荐」里另一篇文章的
+//      标题（形如"…素材包下载"）与「推荐资源」widget，然后 b.click() →
+//      整个标签页导航到那篇文章（/py/50646）→ 源页丢失、扫描结果清空，后续点击全打在新页面上。
+//   ② 对 <a href> 一律 click() = 让当前页导航。下载入口（云桥网 /goto?down=<token> 等）
+//      本身是服务端 302 中转，扩展侧无法解码 token；点它同样会把源页导航走。
+//   现改为：只点「非导航元素」且文案必须是明确的下载/揭示语义；<a href> 只收集不点击；
+//   站内中转入口交后台跟随重定向解析出真实网盘直链（host_permissions=<all_urls> → SW fetch
+//   不受 CORS 限制，res.url 即最终地址），再交给侧栏展示 —— 全程不导航源页。
+const REVEAL_NETDISK_RE = /(pan\.baidu\.com\/s\/|lanzou[s]?\.com|lanzaou\.com|quark\.cn|pan\.quark\.cn|pan\.xunlei\.com|123pan\.com|aliyundrive\.com|alipan\.com|weiyun\.com|cowtransfer\.com|ctfile\.com|mediafire\.com|mega\.nz|drive\.google\.com|terabox|pcloud)/i;
+
+async function resolveRevealRedirect(u) {
+  const raw = String(u || '');
+  if (!/^https?:/i.test(raw)) return '';
+  if (REVEAL_NETDISK_RE.test(raw)) return raw; // 已是真实网盘分享链接
+  // 站内中转（/goto?down=、/down?、?url=…）：后台跟随 302 拿最终地址
+  try {
+    const r = await fetch(raw, { redirect: 'follow', credentials: 'include' });
+    const finalUrl = (r && r.url) || '';
+    if (finalUrl && REVEAL_NETDISK_RE.test(finalUrl)) return finalUrl;
+  } catch (_) {}
+  return raw; // 解析不出真实网盘链接时保留原入口（用户点它仍会走到下载路径）
+}
+
+// 注入页面执行：收集下载入口 + 点击「揭示」按钮（绝不点 <a href>，带导航守卫）
+function revealDownloadLinks() {
+  const TEXT_RE = /(下载地址|立即下载|获取下载|下载链接|点击下载|点击获取|点击显示|点击展开|点击查看|显示隐藏|揭示|提取码|网盘地址|网盘链接|获取资源|下载资源|获取素材|下载文件|免费下载)/;
+  const NETDISK_RE = /(pan\.baidu\.com\/s\/|lanzou[s]?\.com|lanzaou\.com|quark\.cn|pan\.quark\.cn|pan\.xunlei\.com|123pan\.com|aliyundrive\.com|alipan\.com|weiyun\.com|cowtransfer\.com|ctfile\.com|mediafire\.com|mega\.nz|drive\.google\.com|terabox|pcloud)/i;
+  // 站内中转/跳转入口：只认真正的下载中转（/goto?down=<token>、/down?、/download?、?url=http…），
+  // 不能只写 /redirect/ —— 否则会把 `/login?redirect_to=…` 也当成下载入口收进来（实测命中）。
+  const FORWARD_RE = /(\/goto\b|[?&]down=|[/?&]download(?:[?&=/]|s\b)|[?&](?:file|dl|link|url)=(?:https?%3A|https?:))/i;
+  // 与下载无关的站内链接（登录/注册/用户中心等）一律丢弃
+  const NOT_DOWNLOAD_RE = /(\/login|\/register|\/logout|\/signup|\/signin|passport|\/user\/|\/uc\/|javascript:)/i;
+  const isNavAnchor = (el) => el.tagName === 'A' && !!el.getAttribute('href') && !/^(javascript:|#|$)/i.test(el.getAttribute('href'));
+
+  const collected = [];
+  const addHref = (h) => {
+    try {
+      const u = new URL(h, location.href).href;
+      if (!/^https?:/i.test(u)) return;
+      if (NOT_DOWNLOAD_RE.test(u)) return;
+      if (collected.indexOf(u) < 0) collected.push(u);
+    } catch (_) {}
+  };
+  const sweepAnchors = () => {
+    document.querySelectorAll('a[href]').forEach((a) => {
+      const h = a.getAttribute('href') || '';
+      if (NETDISK_RE.test(h)) addHref(h);
+      else if (FORWARD_RE.test(h) && /goto|down|download|link|redirect/i.test(h)) addHref(h);
+    });
+  };
+  sweepAnchors();
+
+  // 只点「非导航元素」+ 文案必须命中明确的下载/揭示语义（去掉裸「资源/click/save」这类泛词）
+  const btnSel = '.ri-down-warp button,.ri-down-warp .btn,.down-btn,[class*="down-btn" i],[class*="download-btn" i],[data-action*="download" i],[id*="download" i],[title*="下载" i],[title*="获取" i],button,[role="button"],.btn';
+  const cands = Array.from(document.querySelectorAll(btnSel)).filter((el) => {
+    if (isNavAnchor(el)) return false;
+    const t = (el.textContent || el.getAttribute('title') || el.getAttribute('aria-label') || '').trim().replace(/\s+/g, '');
+    if (!t || t.length > 24) return false; // 短文案才是按钮；超长说明是容器（旧代码把整块 widget 当按钮点）
+    return TEXT_RE.test(t);
+  });
+
+  const startHref = location.href;
+  const bodyText = () => ((document.body && document.body.innerText) || '').slice(0, 20000);
+
+  return (async () => {
+    let clicked = 0;
+    let navigated = false;
+    for (const b of cands.slice(0, 5)) {
+      try {
+        if (!document.body) { navigated = true; break; }
+        b.click();
+        clicked++;
+      } catch (_) {}
+      await new Promise((r) => setTimeout(r, 150)); // 给页面注入链接的时间
+      sweepAnchors();
+      // 导航守卫：一旦文档卸载/地址变化，立即停止（避免把点击打在新页面上）
+      if (!document.body || location.href !== startHref) { navigated = true; break; }
+    }
+    const needLogin = /登录后(购买|获取|下载|可见|查看)|请先登录|购买后(可见|下载|获取)/.test(bodyText());
+    return { clicked, navigated, needLogin, collected: collected.slice(0, 20) };
+  })();
+}
+
 /* global scanTab */
 registerHandler(HMDAO_MSG.CLICK_REVEAL, (msg, _sender, sendResponse) => {
   (async () => {
@@ -476,17 +636,26 @@ registerHandler(HMDAO_MSG.CLICK_REVEAL, (msg, _sender, sendResponse) => {
       const [res] = await chrome.scripting.executeScript({
         target: { tabId: tab.id, allFrames: false },
         world: 'ISOLATED',
-        func: () => {
-          const SEL = 'a[href*="pan.baidu"],a[href*="lanzou"],a[href*="quark"],a[href*="123pan"],a[href*="aliyundrive"],button,[role="button"],.btn,[class*="download" i],[class*="get" i],[class*="obtain" i],[class*="fetch" i],[data-action*="download" i],[id*="download" i],[title*="下载" i],[title*="获取" i]';
-          const txt = (e) => (e.textContent || e.getAttribute('title') || e.getAttribute('aria-label') || '').toLowerCase();
-          const targets = Array.from(document.querySelectorAll(SEL)).filter((b) => /下载|获取|提取|立即下载|资源|网盘|download|obtain|fetch|save|领取|click/i.test(txt(b)));
-          let clicked = 0;
-          targets.slice(0, 8).forEach((b) => { try { b.click(); clicked++; } catch (_) {} });
-          return { clicked, total: targets.length };
-        },
+        func: revealDownloadLinks,
       });
-      setTimeout(() => { scanTab(tab.id).catch(() => {}); }, 1500);
-      sendResponse({ ok: true, clicked: res && res.result && res.result.clicked });
+      const r = (res && res.result) || {};
+      const collected = Array.isArray(r.collected) ? r.collected : [];
+      const resolved = [];
+      for (const u of collected.slice(0, 8)) {
+        const real = await resolveRevealRedirect(u);
+        if (real && resolved.indexOf(real) < 0) resolved.push(real);
+      }
+      console.log('[HMDAO][reveal] clicked=%d navigated=%s needLogin=%s 入口=%d 解析后=%d',
+        r.clicked || 0, !!r.navigated, !!r.needLogin, collected.length, resolved.length);
+      setTimeout(() => { scanTab(tab.id).catch(() => {}); }, 1200);
+      sendResponse({
+        ok: true,
+        clicked: r.clicked || 0,
+        navigated: !!r.navigated,
+        needLogin: !!r.needLogin,
+        collected: resolved,
+        sourceUrl: tab.url || '',
+      });
     } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
   })();
   return true; // 异步响应

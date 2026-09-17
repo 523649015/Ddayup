@@ -1,3 +1,12 @@
+﻿# ⛔ DEPRECATED / 已弃用（2026-09-16）：本脚本把整仓传到【/opt/ddayup】并调用 centos-deploy.sh，
+#    而线上真实架构是 Ubuntu + Nginx，仓库在 /home/ubuntu/app、静态站在 /var/www/hmdao，
+#    且没有 pm2。照此执行会在服务器上生成错误的 /opt/ddayup 并用 pm2 启动后端（与手动 node 抢 8792）。
+#    → 全量部署：在服务器上执行 deploy/ubuntu-deploy.sh
+#    → 仅前端更新：在本机执行 deploy/deploy-dist.ps1（推荐，最快）
+#    环境对照见 deploy/ENVIRONMENTS.md。
+#
+# [ENV: LOCAL -> CLOUD]（已弃用，保留仅供历史参考）
+#
 # deploy/run-deploy.ps1 - 本地 Windows 一键部署到 CentOS 服务器（需先配好 SSH 免密）
 # 用法（PowerShell，管理员与否均可）：
 #   powershell -File deploy/run-deploy.ps1

@@ -374,6 +374,10 @@ function getDisplayName(platform: SearchPlatform): string {
     youtube: 'YouTube',
     pinterest: 'Pinterest',
     deviantart: 'DeviantArt',
+    youtube_audio: 'YouTube 音频',
+    bilibili: '哔哩哔哩',
+    douyin: '抖音',
+    artstation: 'ArtStation',
   };
   return map[platform] || platform;
 }

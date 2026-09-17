@@ -94,6 +94,31 @@
     .marquee .mbar button { border: 1px solid #30363d; background: #161b22; color: #c9d1d9; border-radius: 8px; padding: 6px 11px; cursor: pointer; font-size: 12px; }
     .marquee .mbar button:hover { border-color: #0ea58b; color: #0ea58b; }
 
+    /* ===== 截图识文结果面板（第二阶段，跟随 #hmAnchor，content script 内渲染） ===== */
+    .sspanel {
+      position: fixed; display: none; z-index: 2147483647; flex-direction: column; gap: 8px;
+      width: 300px; max-width: 92vw; max-height: 86vh; overflow: auto;
+      background: #0f1620; border: 1px solid #2a3a44; border-radius: 14px; padding: 10px 12px;
+      box-shadow: 0 24px 60px rgba(0,0,0,.5); font: 12px/1.5 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; color: #c9d1d9;
+    }
+    .sspanel.open { display: flex; }
+    .ss-head { display: flex; justify-content: space-between; align-items: center; color: #9ecbff; font-weight: 600; }
+    .ss-close { cursor: pointer; opacity: .9; padding: 0 4px; font-size: 14px; }
+    .ss-close:hover { opacity: 1; }
+    .ss-imgwrap { position: relative; width: 100%; }
+    .sspanel img { width: 100%; border-radius: 8px; background: #000; object-fit: contain; display: block; }
+    .ss-crop-overlay { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: none; cursor: crosshair; background: rgba(0,0,0,.12); }
+    .ss-crop-box { position: absolute; border: 2px dashed #0ea58b; background: rgba(14,165,139,.14); display: none; pointer-events: none; }
+    .ss-row { display: flex; gap: 6px; flex-wrap: wrap; }
+    .ss-row button { flex: 1 1 auto; min-width: 64px; border: 1px solid #30363d; background: #161b22; color: #c9d1d9; border-radius: 9px; padding: 7px 6px; cursor: pointer; font-size: 12px; }
+    .ss-row button:hover { border-color: #0ea58b; color: #0ea58b; }
+    .ss-crop-btn { border: 1px solid #30363d; background: #161b22; color: #c9d1d9; border-radius: 9px; padding: 7px 8px; cursor: pointer; font-size: 12px; }
+    .ss-crop-btn:hover { border-color: #0ea58b; color: #0ea58b; }
+    .ss-text { display: none; width: 100%; height: 120px; box-sizing: border-box; background: #0b1118; color: #c9d1d9; border: 1px solid #2a3a44; border-radius: 8px; padding: 8px; font-size: 12px; resize: vertical; }
+    .ss-copytext { display: none; align-self: flex-start; border: 1px solid #30363d; background: #161b22; color: #c9d1d9; border-radius: 8px; padding: 6px 10px; cursor: pointer; font-size: 12px; }
+    .ss-copytext:hover { border-color: #0ea58b; color: #0ea58b; }
+    .sstoast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); display: none; max-width: 80vw; background: #0f1620; border: 1px solid #2a3a44; color: #c9d1d9; border-radius: 10px; padding: 8px 12px; font: 12px/1.4 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; box-shadow: 0 10px 30px rgba(0,0,0,.5); z-index: 2147483647; }
+
     @keyframes hmFloat { 0%,100% { transform: translateY(0) scale(.5); } 50% { transform: translateY(-6px) scale(.5); } }
     @keyframes hmBlink { 0%,8%,44%,46%,100% { transform: scaleY(0); } 4%,45% { transform: scaleY(1); } }
   </style>
@@ -134,6 +159,8 @@
         <button data-action="analyze-page">🔎 分析本网页</button>
         <button data-action="upload">📎 上传图片/视频</button>
         <button data-action="deep">🧠 深度分析</button>
+        <button data-mode="screenshot-region">📷 截图识文</button>
+        <button data-mode="screenshot-long">📜 截长图</button>
       </div>
       <div class="inbox">
         <input type="file" id="hmFile" accept="image/*,video/*" style="display:none" />
@@ -151,6 +178,28 @@
         <button id="hmMcancel">✕ 取消</button>
       </div>
     </div>
+
+    <!-- 截图识文结果面板（第二阶段：跟随 #hmAnchor，content script 内渲染） -->
+    <div class="sspanel" id="hmSsPanel">
+      <div class="ss-head">
+        <span class="ss-ttl">📷 截图识文</span>
+        <span class="ss-close" id="hmSsClose" title="关闭">✕</span>
+      </div>
+      <div class="ss-imgwrap" id="hmSsImgWrap">
+        <img id="hmSsImg" alt="截图预览" />
+        <div class="ss-crop-overlay" id="hmSsCropOverlay"><div class="ss-crop-box" id="hmSsCropBox"></div></div>
+      </div>
+      <div class="ss-row">
+        <button id="hmSsTranslate">🌐 翻译</button>
+        <button id="hmSsExtract">📝 提取文字</button>
+        <button id="hmSsCopy">📋 复制截图</button>
+        <button id="hmSsSave">💾 保存本地</button>
+      </div>
+      <button class="ss-crop-btn" id="hmSsCrop" style="display:none">✂ 框选区域</button>
+      <textarea id="hmSsText" class="ss-text" placeholder="识别结果将显示在这里"></textarea>
+      <button id="hmSsCopyText" class="ss-copytext" style="display:none">复制文字</button>
+    </div>
+    <div class="sstoast" id="hmSsToast"></div>
   </div>`;
 
   const anchor = shadow.getElementById('hmAnchor');
@@ -184,6 +233,7 @@
     anchor.style.left = x + 'px';
     anchor.style.top = y + 'px';
     e.preventDefault();
+    repositionSS(); // 截图结果面板跟随锚点（F4 核心）
   }
   function onUp() { dragEl = null; }
   bot.addEventListener('pointerdown', (e) => onDown(e, bot));
@@ -314,7 +364,11 @@
     window.removeEventListener('mousemove', mouseHandler);
     window.removeEventListener('pointermove', onMove);
     window.removeEventListener('pointerup', onUp);
+    window.removeEventListener('resize', repositionSS);
     if (msgHandler) chrome.runtime.onMessage.removeListener(msgHandler);
+    if (ssHandler) chrome.runtime.onMessage.removeListener(ssHandler);
+    if (ssPanel) ssPanel.classList.remove('open');
+    if (ssToast) ssToast.style.display = 'none';
     try { if (host && host.parentNode) host.parentNode.removeChild(host); } catch (_) {}
     try { delete window.__hmdaoRobotOverlay; } catch (_) {}
     chrome.runtime.sendMessage({ type: 'HMDAO_AI_BOT_RETURN' }).catch(() => {});
@@ -376,11 +430,236 @@
   };
   chrome.runtime.onMessage.addListener(msgHandler);
 
+  // ===== 截图识文（第二阶段：结果面板跟随锚点 + 复制/保存/OCR/长图框选）=====
+  // 消息键回退：content script ISOLATED 世界未必加载 shared/messages.js，故本文件内联常量
+  const SS = (typeof self !== 'undefined' && self.HMDAO_MSG) || {};
+  const SCREENSHOT_OPEN = SS.SCREENSHOT_OPEN || 'HMDAO_SCREENSHOT_OPEN';
+  const SCREENSHOT_RESULT = SS.SCREENSHOT_RESULT || 'HMDAO_SCREENSHOT_RESULT';
+  const SCREENSHOT_ERROR = SS.SCREENSHOT_ERROR || 'HMDAO_SCREENSHOT_ERROR';
+  const SCREENSHOT_OCR_RESULT = SS.SCREENSHOT_OCR_RESULT || 'HMDAO_SCREENSHOT_OCR_RESULT';
+  const SCREENSHOT_SAVE = SS.SCREENSHOT_SAVE || 'HMDAO_SCREENSHOT_SAVE';
+  const SCREENSHOT_COPY = SS.SCREENSHOT_COPY || 'HMDAO_SCREENSHOT_COPY';
+  const SCREENSHOT_OCR = SS.SCREENSHOT_OCR || 'HMDAO_SCREENSHOT_OCR';
+  const SCREENSHOT_CANCEL = SS.SCREENSHOT_CANCEL || 'HMDAO_SCREENSHOT_CANCEL';
+  const SCREENSHOT_REGION_READY = SS.SCREENSHOT_REGION_READY || 'HMDAO_SCREENSHOT_REGION_READY';
+
+  const ssPanel = shadow.getElementById('hmSsPanel');
+  const ssClose = shadow.getElementById('hmSsClose');
+  const ssImg = shadow.getElementById('hmSsImg');
+  const ssCropOverlay = shadow.getElementById('hmSsCropOverlay');
+  const ssCropBox = shadow.getElementById('hmSsCropBox');
+  const ssTranslate = shadow.getElementById('hmSsTranslate');
+  const ssExtract = shadow.getElementById('hmSsExtract');
+  const ssCopy = shadow.getElementById('hmSsCopy');
+  const ssSave = shadow.getElementById('hmSsSave');
+  const ssCropBtn = shadow.getElementById('hmSsCrop');
+  const ssText = shadow.getElementById('hmSsText');
+  const ssCopyText = shadow.getElementById('hmSsCopyText');
+  const ssToast = shadow.getElementById('hmSsToast');
+
+  let lastImage = null, isLong = false, ssW = null, ssH = null;
+  let ssToastTimer = null;
+  let ssCropping = false, ssCropSX = 0, ssCropSY = 0, ssCropRect = null;
+
+  // 轻量 toast（content script 无侧栏 #status，独立实现）
+  function toastSS(text) {
+    if (!ssToast) return;
+    ssToast.textContent = text || '';
+    ssToast.style.display = 'block';
+    if (ssToastTimer) clearTimeout(ssToastTimer);
+    ssToastTimer = setTimeout(() => { ssToast.style.display = 'none'; }, 2600);
+  }
+
+  // 结果面板跟随机器人浮标（F4 核心）：fixed 坐标由 #hmAnchor 推算，越界翻到另一侧
+  function repositionSS() {
+    if (!ssPanel || !ssPanel.classList.contains('open')) return;
+    const a = anchor.getBoundingClientRect();
+    const w = ssPanel.offsetWidth || 300;
+    const h = ssPanel.offsetHeight || 320;
+    let left = a.right + 12;
+    let top = a.bottom + 12;
+    if (left + w > window.innerWidth - 8) left = a.left - w - 12; // 右侧越界 → 翻到左侧
+    if (left < 8) left = 8;
+    if (top + h > window.innerHeight - 8) top = a.top - h - 12;  // 下方越界 → 翻到上方
+    if (top < 8) top = 8;
+    ssPanel.style.left = left + 'px';
+    ssPanel.style.top = top + 'px';
+  }
+
+  function showSsResult(payload) {
+    if (!payload || !payload.dataUrl) return;
+    if (marquee.classList.contains('on')) marquee.classList.remove('on'); // 与文本模式互斥
+    lastImage = payload.dataUrl;
+    isLong = !!payload.isLong;
+    ssW = payload.width || null;
+    ssH = payload.height || null;
+    ssImg.src = payload.dataUrl;
+    ssImg.onload = repositionSS; // 图片尺寸定稿后再次定位，避免初始 0 尺寸导致偏移
+    ssImg.style.maxHeight = isLong ? '50vh' : '38vh';
+    ssText.value = '';
+    ssText.style.display = 'none';
+    ssCopyText.style.display = 'none';
+    ssCropBtn.style.display = isLong ? 'block' : 'none'; // 长图才显示「框选区域」
+    ssPanel.classList.add('open');
+    repositionSS();
+  }
+
+  function showSsError(text) {
+    if (!ssPanel.classList.contains('open')) { ssPanel.classList.add('open'); repositionSS(); }
+    toastSS(text || '出错了');
+  }
+
+  function showSsOcr(payload) {
+    if (!payload) return;
+    if (payload.licenseRequired) {
+      ssText.value = (payload.error || '免费试用已结束') + '\n\n可点击「去订阅」继续使用。';
+      ssText.style.display = 'block';
+      ssCopyText.style.display = 'none';
+      toastSS('试用已结束');
+      return;
+    }
+    if (payload.text) {
+      ssText.value = payload.text;
+      ssText.style.display = 'block';
+      ssCopyText.style.display = 'inline-block';
+      toastSS('识别完成');
+    } else if (payload.error) {
+      ssText.value = '识别失败：' + payload.error;
+      ssText.style.display = 'block';
+      ssCopyText.style.display = 'none';
+      toastSS('识别失败');
+    }
+  }
+
+  // 监听来自 sidepanel 的截图消息（SCREENSHOT_RESULT / ERROR / OCR_RESULT）
+  const ssHandler = (msg) => {
+    if (!msg || !msg.type) return;
+    if (msg.type === SCREENSHOT_RESULT) showSsResult(msg.payload);
+    else if (msg.type === SCREENSHOT_ERROR) showSsError(msg.payload && msg.payload.error);
+    else if (msg.type === SCREENSHOT_OCR_RESULT) showSsOcr(msg.payload);
+  };
+  chrome.runtime.onMessage.addListener(ssHandler);
+
+  // 受限页检测：robot 运行的页即 active tab，用自身地址判定（复刻 B8）
+  function isRestrictedUrl(u) {
+    if (!u) return false;
+    if (/^(chrome:|chrome-extension:|chrome-untrusted:|edge:|devtools:|view-source:|data:)/i.test(u)) return true;
+    if (/^about:/i.test(u) && !/^about:blank/i.test(u)) return true;
+    try { const h = new URL(u).hostname; if (/chrome\.google\.com|chromewebstore\.google\.com/i.test(h)) return true; } catch (_) {}
+    return false;
+  }
+
+  // 截图入口按钮（与 marquee 文本模式互斥）
+  function startScreenshot(mode) {
+    if (marquee.classList.contains('on')) marquee.classList.remove('on');
+    if (isRestrictedUrl(window.location.href)) {
+      toastSS('当前页面（chrome:// 等）不支持截图，请切换到普通网页');
+      return;
+    }
+    chrome.runtime.sendMessage({ type: SCREENSHOT_OPEN, payload: { mode: mode } });
+  }
+
+  function sendSsOcr(task) {
+    if (!lastImage) { toastSS('请先完成截图'); return; }
+    // 不传 callback：由 sidepanel 协调器回传 SCREENSHOT_OCR_RESULT（并负责 license 跳转）
+    chrome.runtime.sendMessage({ type: SCREENSHOT_OCR, payload: { image: lastImage, task: task, lang: 'zh' } });
+  }
+
+  // 长图框选区域（F3 UI）：在预览图上叠加框选层，按「显示尺寸→原图尺寸」裁切
+  function startCropMode() {
+    if (!lastImage || !isLong || !ssImg) return;
+    ssCropping = true;
+    ssCropOverlay.style.display = 'block';
+    ssCropBox.style.display = 'none';
+    ssCropOverlay.addEventListener('pointerdown', onCropDown);
+    toastSS('在预览图上拖拽框选要保留的区域');
+  }
+  function onCropDown(e) {
+    if (!ssCropping) return;
+    const r = ssCropOverlay.getBoundingClientRect();
+    ssCropSX = e.clientX - r.left; ssCropSY = e.clientY - r.top;
+    ssCropRect = { x: ssCropSX, y: ssCropSY, w: 0, h: 0 };
+    ssCropBox.style.display = 'block'; updateCropBox();
+    ssCropOverlay.setPointerCapture && ssCropOverlay.setPointerCapture(e.pointerId);
+    ssCropOverlay.addEventListener('pointermove', onCropMove);
+    ssCropOverlay.addEventListener('pointerup', onCropUp);
+    e.preventDefault();
+  }
+  function onCropMove(e) {
+    const r = ssCropOverlay.getBoundingClientRect();
+    const cx = e.clientX - r.left, cy = e.clientY - r.top;
+    const x = Math.min(ssCropSX, cx), y = Math.min(ssCropSY, cy);
+    ssCropRect = { x, y, w: Math.abs(cx - ssCropSX), h: Math.abs(cy - ssCropSY) };
+    updateCropBox();
+  }
+  function onCropUp() {
+    ssCropOverlay.removeEventListener('pointermove', onCropMove);
+    ssCropOverlay.removeEventListener('pointerup', onCropUp);
+    ssCropping = false;
+    ssCropOverlay.style.display = 'none';
+    if (ssCropRect && ssCropRect.w > 4 && ssCropRect.h > 4) cropLastImage(ssCropRect);
+  }
+  function updateCropBox() {
+    if (!ssCropRect) return;
+    ssCropBox.style.left = ssCropRect.x + 'px';
+    ssCropBox.style.top = ssCropRect.y + 'px';
+    ssCropBox.style.width = ssCropRect.w + 'px';
+    ssCropBox.style.height = ssCropRect.h + 'px';
+  }
+  function cropLastImage(rectDisplay) {
+    const dispW = ssImg.clientWidth, dispH = ssImg.clientHeight;
+    const natW = ssImg.naturalWidth, natH = ssImg.naturalHeight;
+    if (!dispW || !dispH || !natW || !natH) return;
+    const sx = Math.round(rectDisplay.x / dispW * natW);
+    const sy = Math.round(rectDisplay.y / dispH * natH);
+    const sw = Math.max(1, Math.round(rectDisplay.w / dispW * natW));
+    const sh = Math.max(1, Math.round(rectDisplay.h / dispH * natH));
+    const c = document.createElement('canvas'); c.width = sw; c.height = sh;
+    try { c.getContext('2d').drawImage(ssImg, sx, sy, sw, sh, 0, 0, sw, sh); } catch (_) { return; }
+    const cropped = c.toDataURL('image/png');
+    lastImage = cropped; isLong = false; ssW = sw; ssH = sh;
+    ssImg.src = cropped; ssCropBtn.style.display = 'none';
+    toastSS('已裁切选中区域');
+  }
+
+  // 复制/保存直接在页面内执行（利用点击的用户激活，最可靠，可粘微信/QQ；失败再回退 background 消息）
+  async function copyImageInPage(dataUrl) {
+    try {
+      const blob = await (await fetch(dataUrl)).blob();
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+      toastSS('✅ 已复制截图，到微信按 Ctrl+V 粘贴');
+    } catch (e) {
+      // 兜底：转交 background 在 MAIN 世界执行复制
+      chrome.runtime.sendMessage({ type: SCREENSHOT_COPY, payload: { dataUrl: dataUrl } });
+    }
+  }
+  function saveImageInPage(dataUrl) {
+    const filename = 'Ddayup-截图-' + Date.now() + '.png';
+    // Chrome downloads.download 不支持 blob:，用 data: URL 直下（content script 内同样有效）
+    chrome.downloads.download({ url: dataUrl, filename: filename, saveAs: false })
+      .then(() => toastSS('已保存到下载文件夹'))
+      .catch((e) => { chrome.runtime.sendMessage({ type: SCREENSHOT_SAVE, payload: { dataUrl: dataUrl } }); });
+  }
+
+  // 绑定结果面板按钮
+  ssClose.addEventListener('click', () => { ssPanel.classList.remove('open'); lastImage = null; });
+  ssTranslate.addEventListener('click', () => sendSsOcr('translate'));
+  ssExtract.addEventListener('click', () => sendSsOcr('ocr'));
+  ssCopy.addEventListener('click', () => { if (lastImage) copyImageInPage(lastImage); });
+  ssSave.addEventListener('click', () => { if (lastImage) saveImageInPage(lastImage); });
+  ssCopyText.addEventListener('click', () => { if (ssText.value) navigator.clipboard.writeText(ssText.value).then(() => toastSS('已复制文字')).catch(() => toastSS('复制文字失败')); });
+  ssCropBtn.addEventListener('click', () => startCropMode());
+  window.addEventListener('resize', repositionSS);
+
   sendBtn.addEventListener('click', () => sendChat(text.value, 'chat'));
   text.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(text.value, 'chat'); } });
   panel.querySelectorAll('.acts button').forEach((b) => {
     b.addEventListener('click', () => {
       const action = b.dataset.action;
+      const mode = b.dataset.mode;
+      // 截图识文入口（第二阶段）：与文本模式互斥，走 sidepanel 协调器
+      if (mode === 'screenshot-region') { startScreenshot('region'); return; }
+      if (mode === 'screenshot-long') { startScreenshot('long'); return; }
       if (action === 'upload') { fileInput.click(); return; }
       if (action === 'deep') { pendingDeep = true; fileInput.click(); return; }
       if (action === 'analyze-page') {

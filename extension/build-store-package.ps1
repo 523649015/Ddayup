@@ -1,6 +1,9 @@
 ﻿# 打包 Ddayup 扩展为可提交 Microsoft Partner Center 的 zip（0.1.4）
 # 用法：在 PowerShell 中 cd 到 extension/ 目录，执行 .\build-store-package.ps1
 # 排除：native-host/（原生主机单独分发）、node_modules/、开发用脚本
+# 注意：vendor/ 必须进包！sidepanel.html 直接 <script src="vendor/*"> 引用
+#       mp4box.all.min.js / mp4-muxer.js（DASH 兜底合并）、hls.min.js（HLS 预览）、
+#       three/（3D 模型预览），缺失会导致侧栏加载 net::ERR_FILE_NOT_FOUND。
 $ErrorActionPreference = 'Stop'
 
 $extDir = $PSScriptRoot
@@ -10,12 +13,13 @@ $outName = "ddayup-edge-store-v$ver.zip"
 $outPath = Join-Path $extDir $outName
 
 # 需要排除的项（相对 extension/）
-$excludeDirs = @('native-host', 'node_modules', '.git', 'tests', 'store-assets', 'vendor', 'demo-recorder', 'tools',
+$excludeDirs = @('native-host', 'node_modules', '.git', 'tests', 'store-assets', 'demo-recorder', 'tools',
                  'probe_jingxuan')
 # 开发/评审文档与探针脚本一律不进商店包（属于代码残留）
 $excludeFiles = @('build-store-package.ps1', 'STORE_SUBMISSION_NOTES.md', 'README.md', 'debug_out.txt', 'eslint.config.js', 'generate-store-images.mjs',
                   'ARCHITECTURE_REVIEW_screenshot-ocr.md', 'ARCHITECTURE_REVIEW_screenshot-ocr-v2.md',
-                  'QA_screenshot-review.md', 'screenshot-fix-overview.md', 'test-auth-sync.mjs')
+                  'QA_screenshot-review.md', 'screenshot-fix-overview.md', 'test-auth-sync.mjs',
+                  '提交清单.md')
 
 if (Test-Path $outPath) { Remove-Item $outPath -Force }
 

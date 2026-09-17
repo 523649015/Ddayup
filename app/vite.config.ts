@@ -338,10 +338,31 @@ export default defineConfig({
   },
   build: {
     chunkSizeWarningLimit: 900,
+    // ★性能（2026-09-14）：现代浏览器无需 modulepreload 的 polyfill，去掉可省首屏内联脚本。
+    modulePreload: { polyfill: false },
     rollupOptions: {
+      // ★防复发（2026-09-14 黑屏事故复盘）：Rollup 的 “Circular chunk” 是致命信号——
+      //   曾因 vendor-react <-> vendor-misc 循环，导致 vendor-misc 求值时 React 命名空间
+      //   尚未初始化 → `Cannot read properties of undefined (reading 'useLayoutEffect')` → 整站黑屏。
+      //   这里把它从「警告」升级为「构建失败」，从机制上杜绝带病构建产物上线。
+      onwarn(warning, defaultHandler) {
+        const msg = String((warning && warning.message) || '');
+        // ★只拦「跨 chunk 循环」（Rollup: "Circular chunk: A -> B -> A"）。
+        //   注意：第三方库**内部**的模块级循环依赖（code=CIRCULAR_DEPENDENCY，例如
+        //   @xenova/transformers/src/*.js 互相 import）是良性的，绝不能拦，否则正常构建会被误杀。
+        if (/circular chunk/i.test(msg)) {
+          throw new Error('[build-guard] 检测到跨 chunk 循环（Circular chunk），构建已中止，禁止上线：' + msg);
+        }
+        defaultHandler(warning);
+      },
       output: {
         manualChunks(id) {
           if (!id.includes('node_modules')) return undefined;
+          // ★★严禁把 react / react-dom / scheduler 单独切成 vendor-react（2026-09-14 事故复盘）：
+          //   这样会产生跨块循环 vendor-react <-> vendor-misc（Rollup 会警告 Circular chunk），
+          //   导致 vendor-misc 里的库在求值时 React 命名空间尚未初始化 →
+          //   "Cannot read properties of undefined (reading 'useLayoutEffect')" → 整站黑屏。
+          //   react 必须与其消费者同块（或交给 Rollup 自动分片），本规则不得恢复。
           if (id.includes('@xyflow/react')) return 'vendor-flow';
           if (id.includes('react-router')) return 'vendor-router';
           if (id.includes('zustand')) return 'vendor-state';

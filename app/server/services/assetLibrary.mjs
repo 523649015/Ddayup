@@ -290,7 +290,7 @@ async function pickLocalDirectoryWindows(preferredPath = '') {
     '$OutputEncoding = $utf8NoBom',
     'Add-Type -AssemblyName System.Windows.Forms',
     '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog',
-    '$dialog.Description = "选择资产库存储目录',
+    '$dialog.Description = "选择资产库存储目录"',
     '$dialog.ShowNewFolderButton = $true',
     `$initialPath = '${escapePowerShellSingleQuoted(preferredPath)}'`,
     'if ($initialPath -and (Test-Path -LiteralPath $initialPath -PathType Container)) {',

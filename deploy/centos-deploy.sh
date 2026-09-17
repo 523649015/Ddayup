@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
+# ⛔ DEPRECATED / 已弃用（2026-09-16）：本脚本面向【CentOS + pm2 + Caddy + /opt/ddayup】，
+#    与线上真实架构不符。实际服务器是 Ubuntu + Nginx，仓库 /home/ubuntu/app，静态站 /var/www/hmdao。
+#    用它部署会把仓库塞到不存在的 /opt/ddayup、用 pm2 启动后端，导致与现有手动 node 进程抢端口。
+#    → 全量部署请用 deploy/ubuntu-deploy.sh；仅前端更新请用 deploy/deploy-dist.ps1。
+#    详见 deploy/ENVIRONMENTS.md。
+# =============================================================================
 # Ddayup 生产环境一键部署脚本（CentOS / Rocky / AlmaLinux）
 #
 # 用法（必须用 root 执行）：

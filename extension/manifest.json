@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "__MSG_appName__",
-  "version": "0.2.9",
+  "version": "0.3.0",
   "default_locale": "zh_CN",
   "description": "__MSG_appDesc__",
   "offline_enabled": true,
@@ -90,6 +90,12 @@
       "run_at": "document_start",
       "world": "MAIN",
       "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["title-extract.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
     },
     {
       "matches": ["*://pan.xunlei.com/*", "*://*.xunlei.com/*"],

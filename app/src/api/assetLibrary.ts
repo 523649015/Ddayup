@@ -1,4 +1,17 @@
 import type { AssetItem } from '@/types/assets';
+import { useAuthStore } from '@/store/useAuthStore';
+
+/**
+ * 构建带鉴权的请求头（Bearer token）。
+ * 后端 /api/assets/* 路由全部经 requireUserId 校验 getUserFromRequest，
+ * 仅识别 Authorization: Bearer <token> 或 body.access_token；
+ * credentials:'include' 只发 Cookie，不足以通过鉴权 → 必须显式附加 Bearer token。
+ */
+function authHeaders(): Record<string, string> {
+  const token = useAuthStore.getState().session?.accessToken;
+  if (token) return { Authorization: `Bearer ${token}` };
+  return {};
+}
 
 export interface AssetLibrarySettingsResponse {
   success: true;
@@ -90,6 +103,7 @@ export function resolvePersistedAssetLibraryUrl(url: unknown, persistedAssetId: 
 export async function fetchAssetLibrarySettings() {
   const response = await fetch('/api/settings/assets', {
     credentials: 'include',
+    headers: authHeaders(),
   });
   assertOk(response, 'Failed to load asset library settings');
   return await response.json() as AssetLibrarySettingsResponse;
@@ -100,6 +114,7 @@ export async function saveAssetLibrarySettings(storagePath: string) {
     method: 'PUT',
     headers: {
       'Content-Type': 'application/json',
+      ...authHeaders(),
     },
     credentials: 'include',
     body: JSON.stringify({ storagePath }),
@@ -116,6 +131,7 @@ export async function pickAssetLibraryDirectory(initialPath = '', autoSelectPath
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      ...authHeaders(),
     },
     credentials: 'include',
     body: JSON.stringify({ initialPath, autoSelectPath }),
@@ -136,6 +152,7 @@ export async function importAssetDirectory(options: {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      ...authHeaders(),
     },
     credentials: 'include',
     body: JSON.stringify({
@@ -154,6 +171,7 @@ export async function importAssetDirectory(options: {
 export async function fetchPersistedAssetCatalog() {
   const response = await fetch('/api/assets/library', {
     credentials: 'include',
+    headers: authHeaders(),
   });
   assertOk(response, 'Failed to load persisted asset catalog');
   return await response.json() as AssetLibraryCatalogResponse;
@@ -172,6 +190,7 @@ export async function pruneMissingAssets(): Promise<PruneMissingResult> {
   const response = await fetch('/api/assets/prune-missing', {
     method: 'POST',
     credentials: 'include',
+    headers: authHeaders(),
   });
   assertOk(response, 'Failed to prune missing assets');
   return await response.json() as PruneMissingResult;
@@ -195,6 +214,7 @@ export interface AssetDuplicatesResponse {
 export async function fetchAssetDuplicates() {
   const response = await fetch('/api/assets/duplicates', {
     credentials: 'include',
+    headers: authHeaders(),
   });
   assertOk(response, 'Failed to load asset duplicates');
   return await response.json() as AssetDuplicatesResponse;
@@ -204,6 +224,7 @@ export async function fetchAssetDuplicates() {
 export async function fetchPersistedAssetDuplicates() {
   const response = await fetch('/api/assets/duplicates/persisted', {
     credentials: 'include',
+    headers: authHeaders(),
   });
   assertOk(response, 'Failed to load persisted asset duplicates');
   return await response.json() as AssetDuplicatesResponse;
@@ -214,6 +235,7 @@ export async function deletePersistedAssets(assetIds: string[]) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      ...authHeaders(),
     },
     credentials: 'include',
     body: JSON.stringify({ assetIds }),
@@ -233,6 +255,7 @@ export async function restorePersistedAssets(items: AssetItem[]) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      ...authHeaders(),
     },
     credentials: 'include',
     body: JSON.stringify({ items: payload }),
@@ -258,6 +281,7 @@ export async function validatePersistedAsset(assetId: string) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      ...authHeaders(),
     },
     credentials: 'include',
     body: JSON.stringify({ assetId }),
@@ -282,6 +306,7 @@ export async function repairPersistedAsset(assetId: string) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      ...authHeaders(),
     },
     credentials: 'include',
     body: JSON.stringify({ assetId }),
@@ -314,6 +339,7 @@ export async function importLocalAssetFile(file: File, options: ImportAssetOptio
 
   const response = await fetch('/api/assets/import', {
     method: 'POST',
+    headers: authHeaders(),
     body: form,
     credentials: 'include',
   });
@@ -344,6 +370,7 @@ export async function importReferencedLocalAsset(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      ...authHeaders(),
     },
     credentials: 'include',
     body: JSON.stringify({
@@ -376,6 +403,7 @@ export async function importRemoteAsset(sourceUrl: string, options: ImportAssetO
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      ...authHeaders(),
     },
     credentials: 'include',
     body: JSON.stringify({

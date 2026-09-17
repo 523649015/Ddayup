@@ -448,7 +448,7 @@ export function localizeAdapterLabel(value: string | undefined | null, engine: D
 
 export function getUnrealSummaryFallback(status: UnrealPluginStatus | null, t: Translate) {
 
-  if (!status) return t('', 'Loading status...');
+  if (!status) return t('\u672a\u68c0\u6d4b \u00b7 \u70b9\u51fb\u5361\u7247\u6216\u300c\u68c0\u6d4b\u300d\u5f00\u59cb', 'Not checked yet \u00b7 click the card or Detect to start.');
 
   if (status.plugin.syncState && !status.plugin.syncState.runtimeInSync) {
     return t('', 'The deployed Unreal plugin runtime is older than the repaired source. Rebuild or reinstall first.');
@@ -509,7 +509,7 @@ export function getBlenderSummaryFallback(status: BlenderPluginStatus | null, t:
 
 
 
-  if (!status) return t('', 'Loading status...');
+  if (!status) return t('\u672a\u68c0\u6d4b \u00b7 \u70b9\u51fb\u5361\u7247\u6216\u300c\u68c0\u6d4b\u300d\u5f00\u59cb', 'Not checked yet \u00b7 click the card or Detect to start.');
 
 
 

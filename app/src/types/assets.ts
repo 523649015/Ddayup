@@ -415,6 +415,8 @@ export interface RecommendedVLMModel {
   freeQuota: string;
   setupGuide: string;
   priority: number; // 1=best
+  inputCost?: number;  // 每百万 tokens 输入价（CNY）
+  outputCost?: number; // 每百万 tokens 输出价（CNY）
 }
 
 /* ===== 采集任务 ===== */
@@ -529,6 +531,8 @@ export const RECOMMENDED_VLM_MODELS: RecommendedVLMModel[] = [
   },
   {
     id: 'qwen3.7-plus',
+    inputCost: 0.008,
+    outputCost: 0.008,
     name: 'Qwen3.7-Plus',
     provider: 'bailian',
     providerName: '阿里云百炼',
@@ -540,16 +544,32 @@ export const RECOMMENDED_VLM_MODELS: RecommendedVLMModel[] = [
     priority: 2,
   },
   {
-    id: 'gpt-4o',
-    name: 'GPT-4o',
-    provider: 'openai',
-    providerName: 'OpenAI',
-    description: '综合理解能力最强的多模态模型，英文提示词反推质量最高，风格/氛围描述出色',
-    strengths: ['综合理解最全面', '风格/氛围描述出色', '英/中文提示词均衡'],
-    free: false,
-    freeQuota: '按量付费，通过APIMart等Relay平台可能有免费额度',
-    setupGuide: '在OpenAI获取API Key → API管理面板激活OpenAI',
-    priority: 3,
+    id: 'qwen3.7-flash',
+    name: 'Qwen3.7-Flash',
+    provider: 'bailian',
+    providerName: '阿里云百炼',
+    description: '通义千问 Qwen3.7-Flash 轻量高速多模态模型，支持图文输入、对话与截图识文，延迟低、成本低，作为智能机器人与截图识文的统一默认模型。',
+    strengths: ['高速低延迟', '成本低', '多模态视觉'],
+    free: true,
+    freeQuota: '新用户免费额度',
+    setupGuide: '在阿里云百炼获取API Key → API管理面板激活百炼「大模型」(选择Qwen3.7-Flash)',
+    priority: 1,
+    inputCost: 0.002,
+    outputCost: 0.002,
+  },
+  {
+    id: 'qwen3.8-flash',
+    name: 'Qwen3.8-Flash',
+    provider: 'bailian',
+    providerName: '阿里云百炼',
+    description: '通义千问 Qwen3.8-Flash 轻量高速多模态模型，作为 Qwen3.7-Flash 的备选，延迟更低、成本更优，适合对话与截图识文。',
+    strengths: ['高速低延迟', '成本低', '多模态'],
+    free: true,
+    freeQuota: '新用户免费额度',
+    setupGuide: '在阿里云百炼获取API Key → API管理面板激活百炼「大模型」(选择Qwen3.8-Flash)',
+    priority: 2,
+    inputCost: 0.0015,
+    outputCost: 0.0015,
   },
   {
     id: 'glm-4v-plus',
